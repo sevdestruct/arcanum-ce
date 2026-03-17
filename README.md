@@ -116,6 +116,14 @@ These ports are not currently intended for players. Touch controls are not yet i
 
 Check [`ci-build.yml`](.github/workflows/ci-build.yml) for details on how the project is compiled.
 
+- Windows x64 builds automatically download a pinned FFmpeg SDK during CMake configure when one is not already configured.
+
+- Local macOS builds automatically use Homebrew's `ffmpeg` formula and will install `ffmpeg`/`pkg-config` through Homebrew during configure if needed. The default macOS preset now builds for the host architecture so the bundled FFmpeg dylibs match the target.
+
+- macOS CI/release builds should use a pinned SDK provided through `-DBINK_COMPAT_FFMPEG_SDK_ROOT=/path/to/ffmpeg-sdk` (or `FFMPEG_ROOT`). The repository includes [`scripts/build_ffmpeg_macos_sdk.sh`](scripts/build_ffmpeg_macos_sdk.sh), which builds a self-contained SDK from the official FFmpeg 8.0.1 source tarball for the current host architecture without relying on Homebrew's package versions.
+
+- To test the "no Homebrew FFmpeg available" path without uninstalling anything, configure with `-DBINK_COMPAT_ALLOW_HOMEBREW_FFMPEG=OFF`. The configure step should then fail clearly unless a pinned SDK root is provided.
+
 ## Configuration
 
 Several configuration options are available as command-line switches (admittedly not very user-friendly):

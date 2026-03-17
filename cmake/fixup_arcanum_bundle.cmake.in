@@ -1,0 +1,16 @@
+include(BundleUtilities)
+
+set(arcanum_bundle "${CMAKE_INSTALL_PREFIX}/Arcanum Community Edition.app")
+set(arcanum_search_dirs "@BINK_COMPAT_FFMPEG_SEARCH_DIRS_ESCAPED@")
+string(REPLACE "|" ";" arcanum_search_dirs "${arcanum_search_dirs}")
+
+if(EXISTS "${arcanum_bundle}")
+    fixup_bundle("${arcanum_bundle}" "" "${arcanum_search_dirs}")
+    execute_process(
+        COMMAND /usr/bin/codesign --force --deep --sign - --timestamp=none "${arcanum_bundle}"
+        RESULT_VARIABLE arcanum_codesign_result
+    )
+    if(NOT arcanum_codesign_result EQUAL 0)
+        message(FATAL_ERROR "Failed to re-sign fixed-up macOS bundle")
+    endif()
+endif()

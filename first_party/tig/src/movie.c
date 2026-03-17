@@ -2,7 +2,9 @@
 
 #include <bink_compat.h>
 
+#include <SDL3/SDL_timer.h>
 #include <SDL3_mixer/SDL_mixer.h>
+#include <stdint.h>
 
 #include "tig/color.h"
 #include "tig/core.h"
@@ -11,7 +13,7 @@
 #include "tig/video.h"
 #include "tig/window.h"
 
-static bool tig_movie_do_frame(void);
+static bool tig_movie_do_frame(bool* presented);
 
 // 0x62B2BC
 static HBINK tig_movie_bink;
@@ -19,13 +21,16 @@ static HBINK tig_movie_bink;
 static TigVideoBuffer* tig_movie_video_buffer;
 static int tig_movie_screen_width;
 static int tig_movie_screen_height;
+static tig_timestamp_t tig_movie_next_frame_due_ms;
 
 typedef struct SdlMixerSoundData {
     u8* buffer;
-    u32 min_buffer_size;
+    u32 buffer_size;
+    u32 max_queued_bytes;
     SDL_AudioStream* stream;
     MIX_Track* track;
     s32 paused;
+    bool started;
     float volume;
     MIX_StereoGains pan;
 } SdlMixerSoundData;
@@ -40,9 +45,13 @@ static void BINKCALL SdlMixerSetPan(struct BINKSND* snd, s32 pan);
 static s32 BINKCALL SdlMixerPause(struct BINKSND* snd, s32 status);
 static s32 BINKCALL SdlMixerSetOnOff(struct BINKSND* snd, s32 status);
 static void BINKCALL SdlMixerClose(struct BINKSND* snd);
+static bool sdl_mixer_play_track(MIX_Track* track);
 static void setup_track(struct BINKSND* snd);
 static int ref_mixer(void);
 static void unref_mixer(void);
+static tig_timestamp_t tig_movie_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms);
+static bool tig_movie_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due);
+static unsigned int tig_movie_time_until_ms(tig_timestamp_t now, tig_timestamp_t due);
 
 static MIX_Mixer* mixer;
 static int mixer_refcount;
@@ -74,7 +83,8 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     unsigned int bink_open_flags = 0;
     TigMessage message;
     bool stop;
-    int key = -1;
+    bool presented;
+    SDL_Scancode stop_scancode = SDL_SCANCODE_UNKNOWN;
     TigVideoBufferCreateInfo vb_create_info;
 
     if (path == NULL) {
@@ -82,9 +92,10 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
         return TIG_ERR_INVALID_PARAM;
     }
 
-    if (sound_track != 0) {
-        BinkSetSoundTrack(sound_track);
-        bink_open_flags |= BINKSNDTRACK;
+    bink_open_flags |= BINKSNDTRACK;
+
+    if (sound_track >= 0) {
+        BinkSetSoundTrack((unsigned)sound_track);
     }
 
     tig_movie_bink = BinkOpen(path, bink_open_flags);
@@ -92,6 +103,8 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
         tig_video_fade(0, 0, 0.0f, 1);
         return TIG_ERR_IO;
     }
+
+    tig_movie_next_frame_due_ms = 0;
 
     vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
     vb_create_info.background_color = 0;
@@ -119,23 +132,38 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     }
 
     stop = false;
-    while (!stop && tig_movie_do_frame()) {
-        tig_video_flip();
+    while (!stop && tig_movie_do_frame(&presented)) {
+        if (presented) {
+            tig_video_flip();
+        } else {
+            tig_timestamp_t now_ms;
+            unsigned int wait_ms = 1;
+
+            tig_timer_now(&now_ms);
+            if (tig_movie_next_frame_due_ms != 0
+                && tig_movie_time_is_in_future(now_ms, tig_movie_next_frame_due_ms)) {
+                wait_ms = tig_movie_time_until_ms(now_ms, tig_movie_next_frame_due_ms);
+            }
+
+            SDL_Delay(wait_ms > 5 ? 5 : wait_ms);
+        }
+
         tig_ping();
 
         while (tig_message_dequeue(&message) == TIG_OK) {
             if ((movie_flags & TIG_MOVIE_IGNORE_KEYBOARD) == 0
                 && message.type == TIG_MESSAGE_KEYBOARD
-                && message.data.keyboard.pressed == 1) {
-                key = message.data.keyboard.key;
+                && message.data.keyboard.pressed == 1
+                && message.data.keyboard.scancode == SDL_SCANCODE_ESCAPE) {
+                stop_scancode = message.data.keyboard.scancode;
                 stop = true;
             }
         }
     }
 
-    if (key != -1) {
-        // Wait until the key is released.
-        while (tig_kb_is_key_pressed(key)) {
+    if (stop_scancode != SDL_SCANCODE_UNKNOWN) {
+        // Wait until ESC is released so the next screen doesn't see a held key.
+        while (tig_kb_is_key_pressed(stop_scancode)) {
             tig_ping();
         }
     }
@@ -149,6 +177,7 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
 
     BinkClose(tig_movie_bink);
     tig_movie_bink = NULL;
+    tig_movie_next_frame_due_ms = 0;
 
     tig_window_invalidate_rect(NULL);
 
@@ -175,11 +204,30 @@ bool tig_movie_is_playing(void)
 }
 
 // 0x5317D0
-bool tig_movie_do_frame(void)
+bool tig_movie_do_frame(bool* presented)
 {
     TigVideoBufferData video_buffer_data;
     TigRect src_rect;
     TigRect dst_rect;
+    tig_timestamp_t now_ms;
+    unsigned frame_ms;
+
+    *presented = false;
+
+    if (tig_movie_bink->Frames > 0
+        && tig_movie_bink->FrameNum > tig_movie_bink->Frames) {
+        return false;
+    }
+
+    frame_ms = tig_movie_bink->FrameDurationMs > 0
+        ? tig_movie_bink->FrameDurationMs
+        : 33;
+
+    tig_timer_now(&now_ms);
+    if (tig_movie_next_frame_due_ms != 0
+        && tig_movie_time_is_in_future(now_ms, tig_movie_next_frame_due_ms)) {
+        return true;
+    }
 
     if (!BinkWait(tig_movie_bink)) {
         BinkDoFrame(tig_movie_bink);
@@ -216,11 +264,13 @@ bool tig_movie_do_frame(void)
         // Blit buffer to the center of the screen.
         tig_video_blit(tig_movie_video_buffer, &src_rect, &dst_rect);
 
-        if (tig_movie_bink->FrameNum == tig_movie_bink->Frames) {
-            return false;
-        }
+        *presented = true;
 
         BinkNextFrame(tig_movie_bink);
+        tig_movie_next_frame_due_ms = tig_movie_schedule_next_frame_due(
+            now_ms,
+            tig_movie_next_frame_due_ms,
+            frame_ms);
     }
 
     return true;
@@ -259,8 +309,12 @@ s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u3
     src_spec.format = SDL_AUDIO_S16LE;
     MIX_GetMixerFormat(mixer, &dst_spec);
 
-    snddata->min_buffer_size = 16536;
-    snddata->buffer = SDL_malloc(snddata->min_buffer_size * 2);
+    snddata->buffer_size = freq * (u32)chans * (u32)(bits / 8);
+    if (snddata->buffer_size < 65536) {
+        snddata->buffer_size = 65536;
+    }
+    snddata->max_queued_bytes = snddata->buffer_size * 4;
+    snddata->buffer = SDL_malloc(snddata->buffer_size);
     if (snddata->buffer == NULL) {
         return 0;
     }
@@ -286,6 +340,7 @@ s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u3
     }
 
     snddata->paused = 0;
+    snddata->started = false;
     snddata->volume = 1.0f;
     snddata->pan.left = 0.5f;
     snddata->pan.right = 0.5f;
@@ -312,7 +367,7 @@ s32 BINKCALL SdlMixerReady(struct BINKSND* snd)
         return 0;
     }
 
-    return SDL_GetAudioStreamQueued(snddata->stream) < (int)snddata->min_buffer_size;
+    return SDL_GetAudioStreamQueued(snddata->stream) < (int)snddata->max_queued_bytes;
 }
 
 s32 BINKCALL SdlMixerLock(struct BINKSND* snd, u8** addr, u32* len)
@@ -320,7 +375,7 @@ s32 BINKCALL SdlMixerLock(struct BINKSND* snd, u8** addr, u32* len)
     SdlMixerSoundData* snddata = (SdlMixerSoundData*)snd->snddata;
 
     *addr = snddata->buffer;
-    *len = snddata->min_buffer_size;
+    *len = snddata->buffer_size;
 
     return 1;
 }
@@ -329,8 +384,15 @@ s32 BINKCALL SdlMixerUnlock(struct BINKSND* snd, u32 filled)
 {
     SdlMixerSoundData* snddata = (SdlMixerSoundData*)snd->snddata;
 
+    if (filled == 0) {
+        return 1;
+    }
+
     SDL_PutAudioStreamData(snddata->stream, snddata->buffer, (int)filled);
-    MIX_PlayTrack(snddata->track, 0);
+    if (!snddata->started || !MIX_TrackPlaying(snddata->track)) {
+        sdl_mixer_play_track(snddata->track);
+        snddata->started = true;
+    }
 
     return 1;
 }
@@ -398,6 +460,10 @@ s32 BINKCALL SdlMixerSetOnOff(struct BINKSND* snd, s32 status)
         if (snd->OnOff == 0) {
             setup_track(snd);
             snd->OnOff = 1;
+            if (SDL_GetAudioStreamQueued(snddata->stream) > 0) {
+                sdl_mixer_play_track(snddata->track);
+                snddata->started = true;
+            }
         }
     }
 
@@ -413,6 +479,19 @@ void BINKCALL SdlMixerClose(struct BINKSND* snd)
     SDL_free(snddata->buffer);
 
     unref_mixer();
+}
+
+bool sdl_mixer_play_track(MIX_Track* track)
+{
+    SDL_PropertiesID props;
+    bool started;
+
+    props = SDL_CreateProperties();
+    SDL_SetBooleanProperty(props, MIX_PROP_PLAY_HALT_WHEN_EXHAUSTED_BOOLEAN, false);
+    started = MIX_PlayTrack(track, props);
+    SDL_DestroyProperties(props);
+
+    return started;
 }
 
 void setup_track(struct BINKSND* snd)
@@ -441,4 +520,35 @@ void unref_mixer(void)
     if (--mixer_refcount == 0) {
         MIX_DestroyMixer(mixer);
     }
+}
+
+static tig_timestamp_t tig_movie_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms)
+{
+    tig_timestamp_t next_due;
+
+    if (previous_due == 0) {
+        return now + frame_ms;
+    }
+
+    next_due = previous_due + frame_ms;
+
+    /* Clamp only after a noticeable stall; otherwise keep the original
+     * timeline so video can catch back up to audio when we're slightly late. */
+    if (!tig_movie_time_is_in_future(now, next_due)
+        && (unsigned int)(now - next_due) > frame_ms * 4) {
+        next_due = now + frame_ms;
+    }
+
+    return next_due;
+}
+
+bool tig_movie_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due)
+{
+    return (int32_t)(due - now) > 0;
+}
+
+unsigned int tig_movie_time_until_ms(tig_timestamp_t now, tig_timestamp_t due)
+{
+    int32_t delta = (int32_t)(due - now);
+    return delta > 0 ? (unsigned int)delta : 0;
 }
