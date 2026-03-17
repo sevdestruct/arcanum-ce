@@ -1,6 +1,11 @@
 #include "ui/slide_ui.h"
 
 #include <stdio.h>
+#include <string.h>
+
+#include "tig/bmp.h"
+#include "tig/color.h"
+#include "tig/memory.h"
 
 #include "game/gamelib.h"
 #include "game/gfade.h"
@@ -15,8 +20,13 @@
 #define MAX_QUEUE_SIZE 100
 
 static void slide_ui_prepare(int type);
-static bool slide_ui_do_slide(tig_window_handle_t window_handle, int slide);
+static bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide);
 static bool slide_ui_get_assets(int slide, char* bmp_path, char* speech_path);
+static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
+static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
+static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
+static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y);
+static bool slide_ui_colors_match(uint32_t a, uint32_t b);
 static void slide_ui_fade_out(void);
 static void slide_ui_fade_in(void);
 static void slide_ui_queue_clear(void);
@@ -131,7 +141,7 @@ void slide_ui_start(int type)
 
             // Present each slide in the queue.
             for (index = 0; index < slide_ui_queue_size; index++) {
-                if (!slide_ui_do_slide(window_handle, slide_ui_queue[index])) {
+                if (!slide_ui_do_slide(window_handle, type, slide_ui_queue[index])) {
                     // Escape was pressed - stop slideshow.
                     break;
                 }
@@ -187,15 +197,18 @@ void slide_ui_prepare(int type)
  *
  * 0x569770
  */
-bool slide_ui_do_slide(tig_window_handle_t window_handle, int slide)
+bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
 {
     TigMessage msg;
     TigRect rect;
     TigBmp bmp;
+    char bmp_path[TIG_MAX_PATH];
+    char custom_bg_path[TIG_MAX_PATH];
     char speech_path[TIG_MAX_PATH];
     tig_sound_handle_t speech_handle;
     bool cont = true;
     bool stop;
+    bool custom_override;
     tig_timestamp_t start;
     tig_duration_t elapsed;
 
@@ -205,11 +218,22 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int slide)
     rect.width = 800;
     rect.height = 600;
 
-    if (slide_ui_get_assets(slide, bmp.name, speech_path)) {
+    if (slide_ui_get_assets(slide, bmp_path, speech_path)) {
+        strcpy(bmp.name, bmp_path);
+        custom_override = type == SLIDE_UI_TYPE_CREDITS
+            && slide_ui_get_custom_credits_bg_path(custom_bg_path);
+
         // Load image.
         if (tig_bmp_create(&bmp) == TIG_OK) {
             // Put image into window.
-            tig_bmp_copy_to_window(&bmp, &rect, window_handle, &rect);
+            if (custom_override) {
+                if (!slide_ui_blit_custom_credits_slide(&bmp, custom_bg_path, window_handle)) {
+                    TigRect dst_rect = rect;
+                    tig_bmp_copy_to_window(&bmp, &rect, window_handle, &dst_rect);
+                }
+            } else {
+                tig_bmp_copy_to_window(&bmp, &rect, window_handle, &rect);
+            }
             tig_bmp_destroy(&bmp);
 
             // Refresh screen.
@@ -299,6 +323,234 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int slide)
     }
 
     return cont;
+}
+
+static bool slide_ui_get_custom_credits_bg_path(char* bmp_path)
+{
+    FILE* stream;
+
+    stream = fopen("data/art/ui/credits_bg.bmp", "rb");
+    if (stream != NULL) {
+        fclose(stream);
+        strcpy(bmp_path, "art\\ui\\credits_bg.bmp");
+        return true;
+    }
+
+    stream = fopen("data/art/ui/mainmenu_bg.bmp", "rb");
+    if (stream != NULL) {
+        fclose(stream);
+        strcpy(bmp_path, "art\\ui\\mainmenu_bg.bmp");
+        return true;
+    }
+
+    return false;
+}
+
+static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle)
+{
+    TigWindowData window_data;
+    TigBmp custom_bg_bmp;
+    TigBmp composite_bmp;
+    TigRect src_rect;
+    TigRect dst_rect;
+    int sw;
+    int sh;
+    int bmp_ox;
+    int bmp_oy;
+    int src_x;
+    int src_y;
+    int x;
+    int y;
+    uint8_t* background_mask;
+
+    strcpy(custom_bg_bmp.name, custom_bg_path);
+    if (tig_bmp_create(&custom_bg_bmp) != TIG_OK) {
+        return false;
+    }
+
+    if (tig_window_data(window_handle, &window_data) != TIG_OK) {
+        tig_bmp_destroy(&custom_bg_bmp);
+        return false;
+    }
+
+    sw = hrp_iso_window_width_get();
+    sh = hrp_iso_window_height_get();
+    bmp_ox = (sw - custom_bg_bmp.width) / 2;
+    bmp_oy = (sh - custom_bg_bmp.height) / 2;
+    src_x = window_data.rect.x - bmp_ox;
+    src_y = window_data.rect.y - bmp_oy;
+
+    if (src_x < 0
+        || src_y < 0
+        || src_x + window_data.rect.width > custom_bg_bmp.width
+        || src_y + window_data.rect.height > custom_bg_bmp.height
+        || slide_bmp->width < window_data.rect.width
+        || slide_bmp->height < window_data.rect.height) {
+        tig_bmp_destroy(&custom_bg_bmp);
+        return false;
+    }
+
+    background_mask = MALLOC(window_data.rect.width * window_data.rect.height);
+    if (background_mask == NULL) {
+        tig_bmp_destroy(&custom_bg_bmp);
+        return false;
+    }
+
+    if (!slide_ui_build_background_mask(slide_bmp, background_mask)) {
+        FREE(background_mask);
+        tig_bmp_destroy(&custom_bg_bmp);
+        return false;
+    }
+
+    composite_bmp.bpp = 24;
+    composite_bmp.width = window_data.rect.width;
+    composite_bmp.height = window_data.rect.height;
+    composite_bmp.pitch = composite_bmp.width * 3;
+    composite_bmp.pixels = MALLOC(composite_bmp.pitch * composite_bmp.height);
+    if (composite_bmp.pixels == NULL) {
+        FREE(background_mask);
+        tig_bmp_destroy(&custom_bg_bmp);
+        return false;
+    }
+
+    for (y = 0; y < composite_bmp.height; y++) {
+        uint8_t* dst = (uint8_t*)composite_bmp.pixels + y * composite_bmp.pitch;
+        for (x = 0; x < composite_bmp.width; x++) {
+            uint32_t slide_color = slide_ui_bmp_color_at(slide_bmp, x, y);
+            uint32_t bg_color = slide_ui_bmp_color_at(&custom_bg_bmp, src_x + x, src_y + y);
+            uint32_t out_color;
+
+            if (background_mask[y * composite_bmp.width + x] != 0) {
+                out_color = bg_color;
+            } else {
+                out_color = slide_color;
+            }
+
+            dst[0] = (uint8_t)(out_color & 0xFF);
+            dst[1] = (uint8_t)((out_color >> 8) & 0xFF);
+            dst[2] = (uint8_t)((out_color >> 16) & 0xFF);
+            dst += 3;
+        }
+    }
+
+    src_rect.x = 0;
+    src_rect.y = 0;
+    src_rect.width = composite_bmp.width;
+    src_rect.height = composite_bmp.height;
+    dst_rect = src_rect;
+    tig_bmp_copy_to_window(&composite_bmp, &src_rect, window_handle, &dst_rect);
+
+    FREE(background_mask);
+    tig_bmp_destroy(&custom_bg_bmp);
+    tig_bmp_destroy(&composite_bmp);
+    return true;
+}
+
+static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)
+{
+    int width = slide_bmp->width;
+    int height = slide_bmp->height;
+    int queue_size = width * height;
+    int* queue;
+    int head = 0;
+    int tail = 0;
+    static const int offsets[4][2] = {
+        { 1, 0 },
+        { -1, 0 },
+        { 0, 1 },
+        { 0, -1 },
+    };
+    int x;
+    int y;
+    int i;
+
+    memset(mask, 0, width * height);
+
+    queue = MALLOC(sizeof(*queue) * queue_size);
+    if (queue == NULL) {
+        return false;
+    }
+
+    for (x = 0; x < width; x++) {
+        mask[x] = 1;
+        queue[tail++] = x;
+
+        if (height > 1) {
+            mask[(height - 1) * width + x] = 1;
+            queue[tail++] = (height - 1) * width + x;
+        }
+    }
+
+    for (y = 1; y < height - 1; y++) {
+        mask[y * width] = 1;
+        queue[tail++] = y * width;
+
+        if (width > 1) {
+            mask[y * width + (width - 1)] = 1;
+            queue[tail++] = y * width + (width - 1);
+        }
+    }
+
+    while (head < tail) {
+        int index = queue[head++];
+        int curr_x = index % width;
+        int curr_y = index / width;
+        uint32_t base_color = slide_ui_bmp_color_at(slide_bmp, curr_x, curr_y);
+
+        for (i = 0; i < 4; i++) {
+            int nx = curr_x + offsets[i][0];
+            int ny = curr_y + offsets[i][1];
+            int nindex;
+
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+                continue;
+            }
+
+            nindex = ny * width + nx;
+            if (mask[nindex] != 0) {
+                continue;
+            }
+
+            if (!slide_ui_colors_match(base_color, slide_ui_bmp_color_at(slide_bmp, nx, ny))) {
+                continue;
+            }
+
+            mask[nindex] = 1;
+            queue[tail++] = nindex;
+        }
+    }
+
+    FREE(queue);
+    return true;
+}
+
+static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y)
+{
+    if (bmp->bpp == 8) {
+        uint8_t index = *((uint8_t*)bmp->pixels + y * bmp->pitch + x);
+        return bmp->palette[index];
+    }
+
+    if (bmp->bpp == 24) {
+        uint8_t* src = (uint8_t*)bmp->pixels + y * bmp->pitch + x * 3;
+        return tig_color_make(src[2], src[1], src[0]);
+    }
+
+    return 0;
+}
+
+static bool slide_ui_colors_match(uint32_t a, uint32_t b)
+{
+    int ar = (a >> 16) & 0xFF;
+    int ag = (a >> 8) & 0xFF;
+    int ab = a & 0xFF;
+    int br = (b >> 16) & 0xFF;
+    int bg = (b >> 8) & 0xFF;
+    int bb = b & 0xFF;
+
+    return abs(ar - br) <= 10
+        && abs(ag - bg) <= 10
+        && abs(ab - bb) <= 10;
 }
 
 /**

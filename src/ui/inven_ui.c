@@ -25,6 +25,7 @@
 #include "game/spell.h"
 #include "game/stat.h"
 #include "game/target.h"
+#include "ui/gameuilib.h"
 #include "ui/hotkey_ui.h"
 #include "ui/intgame.h"
 #include "ui/item_ui.h"
@@ -82,6 +83,8 @@ static void redraw_inven_fix_bad_inven_obj(int64_t a1);
 static bool redraw_inven_fix_bad_inven(int64_t a1, int64_t a2);
 static void redraw_inven(bool a1);
 static tig_art_id_t sub_5782D0(void);
+static const char* const* inven_ui_bg_candidates(void);
+static bool inven_ui_blit_custom_bg(const TigRect* canvas_rect, const TigRect* dst_rect);
 static void sub_578330(int64_t a1, int64_t a2);
 static void sub_5786C0(int64_t obj);
 static void sub_578760(int64_t obj);
@@ -2919,6 +2922,8 @@ void redraw_inven(bool a1)
     int inventory_location;
     int weapon_min_str;
     bool weapon_too_heavy;
+    int bg_width;
+    int bg_height;
 
     art_blit_info.art_id = sub_5782D0();
     if (tig_art_frame_data(art_blit_info.art_id, &art_frame_data) != TIG_OK) {
@@ -2929,6 +2934,8 @@ void redraw_inven(bool a1)
     src_rect.y = 0;
     src_rect.width = art_frame_data.width;
     src_rect.height = art_frame_data.height;
+    bg_width = art_frame_data.width;
+    bg_height = art_frame_data.height;
 
     dst_rect.x = 0;
     dst_rect.y = 0;
@@ -2938,7 +2945,9 @@ void redraw_inven(bool a1)
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &src_rect;
     art_blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+    if (!inven_ui_blit_custom_bg(&dst_rect, &dst_rect)) {
+        tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+    }
 
     // 0x5765A5
     switch (inven_ui_mode) {
@@ -3101,7 +3110,9 @@ void redraw_inven(bool a1)
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &src_rect;
     art_blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+    if (!inven_ui_blit_custom_bg(&(TigRect){ 0, 0, bg_width, bg_height }, &dst_rect)) {
+        tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+    }
 
     if (inven_ui_panel == INVEN_UI_PANEL_PAPERDOLL) {
         tig_art_interface_id_create(341, 0, 0, 0, &(art_blit_info.art_id));
@@ -3122,7 +3133,9 @@ void redraw_inven(bool a1)
         art_blit_info.flags = 0;
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
-        tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+        if (!inven_ui_blit_custom_bg(&(TigRect){ 0, 0, bg_width, bg_height }, &dst_rect)) {
+            tig_window_blit_art(inven_ui_window_handle, &art_blit_info);
+        }
     }
 
     // 0x576C38
@@ -3788,6 +3801,64 @@ tig_art_id_t sub_5782D0(void)
     tig_art_interface_id_create(num, 0, 0, 0, &art_id);
 
     return art_id;
+}
+
+static const char* const* inven_ui_bg_candidates(void)
+{
+    static const char* inventory_candidates[] = {
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+    static const char* barter_candidates[] = {
+        "art\\ui\\barter_bg.bmp",
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+    static const char* loot_candidates[] = {
+        "art\\ui\\loot_bg.bmp",
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+    static const char* steal_candidates[] = {
+        "art\\ui\\steal_bg.bmp",
+        "art\\ui\\loot_bg.bmp",
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+    static const char* identify_candidates[] = {
+        "art\\ui\\identify_bg.bmp",
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+    static const char* repair_candidates[] = {
+        "art\\ui\\repair_bg.bmp",
+        "art\\ui\\inventory_bg.bmp",
+        NULL,
+    };
+
+    switch (inven_ui_mode) {
+    case INVEN_UI_MODE_BARTER:
+        return barter_candidates;
+    case INVEN_UI_MODE_LOOT:
+        return loot_candidates;
+    case INVEN_UI_MODE_STEAL:
+        return steal_candidates;
+    case INVEN_UI_MODE_IDENTIFY:
+    case INVEN_UI_MODE_NPC_IDENTIFY:
+        return identify_candidates;
+    case INVEN_UI_MODE_NPC_REPAIR:
+        return repair_candidates;
+    default:
+        return inventory_candidates;
+    }
+}
+
+static bool inven_ui_blit_custom_bg(const TigRect* canvas_rect, const TigRect* dst_rect)
+{
+    return gameuilib_custom_ui_blit(inven_ui_window_handle,
+        canvas_rect,
+        dst_rect,
+        inven_ui_bg_candidates());
 }
 
 // 0x578330
@@ -4573,6 +4644,8 @@ void sub_579E00(int a1)
 void sub_579E30(TigRect* rect)
 {
     TigArtBlitInfo blit_info;
+    TigArtFrameData art_frame_data;
+    TigRect canvas_rect;
 
     if (inven_ui_mode == INVEN_UI_MODE_INVENTORY
         || inven_ui_mode == INVEN_UI_MODE_NPC_IDENTIFY
@@ -4584,5 +4657,15 @@ void sub_579E30(TigRect* rect)
     blit_info.art_id = sub_5782D0();
     blit_info.src_rect = rect;
     blit_info.dst_rect = rect;
-    tig_window_blit_art(inven_ui_window_handle, &blit_info);
+    if (tig_art_frame_data(blit_info.art_id, &art_frame_data) != TIG_OK) {
+        return;
+    }
+
+    canvas_rect.x = 0;
+    canvas_rect.y = 0;
+    canvas_rect.width = art_frame_data.width;
+    canvas_rect.height = art_frame_data.height;
+    if (!inven_ui_blit_custom_bg(&canvas_rect, rect)) {
+        tig_window_blit_art(inven_ui_window_handle, &blit_info);
+    }
 }

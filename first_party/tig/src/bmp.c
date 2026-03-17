@@ -259,6 +259,26 @@ int tig_bmp_copy_to_video_buffer(TigBmp* bmp, const TigRect* src_rect, TigVideoB
                 }
                 break;
             }
+        } else if (bmp->bpp == 24 && video_buffer_data.bpp == 32) {
+            // SDL3 loads 24-bit BMPs as BGR24 (bytes: B, G, R in memory).
+            // src_pixels is already offset to blit_src_rect origin (1 byte per channel).
+            uint8_t* src_pixels24 = (uint8_t*)bmp->pixels
+                + blit_src_rect.y * bmp->pitch + blit_src_rect.x * 3;
+            uint32_t* dst = (uint32_t*)video_buffer_data.surface_data.pixels
+                + blit_dst_rect.y * (video_buffer_data.pitch / 4) + blit_dst_rect.x;
+            int skip = video_buffer_data.pitch / 4 - blit_dst_rect.width;
+
+            float src_y = 0.0f;
+            for (int y = 0; y < blit_dst_rect.height; y++) {
+                float src_x = 0.0f;
+                for (int x = 0; x < blit_dst_rect.width; x++) {
+                    uint8_t* src = src_pixels24 + (int)src_y * bmp->pitch + (int)src_x * 3;
+                    *dst++ = tig_color_index_of(tig_color_make(src[2], src[1], src[0]));
+                    src_x += src_step_x;
+                }
+                dst += skip;
+                src_y += src_step_y;
+            }
         } else if (bmp->bpp == 24 && video_buffer_data.bpp == 16) {
             for (int y = 0; y < bmp->height; y++) {
                 for (int x = 0; x < bmp->width; x++) {

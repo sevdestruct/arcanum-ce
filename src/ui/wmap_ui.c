@@ -22,6 +22,7 @@
 #include "game/townmap.h"
 #include "game/ui.h"
 #include "ui/anim_ui.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/textedit_ui.h"
 #include "ui/types.h"
@@ -435,6 +436,13 @@ static bool wmap_ui_initialized;
 
 // 0x66D864
 static bool wmap_ui_created;
+
+static const char* wmap_ui_bg_candidates[] = {
+    "art\\ui\\worldmap_bg.bmp",
+    "art\\ui\\map_bg.bmp",
+    "art\\ui\\wmap_bg.bmp",
+    NULL,
+};
 
 // 0x66D868
 static WmapUiMode wmap_ui_mode;
@@ -1549,7 +1557,12 @@ bool wmap_ui_create(void)
         exit(EXIT_SUCCESS); // FIXME: Should be EXIT_FAILURE.
     }
 
-    tig_window_blit_art(wmap_ui_window, &art_blit_info);
+    if (!gameuilib_custom_ui_blit(wmap_ui_window,
+            &dst_rect,
+            &dst_rect,
+            wmap_ui_bg_candidates)) {
+        tig_window_blit_art(wmap_ui_window, &art_blit_info);
+    }
 
     font_desc.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_SHADOW;
     tig_art_interface_id_create(840, 0, 0, 0, &(font_desc.art_id));
