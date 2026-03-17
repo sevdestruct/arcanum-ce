@@ -12,6 +12,7 @@
 #include "game/proto.h"
 #include "game/snd.h"
 #include "game/tech.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/tb_ui.h"
 
@@ -351,6 +352,12 @@ static bool schematic_ui_initialized;
  * 0x680EA0
  */
 static bool schematic_ui_created;
+
+static const char* schematic_ui_bg_candidates[] = {
+    "art\\ui\\crafting_bg.bmp",
+    "art\\ui\\schematic_bg.bmp",
+    NULL,
+};
 
 /**
  * Called when the game is initialized.
@@ -1095,19 +1102,21 @@ void schematic_ui_redraw(void)
     }
 
     // Draw background.
-    blit_info.flags = 0;
-    tig_art_interface_id_create(365, 0, 0, 0, &(blit_info.art_id));
-
     src_rect.x = 0;
     src_rect.y = 0;
     src_rect.width = schematic_ui_window_rect.width;
     src_rect.height = schematic_ui_window_rect.height;
-    blit_info.src_rect = &src_rect;
-
     dst_rect = src_rect;
-    blit_info.dst_rect = &dst_rect;
-
-    tig_window_blit_art(schematic_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(schematic_ui_window,
+            &dst_rect,
+            &dst_rect,
+            schematic_ui_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(365, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(schematic_ui_window, &blit_info);
+    }
 
     // Obtain current schematic info.
     schematic = schematic_ui_current_id();

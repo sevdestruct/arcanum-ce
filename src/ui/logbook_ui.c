@@ -20,6 +20,7 @@
 #include "game/snd.h"
 #include "game/timeevent.h"
 #include "game/ui.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/types.h"
 
@@ -186,6 +187,20 @@ static bool logbook_ui_initialized;
 
 // 0x64B86C
 static bool logbook_ui_created;
+
+static const char* logbook_ui_bg_candidates[] = {
+    "art\\ui\\journal_bg.bmp",
+    "art\\ui\\logbook_bg.bmp",
+    NULL,
+};
+
+static const char* logbook_ui_panel_bg_candidates[] = {
+    "art\\ui\\journal_panel_bg.bmp",
+    "art\\ui\\logbook_panel_bg.bmp",
+    "art\\ui\\journal_page_bg.bmp",
+    "art\\ui\\logbook_page_bg.bmp",
+    NULL,
+};
 
 // 0x53EB10
 bool logbook_ui_init(GameInitInfo* init_info)
@@ -393,11 +408,16 @@ void logbook_ui_create(void)
     dst_rect.width = src_rect.width;
     dst_rect.height = src_rect.height;
 
-    blit_info.flags = 0;
-    tig_art_interface_id_create(264, 0, 0, 0, &(blit_info.art_id));
-    blit_info.src_rect = &src_rect;
-    blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(logbook_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(logbook_ui_window,
+            &dst_rect,
+            &dst_rect,
+            logbook_ui_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(264, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(logbook_ui_window, &blit_info);
+    }
 
     for (index = 0; index < LOGBOOK_UI_BUTTON_COUNT; index++) {
         intgame_button_create_ex(logbook_ui_window,
@@ -542,16 +562,21 @@ void logbook_ui_draw_panel(int art_num, bool preserve_page)
     dst_rect.width = src_rect.width;
     dst_rect.height = src_rect.height;
 
-    blit_info.flags = 0;
-    tig_art_interface_id_create(260, 0, 0, 0, &(blit_info.art_id));
-    blit_info.src_rect = &src_rect;
-    blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(logbook_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(logbook_ui_window,
+            &dst_rect,
+            &dst_rect,
+            logbook_ui_panel_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(260, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(logbook_ui_window, &blit_info);
 
-    tig_art_interface_id_create(logbook_ui_art_num, 0, 0, 0, &(blit_info.art_id));
-    dst_rect.x = 172;
-    dst_rect.y = 23;
-    tig_window_blit_art(logbook_ui_window, &blit_info);
+        tig_art_interface_id_create(logbook_ui_art_num, 0, 0, 0, &(blit_info.art_id));
+        dst_rect.x = 172;
+        dst_rect.y = 23;
+        tig_window_blit_art(logbook_ui_window, &blit_info);
+    }
 
     selected_button_handle = sub_538730(logbook_ui_tab_buttons[0].button_handle);
     selected_button_index = 0;

@@ -1,6 +1,9 @@
 #include "ui/mainmenu_ui.h"
 
 #include <stdio.h>
+#include <string.h>
+
+#include "tig/bmp.h"
 
 #include "game/area.h"
 #include "game/background.h"
@@ -141,6 +144,12 @@ static bool main_menu_button_create(MainMenuButtonInfo* info, int width, int hei
 static bool main_menu_button_create_ex(MainMenuButtonInfo* info, int width, int height, unsigned int flags);
 static void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str, TigRect* rect, unsigned int flags);
 static void sub_546DD0(void);
+static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void);
+static void mainmenu_ui_blit_custom_bg_to_window(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_rect);
+static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect);
+static bool mainmenu_ui_load_bg_bmp(TigBmp* bmp, MainMenuWindowType type);
+static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type);
+static void mainmenu_ui_reapply_custom_bg(void);
 static void mainmenu_ui_create_shared_radio_buttons(void);
 static bool sub_546EE0(TigMessage* msg);
 static void mainmenu_ui_refresh_button_text(int btn, unsigned int flags);
@@ -189,6 +198,12 @@ static bool dword_5C3620 = true;
 
 // 0x5C3624
 static tig_window_handle_t dword_5C3624 = TIG_WINDOW_HANDLE_INVALID;
+
+static tig_window_handle_t mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+static TigBmp mainmenu_ui_custom_bg_bmp;
+static bool mainmenu_ui_has_custom_bg = false;
+static MainMenuWindowType mainmenu_ui_custom_bg_window_type = MM_WINDOW_0;
+static bool mainmenu_ui_custom_bg_window_type_override = false;
 
 // 0x5C3628
 static TigRect stru_5C3628 = { 0, 0, 800, 600 };
@@ -2464,6 +2479,12 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
         tig_window_blit_art(dword_5C3624, &art_blit_info);
+        if (mainmenu_ui_has_custom_bg) {
+            TigWindowData wd;
+            if (tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+                mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, dword_5C3624, wd.rect, dst_rect);
+            }
+        }
     }
 
     if (rect == NULL
@@ -3161,6 +3182,12 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
         tig_window_blit_art(dword_5C3624, &art_blit_info);
+        if (mainmenu_ui_has_custom_bg) {
+            TigWindowData wd;
+            if (tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+                mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, dword_5C3624, wd.rect, dst_rect);
+            }
+        }
     }
 
     if (rect == NULL
@@ -3533,9 +3560,20 @@ void mainmenu_ui_credits_create(void)
     mainmenu_ui_num_windows++;
     mainmenu_ui_pop_window_stack();
     mainmenu_ui_window_type = MM_WINDOW_MAINMENU;
+    mainmenu_ui_custom_bg_window_type = MM_WINDOW_CREDITS;
+    mainmenu_ui_custom_bg_window_type_override = true;
     mainmenu_ui_open();
+    mainmenu_ui_custom_bg_window_type_override = false;
     dword_64C38C = true;
     slide_ui_start(SLIDE_UI_TYPE_CREDITS);
+    if (mainmenu_ui_active && mainmenu_ui_window_type == MM_WINDOW_MAINMENU) {
+        if (!mainmenu_ui_reload_custom_bg(MM_WINDOW_MAINMENU)) {
+            mainmenu_ui_reapply_custom_bg();
+        }
+        sub_549960();
+        mainmenu_ui_draw_version();
+        tig_window_display();
+    }
 
     if (mainmenu_ui_active) {
         if (main_menu_window_info[mainmenu_ui_window_type]->refresh_func != NULL) {
@@ -4463,6 +4501,194 @@ void mainmenu_ui_create_window(void)
     mainmenu_ui_create_window_func(true);
 }
 
+// Each entry: { primary file, fallback file (or NULL) }.
+// Screens that share the main menu look fall back to mainmenu_bg.bmp when
+// no bespoke file is present.  Screens with two NULLs use original game art.
+static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void)
+{
+    if (mainmenu_ui_custom_bg_window_type_override) {
+        return mainmenu_ui_custom_bg_window_type;
+    }
+
+    return mainmenu_ui_window_type;
+}
+
+static bool mainmenu_ui_load_bg_bmp(TigBmp* bmp, MainMenuWindowType type)
+{
+    static const char* candidates[MM_WINDOW_COUNT][2] = {
+        /* MM_WINDOW_0                    */ { NULL, NULL },
+        /* MM_WINDOW_1                    */ { NULL, NULL },
+        /* MM_WINDOW_MAINMENU             */ { "art\\ui\\mainmenu_bg.bmp", NULL },
+        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art\\ui\\inmenu_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art\\ui\\inmenu_locked_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_SINGLE_PLAYER        */ { "art\\ui\\singleplayer_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_OPTIONS              */ { "art\\ui\\options_bg.bmp", NULL },
+        /* MM_WINDOW_LOAD_GAME            */ { "art\\ui\\loadgame_bg.bmp", NULL },
+        /* MM_WINDOW_SAVE_GAME            */ { "art\\ui\\savegame_bg.bmp", NULL },
+        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art\\ui\\savegame_bg.bmp", NULL },
+        /* MM_WINDOW_INTRO                */ { "art\\ui\\intro_bg.bmp", NULL },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art\\ui\\newchar_bg.bmp", NULL },
+        /* MM_WINDOW_NEW_CHAR             */ { "art\\ui\\newchar_bg.bmp", NULL },
+        /* MM_WINDOW_PREGEN_CHAR          */ { "art\\ui\\newchar_bg.bmp", NULL },
+        /* MM_WINDOW_CHAREDIT             */ { "art\\ui\\charedit_bg.bmp", NULL },
+        /* MM_WINDOW_SHOP                 */ { "art\\ui\\shop_bg.bmp", NULL },
+        /* MM_WINDOW_CREDITS              */ { "art\\ui\\credits_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_26                   */ { NULL, NULL },
+    };
+    int i;
+
+    if (type < 0 || type >= MM_WINDOW_COUNT) {
+        return false;
+    }
+
+    for (i = 0; i < 2; i++) {
+        if (candidates[type][i] == NULL) {
+            break;
+        }
+        strncpy(bmp->name, candidates[type][i], sizeof(bmp->name) - 1);
+        bmp->name[sizeof(bmp->name) - 1] = '\0';
+        if (tig_bmp_create(bmp) == TIG_OK) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type)
+{
+    TigBmp bmp;
+
+    if (!mainmenu_ui_load_bg_bmp(&bmp, type)) {
+        return false;
+    }
+
+    if (mainmenu_ui_has_custom_bg) {
+        tig_bmp_destroy(&mainmenu_ui_custom_bg_bmp);
+    }
+
+    mainmenu_ui_custom_bg_bmp = bmp;
+    mainmenu_ui_has_custom_bg = true;
+    mainmenu_ui_reapply_custom_bg();
+
+    return true;
+}
+
+static void mainmenu_ui_blit_custom_bg_to_window(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_rect)
+{
+    int sw = hrp_iso_window_width_get();
+    int sh = hrp_iso_window_height_get();
+    int bmp_ox = (sw - bmp->width) / 2;
+    int bmp_oy = (sh - bmp->height) / 2;
+    int src_x = win_rect.x - bmp_ox;
+    int src_y = win_rect.y - bmp_oy;
+    int dst_x = 0;
+    int dst_y = 0;
+    int blit_w = win_rect.width;
+    int blit_h = win_rect.height;
+    TigRect src_r;
+    TigRect dst_r;
+
+    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
+    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
+    if (src_x + blit_w > bmp->width) { blit_w = bmp->width - src_x; }
+    if (src_y + blit_h > bmp->height) { blit_h = bmp->height - src_y; }
+
+    if (blit_w <= 0 || blit_h <= 0) {
+        return;
+    }
+
+    src_r.x = src_x;
+    src_r.y = src_y;
+    src_r.width = blit_w;
+    src_r.height = blit_h;
+    dst_r.x = dst_x;
+    dst_r.y = dst_y;
+    dst_r.width = blit_w;
+    dst_r.height = blit_h;
+    tig_bmp_copy_to_window(bmp, &src_r, wnd, &dst_r);
+    TigRect dirty = win_rect;
+    tig_window_invalidate_rect(&dirty);
+}
+
+// Blit the custom background art to a sub-rect of a window.
+// win_screen_rect: the window's screen rect (used to map to BMP coordinates).
+// local_rect: destination rect in window-local coordinates.
+static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect)
+{
+    int sw = hrp_iso_window_width_get();
+    int sh = hrp_iso_window_height_get();
+    int bmp_ox = (sw - bmp->width) / 2;
+    int bmp_oy = (sh - bmp->height) / 2;
+    int sx = win_screen_rect.x + local_rect.x;
+    int sy = win_screen_rect.y + local_rect.y;
+    int src_x = sx - bmp_ox;
+    int src_y = sy - bmp_oy;
+    int dst_x = local_rect.x;
+    int dst_y = local_rect.y;
+    int blit_w = local_rect.width;
+    int blit_h = local_rect.height;
+    TigRect src_r;
+    TigRect dst_r;
+    TigRect dirty;
+
+    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
+    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
+    if (src_x + blit_w > bmp->width) { blit_w = bmp->width - src_x; }
+    if (src_y + blit_h > bmp->height) { blit_h = bmp->height - src_y; }
+
+    if (blit_w <= 0 || blit_h <= 0) {
+        return;
+    }
+
+    src_r.x = src_x;
+    src_r.y = src_y;
+    src_r.width = blit_w;
+    src_r.height = blit_h;
+    dst_r.x = dst_x;
+    dst_r.y = dst_y;
+    dst_r.width = blit_w;
+    dst_r.height = blit_h;
+    tig_bmp_copy_to_window(bmp, &src_r, wnd, &dst_r);
+    dirty.x = win_screen_rect.x + dst_x;
+    dirty.y = win_screen_rect.y + dst_y;
+    dirty.width = blit_w;
+    dirty.height = blit_h;
+    tig_window_invalidate_rect(&dirty);
+}
+
+static void mainmenu_ui_reapply_custom_bg(void)
+{
+    TigWindowData window_data;
+    int idx;
+
+    if (!mainmenu_ui_has_custom_bg) {
+        return;
+    }
+
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(mainmenu_ui_backdrop_handle, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, mainmenu_ui_backdrop_handle, window_data.rect);
+    }
+
+    if (dword_5C3624 != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(dword_5C3624, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3624, window_data.rect);
+    }
+
+    for (idx = 0; idx < SDL_arraysize(dword_5C3670); idx++) {
+        if (dword_5C3670[idx] != TIG_WINDOW_HANDLE_INVALID
+            && tig_window_data(dword_5C3670[idx], &window_data) == TIG_OK) {
+            mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3670[idx], window_data.rect);
+        }
+    }
+
+    if (dword_5C3658 != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(dword_5C3658, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3658, window_data.rect);
+    }
+}
+
 // 0x546340
 void mainmenu_ui_create_window_func(bool should_display)
 {
@@ -4480,6 +4706,7 @@ void mainmenu_ui_create_window_func(bool should_display)
     tig_art_id_t art_id;
     tig_font_handle_t font;
     tig_window_handle_t window_handle;
+    mainmenu_ui_has_custom_bg = false;
     bool v1 = false;
     int idx;
     int rc;
@@ -4490,6 +4717,24 @@ void mainmenu_ui_create_window_func(bool should_display)
 
     if (mainmenu_ui_active) {
         return;
+    }
+
+    if (hrp_iso_window_width_get() > 800 || hrp_iso_window_height_get() > 600) {
+        TigWindowData backdrop_data;
+        backdrop_data.flags = TIG_WINDOW_ALWAYS_ON_TOP | TIG_WINDOW_MESSAGE_FILTER;
+        backdrop_data.rect.x = 0;
+        backdrop_data.rect.y = 0;
+        backdrop_data.rect.width = hrp_iso_window_width_get();
+        backdrop_data.rect.height = hrp_iso_window_height_get();
+        backdrop_data.background_color = tig_color_make(0, 0, 0);
+        backdrop_data.color_key = tig_color_make(0, 0, 0);
+        backdrop_data.message_filter = sub_546EE0;
+        if (tig_window_create(&backdrop_data, &mainmenu_ui_backdrop_handle) == TIG_OK) {
+            if (mainmenu_ui_load_bg_bmp(&mainmenu_ui_custom_bg_bmp, mainmenu_ui_bg_window_type_resolve())) {
+                mainmenu_ui_has_custom_bg = true;
+                mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, mainmenu_ui_backdrop_handle, backdrop_data.rect);
+            }
+        }
     }
 
     window = main_menu_window_info[mainmenu_ui_window_type];
@@ -4533,6 +4778,9 @@ void mainmenu_ui_create_window_func(bool should_display)
             }
 
             tig_window_blit_art(dword_5C3624, &art_blit_info);
+            if (mainmenu_ui_has_custom_bg) {
+                mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3624, window_data.rect);
+            }
         }
     } else {
         v1 = true;
@@ -4577,6 +4825,9 @@ void mainmenu_ui_create_window_func(bool should_display)
                 }
 
                 tig_window_blit_art(dword_5C3670[idx], &art_blit_info);
+                if (mainmenu_ui_has_custom_bg) {
+                    mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3670[idx], window_data.rect);
+                }
 
                 v1 = true;
             }
@@ -4614,6 +4865,9 @@ void mainmenu_ui_create_window_func(bool should_display)
             }
 
             tig_window_blit_art(dword_5C3658, &art_blit_info);
+            if (mainmenu_ui_has_custom_bg) {
+                mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3658, window_data.rect);
+            }
         } else {
             if (!v1) {
                 tig_debug_printf("mainmenu_ui_create_window_func: ERROR: tig_art_anim_data2 failed!\n");
@@ -4835,6 +5089,12 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
                 art_blit_info.src_rect = &src_rect;
                 art_blit_info.dst_rect = &dst_rect;
                 tig_window_blit_art(dword_5C3624, &art_blit_info);
+                if (mainmenu_ui_has_custom_bg) {
+                    TigWindowData wd;
+                    if (tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+                        mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, dword_5C3624, wd.rect, dst_rect);
+                    }
+                }
             }
         }
 
@@ -4878,6 +5138,16 @@ void sub_546DD0(void)
         if (dword_5C3658 != TIG_WINDOW_HANDLE_INVALID
             && tig_window_destroy(dword_5C3658) == TIG_OK) {
             dword_5C3658 = TIG_WINDOW_HANDLE_INVALID;
+        }
+
+        if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
+            && tig_window_destroy(mainmenu_ui_backdrop_handle) == TIG_OK) {
+            mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+        }
+
+        if (mainmenu_ui_has_custom_bg) {
+            tig_bmp_destroy(&mainmenu_ui_custom_bg_bmp);
+            mainmenu_ui_has_custom_bg = false;
         }
 
         mainmenu_ui_active = false;

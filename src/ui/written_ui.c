@@ -12,6 +12,7 @@
 #include "game/proto.h"
 #include "game/snd.h"
 #include "game/tech.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/types.h"
 
@@ -76,6 +77,7 @@ static bool written_ui_draw_paragraph(char* str, int font_num, int centered, Tig
 static void written_ui_parse(char* str, int* font_num_ptr, int* centered_ptr, char** str_ptr);
 static void written_ui_draw_book_side(int side, int* num_ptr, int* offset_ptr);
 static int written_ui_draw_page_like(TigRect* rect, int* num_ptr, int* offset_ptr);
+static const char* const* written_ui_bg_candidates(void);
 
 /**
  * 0x5CA478
@@ -935,12 +937,74 @@ void written_ui_draw_background(int num, int x, int y)
     dst_rect.width = src_rect.width;
     dst_rect.height = src_rect.height;
 
-    blit_info.flags = 0;
-    tig_art_interface_id_create(num, 0, 0, 0, &(blit_info.art_id));
-    blit_info.src_rect = &src_rect;
-    blit_info.dst_rect = &dst_rect;
+    if (!gameuilib_custom_ui_blit(written_ui_window,
+            &(TigRect){ 0, 0, written_ui_frame.width, written_ui_frame.height },
+            &dst_rect,
+            written_ui_bg_candidates())) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(num, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
 
-    tig_window_blit_art(written_ui_window, &blit_info);
+        tig_window_blit_art(written_ui_window, &blit_info);
+    }
+}
+
+static const char* const* written_ui_bg_candidates(void)
+{
+    static const char* book_candidates[] = {
+        "art\\ui\\book_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+    static const char* note_candidates[] = {
+        "art\\ui\\note_bg.bmp",
+        "art\\ui\\paper_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+    static const char* newspaper_candidates[] = {
+        "art\\ui\\newspaper_bg.bmp",
+        "art\\ui\\paper_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+    static const char* vendigroth_newspaper_candidates[] = {
+        "art\\ui\\vendigroth_newspaper_bg.bmp",
+        "art\\ui\\newspaper_bg.bmp",
+        "art\\ui\\paper_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+    static const char* telegram_candidates[] = {
+        "art\\ui\\telegram_bg.bmp",
+        "art\\ui\\paper_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+    static const char* plaque_candidates[] = {
+        "art\\ui\\plaque_bg.bmp",
+        "art\\ui\\written_bg.bmp",
+        NULL,
+    };
+
+    switch (written_ui_type) {
+    case WRITTEN_TYPE_BOOK:
+        return book_candidates;
+    case WRITTEN_TYPE_NOTE:
+        return note_candidates;
+    case WRITTEN_TYPE_NEWSPAPER:
+        if (written_ui_is_vendigroth_times) {
+            return vendigroth_newspaper_candidates;
+        }
+        return newspaper_candidates;
+    case WRITTEN_TYPE_TELEGRAM:
+        return telegram_candidates;
+    case WRITTEN_TYPE_PLAQUE:
+        return plaque_candidates;
+    default:
+        return NULL;
+    }
 }
 
 /**

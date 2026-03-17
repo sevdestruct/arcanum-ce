@@ -22,6 +22,7 @@
 #include "game/stat.h"
 #include "game/tech.h"
 #include "game/ui.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/schematic_ui.h"
 #include "ui/scrollbar_ui.h"
@@ -161,6 +162,7 @@ static void sub_55EFF0(void);
 static void sub_55F0D0(void);
 static void charedit_scheme_scrollbar_value_changed(int value);
 static void charedit_scheme_scrollbar_refresh_rect(TigRect* rect);
+static bool charedit_blit_custom_bg(tig_window_handle_t window_handle, const TigRect* canvas_rect, const TigRect* dst_rect, const char* const* candidates);
 
 // 0x5C7E70
 static struct {
@@ -816,6 +818,45 @@ static int64_t charedit_obj;
 // 0x64E018
 static bool charedit_created;
 
+static const char* charedit_bg_candidates[] = {
+    "art\\ui\\character_bg.bmp",
+    "art\\ui\\status_bg.bmp",
+    "art\\ui\\charedit_bg.bmp",
+    NULL,
+};
+
+static const char* charedit_skills_bg_candidates[] = {
+    "art\\ui\\skills_bg.bmp",
+    "art\\ui\\charedit_skills_bg.bmp",
+    "art\\ui\\character_bg.bmp",
+    "art\\ui\\charedit_bg.bmp",
+    NULL,
+};
+
+static const char* charedit_tech_bg_candidates[] = {
+    "art\\ui\\tech_bg.bmp",
+    "art\\ui\\charedit_tech_bg.bmp",
+    "art\\ui\\character_bg.bmp",
+    "art\\ui\\charedit_bg.bmp",
+    NULL,
+};
+
+static const char* charedit_spells_bg_candidates[] = {
+    "art\\ui\\spellbook_bg.bmp",
+    "art\\ui\\charedit_spells_bg.bmp",
+    "art\\ui\\character_bg.bmp",
+    "art\\ui\\charedit_bg.bmp",
+    NULL,
+};
+
+static const char* charedit_scheme_bg_candidates[] = {
+    "art\\ui\\crafting_tab_bg.bmp",
+    "art\\ui\\charedit_scheme_bg.bmp",
+    "art\\ui\\character_bg.bmp",
+    "art\\ui\\charedit_bg.bmp",
+    NULL,
+};
+
 // 0x64E01C
 static int dword_64E01C;
 
@@ -824,6 +865,11 @@ static int dword_64E020;
 
 // 0x64E024
 static int dword_64E024;
+
+static bool charedit_blit_custom_bg(tig_window_handle_t window_handle, const TigRect* canvas_rect, const TigRect* dst_rect, const char* const* candidates)
+{
+    return gameuilib_custom_ui_blit(window_handle, canvas_rect, dst_rect, candidates);
+}
 
 // 0x64E028
 static int charedit_selected_tech;
@@ -947,14 +993,19 @@ bool charedit_open(int64_t obj, ChareditMode mode)
     dst_rect.width = window_data.rect.width;
     dst_rect.height = window_data.rect.height;
 
-    art_blit_info.flags = 0;
-    art_blit_info.art_id = art_id;
-    art_blit_info.src_rect = &(window_data.rect);
-    art_blit_info.dst_rect = &dst_rect;
-    if (tig_window_blit_art(charedit_window_handle, &art_blit_info) != TIG_OK) {
-        intgame_big_window_unlock();
-        charedit_obj = OBJ_HANDLE_NULL;
-        return false;
+    if (!charedit_blit_custom_bg(charedit_window_handle,
+            &dst_rect,
+            &dst_rect,
+            charedit_bg_candidates)) {
+        art_blit_info.flags = 0;
+        art_blit_info.art_id = art_id;
+        art_blit_info.src_rect = &(window_data.rect);
+        art_blit_info.dst_rect = &dst_rect;
+        if (tig_window_blit_art(charedit_window_handle, &art_blit_info) != TIG_OK) {
+            intgame_big_window_unlock();
+            charedit_obj = OBJ_HANDLE_NULL;
+            return false;
+        }
     }
 
     button_data.flags = TIG_BUTTON_MOMENTARY;
@@ -2178,7 +2229,12 @@ void sub_55BD10(int group)
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &rect;
     art_blit_info.dst_rect = &rect;
-    tig_window_blit_art(charedit_skills_win, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_skills_win,
+            &rect,
+            &rect,
+            charedit_skills_bg_candidates)) {
+        tig_window_blit_art(charedit_skills_win, &art_blit_info);
+    }
 
     sub_55B880(charedit_skills_win, charedit_morph15_white_font, &stru_5C82F0[4 * dword_64E020], 0, -1, 4);
 
@@ -2265,7 +2321,12 @@ void charedit_refresh_skills_win(void)
         dst_rect.height = gauge_art_frame_data.height;
 
         art_blit_info.art_id = skills_win_art_id;
-        tig_window_blit_art(charedit_skills_win, &art_blit_info);
+        if (!charedit_blit_custom_bg(charedit_skills_win,
+                &(TigRect){ 0, 0, skills_win_art_frame_data.width, skills_win_art_frame_data.height },
+                &dst_rect,
+                charedit_skills_bg_candidates)) {
+            tig_window_blit_art(charedit_skills_win, &art_blit_info);
+        }
 
         if (skill_level != 0) {
             src_rect.x = 0;
@@ -2318,13 +2379,18 @@ bool charedit_create_tech_win(void)
     window_data.rect.x = 0;
     window_data.rect.y = 0;
 
-    art_blit_info.flags = 0;
-    art_blit_info.art_id = art_id;
-    art_blit_info.src_rect = &(window_data.rect);
-    art_blit_info.dst_rect = &(window_data.rect);
-    if (tig_window_blit_art(charedit_tech_win, &art_blit_info) != TIG_OK) {
-        tig_window_destroy(charedit_tech_win);
-        return false;
+    if (!charedit_blit_custom_bg(charedit_tech_win,
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            charedit_tech_bg_candidates)) {
+        art_blit_info.flags = 0;
+        art_blit_info.art_id = art_id;
+        art_blit_info.src_rect = &(window_data.rect);
+        art_blit_info.dst_rect = &(window_data.rect);
+        if (tig_window_blit_art(charedit_tech_win, &art_blit_info) != TIG_OK) {
+            tig_window_destroy(charedit_tech_win);
+            return false;
+        }
     }
 
     button_data.flags = TIG_BUTTON_TOGGLE | TIG_BUTTON_LATCH;
@@ -2431,7 +2497,12 @@ void charedit_refresh_tech_win(void)
         }
     }
 
-    tig_window_blit_art(charedit_tech_win, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_tech_win,
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            &rect,
+            charedit_tech_bg_candidates)) {
+        tig_window_blit_art(charedit_tech_win, &art_blit_info);
+    }
 
     for (index = 0; index < 3; index++) {
         stru_5C8FC8[index].str = str[0];
@@ -2555,13 +2626,18 @@ bool charedit_create_spells_win(void)
     window_data.rect.x = 0;
     window_data.rect.y = 0;
 
-    art_blit_info.flags = 0;
-    art_blit_info.art_id = art_id;
-    art_blit_info.src_rect = &(window_data.rect);
-    art_blit_info.dst_rect = &(window_data.rect);
-    if (tig_window_blit_art(charedit_spells_win, &art_blit_info) != TIG_OK) {
-        tig_window_destroy(charedit_spells_win);
-        return false;
+    if (!charedit_blit_custom_bg(charedit_spells_win,
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            charedit_spells_bg_candidates)) {
+        art_blit_info.flags = 0;
+        art_blit_info.art_id = art_id;
+        art_blit_info.src_rect = &(window_data.rect);
+        art_blit_info.dst_rect = &(window_data.rect);
+        if (tig_window_blit_art(charedit_spells_win, &art_blit_info) != TIG_OK) {
+            tig_window_destroy(charedit_spells_win);
+            return false;
+        }
     }
 
     button_data.flags = TIG_BUTTON_TOGGLE | TIG_BUTTON_LATCH;
@@ -2698,7 +2774,12 @@ void charedit_refresh_spells_win(void)
         }
     }
 
-    tig_window_blit_art(charedit_spells_win, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_spells_win,
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            &rect,
+            charedit_spells_bg_candidates)) {
+        tig_window_blit_art(charedit_spells_win, &art_blit_info);
+    }
 
     cnt = spell_college_level_get(charedit_obj, dword_64E024);
 
@@ -2842,13 +2923,18 @@ bool charedit_scheme_win_create(void)
     window_data.rect.x = 0;
     window_data.rect.y = 0;
 
-    art_blit_info.flags = 0;
-    art_blit_info.art_id = art_id;
-    art_blit_info.src_rect = &(window_data.rect);
-    art_blit_info.dst_rect = &(window_data.rect);
-    if (tig_window_blit_art(charedit_scheme_win, &art_blit_info) != TIG_OK) {
-        tig_window_destroy(charedit_scheme_win);
-        return false;
+    if (!charedit_blit_custom_bg(charedit_scheme_win,
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            &(TigRect){ 0, 0, art_frame_data.width, art_frame_data.height },
+            charedit_scheme_bg_candidates)) {
+        art_blit_info.flags = 0;
+        art_blit_info.art_id = art_id;
+        art_blit_info.src_rect = &(window_data.rect);
+        art_blit_info.dst_rect = &(window_data.rect);
+        if (tig_window_blit_art(charedit_scheme_win, &art_blit_info) != TIG_OK) {
+            tig_window_destroy(charedit_scheme_win);
+            return false;
+        }
     }
 
     charedit_num_schemes = 0;
@@ -2903,7 +2989,12 @@ void charedit_scheme_win_refresh(void)
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &rect;
     art_blit_info.dst_rect = &rect;
-    tig_window_blit_art(charedit_scheme_win, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_scheme_win,
+            &rect,
+            &rect,
+            charedit_scheme_bg_candidates)) {
+        tig_window_blit_art(charedit_scheme_win, &art_blit_info);
+    }
 
     if (obj_field_int32_get(charedit_obj, OBJ_F_TYPE) == OBJ_TYPE_PC
         && (obj_field_int32_get(charedit_obj, OBJ_F_PC_FLAGS) & OPCF_USE_ALT_DATA) != 0) {
@@ -3768,8 +3859,6 @@ void charedit_refresh_alignment_aptitude_bars(void)
         return;
     }
 
-    tig_art_interface_id_create(22, 0, 0, 0, &(art_blit_info.art_id));
-
     src_rect.x = 775;
     src_rect.y = 87;
     src_rect.width = art_frame_data.width;
@@ -3783,7 +3872,13 @@ void charedit_refresh_alignment_aptitude_bars(void)
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &src_rect;
     art_blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_window_handle,
+            &(TigRect){ 0, 0, 800, 560 },
+            &dst_rect,
+            charedit_bg_candidates)) {
+        tig_art_interface_id_create(22, 0, 0, 0, &(art_blit_info.art_id));
+        tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    }
 
     value = stat_level_get(charedit_obj, STAT_MAGICK_TECH_APTITUDE);
     if (value < 0) {
@@ -3811,16 +3906,26 @@ void charedit_refresh_alignment_aptitude_bars(void)
     art_blit_info.dst_rect = &dst_rect;
     tig_window_blit_art(charedit_window_handle, &art_blit_info);
 
-    tig_art_interface_id_create(22, 0, 0, 0, &(art_blit_info.art_id));
-
     art_blit_info.src_rect = &stru_5C8970;
     art_blit_info.dst_rect = &stru_5C8970;
     art_blit_info.flags = 0;
-    tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_window_handle,
+            &(TigRect){ 0, 0, 800, 560 },
+            &stru_5C8970,
+            charedit_bg_candidates)) {
+        tig_art_interface_id_create(22, 0, 0, 0, &(art_blit_info.art_id));
+        tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    }
 
     art_blit_info.src_rect = &stru_5C8980;
     art_blit_info.dst_rect = &stru_5C8980;
-    tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    if (!charedit_blit_custom_bg(charedit_window_handle,
+            &(TigRect){ 0, 0, 800, 560 },
+            &stru_5C8980,
+            charedit_bg_candidates)) {
+        tig_art_interface_id_create(22, 0, 0, 0, &(art_blit_info.art_id));
+        tig_window_blit_art(charedit_window_handle, &art_blit_info);
+    }
 
     sub_55B880(charedit_window_handle, charedit_cloister18_white_font, stru_5C8940, labels, -1, 3);
 }
@@ -3898,11 +4003,16 @@ void charedit_scheme_scrollbar_refresh_rect(TigRect* rect)
     TigArtBlitInfo blit_info;
 
     if (charedit_scheme_scrollbar_initialized) {
-        tig_art_interface_id_create(567, 0, 0, 0, &(blit_info.art_id));
-        blit_info.flags = 0;
-        blit_info.src_rect = rect;
-        blit_info.dst_rect = rect;
-        tig_window_blit_art(charedit_scheme_win, &blit_info);
+        if (!charedit_blit_custom_bg(charedit_scheme_win,
+                &(TigRect){ 0, 0, 297, 393 },
+                rect,
+                charedit_scheme_bg_candidates)) {
+            tig_art_interface_id_create(567, 0, 0, 0, &(blit_info.art_id));
+            blit_info.flags = 0;
+            blit_info.src_rect = rect;
+            blit_info.dst_rect = rect;
+            tig_window_blit_art(charedit_scheme_win, &blit_info);
+        }
     }
 }
 
