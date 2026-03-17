@@ -127,7 +127,12 @@ jobs:
             libxinerama-dev:i386 \
             libxcursor-dev:i386 \
             libasound2-dev:i386 \
+            libavcodec-dev:i386 \
+            libavformat-dev:i386 \
+            libavutil-dev:i386 \
             libpulse-dev:i386 \
+            libswresample-dev:i386 \
+            libswscale-dev:i386 \
             libxss-dev:i386 \
             libxtst-dev:i386 \
             ${NULL+}
@@ -144,7 +149,12 @@ jobs:
             libxinerama-dev \
             libxcursor-dev \
             libasound2-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
             libpulse-dev \
+            libswresample-dev \
+            libswscale-dev \
             libxss-dev \
             libxtst-dev \
             ${NULL+}
@@ -185,8 +195,11 @@ jobs:
           path: out/build/macos
           key: macos-cmake-v4
 
+      - name: Build FFmpeg SDK
+        run: bash scripts/build_ffmpeg_macos_sdk.sh "$PWD/out/build/macos/ffmpeg-sdk"
+
       - name: Configure
-        run: cmake --preset macos
+        run: cmake --preset macos -DBINK_COMPAT_FFMPEG_SDK_ROOT="$PWD/out/build/macos/ffmpeg-sdk" -DBINK_COMPAT_ALLOW_HOMEBREW_FFMPEG=OFF
 
       - name: Build
         run: cmake --build --preset macos-debug
@@ -232,9 +245,12 @@ jobs:
       - name: Build
         run: cmake --build --preset windows-${{ matrix.arch }}-debug
 
+      - name: Pack
+        run: cpack --config out/build/windows-${{ matrix.arch }}/CPackConfig.cmake -C Debug -B out/build/windows-${{ matrix.arch }}
+
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
           name: arcanum-ce-windows-${{ matrix.arch }}
-          path:  out/build/windows-${{ matrix.arch }}/Debug/arcanum-ce.exe
+          path: out/build/windows-${{ matrix.arch }}/*.zip
           retention-days: 7

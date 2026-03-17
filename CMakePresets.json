@@ -143,7 +143,6 @@
                 "darwin-base"
             ],
             "cacheVariables": {
-                "CMAKE_OSX_ARCHITECTURES": "x86_64;arm64",
                 "CMAKE_OSX_DEPLOYMENT_TARGET": "10.13"
             }
         },

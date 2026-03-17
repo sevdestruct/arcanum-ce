@@ -1,8 +1,10 @@
 #include "ui/mainmenu_ui.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "bink_compat.h"
 #include "tig/bmp.h"
 
 #include "game/area.h"
@@ -148,8 +150,22 @@ static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void);
 static void mainmenu_ui_blit_custom_bg_to_window(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_rect);
 static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect);
 static bool mainmenu_ui_load_bg_bmp(TigBmp* bmp, MainMenuWindowType type);
+static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* path);
 static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type);
 static void mainmenu_ui_reapply_custom_bg(void);
+/* Feature 1: BMP sequence overlay animation. */
+static void mainmenu_ui_overlays_load(void);
+static void mainmenu_ui_overlays_unload(void);
+static void mainmenu_ui_overlay_blit(int slot, int frame);
+/* Feature 2: looping video background. */
+static void mainmenu_ui_bg_video_start(void);
+static void mainmenu_ui_bg_video_stop(void);
+static bool mainmenu_ui_bg_video_tick(TimeEvent* timeevent);
+static bool mainmenu_ui_bg_video_is_supported_window_type(MainMenuWindowType type);
+static void mainmenu_ui_bg_video_redraw_foreground(void);
+static tig_timestamp_t mainmenu_ui_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms);
+static bool mainmenu_ui_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due);
+static unsigned int mainmenu_ui_time_until_ms(tig_timestamp_t now, tig_timestamp_t due);
 static void mainmenu_ui_create_shared_radio_buttons(void);
 static bool sub_546EE0(TigMessage* msg);
 static void mainmenu_ui_refresh_button_text(int btn, unsigned int flags);
@@ -204,6 +220,28 @@ static TigBmp mainmenu_ui_custom_bg_bmp;
 static bool mainmenu_ui_has_custom_bg = false;
 static MainMenuWindowType mainmenu_ui_custom_bg_window_type = MM_WINDOW_0;
 static bool mainmenu_ui_custom_bg_window_type_override = false;
+
+/* Feature 1: BMP sequence overlay animation. */
+#define MAINMENU_OVERLAY_MAX_SLOTS 4
+#define MAINMENU_OVERLAY_MAX_FRAMES 64
+
+typedef struct MainMenuOverlay {
+    TigBmp frames[MAINMENU_OVERLAY_MAX_FRAMES];
+    int num_frames;
+    int current_frame;
+    int fps_ms; /* milliseconds per frame (= 1000 / fps) */
+    int x, y; /* window-local position in 800×600 coords */
+    bool active;
+} MainMenuOverlay;
+
+static MainMenuOverlay mainmenu_ui_overlays[MAINMENU_OVERLAY_MAX_SLOTS];
+
+/* Feature 2: looping video background. */
+static HBINK mainmenu_ui_bg_video = NULL;
+static TigVideoBuffer* mainmenu_ui_bg_video_buffer = NULL;
+static char mainmenu_ui_bg_video_path[TIG_MAX_PATH];
+static tig_timestamp_t mainmenu_ui_bg_video_last_tick_ms = 0;
+static tig_timestamp_t mainmenu_ui_bg_video_next_frame_due_ms = 0;
 
 // 0x5C3628
 static TigRect stru_5C3628 = { 0, 0, 800, 600 };
@@ -4555,6 +4593,62 @@ static bool mainmenu_ui_load_bg_bmp(TigBmp* bmp, MainMenuWindowType type)
     return false;
 }
 
+static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* path)
+{
+    static const char* candidates[MM_WINDOW_COUNT][2] = {
+        /* MM_WINDOW_0                    */ { NULL, NULL },
+        /* MM_WINDOW_1                    */ { NULL, NULL },
+        /* MM_WINDOW_MAINMENU             */ { "art/ui/mainmenu_bg", NULL },
+        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art/ui/inmenu_bg", "art/ui/mainmenu_bg" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art/ui/inmenu_locked_bg", "art/ui/mainmenu_bg" },
+        /* MM_WINDOW_SINGLE_PLAYER        */ { "art/ui/singleplayer_bg", "art/ui/mainmenu_bg" },
+        /* MM_WINDOW_OPTIONS              */ { "art/ui/options_bg", NULL },
+        /* MM_WINDOW_LOAD_GAME            */ { "art/ui/loadgame_bg", NULL },
+        /* MM_WINDOW_SAVE_GAME            */ { "art/ui/savegame_bg", NULL },
+        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art/ui/savegame_bg", NULL },
+        /* MM_WINDOW_INTRO                */ { "art/ui/intro_bg", NULL },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art/ui/newchar_bg", NULL },
+        /* MM_WINDOW_NEW_CHAR             */ { "art/ui/newchar_bg", NULL },
+        /* MM_WINDOW_PREGEN_CHAR          */ { "art/ui/newchar_bg", NULL },
+        /* MM_WINDOW_CHAREDIT             */ { "art/ui/charedit_bg", NULL },
+        /* MM_WINDOW_SHOP                 */ { "art/ui/shop_bg", NULL },
+        /* MM_WINDOW_CREDITS              */ { "art/ui/credits_bg", "art/ui/mainmenu_bg" },
+        /* MM_WINDOW_26                   */ { NULL, NULL },
+    };
+    static const char* extensions[] = {
+        ".mp4",
+        ".bik",
+    };
+    char candidate[TIG_MAX_PATH];
+    int candidate_index;
+    int extension_index;
+
+    if (path == NULL || type < 0 || type >= MM_WINDOW_COUNT) {
+        return false;
+    }
+
+    path[0] = '\0';
+
+    for (candidate_index = 0; candidate_index < 2; candidate_index++) {
+        if (candidates[type][candidate_index] == NULL) {
+            break;
+        }
+
+        for (extension_index = 0; extension_index < SDL_arraysize(extensions); extension_index++) {
+            snprintf(candidate,
+                sizeof(candidate),
+                "%s%s",
+                candidates[type][candidate_index],
+                extensions[extension_index]);
+            if (tig_file_extract(candidate, path)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type)
 {
     TigBmp bmp;
@@ -4589,10 +4683,22 @@ static void mainmenu_ui_blit_custom_bg_to_window(TigBmp* bmp, tig_window_handle_
     TigRect src_r;
     TigRect dst_r;
 
-    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
-    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
-    if (src_x + blit_w > bmp->width) { blit_w = bmp->width - src_x; }
-    if (src_y + blit_h > bmp->height) { blit_h = bmp->height - src_y; }
+    if (src_x < 0) {
+        dst_x -= src_x;
+        blit_w += src_x;
+        src_x = 0;
+    }
+    if (src_y < 0) {
+        dst_y -= src_y;
+        blit_h += src_y;
+        src_y = 0;
+    }
+    if (src_x + blit_w > bmp->width) {
+        blit_w = bmp->width - src_x;
+    }
+    if (src_y + blit_h > bmp->height) {
+        blit_h = bmp->height - src_y;
+    }
 
     if (blit_w <= 0 || blit_h <= 0) {
         return;
@@ -4632,10 +4738,22 @@ static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, 
     TigRect dst_r;
     TigRect dirty;
 
-    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
-    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
-    if (src_x + blit_w > bmp->width) { blit_w = bmp->width - src_x; }
-    if (src_y + blit_h > bmp->height) { blit_h = bmp->height - src_y; }
+    if (src_x < 0) {
+        dst_x -= src_x;
+        blit_w += src_x;
+        src_x = 0;
+    }
+    if (src_y < 0) {
+        dst_y -= src_y;
+        blit_h += src_y;
+        src_y = 0;
+    }
+    if (src_x + blit_w > bmp->width) {
+        blit_w = bmp->width - src_x;
+    }
+    if (src_y + blit_h > bmp->height) {
+        blit_h = bmp->height - src_y;
+    }
 
     if (blit_w <= 0 || blit_h <= 0) {
         return;
@@ -4687,6 +4805,519 @@ static void mainmenu_ui_reapply_custom_bg(void)
         && tig_window_data(dword_5C3658, &window_data) == TIG_OK) {
         mainmenu_ui_blit_custom_bg_to_window(&mainmenu_ui_custom_bg_bmp, dword_5C3658, window_data.rect);
     }
+}
+
+/* -------------------------------------------------------------------------
+ * Feature 1: BMP sequence overlay animation
+ * -------------------------------------------------------------------------
+ * Numbered 24-bit BMP frames in art/ui/ with magenta (R=255,G=0,B=255) as
+ * transparent color key.  Sidecar text files control fps and position.
+ *
+ *   art/ui/mainmenu_overlay_0_000.bmp   ← slot 0, frame 0
+ *   art/ui/mainmenu_overlay_0_001.bmp   ← slot 0, frame 1
+ *   art/ui/mainmenu_overlay_0.txt       ← fps as integer (default 12)
+ *   art/ui/mainmenu_overlay_0_pos.txt   ← "x y" in 800×600 local coords
+ *
+ * Only active when mainmenu_ui_has_custom_bg is true (so we can erase the
+ * previous frame by restoring the custom background underneath).
+ * -------------------------------------------------------------------------
+ */
+
+/* Blit one overlay frame onto dword_5C3624 with magenta color-key. */
+static void mainmenu_ui_overlay_blit(int slot, int frame)
+{
+    TigBmp* bmp = &mainmenu_ui_overlays[slot].frames[frame];
+    TigVideoBuffer* vb;
+    TigVideoBufferData vbd;
+    TigWindowData wd;
+    uint8_t* src_row;
+    int ox, oy, x, y, dst_x, dst_y;
+    TigRect dirty;
+
+    if (dword_5C3624 == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
+    if (tig_window_vbid_get(dword_5C3624, &vb)) {
+        return;
+    }
+
+    if (tig_video_buffer_lock(vb) != TIG_OK) {
+        return;
+    }
+
+    if (tig_video_buffer_data(vb, &vbd) != TIG_OK) {
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+
+    ox = mainmenu_ui_overlays[slot].x;
+    oy = mainmenu_ui_overlays[slot].y;
+
+    if (vbd.bpp == 32) {
+        src_row = (uint8_t*)bmp->pixels;
+        for (y = 0; y < bmp->height; y++) {
+            dst_y = oy + y;
+            if (dst_y >= 0 && dst_y < vbd.height) {
+                uint32_t* dst_row = vbd.surface_data.p32 + dst_y * (vbd.pitch / 4);
+                uint8_t* src_px = src_row;
+                for (x = 0; x < bmp->width; x++) {
+                    dst_x = ox + x;
+                    /* SDL3 24-bit BMPs store bytes as [B, G, R]. */
+                    uint8_t b = src_px[0];
+                    uint8_t g = src_px[1];
+                    uint8_t r = src_px[2];
+                    if (dst_x >= 0 && dst_x < vbd.width
+                        && !(r == 255 && g == 0 && b == 255)) {
+                        dst_row[dst_x] = tig_color_index_of(tig_color_make(r, g, b));
+                    }
+                    src_px += 3;
+                }
+            }
+            src_row += bmp->pitch;
+        }
+    }
+
+    tig_video_buffer_unlock(vb);
+
+    if (tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+        dirty.x = wd.rect.x + ox;
+        dirty.y = wd.rect.y + oy;
+        dirty.width = bmp->width;
+        dirty.height = bmp->height;
+        tig_window_invalidate_rect(&dirty);
+    }
+}
+
+static void mainmenu_ui_overlays_load(void)
+{
+    int slot, frame;
+    char path[TIG_MAX_PATH];
+    SDL_IOStream* io;
+    TimeEvent timeevent;
+    DateTime datetime;
+    char buf[32];
+    Sint64 n;
+
+    for (slot = 0; slot < MAINMENU_OVERLAY_MAX_SLOTS; slot++) {
+        mainmenu_ui_overlays[slot].active = false;
+        mainmenu_ui_overlays[slot].num_frames = 0;
+        mainmenu_ui_overlays[slot].current_frame = 0;
+        mainmenu_ui_overlays[slot].fps_ms = 1000 / 12; /* default 12 fps */
+        mainmenu_ui_overlays[slot].x = 0;
+        mainmenu_ui_overlays[slot].y = 0;
+
+        /* Load consecutive frames until one is missing. */
+        for (frame = 0; frame < MAINMENU_OVERLAY_MAX_FRAMES; frame++) {
+            snprintf(path, sizeof(path),
+                "art/ui/mainmenu_overlay_%d_%03d.bmp", slot, frame);
+            io = tig_file_io_open(path, "rb");
+            if (io == NULL) {
+                break;
+            }
+            SDL_CloseIO(io);
+
+            snprintf(mainmenu_ui_overlays[slot].frames[frame].name,
+                TIG_MAX_PATH, "%s", path);
+            if (tig_bmp_create(&mainmenu_ui_overlays[slot].frames[frame]) != TIG_OK) {
+                break;
+            }
+            mainmenu_ui_overlays[slot].num_frames = frame + 1;
+        }
+
+        if (mainmenu_ui_overlays[slot].num_frames == 0) {
+            continue;
+        }
+
+        mainmenu_ui_overlays[slot].active = true;
+
+        /* Optional fps sidecar. */
+        snprintf(path, sizeof(path), "art/ui/mainmenu_overlay_%d.txt", slot);
+        io = tig_file_io_open(path, "rb");
+        if (io != NULL) {
+            n = SDL_ReadIO(io, buf, sizeof(buf) - 1);
+            SDL_CloseIO(io);
+            if (n > 0) {
+                int fps;
+                buf[n] = '\0';
+                fps = atoi(buf);
+                if (fps > 0) {
+                    mainmenu_ui_overlays[slot].fps_ms = 1000 / fps;
+                }
+            }
+        }
+
+        /* Optional position sidecar. */
+        snprintf(path, sizeof(path), "art/ui/mainmenu_overlay_%d_pos.txt", slot);
+        io = tig_file_io_open(path, "rb");
+        if (io != NULL) {
+            n = SDL_ReadIO(io, buf, sizeof(buf) - 1);
+            SDL_CloseIO(io);
+            if (n > 0) {
+                buf[n] = '\0';
+                sscanf(buf, "%d %d",
+                    &mainmenu_ui_overlays[slot].x,
+                    &mainmenu_ui_overlays[slot].y);
+            }
+        }
+
+        /* Draw first frame immediately. */
+        mainmenu_ui_overlay_blit(slot, 0);
+
+        /* Schedule animation timer only if there are multiple frames. */
+        if (mainmenu_ui_overlays[slot].num_frames > 1) {
+            timeevent.type = TIMEEVENT_TYPE_MAINMENU;
+            timeevent.params[0].integer_value = slot;
+            timeevent.params[1].integer_value = 1; /* overlay discriminator */
+            sub_45A950(&datetime, mainmenu_ui_overlays[slot].fps_ms);
+            timeevent_add_delay(&timeevent, &datetime);
+        }
+    }
+}
+
+static void mainmenu_ui_overlays_unload(void)
+{
+    int slot, frame;
+
+    for (slot = 0; slot < MAINMENU_OVERLAY_MAX_SLOTS; slot++) {
+        if (mainmenu_ui_overlays[slot].active) {
+            for (frame = 0; frame < mainmenu_ui_overlays[slot].num_frames; frame++) {
+                tig_bmp_destroy(&mainmenu_ui_overlays[slot].frames[frame]);
+            }
+            mainmenu_ui_overlays[slot].active = false;
+            mainmenu_ui_overlays[slot].num_frames = 0;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Feature 2: looping video background
+ * -------------------------------------------------------------------------
+ * Drop art/ui/mainmenu_bg.mp4 (or .bik) beside the game data.  The video
+ * replaces the static custom BMP backdrop and loops seamlessly.  The same
+ * FFmpeg-backed bink_compat also fixes Bink cutscene playback on non-Windows
+ * because BinkOpen now works for real .bik files.
+ *
+ * The timer callback reuses TIMEEVENT_TYPE_MAINMENU with params[1]==2 so no
+ * new timeevent type needs to be registered in timeevent.c / anim_ui.c.
+ * -------------------------------------------------------------------------
+ */
+
+static void mainmenu_ui_bg_video_start(void)
+{
+    TigVideoBufferCreateInfo vb_info;
+    TimeEvent timeevent;
+    DateTime datetime;
+
+    mainmenu_ui_bg_video = NULL;
+    mainmenu_ui_bg_video_buffer = NULL;
+    mainmenu_ui_bg_video_path[0] = '\0';
+    mainmenu_ui_bg_video_last_tick_ms = 0;
+    mainmenu_ui_bg_video_next_frame_due_ms = 0;
+
+    if (!mainmenu_ui_bg_video_is_supported_window_type(mainmenu_ui_bg_window_type_resolve())) {
+        return;
+    }
+
+    if (!mainmenu_ui_extract_bg_video_path(mainmenu_ui_bg_window_type_resolve(), mainmenu_ui_bg_video_path)) {
+        return;
+    }
+
+    /* BINKSNDTRACK enables audio decoding in the FFmpeg backend. */
+    mainmenu_ui_bg_video = BinkOpen(mainmenu_ui_bg_video_path, BINKSNDTRACK);
+    if (!mainmenu_ui_bg_video) {
+        mainmenu_ui_bg_video_path[0] = '\0';
+        return;
+    }
+
+    vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+    vb_info.background_color = 0;
+    vb_info.color_key = 0;
+    vb_info.width = (int)mainmenu_ui_bg_video->Width;
+    vb_info.height = (int)mainmenu_ui_bg_video->Height;
+
+    if (tig_video_buffer_create(&vb_info, &mainmenu_ui_bg_video_buffer) != TIG_OK) {
+        BinkClose(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video = NULL;
+        mainmenu_ui_bg_video_path[0] = '\0';
+        return;
+    }
+
+    tig_debug_printf("mainmenu_ui_bg_video_start: %ux%u, %u frames, FrameDurationMs=%u\n",
+        mainmenu_ui_bg_video->Width, mainmenu_ui_bg_video->Height,
+        mainmenu_ui_bg_video->Frames, mainmenu_ui_bg_video->FrameDurationMs);
+
+    /* Video takes over from the static BMP. */
+    mainmenu_ui_has_custom_bg = false;
+
+    /* Schedule first decode tick using the video's actual frame duration. */
+    timeevent.type = TIMEEVENT_TYPE_MAINMENU;
+    timeevent.params[0].integer_value = 0;
+    timeevent.params[1].integer_value = 2; /* video discriminator */
+    sub_45A950(&datetime,
+        mainmenu_ui_bg_video->FrameDurationMs > 0
+            ? mainmenu_ui_bg_video->FrameDurationMs
+            : 33);
+    timeevent_add_delay(&timeevent, &datetime);
+}
+
+static void mainmenu_ui_bg_video_stop(void)
+{
+    if (mainmenu_ui_bg_video_buffer != NULL) {
+        tig_video_buffer_destroy(mainmenu_ui_bg_video_buffer);
+        mainmenu_ui_bg_video_buffer = NULL;
+    }
+    if (mainmenu_ui_bg_video != NULL) {
+        BinkClose(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video = NULL;
+    }
+    mainmenu_ui_bg_video_path[0] = '\0';
+    mainmenu_ui_bg_video_last_tick_ms = 0;
+    mainmenu_ui_bg_video_next_frame_due_ms = 0;
+}
+
+static bool mainmenu_ui_bg_video_is_supported_window_type(MainMenuWindowType type)
+{
+    char path[TIG_MAX_PATH];
+
+    return mainmenu_ui_extract_bg_video_path(type, path);
+}
+
+static void mainmenu_ui_bg_video_redraw_foreground(void)
+{
+    MainMenuWindowInfo* window;
+    TigWindowData wd;
+    TigRect window_rect;
+    TigArtBlitInfo art_blit_info;
+    TigArtFrameData art_frame_data;
+    TigRect src_rect;
+    TigRect dst_rect;
+    TigButtonState button_state;
+    unsigned int flags;
+    int index;
+
+    if (dword_5C3624 == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
+    if (tig_window_data(dword_5C3624, &wd) != TIG_OK) {
+        return;
+    }
+
+    window = main_menu_window_info[mainmenu_ui_window_type];
+    window_rect = wd.rect;
+
+    tig_button_refresh_rect(dword_5C3624, &window_rect);
+
+    for (index = 0; index < 2; index++) {
+        if (stru_64B870[index].art_id == TIG_ART_ID_INVALID) {
+            continue;
+        }
+
+        if (tig_art_frame_data(stru_64B870[index].art_id, &art_frame_data) != TIG_OK) {
+            continue;
+        }
+
+        src_rect.x = 0;
+        src_rect.y = 0;
+        src_rect.width = art_frame_data.width;
+        src_rect.height = art_frame_data.height;
+
+        dst_rect.x = window->field_3C[index].x;
+        dst_rect.y = window->field_3C[index].y;
+        dst_rect.width = art_frame_data.width;
+        dst_rect.height = art_frame_data.height;
+
+        art_blit_info.flags = 0;
+        art_blit_info.art_id = stru_64B870[index].art_id;
+        art_blit_info.src_rect = &src_rect;
+        art_blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(dword_5C3624, &art_blit_info);
+    }
+
+    for (index = 0; index < window->num_buttons; index++) {
+        flags = 0;
+        if (tig_button_state_get(window->buttons[index].button_handle, &button_state) == TIG_OK
+            && button_state != TIG_BUTTON_STATE_MOUSE_OUTSIDE) {
+            flags = 0x2;
+        }
+        mainmenu_ui_refresh_button_text(index, flags);
+    }
+
+    if (mainmenu_ui_window_type == MM_WINDOW_MAINMENU) {
+        mainmenu_ui_draw_version();
+    }
+}
+
+static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
+{
+    TigVideoBufferData vbd;
+    TigRect src_rect, dst_rect;
+    TimeEvent next_te;
+    DateTime dt;
+    TigWindowData wd;
+    int sw, sh, vw, vh, cx, cy;
+    unsigned frame_ms;
+    tig_timestamp_t now_ms;
+    tig_duration_t wait_ms;
+
+    (void)te_in;
+
+    if (!mainmenu_ui_bg_video || !mainmenu_ui_bg_video_buffer) {
+        return true;
+    }
+
+    frame_ms = mainmenu_ui_bg_video->FrameDurationMs > 0
+        ? mainmenu_ui_bg_video->FrameDurationMs
+        : 33;
+
+    tig_timer_now(&now_ms);
+    if (mainmenu_ui_bg_video_next_frame_due_ms != 0
+        && mainmenu_ui_time_is_in_future(now_ms, mainmenu_ui_bg_video_next_frame_due_ms)) {
+        goto reschedule;
+    }
+    mainmenu_ui_bg_video_last_tick_ms = now_ms;
+
+    if (BinkWait(mainmenu_ui_bg_video)) {
+        /* Decoder not ready — try again shortly. */
+        goto reschedule;
+    }
+
+    BinkDoFrame(mainmenu_ui_bg_video);
+
+    /* Copy decoded pixels into our staging video buffer. */
+    if (tig_video_buffer_lock(mainmenu_ui_bg_video_buffer) == TIG_OK) {
+        if (tig_video_buffer_data(mainmenu_ui_bg_video_buffer, &vbd) == TIG_OK) {
+            BinkCopyToBuffer(mainmenu_ui_bg_video,
+                vbd.surface_data.pixels, vbd.pitch,
+                (unsigned)vbd.height, 0, 0, 3);
+        }
+        tig_video_buffer_unlock(mainmenu_ui_bg_video_buffer);
+    }
+
+    sw = hrp_iso_window_width_get();
+    sh = hrp_iso_window_height_get();
+    vw = (int)mainmenu_ui_bg_video->Width;
+    vh = (int)mainmenu_ui_bg_video->Height;
+    cx = (sw - vw) / 2;
+    cy = (sh - vh) / 2;
+
+    src_rect.x = 0;
+    src_rect.y = 0;
+    src_rect.width = vw;
+    src_rect.height = vh;
+
+    /* Blit to full-screen backdrop window (HRP mode). */
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        dst_rect.x = cx;
+        dst_rect.y = cy;
+        dst_rect.width = vw;
+        dst_rect.height = vh;
+        tig_window_copy_from_vbuffer(mainmenu_ui_backdrop_handle,
+            &dst_rect,
+            mainmenu_ui_bg_video_buffer,
+            &src_rect);
+    }
+
+    /* Blit into the 800×600 main window (both HRP and non-HRP mode). */
+    if (dword_5C3624 != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+        TigRect local_src = src_rect;
+        int lx = cx - wd.rect.x;
+        int ly = cy - wd.rect.y;
+        int lw = vw;
+        int lh = vh;
+
+        /* Clip to window boundaries. */
+        if (lx < 0) {
+            local_src.x -= lx;
+            lw += lx;
+            lx = 0;
+        }
+        if (ly < 0) {
+            local_src.y -= ly;
+            lh += ly;
+            ly = 0;
+        }
+        if (lx + lw > wd.rect.width) {
+            lw = wd.rect.width - lx;
+        }
+        if (ly + lh > wd.rect.height) {
+            lh = wd.rect.height - ly;
+        }
+        local_src.width = lw;
+        local_src.height = lh;
+
+        if (lw > 0 && lh > 0) {
+            dst_rect.x = lx;
+            dst_rect.y = ly;
+            dst_rect.width = lw;
+            dst_rect.height = lh;
+            tig_window_copy_from_vbuffer(dword_5C3624,
+                &dst_rect,
+                mainmenu_ui_bg_video_buffer,
+                &local_src);
+        }
+    }
+
+    mainmenu_ui_bg_video_redraw_foreground();
+
+    BinkNextFrame(mainmenu_ui_bg_video);
+    mainmenu_ui_bg_video_next_frame_due_ms = mainmenu_ui_schedule_next_frame_due(
+        now_ms,
+        mainmenu_ui_bg_video_next_frame_due_ms,
+        frame_ms);
+
+    /* Loop seamlessly at end. */
+    if (mainmenu_ui_bg_video->Frames > 0
+        && mainmenu_ui_bg_video->FrameNum >= mainmenu_ui_bg_video->Frames) {
+        BinkRewind(mainmenu_ui_bg_video);
+    }
+
+reschedule:
+    tig_timer_now(&now_ms);
+    wait_ms = 1;
+    if (mainmenu_ui_bg_video_next_frame_due_ms != 0
+        && mainmenu_ui_time_is_in_future(now_ms, mainmenu_ui_bg_video_next_frame_due_ms)) {
+        wait_ms = mainmenu_ui_time_until_ms(now_ms, mainmenu_ui_bg_video_next_frame_due_ms);
+    }
+
+    next_te.type = TIMEEVENT_TYPE_MAINMENU;
+    next_te.params[0].integer_value = 0;
+    next_te.params[1].integer_value = 2;
+    sub_45A950(&dt, wait_ms);
+    timeevent_add_delay(&next_te, &dt);
+
+    return true;
+}
+
+static tig_timestamp_t mainmenu_ui_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms)
+{
+    tig_timestamp_t next_due;
+
+    if (previous_due == 0) {
+        return now + frame_ms;
+    }
+
+    next_due = previous_due + frame_ms;
+
+    if (!mainmenu_ui_time_is_in_future(now, next_due)
+        && (unsigned int)(now - next_due) > frame_ms * 4) {
+        next_due = now + frame_ms;
+    }
+
+    return next_due;
+}
+
+static bool mainmenu_ui_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due)
+{
+    return (int32_t)(due - now) > 0;
+}
+
+static unsigned int mainmenu_ui_time_until_ms(tig_timestamp_t now, tig_timestamp_t due)
+{
+    int32_t delta = (int32_t)(due - now);
+    return delta > 0 ? (unsigned int)delta : 0;
 }
 
 // 0x546340
@@ -5000,6 +5631,10 @@ void mainmenu_ui_create_window_func(bool should_display)
     window->refresh_text_flags |= 0x20;
     mainmenu_ui_active = true;
 
+    /* Feature 1 & 2: start animated overlays and optional video background. */
+    mainmenu_ui_bg_video_start();
+    mainmenu_ui_overlays_load();
+
     if (window->refresh_func != NULL) {
         window->refresh_func(NULL);
     }
@@ -5118,6 +5753,10 @@ void sub_546DD0(void)
     if (mainmenu_ui_active) {
         sub_549450();
         timeevent_clear_all_typed(TIMEEVENT_TYPE_MAINMENU);
+
+        /* Feature 1 & 2: stop overlays/video before destroying windows. */
+        mainmenu_ui_overlays_unload();
+        mainmenu_ui_bg_video_stop();
 
         for (index = 0; index < 2; index++) {
             stru_64B870[index].art_id = TIG_ART_ID_INVALID;
@@ -5725,6 +6364,7 @@ void sub_547EF0(void)
 bool mainmenu_ui_process_callback(TimeEvent* timeevent)
 {
     int index;
+    int discriminator;
     tig_art_id_t next_art_id;
     TigArtFrameData art_frame_data;
     TigArtBlitInfo art_blit_info;
@@ -5733,6 +6373,44 @@ bool mainmenu_ui_process_callback(TimeEvent* timeevent)
     DateTime datetime;
     TimeEvent next_timeevent;
 
+    discriminator = timeevent->params[1].integer_value;
+
+    /* Feature 1: BMP overlay animation tick. */
+    if (discriminator == 1) {
+        int slot = timeevent->params[0].integer_value;
+        if (slot >= 0 && slot < MAINMENU_OVERLAY_MAX_SLOTS
+            && mainmenu_ui_overlays[slot].active
+            && mainmenu_ui_overlays[slot].num_frames > 1) {
+            TigRect dirty;
+            TigWindowData wd;
+            /* Erase previous frame by repainting the backdrop region. */
+            TigBmp* bmp = &mainmenu_ui_overlays[slot].frames[mainmenu_ui_overlays[slot].current_frame];
+            if (mainmenu_ui_has_custom_bg && tig_window_data(dword_5C3624, &wd) == TIG_OK) {
+                dirty.x = mainmenu_ui_overlays[slot].x;
+                dirty.y = mainmenu_ui_overlays[slot].y;
+                dirty.width = bmp->width;
+                dirty.height = bmp->height;
+                mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, dword_5C3624, wd.rect, dirty);
+            }
+            /* Advance frame. */
+            mainmenu_ui_overlays[slot].current_frame = (mainmenu_ui_overlays[slot].current_frame + 1) % mainmenu_ui_overlays[slot].num_frames;
+            mainmenu_ui_overlay_blit(slot, mainmenu_ui_overlays[slot].current_frame);
+            /* Reschedule. */
+            next_timeevent.type = TIMEEVENT_TYPE_MAINMENU;
+            next_timeevent.params[0].integer_value = slot;
+            next_timeevent.params[1].integer_value = 1;
+            sub_45A950(&datetime, mainmenu_ui_overlays[slot].fps_ms);
+            timeevent_add_delay(&next_timeevent, &datetime);
+        }
+        return true;
+    }
+
+    /* Feature 2: video background tick. */
+    if (discriminator == 2) {
+        return mainmenu_ui_bg_video_tick(timeevent);
+    }
+
+    /* Original sprite animation. */
     index = timeevent->params[0].integer_value;
     if (stru_64B870[index].art_id == TIG_ART_ID_INVALID) {
         return true;
@@ -5759,6 +6437,7 @@ bool mainmenu_ui_process_callback(TimeEvent* timeevent)
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
         tig_window_blit_art(dword_5C3624, &art_blit_info);
+        stru_64B870[index].art_id = next_art_id;
     } else {
         tig_debug_printf("main_menu_ui_process_callback: ERROR: tig_art_frame_data failed!\n");
     }
