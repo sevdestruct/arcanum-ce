@@ -1,0 +1,13 @@
+if(NOT DEFINED target_dir)
+    message(FATAL_ERROR "target_dir is required")
+endif()
+
+file(GLOB ffmpeg_runtime_dlls "@BINK_COMPAT_FFMPEG_RUNTIME_DIR@/*.dll")
+
+foreach(ffmpeg_runtime_dll IN LISTS ffmpeg_runtime_dlls)
+    execute_process(
+        COMMAND "@CMAKE_COMMAND@" -E copy_if_different
+            "${ffmpeg_runtime_dll}"
+            "${target_dir}"
+    )
+endforeach()

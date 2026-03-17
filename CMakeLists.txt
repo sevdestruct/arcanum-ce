@@ -401,3 +401,52 @@ if(APPLE)
 
     include(CPack)
 endif()
+
+if(WIN32)
+    install(TARGETS arcanum-ce DESTINATION .)
+
+    if(BINK_COMPAT_FFMPEG_RUNTIME_DIR)
+        file(GLOB BINK_COMPAT_FFMPEG_RUNTIME_DLLS
+            "${BINK_COMPAT_FFMPEG_RUNTIME_DIR}/*.dll")
+        if(BINK_COMPAT_FFMPEG_RUNTIME_DLLS)
+            install(FILES ${BINK_COMPAT_FFMPEG_RUNTIME_DLLS} DESTINATION .)
+        endif()
+    endif()
+
+    set(CPACK_GENERATOR "ZIP")
+    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+    set(CPACK_PACKAGE_FILE_NAME "arcanum-ce")
+
+    include(CPack)
+endif()
+
+if(WIN32 AND BINK_COMPAT_FFMPEG_RUNTIME_DIR)
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/copy_ffmpeg_runtime_dlls.cmake.in"
+        "${CMAKE_BINARY_DIR}/copy_ffmpeg_runtime_dlls.cmake"
+        @ONLY
+    )
+
+    add_custom_command(TARGET arcanum-ce POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+            -Dtarget_dir=$<TARGET_FILE_DIR:arcanum-ce>
+            -P "${CMAKE_BINARY_DIR}/copy_ffmpeg_runtime_dlls.cmake"
+        VERBATIM
+    )
+endif()
+
+if(APPLE AND NOT IOS AND BINK_COMPAT_FFMPEG_SEARCH_DIRS)
+    string(REPLACE ";" "|" BINK_COMPAT_FFMPEG_SEARCH_DIRS_ESCAPED "${BINK_COMPAT_FFMPEG_SEARCH_DIRS}")
+
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/fixup_arcanum_bundle.cmake.in"
+        "${CMAKE_BINARY_DIR}/fixup_arcanum_bundle.cmake"
+        @ONLY
+    )
+
+    install(SCRIPT "${CMAKE_BINARY_DIR}/fixup_arcanum_bundle.cmake")
+endif()
+
+if(APPLE AND NOT IOS AND BINK_COMPAT_FFMPEG_SOURCE STREQUAL "homebrew")
+    message(WARNING "arcanum-ce: using Homebrew FFmpeg for macOS packaging; this is convenient for development, but release builds targeting older macOS should provide a pinned SDK via BINK_COMPAT_FFMPEG_SDK_ROOT or FFMPEG_ROOT")
+endif()
