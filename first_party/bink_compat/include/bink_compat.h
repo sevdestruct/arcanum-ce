@@ -57,6 +57,7 @@ typedef struct BINK {
     unsigned Height;
     unsigned Frames;
     unsigned FrameNum;
+    unsigned FrameDurationMs; /* milliseconds per frame; 0 = unknown (use 33ms default) */
 } BINK;
 
 void BINKCALL BinkClose(HBINK bnk);
@@ -69,6 +70,7 @@ BINKSNDOPEN BINKCALL BinkOpenMiles(void* param);
 int BINKCALL BinkSetSoundSystem(BINKSNDSYSOPEN open, void* param);
 void BINKCALL BinkSetSoundTrack(unsigned track);
 int BINKCALL BinkWait(HBINK bnk);
+void BINKCALL BinkRewind(HBINK bnk);
 
 bool bink_compat_init(void);
 void bink_compat_exit(void);
