@@ -311,7 +311,6 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
 {
     BINKSND* snd = &bff->snd_buf;
     uint8_t* addr;
-    const uint8_t* src_data[1];
     uint8_t* out_data[1];
     int out_capacity_samples;
     int out_samples;
@@ -350,16 +349,17 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
         bff->audio_scratch_size = out_capacity_samples * bytes_per_sample;
     }
 
-    src_data[0] = audio_frame->extended_data[0];
     out_data[0] = bff->audio_scratch;
 
     /* Convert the full decoded audio frame up front so large Bink audio
      * packets keep their original timing instead of being truncated to the
-     * small callback scratch buffer. */
+     * small callback scratch buffer.
+     * Pass extended_data directly so planar multi-channel formats (e.g.
+     * AV_SAMPLE_FMT_FLTP) supply all channel planes, not just channel 0. */
     out_samples = swr_convert(bff->swr,
         out_data,
         out_capacity_samples,
-        src_data,
+        (const uint8_t**)audio_frame->extended_data,
         audio_frame->nb_samples);
     if (out_samples <= 0) {
         return;
@@ -449,7 +449,7 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
     bff->sws = sws_getContext(
         bff->vid_ctx->width, bff->vid_ctx->height, bff->vid_ctx->pix_fmt,
         bff->vid_ctx->width, bff->vid_ctx->height, AV_PIX_FMT_BGRA,
-        SWS_BILINEAR, NULL, NULL, NULL);
+        SWS_FAST_BILINEAR, NULL, NULL, NULL);
     if (!bff->sws) {
         avcodec_free_context(&bff->vid_ctx);
         avformat_close_input(&bff->fmt_ctx);
@@ -665,9 +665,17 @@ int BINKCALL BinkDoFrame(HBINK bnk)
     while (1) {
         ret = av_read_frame(bff->fmt_ctx, bff->pkt);
         if (ret < 0) {
-            /* EOF or error — flush decoder. */
+            /* EOF or error — flush decoders. */
             avcodec_send_packet(bff->vid_ctx, NULL);
             avcodec_receive_frame(bff->vid_ctx, bff->frame);
+            if (bff->aud_ctx) {
+                AVFrame* af = av_frame_alloc();
+                avcodec_send_packet(bff->aud_ctx, NULL);
+                while (af && avcodec_receive_frame(bff->aud_ctx, af) == 0) {
+                    bink_ffmpeg_feed_audio(bff, af);
+                }
+                av_frame_free(&af);
+            }
             return -1;
         }
 
@@ -796,11 +804,18 @@ void BINKCALL BinkRewind(HBINK bnk)
     BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
     if (!bff || !bff->fmt_ctx) return;
 
-    av_seek_frame(bff->fmt_ctx, bff->vid_stream,
-        bff->vid_start_pts, AVSEEK_FLAG_BACKWARD);
+    if (av_seek_frame(bff->fmt_ctx, bff->vid_stream,
+            bff->vid_start_pts, AVSEEK_FLAG_BACKWARD) < 0) {
+        fprintf(stderr, "bink_compat: BinkRewind seek failed\n");
+    }
     avcodec_flush_buffers(bff->vid_ctx);
     if (bff->aud_ctx) {
         avcodec_flush_buffers(bff->aud_ctx);
+        if (bff->swr) {
+            /* Drain any latency-buffered samples so they don't bleed into
+             * the next loop iteration's audio. */
+            swr_convert(bff->swr, NULL, 0, NULL, 0);
+        }
     }
     bff->pub.FrameNum = 0;
 #else

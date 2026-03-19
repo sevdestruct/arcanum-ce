@@ -5487,9 +5487,10 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
         goto reschedule;
     }
 
-    BinkDoFrame(mainmenu_ui_bg_video);
+    bool at_eof = (BinkDoFrame(mainmenu_ui_bg_video) < 0);
 
-    /* Copy decoded pixels into our staging video buffer. */
+    /* Copy decoded pixels into our staging video buffer. At EOF, bff->frame
+     * still holds the last decoded frame — present it rather than going black. */
     if (tig_video_buffer_lock(mainmenu_ui_bg_video_buffer) == TIG_OK) {
         if (tig_video_buffer_data(mainmenu_ui_bg_video_buffer, &vbd) == TIG_OK) {
             BinkCopyToBuffer(mainmenu_ui_bg_video,
@@ -5500,6 +5501,13 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
     }
 
     mainmenu_ui_bg_video_present_current_frame();
+
+    if (at_eof) {
+        /* EOF — rewind after presenting the last frame so there is no black
+         * flash. Handles Frames==0 (unknown count) and frame-count mismatches. */
+        BinkRewind(mainmenu_ui_bg_video);
+        goto reschedule;
+    }
 
     BinkNextFrame(mainmenu_ui_bg_video);
     mainmenu_ui_bg_video_next_frame_due_ms = mainmenu_ui_schedule_next_frame_due(
