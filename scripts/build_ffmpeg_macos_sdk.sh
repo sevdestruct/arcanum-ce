@@ -37,12 +37,35 @@ marker_path="${sdk_prefix}/ARCANUM_FFMPEG_SDK.txt"
 
 mkdir -p "$cache_root"
 
+normalize_install_names() {
+    local dylib
+    local dep
+    local dep_basename
+    local normalized_dep
+    local dylib_dir="${sdk_prefix}/lib"
+
+    [[ -d "${dylib_dir}" ]] || return 0
+
+    find "${dylib_dir}" -maxdepth 1 -type f -name '*.dylib' | while read -r dylib; do
+        install_name_tool -id "${dylib}" "${dylib}"
+        while read -r dep; do
+            dep_basename=$(basename "${dep}")
+            normalized_dep="${dylib_dir}/${dep_basename}"
+            if [[ -e "${normalized_dep}" && "${dep}" != "${normalized_dep}" ]]; then
+                install_name_tool -change "${dep}" "${normalized_dep}" "${dylib}"
+            fi
+        done < <(otool -L "${dylib}" | awk 'NR > 1 { print $1 }')
+    done
+}
+
 if [[ -f "$marker_path" ]] \
     && grep -qx "version=${ffmpeg_version}" "$marker_path" \
     && grep -qx "arch=${sdk_arch}" "$marker_path" \
     && grep -qx "deployment_target=${deployment_target}" "$marker_path" \
     && [[ -f "${sdk_prefix}/include/libavcodec/avcodec.h" ]] \
     && [[ -f "${sdk_prefix}/lib/libavcodec.dylib" ]]; then
+    install_root="${sdk_prefix}"
+    normalize_install_names
     echo "Using cached FFmpeg macOS SDK at ${sdk_prefix}"
     exit 0
 fi
@@ -86,7 +109,6 @@ extra_ldflags="-arch ${sdk_arch} -mmacosx-version-min=${deployment_target}"
     --disable-autodetect \
     --disable-avdevice \
     --disable-avfilter \
-    --disable-postproc \
     --extra-cflags="$extra_cflags" \
     --extra-ldflags="$extra_ldflags"
 
@@ -96,6 +118,7 @@ make install
 rm -rf "$sdk_prefix"
 mkdir -p "$sdk_prefix"
 cp -R "$install_root"/. "$sdk_prefix"/
+normalize_install_names
 
 cat >"$marker_path" <<EOF
 version=${ffmpeg_version}

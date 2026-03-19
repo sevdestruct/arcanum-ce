@@ -27,6 +27,9 @@ function(bink_compat_prepare_ffmpeg)
         set(ffmpeg_source "sdk")
     elseif(BINK_COMPAT_FFMPEG_HINT_ROOT
         AND EXISTS "${BINK_COMPAT_FFMPEG_HINT_ROOT}"
+        AND NOT (APPLE
+            AND NOT IOS
+            AND BINK_COMPAT_BOOTSTRAP_FFMPEG)
         AND NOT (BINK_COMPAT_FFMPEG_SOURCE STREQUAL "homebrew"
             AND APPLE
             AND NOT IOS
@@ -94,6 +97,58 @@ function(bink_compat_prepare_ffmpeg)
 
         set(ffmpeg_root "${ffmpeg_cache_root}")
         set(ffmpeg_source "windows-bootstrap")
+    endif()
+
+    if(NOT ffmpeg_root
+        AND BINK_COMPAT_BOOTSTRAP_FFMPEG
+        AND APPLE
+        AND NOT IOS)
+        set(ffmpeg_macos_arch "")
+        if(CMAKE_OSX_ARCHITECTURES)
+            if(CMAKE_OSX_ARCHITECTURES MATCHES ";")
+                message(FATAL_ERROR "bink_compat: the prepared FFmpeg SDK is single-architecture; use a native-architecture macOS build or provide FFMPEG_ROOT to a universal FFmpeg SDK")
+            endif()
+            set(ffmpeg_macos_arch "${CMAKE_OSX_ARCHITECTURES}")
+        elseif(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+            set(ffmpeg_macos_arch "arm64")
+        elseif(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+            set(ffmpeg_macos_arch "x86_64")
+        endif()
+
+        if(ffmpeg_macos_arch)
+            set(ffmpeg_macos_sdk_root "${CMAKE_BINARY_DIR}/_deps/ffmpeg-macos-${ffmpeg_macos_arch}")
+            set(ffmpeg_macos_deployment_target "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+            if(ffmpeg_macos_arch STREQUAL "arm64"
+                AND ffmpeg_macos_deployment_target
+                AND ffmpeg_macos_deployment_target VERSION_LESS "11.0")
+                set(ffmpeg_macos_deployment_target "11.0")
+            endif()
+            set(ffmpeg_macos_bootstrap_command
+                /usr/bin/env
+                bash
+                "${CMAKE_SOURCE_DIR}/scripts/build_ffmpeg_macos_sdk.sh"
+                "${ffmpeg_macos_sdk_root}"
+                "${ffmpeg_macos_arch}")
+            if(ffmpeg_macos_deployment_target)
+                list(APPEND ffmpeg_macos_bootstrap_command "${ffmpeg_macos_deployment_target}")
+            endif()
+
+            execute_process(
+                COMMAND ${ffmpeg_macos_bootstrap_command}
+                RESULT_VARIABLE ffmpeg_macos_bootstrap_result
+            )
+
+            if(ffmpeg_macos_bootstrap_result EQUAL 0
+                AND EXISTS "${ffmpeg_macos_sdk_root}/include/libavcodec/avcodec.h"
+                AND EXISTS "${ffmpeg_macos_sdk_root}/lib/libavcodec.dylib")
+                set(ffmpeg_root "${ffmpeg_macos_sdk_root}")
+                set(ffmpeg_source "macos-bootstrap")
+            elseif(BINK_COMPAT_ALLOW_HOMEBREW_FFMPEG)
+                message(WARNING "bink_compat: failed to bootstrap pinned macOS FFmpeg SDK; falling back to Homebrew")
+            else()
+                message(FATAL_ERROR "bink_compat: failed to bootstrap pinned macOS FFmpeg SDK")
+            endif()
+        endif()
     endif()
 
     if(NOT ffmpeg_root
