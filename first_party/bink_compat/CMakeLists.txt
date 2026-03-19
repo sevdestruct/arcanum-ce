@@ -7,8 +7,10 @@ target_include_directories(bink_compat PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/inclu
 
 include("${CMAKE_SOURCE_DIR}/cmake/prepare_ffmpeg.cmake")
 
+option(ARCANUM_VIDEO_PLAYBACK "Enable video playback via FFmpeg (opt-in)" OFF)
+
 set(BINK_COMPAT_ENABLE_FFMPEG OFF)
-if(NOT WIN32 OR CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(ARCANUM_VIDEO_PLAYBACK AND (NOT WIN32 OR CMAKE_SIZEOF_VOID_P EQUAL 8))
     set(BINK_COMPAT_ENABLE_FFMPEG ON)
 endif()
 
@@ -20,7 +22,7 @@ if(BINK_COMPAT_ENABLE_FFMPEG)
     set(BINK_COMPAT_FFMPEG_FOUND OFF)
     bink_compat_prepare_ffmpeg()
 
-    unset(FFMPEG_FOUND)
+    unset(FFMPEG_FOUND CACHE)
     unset(FFMPEG_INCLUDE_DIR CACHE)
     unset(FFMPEG_AVCODEC_LIBRARY CACHE)
     unset(FFMPEG_AVFORMAT_LIBRARY CACHE)
@@ -48,12 +50,12 @@ if(BINK_COMPAT_ENABLE_FFMPEG)
     if((NOT BINK_COMPAT_FFMPEG_HINT_ROOT OR BINK_COMPAT_FFMPEG_SOURCE STREQUAL "homebrew")
         AND NOT (APPLE AND NOT IOS AND NOT BINK_COMPAT_ALLOW_HOMEBREW_FFMPEG))
         find_package(PkgConfig QUIET)
-    endif()
-    if(PkgConfig_FOUND)
-        pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
-            libavcodec libavformat libavutil libswscale libswresample)
-        if(FFMPEG_FOUND)
-            set(BINK_COMPAT_FFMPEG_FOUND ON)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+                libavcodec libavformat libavutil libswscale libswresample)
+            if(FFMPEG_FOUND)
+                set(BINK_COMPAT_FFMPEG_FOUND ON)
+            endif()
         endif()
     endif()
 
