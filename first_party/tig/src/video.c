@@ -203,6 +203,34 @@ int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect*
     return TIG_OK;
 }
 
+int tig_video_blit_scaled(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect)
+{
+    SDL_Rect native_src_rect;
+    SDL_Rect native_dst_rect;
+
+    if (!tig_video_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+
+    native_src_rect.x = src_rect->x;
+    native_src_rect.y = src_rect->y;
+    native_src_rect.w = src_rect->width;
+    native_src_rect.h = src_rect->height;
+
+    native_dst_rect.x = dst_rect->x;
+    native_dst_rect.y = dst_rect->y;
+    native_dst_rect.w = dst_rect->width;
+    native_dst_rect.h = dst_rect->height;
+
+    SDL_BlitSurfaceScaled(src_video_buffer->surface,
+        &native_src_rect,
+        tig_video_state.surface,
+        &native_dst_rect,
+        SDL_SCALEMODE_LINEAR);
+
+    return TIG_OK;
+}
+
 // 0x51F7C0
 int tig_video_fill(const TigRect* rect, tig_color_t color)
 {
