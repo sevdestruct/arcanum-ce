@@ -126,6 +126,7 @@ int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
     int underlay_offset_y,
     uint8_t threshold,
     uint8_t opacity);
+int tig_video_blit_scaled(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);
