@@ -76,10 +76,40 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
 {
     char temp_path[TIG_MAX_PATH];
     unsigned int movie_flags;
+    const char* sep;
+    const char* basename;
+    char base_noext[TIG_MAX_PATH];
+    char* dot;
+    bool found;
 
-    // Copy movie file from DAT archive to file system. This is needed because
-    // underlying BINK player needs a file path.
-    if (!tig_file_extract(path, temp_path)) {
+    // Check art/videos/<name>.mp4 (then .bik) for a user-supplied replacement
+    // video matching the original file's base name. This allows swapping any
+    // game movie without modifying the DAT archives.
+    sep = strrchr(path, '\\');
+    if (!sep) sep = strrchr(path, '/');
+    basename = sep ? sep + 1 : path;
+
+    strncpy(base_noext, basename, sizeof(base_noext) - 1);
+    base_noext[sizeof(base_noext) - 1] = '\0';
+    dot = strrchr(base_noext, '.');
+    if (dot) *dot = '\0';
+
+    found = false;
+    {
+        static const char* const video_exts[] = { ".mp4", ".bik" };
+        int i;
+        char candidate[TIG_MAX_PATH];
+        for (i = 0; i < (int)(sizeof(video_exts) / sizeof(video_exts[0])); i++) {
+            snprintf(candidate, sizeof(candidate), "data/videos/%s%s", base_noext, video_exts[i]);
+            if (tig_file_extract(candidate, temp_path)) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    // Fall back to the original DAT-archive path if no override was found.
+    if (!found && !tig_file_extract(path, temp_path)) {
         return;
     }
 
