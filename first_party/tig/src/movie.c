@@ -21,6 +21,8 @@ static HBINK tig_movie_bink;
 static TigVideoBuffer* tig_movie_video_buffer;
 static int tig_movie_screen_width;
 static int tig_movie_screen_height;
+static int tig_movie_display_width;
+static int tig_movie_display_height;
 static tig_timestamp_t tig_movie_next_frame_due_ms;
 
 typedef struct SdlMixerSoundData {
@@ -105,6 +107,22 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     }
 
     tig_movie_next_frame_due_ms = 0;
+
+    /* Compute display size: scale down to fit screen, never upscale. */
+    {
+        int vid_w = (int)tig_movie_bink->Width;
+        int vid_h = (int)tig_movie_bink->Height;
+        if (vid_w <= tig_movie_screen_width && vid_h <= tig_movie_screen_height) {
+            tig_movie_display_width = vid_w;
+            tig_movie_display_height = vid_h;
+        } else {
+            float scale_x = (float)tig_movie_screen_width / (float)vid_w;
+            float scale_y = (float)tig_movie_screen_height / (float)vid_h;
+            float scale = scale_x < scale_y ? scale_x : scale_y;
+            tig_movie_display_width = (int)(vid_w * scale);
+            tig_movie_display_height = (int)(vid_h * scale);
+        }
+    }
 
     vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
     vb_create_info.background_color = 0;
@@ -245,10 +263,10 @@ bool tig_movie_do_frame(bool* presented)
         src_rect.width = video_buffer_data.width;
         src_rect.height = video_buffer_data.height;
 
-        dst_rect.x = (tig_movie_screen_width - video_buffer_data.width) / 2;
-        dst_rect.y = (tig_movie_screen_height - video_buffer_data.height) / 2;
-        dst_rect.width = video_buffer_data.width;
-        dst_rect.height = video_buffer_data.height;
+        dst_rect.x = (tig_movie_screen_width - tig_movie_display_width) / 2;
+        dst_rect.y = (tig_movie_screen_height - tig_movie_display_height) / 2;
+        dst_rect.width = tig_movie_display_width;
+        dst_rect.height = tig_movie_display_height;
 
         // Copy movie pixels to the video buffer.
         BinkCopyToBuffer(tig_movie_bink,
@@ -261,8 +279,9 @@ bool tig_movie_do_frame(bool* presented)
 
         tig_video_buffer_unlock(tig_movie_video_buffer);
 
-        // Blit buffer to the center of the screen.
-        tig_video_blit(tig_movie_video_buffer, &src_rect, &dst_rect);
+        // Blit buffer to screen, scaling down if needed to fit within screen
+        // dimensions while preserving aspect ratio.
+        tig_video_blit_scaled(tig_movie_video_buffer, &src_rect, &dst_rect);
 
         *presented = true;
 
