@@ -5094,6 +5094,22 @@ static void mainmenu_ui_bg_video_start(void)
     /* Video takes over from the static BMP. */
     mainmenu_ui_has_custom_bg = false;
 
+    /* Pre-decode the first frame into the buffer so present_current_frame
+     * can paint it immediately after the window refresh_func runs, preventing
+     * a single-frame flash of the original art background. */
+    if (BinkDoFrame(mainmenu_ui_bg_video) == 0) {
+        TigVideoBufferData vbd;
+        if (tig_video_buffer_lock(mainmenu_ui_bg_video_buffer) == TIG_OK) {
+            if (tig_video_buffer_data(mainmenu_ui_bg_video_buffer, &vbd) == TIG_OK) {
+                BinkCopyToBuffer(mainmenu_ui_bg_video,
+                    vbd.surface_data.pixels, vbd.pitch,
+                    (unsigned)vbd.height, 0, 0, 3);
+            }
+            tig_video_buffer_unlock(mainmenu_ui_bg_video_buffer);
+        }
+        BinkNextFrame(mainmenu_ui_bg_video);
+    }
+
     mainmenu_ui_bg_video_schedule_tick();
     mainmenu_ui_bg_video_preserve_on_close = false;
 }
@@ -5748,6 +5764,10 @@ void mainmenu_ui_create_window_func(bool should_display)
     if (window->refresh_func != NULL) {
         window->refresh_func(NULL);
     }
+
+    /* Paint the pre-decoded first video frame over the art background so
+     * tig_window_display shows the video immediately with no flash. */
+    mainmenu_ui_bg_video_present_current_frame();
 
     if (should_display) {
         tig_window_display();
