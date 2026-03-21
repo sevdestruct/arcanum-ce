@@ -264,6 +264,15 @@ bool target_pick_at_screen_xy(int x, int y, TargetDescriptor* td, bool fullscree
     return sub_4F28A0(x, y, td);
 }
 
+bool target_pick_at_virtual_xy(int x, int y, TargetDescriptor* td, bool fullscreen)
+{
+    x -= target_iso_content_rect.x;
+    if (!fullscreen) {
+        y -= target_iso_content_rect.y;
+    }
+    return sub_4F28A0(x, y, td);
+}
+
 // 0x4F28A0
 bool sub_4F28A0(int x, int y, TargetDescriptor* td)
 {
