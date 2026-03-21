@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 #define ISO_ZOOM_MIN  0.5f
-#define ISO_ZOOM_MAX  2.0f
+#define ISO_ZOOM_MAX  1.75f
 #define ISO_ZOOM_STEP 0.25f
 #define ISO_ZOOM_LERP 0.18f
 

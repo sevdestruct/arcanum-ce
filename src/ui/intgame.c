@@ -4767,13 +4767,25 @@ bool intgame_get_location_under_cursor(int64_t* loc_ptr)
 {
     TigMouseState mouse_state;
     TargetDescriptor td;
+    int x, y;
+    float z;
 
     if (tig_mouse_get_state(&mouse_state) == TIG_OK
-        && sub_5518C0(mouse_state.x, mouse_state.y)
-        && target_pick_at_screen_xy_ex(mouse_state.x, mouse_state.y, &td, Tgt_Tile, intgame_fullscreen)
-        && td.is_loc) {
-        *loc_ptr = td.loc;
-        return true;
+        && sub_5518C0(mouse_state.x, mouse_state.y)) {
+        x = mouse_state.x;
+        y = mouse_state.y;
+        z = iso_zoom_current();
+        if (z != 1.0f) {
+            int64_t ax, ay;
+            location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+            x = (int)ax;
+            y = (int)ay;
+        }
+        if (target_pick_at_screen_xy_ex(x, y, &td, Tgt_Tile, intgame_fullscreen)
+            && td.is_loc) {
+            *loc_ptr = td.loc;
+            return true;
+        }
     }
 
     *loc_ptr = 0;
@@ -4803,18 +4815,30 @@ bool sub_5518C0(int x, int y)
 void sub_551910(TigMessage* msg)
 {
     TargetDescriptor td;
+    int x, y;
+    float z;
 
     if (sub_5517A0(msg)) {
         sub_551F80();
 
+        x = msg->data.mouse.x;
+        y = msg->data.mouse.y;
+        z = iso_zoom_current();
+        if (z != 1.0f) {
+            int64_t ax, ay;
+            location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+            x = (int)ax;
+            y = (int)ay;
+        }
+
         if (!map_is_clearing_objects()) {
-            if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+            if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
                 if (!td.is_loc) {
                     sub_57CCF0(player_get_local_pc_obj(), td.obj);
                     object_hover_obj_set(td.obj);
                 }
             } else if (combat_turn_based_is_active()
-                && target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, Tgt_Tile, intgame_fullscreen)
+                && target_pick_at_screen_xy_ex(x, y, &td, Tgt_Tile, intgame_fullscreen)
                 && td.is_loc
                 && intgame_mode_get() == INTGAME_MODE_MAIN) {
                 combat_check_move_to(player_get_local_pc_obj(), td.loc);
@@ -6179,6 +6203,8 @@ void sub_553A70(TigMessage* msg)
 {
     int64_t obj;
     TargetDescriptor td;
+    int x, y;
+    float z;
 
     if (!sub_5517A0(msg)) {
         return;
@@ -6189,7 +6215,17 @@ void sub_553A70(TigMessage* msg)
         return;
     }
 
-    if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+    x = msg->data.mouse.x;
+    y = msg->data.mouse.y;
+    z = iso_zoom_current();
+    if (z != 1.0f) {
+        int64_t ax, ay;
+        location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+        x = (int)ax;
+        y = (int)ay;
+    }
+
+    if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
         if (obj != td.obj) {
             sub_57CCF0(player_get_local_pc_obj(), td.obj);
             object_hover_obj_set(td.obj);
