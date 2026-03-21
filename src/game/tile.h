@@ -18,6 +18,7 @@ bool tile_is_slippery(int64_t loc);
 void sub_4D7430(int64_t loc);
 tig_art_id_t sub_4D7480(tig_art_id_t art_id, int num2, bool flippable2, int a4);
 void sub_4D7590(tig_art_id_t art_id, TigVideoBuffer* video_buffer);
+void tile_set_render_target(TigVideoBuffer* vb);
 
 #define TILE_X(tile) ((tile) & 0x3F)
 #define TILE_Y(tile) (((tile) >> 6) & 0x3F)

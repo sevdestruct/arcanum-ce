@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+#include "game/iso_zoom.h"
+#include "game/location.h"
 #include "game/ai.h"
 #include "game/anim.h"
 #include "game/bless.h"
@@ -2744,7 +2746,7 @@ void intgame_process_event(TigMessage* msg)
                             sub_4B4320(pc_obj);
 
                             tig_mouse_get_state(&mouse_state);
-                            if (location_at(mouse_state.x, mouse_state.y, &loc)
+                            if (location_at_zoomed(mouse_state.x, mouse_state.y, iso_zoom_current(), &loc)
                                 && sub_5517A0(msg)) {
                                 int64_t pc_loc;
                                 tig_art_id_t aid;
@@ -2767,6 +2769,10 @@ void intgame_process_event(TigMessage* msg)
                         intgame_refresh_cursor();
                     }
                 }
+                break;
+            case TIG_MESSAGE_MOUSE_WHEEL:
+                iso_zoom_wheel(msg->data.mouse.dy);
+                gamelib_invalidate_rect(NULL);
                 break;
             case TIG_MESSAGE_MOUSE_IDLE:
                 sub_551910(msg);
@@ -5118,6 +5124,14 @@ void sub_551F80(void)
 // 0x552050
 bool sub_552050(int x, int y, TargetDescriptor* td)
 {
+    float z = iso_zoom_current();
+    if (z != 1.0f) {
+        int64_t ax;
+        int64_t ay;
+        location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+        x = (int)ax;
+        y = (int)ay;
+    }
     sub_551F80();
     return target_pick_at_screen_xy(x, y, td, intgame_fullscreen);
 }

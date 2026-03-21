@@ -84,6 +84,8 @@ set(SRCS
     "src/game/hrp.h"
     "src/game/invensource.c"
     "src/game/invensource.h"
+    "src/game/iso_zoom.c"
+    "src/game/iso_zoom.h"
     "src/game/item_effect.c"
     "src/game/item_effect.h"
     "src/game/item.c"

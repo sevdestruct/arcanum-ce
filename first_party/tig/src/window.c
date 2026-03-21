@@ -111,6 +111,8 @@ static int tig_window_num_windows;
 // 0x60F12C
 static TigRectListNode* tig_window_dirty_rects;
 
+static bool tig_window_invalidate_suppressed;
+
 // 0x60F130
 static tig_font_handle_t tig_window_modal_dialog_font;
 
@@ -1266,6 +1268,10 @@ void tig_window_invalidate_rect(TigRect* rect)
         return;
     }
 
+    if (tig_window_invalidate_suppressed) {
+        return;
+    }
+
     if (rect != NULL) {
         dirty_rect = *rect;
         if (tig_rect_intersection(&dirty_rect, &tig_window_screen_rect, &dirty_rect) != TIG_OK) {
@@ -1537,6 +1543,27 @@ int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** vide
     *video_buffer_ptr = win->video_buffer;
 
     return TIG_OK;
+}
+
+int tig_window_set_video_buffer(tig_window_handle_t window_handle, TigVideoBuffer* vb)
+{
+    int window_index;
+    TigWindow* win;
+
+    if (!tig_window_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+
+    window_index = tig_window_handle_to_index(window_handle);
+    win = &(windows[window_index]);
+    win->video_buffer = vb;
+
+    return TIG_OK;
+}
+
+void tig_window_set_invalidate_suppressed(bool suppressed)
+{
+    tig_window_invalidate_suppressed = suppressed;
 }
 
 // 0x51EA60

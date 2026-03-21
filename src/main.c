@@ -17,6 +17,7 @@
 #include "game/descriptions.h"
 #include "game/dialog.h"
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
 #include "game/highres_config.h"
@@ -227,6 +228,8 @@ int main(int argc, char** argv)
     game_init_info.editor = false;
     game_init_info.invalidate_rect_func = iso_invalidate_rect;
     game_init_info.draw_func = iso_redraw;
+
+    iso_zoom_init();
 
     if (!gamelib_init(&game_init_info)) {
         tig_window_destroy(game_init_info.iso_window_handle);
@@ -502,6 +505,18 @@ void main_loop(void)
                             iso_interface_refresh();
                             intgame_draw_bar(INTGAME_BAR_HEALTH);
                             intgame_draw_bar(INTGAME_BAR_FATIGUE);
+                        }
+                        break;
+                    case SDL_SCANCODE_EQUALS:
+                        if (!textedit_ui_is_focused()) {
+                            iso_zoom_step_in();
+                            gamelib_invalidate_rect(NULL);
+                        }
+                        break;
+                    case SDL_SCANCODE_MINUS:
+                        if (!textedit_ui_is_focused()) {
+                            iso_zoom_step_out();
+                            gamelib_invalidate_rect(NULL);
                         }
                         break;
                     default:

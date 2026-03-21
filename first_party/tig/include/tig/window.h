@@ -121,6 +121,8 @@ int tig_window_show(tig_window_handle_t window_handle);
 int tig_window_hide(tig_window_handle_t window_handle);
 bool tig_window_is_hidden(tig_window_handle_t window_handle);
 int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** video_buffer_ptr);
+int tig_window_set_video_buffer(tig_window_handle_t window_handle, TigVideoBuffer* vb);
+void tig_window_set_invalidate_suppressed(bool suppressed);
 int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModalDialogChoice* choice_ptr);
 
 #ifdef __cplusplus
