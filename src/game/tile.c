@@ -99,6 +99,11 @@ void tile_resize(GameResizeInfo* resize_info)
     tile_iso_window_handle = resize_info->window_handle;
 }
 
+void tile_set_render_target(TigVideoBuffer* vb)
+{
+    dword_602DF0 = vb;
+}
+
 // 0x4D6900
 void tile_update_view(ViewOptions* view_options)
 {

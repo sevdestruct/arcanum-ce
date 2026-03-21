@@ -1,6 +1,7 @@
 #include "game/scroll.h"
 
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
 #include "game/gsound.h"
 #include "game/location.h"
 #include "game/name.h"
@@ -446,6 +447,13 @@ void scroll_by(int64_t dx, int64_t dy)
     int64_t new_origin_x;
     int64_t new_origin_y;
     TigRect rect;
+    float z;
+
+    z = iso_zoom_current();
+    if (z != 1.0f) {
+        dx = (int64_t)(dx / z);
+        dy = (int64_t)(dy / z);
+    }
 
     // Redraw the view to prepare for scrolling.
     scroll_init_info.draw_func();
@@ -464,36 +472,42 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
-    // Scroll the window content.
-    tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
+    if (z != 1.0f) {
+        // At non-unity zoom the hardware scroll optimization is broken;
+        // invalidate the full world rect to force a complete redraw.
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    } else {
+        // Scroll the window content.
+        tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
 
-    // Invalidate newly revealed areas (horizontal scroll).
-    if (dx > 0) {
-        rect = scroll_iso_content_rect;
-        rect.width = (int)dx;
-        scroll_init_info.invalidate_rect_func(&rect);
-    } else if (dx < 0) {
-        rect = scroll_iso_content_rect;
-        rect.x = rect.width + (int)dx;
-        rect.width = -((int)dx);
-        scroll_init_info.invalidate_rect_func(&rect);
-    }
+        // Invalidate newly revealed areas (horizontal scroll).
+        if (dx > 0) {
+            rect = scroll_iso_content_rect;
+            rect.width = (int)dx;
+            scroll_init_info.invalidate_rect_func(&rect);
+        } else if (dx < 0) {
+            rect = scroll_iso_content_rect;
+            rect.x = rect.width + (int)dx;
+            rect.width = -((int)dx);
+            scroll_init_info.invalidate_rect_func(&rect);
+        }
 
-    // Force redraw when scrolling in both directions.
-    if (dx != 0 && dy != 0) {
-        scroll_init_info.draw_func();
-    }
+        // Force redraw when scrolling in both directions.
+        if (dx != 0 && dy != 0) {
+            scroll_init_info.draw_func();
+        }
 
-    // Invalidate newly revealed areas (vertical scroll).
-    if (dy < 0) {
-        rect = scroll_iso_content_rect;
-        rect.y += rect.height + (int)dy;
-        rect.height = -(int)dy;
-        scroll_init_info.invalidate_rect_func(&rect);
-    } else if (dy > 0) {
-        rect = scroll_iso_content_rect;
-        rect.height = (int)dy;
-        scroll_init_info.invalidate_rect_func(&rect);
+        // Invalidate newly revealed areas (vertical scroll).
+        if (dy < 0) {
+            rect = scroll_iso_content_rect;
+            rect.y += rect.height + (int)dy;
+            rect.height = -(int)dy;
+            scroll_init_info.invalidate_rect_func(&rect);
+        } else if (dy > 0) {
+            rect = scroll_iso_content_rect;
+            rect.height = (int)dy;
+            scroll_init_info.invalidate_rect_func(&rect);
+        }
     }
 
     // Notify text conversation system of the scroll, so it can update it's
