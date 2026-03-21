@@ -5131,6 +5131,8 @@ bool sub_552050(int x, int y, TargetDescriptor* td)
         location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
         x = (int)ax;
         y = (int)ay;
+        sub_551F80();
+        return target_pick_at_virtual_xy(x, y, td, intgame_fullscreen);
     }
     sub_551F80();
     return target_pick_at_screen_xy(x, y, td, intgame_fullscreen);

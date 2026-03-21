@@ -453,10 +453,10 @@ void scroll_by(int64_t dx, int64_t dy)
     if (z != 1.0f) {
         dx = (int64_t)(dx / z);
         dy = (int64_t)(dy / z);
+    } else {
+        // Redraw the view to prepare for the hardware pixel-copy scroll below.
+        scroll_init_info.draw_func();
     }
-
-    // Redraw the view to prepare for scrolling.
-    scroll_init_info.draw_func();
 
     // Update the view origin and check for actual movement.
     location_origin_get(&old_origin_x, &old_origin_y);

@@ -296,6 +296,17 @@ void object_resize(GameResizeInfo* resize_info)
     qword_5E2E60 = object_iso_content_rect.height / 20 / 2 + 2;
 }
 
+void object_set_iso_content_rect(const TigRect* rect)
+{
+    object_iso_content_rect = *rect;
+    object_iso_content_rect_ex.x = rect->x - 256;
+    object_iso_content_rect_ex.y = rect->y - 256;
+    object_iso_content_rect_ex.width = rect->width + 512;
+    object_iso_content_rect_ex.height = rect->height + 512;
+    qword_5E2F50 = rect->width / 40 / 2 + 2;
+    qword_5E2E60 = rect->height / 20 / 2 + 2;
+}
+
 // 0x43A650
 void object_reset(void)
 {

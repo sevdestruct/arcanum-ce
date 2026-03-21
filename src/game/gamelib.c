@@ -416,6 +416,11 @@ bool gamelib_init(GameInitInfo* init_info)
         }
     }
 
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
+    }
+
     return true;
 }
 
@@ -587,6 +592,11 @@ void gamelib_resize(GameResizeInfo* resize_info)
         if (gamelib_modules[index].resize_func != NULL) {
             gamelib_modules[index].resize_func(resize_info);
         }
+    }
+
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
     }
 
     if (gamelib_dirty_rects_head != NULL) {
@@ -967,11 +977,16 @@ bool gamelib_draw(void)
             }
             tig_window_set_invalidate_suppressed(true);
             gamelib_zoom_world_pass_active = true;
+            TigRect zoom_content_rect = { 0, 0, ww * 2, wh * 2 };
+            object_set_iso_content_rect(&zoom_content_rect);
+            light_set_iso_content_rect(&zoom_content_rect);
         }
         gamelib_draw_func(&draw_info);
         if (zoom_active) {
             gamelib_zoom_world_pass_active = false;
             tig_window_set_invalidate_suppressed(false);
+            object_set_iso_content_rect(&orig_content_rect);
+            light_set_iso_content_rect(&orig_content_rect);
         }
         sector_list_destroy(sectors);
 
@@ -1060,6 +1075,8 @@ bool gamelib_draw(void)
         gamelib_iso_content_rect = orig_content_rect;
         gamelib_iso_content_rect_ex = orig_content_rect_ex;
         location_origin_pixel_set(orig_ox, orig_oy);
+        object_set_iso_content_rect(&orig_content_rect);
+        light_set_iso_content_rect(&orig_content_rect);
     }
 
     gamelib_dirty_rects_head = gamelib_pending_dirty_rects_head;
