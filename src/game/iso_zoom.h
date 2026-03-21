@@ -15,5 +15,6 @@ void iso_zoom_step_out(void);
 void iso_zoom_wheel(int dy);
 float iso_zoom_current(void);
 bool iso_zoom_is_animating(void);
+void iso_zoom_reset(void);
 
 #endif /* ARCANUM_GAME_ISO_ZOOM_H_ */
