@@ -53,3 +53,8 @@ bool iso_zoom_is_animating(void)
 {
     return zoom_current != zoom_target;
 }
+
+void iso_zoom_reset(void)
+{
+    zoom_target = 1.0f;
+}

@@ -2821,7 +2821,18 @@ void intgame_process_event(TigMessage* msg)
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
                 if (!inven_ui_is_created()) {
-                    if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    float z = iso_zoom_current();
+                    bool picked;
+                    if (z != 1.0f) {
+                        int64_t ax, ay;
+                        location_zoom_adjust_screen_xy(mx, my, z, &ax, &ay);
+                        picked = target_pick_at_virtual_xy((int)ax, (int)ay, &td, intgame_fullscreen);
+                    } else {
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                    }
+                    if (picked) {
                         spell_ui_apply(&td);
                     } else if (target_last_rejection_get() == 0x100000) {
                         spell_ui_error_target_not_damaged();
@@ -2893,11 +2904,21 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                float z = iso_zoom_current();
+                if (z != 1.0f) {
+                    int64_t ax, ay;
+                    location_zoom_adjust_screen_xy(mx, my, z, &ax, &ay);
+                    if (target_pick_at_virtual_xy((int)ax, (int)ay, &td, intgame_fullscreen)) {
+                        skill_ui_apply(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     skill_ui_apply(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 skill_ui_cancel();
                 break;
@@ -2949,24 +2970,36 @@ void intgame_process_event(TigMessage* msg)
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_DOWN:
-                if (sub_5517A0(msg)
-                    && target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)
-                    && td.is_loc
-                    && !inven_ui_drag_item_obj_get()
-                    && !critter_is_dead(pc_obj)
-                    && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
-                    if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
-                            || tig_kb_get_modifier(SDL_KMOD_NUM))
-                        && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                        anim_goal_run_to_tile(pc_obj, td.loc);
+                if (sub_5517A0(msg)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    float z = iso_zoom_current();
+                    bool picked;
+                    if (z != 1.0f) {
+                        int64_t ax, ay;
+                        location_zoom_adjust_screen_xy(mx, my, z, &ax, &ay);
+                        picked = target_pick_at_virtual_xy((int)ax, (int)ay, &td, intgame_fullscreen);
                     } else {
-                        anim_goal_move_to_tile(pc_obj, td.loc);
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
                     }
+                    if (picked
+                        && td.is_loc
+                        && !inven_ui_drag_item_obj_get()
+                        && !critter_is_dead(pc_obj)
+                        && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
+                        if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
+                                || tig_kb_get_modifier(SDL_KMOD_NUM))
+                            && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
+                            anim_goal_run_to_tile(pc_obj, td.loc);
+                        } else {
+                            anim_goal_move_to_tile(pc_obj, td.loc);
+                        }
 
-                    if (dword_64C6D8) {
-                        sub_436CF0();
+                        if (dword_64C6D8) {
+                            sub_436CF0();
+                        }
+                        dword_64C6D8 = true;
                     }
-                    dword_64C6D8 = true;
                 }
                 break;
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
@@ -2998,13 +3031,25 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                float z = iso_zoom_current();
+                bool picked;
+                if (z != 1.0f) {
+                    int64_t ax, ay;
+                    location_zoom_adjust_screen_xy(mx, my, z, &ax, &ay);
+                    picked = target_pick_at_virtual_xy((int)ax, (int)ay, &td, intgame_fullscreen);
+                } else {
+                    picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                }
+                if (picked) {
                     item_ui_apply(&td);
                 } else if (target_last_rejection_get() == 0x100000) {
                     spell_ui_error_target_not_damaged();
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 item_ui_deactivate();
                 break;
@@ -3033,11 +3078,21 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                float z = iso_zoom_current();
+                if (z != 1.0f) {
+                    int64_t ax, ay;
+                    location_zoom_adjust_screen_xy(mx, my, z, &ax, &ay);
+                    if (target_pick_at_virtual_xy((int)ax, (int)ay, &td, intgame_fullscreen)) {
+                        follower_ui_execute_order(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     follower_ui_execute_order(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 follower_ui_end_order_mode();
                 break;

@@ -519,6 +519,12 @@ void main_loop(void)
                             gamelib_invalidate_rect(NULL);
                         }
                         break;
+                    case SDL_SCANCODE_0:
+                        if (!textedit_ui_is_focused()) {
+                            iso_zoom_reset();
+                            gamelib_invalidate_rect(NULL);
+                        }
+                        break;
                     default:
                         break;
                     }
