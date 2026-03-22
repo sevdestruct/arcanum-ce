@@ -65,6 +65,7 @@
 
 
 typedef unsigned int TextBubbleFlags;
+typedef unsigned int TextBubblePlacementFlags;
 
 /**
  * Flag indicating that a text bubble is currently active.
@@ -76,6 +77,14 @@ typedef unsigned int TextBubbleFlags;
  * automatically.
  */
 #define TEXT_BUBBLE_PERMANENT 0x0002u
+
+// Placement flags describe which viewport/UI safety clamped the preferred
+// position. Side clamps can prefer lateral cascades; top/bottom clamps keep
+// the existing Y-first stack behavior.
+#define TB_PLACEMENT_CLAMP_LEFT   0x01u
+#define TB_PLACEMENT_CLAMP_RIGHT  0x02u
+#define TB_PLACEMENT_CLAMP_TOP    0x04u
+#define TB_PLACEMENT_CLAMP_BOTTOM 0x08u
 
 
 /**
@@ -101,11 +110,22 @@ typedef struct TextBubble {
 #define TB_ALIGN_RIGHT     2
 
 static void tb_remove_internal(TextBubble* tb);
+static void tb_get_rect_ex(TextBubble* tb, TigRect* rect, TextBubblePlacementFlags* placement_flags);
 static void tb_get_rect(TextBubble* tb, TigRect* rect);
 static void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect);
+static void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect, TextBubblePlacementFlags* placement_flags);
 static int  tb_get_anchor_y(TextBubble* tb);
 static int  tb_get_safe_bottom(int rect_x, int rect_width, int rect_height);
-static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys);
+static bool tb_rects_overlap_horizontally(const TigRect* a, const TigRect* b, int gap);
+static bool tb_rects_overlap_vertically(const TigRect* a, const TigRect* b);
+static bool tb_pair_prefers_x_cascade(int first,
+    int second,
+    TigRect* rects,
+    TigRect* base_rects,
+    TextBubblePlacementFlags* placement_flags,
+    bool allow_x_preferred_skip);
+static bool tb_has_unresolved_overlap(TigRect* rects, int* indices, int count);
+static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys, TextBubblePlacementFlags* placement_flags);
 static void tb_text_duration_changed(void);
 static TextBubble* find_text_bubble(int64_t obj);
 static TextBubble* find_free_text_bubble(int64_t obj);
@@ -455,6 +475,7 @@ void tb_draw(GameDrawInfo* draw_info)
     int idx;
     TigRect rects[MAX_TEXT_BUBBLES];
     int anchor_ys[MAX_TEXT_BUBBLES];
+    TextBubblePlacementFlags placement_flags[MAX_TEXT_BUBBLES];
     TigRectListNode* node;
     TigRect dst_rect;
     TigRect src_rect;
@@ -472,10 +493,11 @@ void tb_draw(GameDrawInfo* draw_info)
 
     // Pass 1: compute screen rect for every bubble independently. tb_calc_rect
     // handles anchor→screen transform, UI collision, and drift hiding.
-    // Also capture each bubble's unclamped sprite anchor Y for stable sorting.
+    // Also capture each bubble's unclamped sprite anchor Y for stable sorting
+    // plus which screen/UI safeties clamped the preferred placement.
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
-            tb_get_rect(&(tb_text_bubbles[idx]), &rects[idx]);
+            tb_get_rect_ex(&(tb_text_bubbles[idx]), &rects[idx], &placement_flags[idx]);
             anchor_ys[idx] = tb_get_anchor_y(&tb_text_bubbles[idx]);
         } else {
             rects[idx].x = 0;
@@ -483,11 +505,12 @@ void tb_draw(GameDrawInfo* draw_info)
             rects[idx].width = 0;
             rects[idx].height = 0;
             anchor_ys[idx] = 0;
+            placement_flags[idx] = 0;
         }
     }
 
     // Pass 2: push overlapping bubbles apart so they stack cleanly.
-    tb_resolve_overlaps(rects, anchor_ys);
+    tb_resolve_overlaps(rects, anchor_ys, placement_flags);
 
     // Store resolved rects so tb_ping can pre-invalidate them next frame,
     // guaranteeing dirty-rect coverage even at 1.0x zoom.
@@ -739,7 +762,7 @@ void tb_remove_internal(TextBubble* tb)
  *
  * 0x4D63B0
  */
-void tb_get_rect(TextBubble* tb, TigRect* rect)
+void tb_get_rect_ex(TextBubble* tb, TigRect* rect, TextBubblePlacementFlags* placement_flags)
 {
     int64_t loc;
     int offset_x;
@@ -751,7 +774,12 @@ void tb_get_rect(TextBubble* tb, TigRect* rect)
     offset_y = obj_field_int32_get(tb->obj, OBJ_F_OFFSET_Y);
 
     // Calculate the screen rectangle.
-    tb_calc_rect(tb, loc, offset_x, offset_y, rect);
+    tb_calc_rect_ex(tb, loc, offset_x, offset_y, rect, placement_flags);
+}
+
+void tb_get_rect(TextBubble* tb, TigRect* rect)
+{
+    tb_get_rect_ex(tb, rect, NULL);
 }
 
 
@@ -763,8 +791,17 @@ void tb_get_rect(TextBubble* tb, TigRect* rect)
  */
 void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect)
 {
+    tb_calc_rect_ex(tb, loc, offset_x, offset_y, rect, NULL);
+}
+
+void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect, TextBubblePlacementFlags* placement_flags)
+{
     int64_t x;
     int64_t y;
+
+    if (placement_flags != NULL) {
+        *placement_flags = 0;
+    }
 
     // Retrieve screen coordinates of the location.
     location_xy(loc, &x, &y);
@@ -896,6 +933,20 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     rect->x = rect->x < vp_left   ? vp_left   : (rect->x > vp_right  ? vp_right  : rect->x);
     rect->y = rect->y < vp_top    ? vp_top    : (rect->y > vp_bottom  ? vp_bottom : rect->y);
 
+    if (placement_flags != NULL) {
+        if (rect->x > ideal_x) {
+            *placement_flags |= TB_PLACEMENT_CLAMP_LEFT;
+        } else if (rect->x < ideal_x) {
+            *placement_flags |= TB_PLACEMENT_CLAMP_RIGHT;
+        }
+
+        if (rect->y > ideal_y) {
+            *placement_flags |= TB_PLACEMENT_CLAMP_TOP;
+        } else if (rect->y < ideal_y) {
+            *placement_flags |= TB_PLACEMENT_CLAMP_BOTTOM;
+        }
+    }
+
     // Hide bubble if NPC has panned too far out of frame.
     // The downward threshold gets an extra sprite_hot_y of slack: ideal_y is
     // above the sprite head, so sliding the bubble down toward (or past) the
@@ -905,6 +956,9 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     int drift_down  = TB_DRIFT_MAX_PX + (int)((float)sprite_hot_y * z);
     if (rect->x - ideal_x > drift_horiz  || ideal_x - rect->x > drift_horiz
         || rect->y - ideal_y > drift_down || ideal_y - rect->y > TB_DRIFT_MAX_PX) {
+        if (placement_flags != NULL) {
+            *placement_flags = 0;
+        }
         rect->x = 0; rect->y = 0; rect->width = 0; rect->height = 0;
         return;
     }
@@ -1009,14 +1063,86 @@ static int tb_get_safe_bottom(int rect_x, int rect_width, int rect_height)
     return limit;
 }
 
-static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
+static bool tb_rects_overlap_horizontally(const TigRect* a, const TigRect* b, int gap)
+{
+    return !(a->x + a->width + gap <= b->x
+        || b->x + b->width + gap <= a->x);
+}
+
+static bool tb_rects_overlap_vertically(const TigRect* a, const TigRect* b)
+{
+    return !(a->y + a->height <= b->y
+        || b->y + b->height <= a->y);
+}
+
+static bool tb_pair_prefers_x_cascade(int first,
+    int second,
+    TigRect* rects,
+    TigRect* base_rects,
+    TextBubblePlacementFlags* placement_flags,
+    bool allow_x_preferred_skip)
+{
+    TextBubblePlacementFlags side_flags = TB_PLACEMENT_CLAMP_LEFT | TB_PLACEMENT_CLAMP_RIGHT;
+    TextBubblePlacementFlags vertical_flags = TB_PLACEMENT_CLAMP_TOP | TB_PLACEMENT_CLAMP_BOTTOM;
+    TextBubblePlacementFlags combined_flags;
+    TextBubblePlacementFlags shared_vertical_flags;
+
+    if (!allow_x_preferred_skip) {
+        return false;
+    }
+
+    if (rects[first].y != base_rects[first].y
+        || rects[second].y != base_rects[second].y) {
+        return false;
+    }
+
+    combined_flags = placement_flags[first] | placement_flags[second];
+    if ((combined_flags & side_flags) == 0) {
+        return false;
+    }
+
+    shared_vertical_flags = placement_flags[first] & placement_flags[second] & vertical_flags;
+    if ((combined_flags & vertical_flags) != 0
+        && !(rects[first].y == rects[second].y
+            && base_rects[first].y == base_rects[second].y
+            && (shared_vertical_flags == TB_PLACEMENT_CLAMP_TOP
+                || shared_vertical_flags == TB_PLACEMENT_CLAMP_BOTTOM))) {
+        return false;
+    }
+
+    return tb_rects_overlap_vertically(&(rects[first]), &(rects[second]));
+}
+
+static bool tb_has_unresolved_overlap(TigRect* rects, int* indices, int count)
+{
+    int i;
+    int j;
+
+    for (i = 0; i < count - 1; i++) {
+        for (j = i + 1; j < count; j++) {
+            TigRect* first = &(rects[indices[i]]);
+            TigRect* second = &(rects[indices[j]]);
+
+            if (tb_rects_overlap_horizontally(first, second, 0)
+                && tb_rects_overlap_vertically(first, second)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys, TextBubblePlacementFlags* placement_flags)
 {
     int sorted[MAX_TEXT_BUBBLES];
+    TigRect base_rects[MAX_TEXT_BUBBLES];
     int count = 0;
     int i;
     int j;
     int k;
     int pass;
+    bool allow_x_preferred_skip = true;
 
     int vp_left   = tb_iso_content_rect.x + TB_EDGE_MARGIN_PX;
     int vp_top    = tb_iso_content_rect.y + TB_EDGE_MARGIN_PX;
@@ -1034,6 +1160,10 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
         return;
     }
 
+    for (i = 0; i < MAX_TEXT_BUBBLES; i++) {
+        base_rects[i] = rects[i];
+    }
+
     // Sort by sprite anchor Y ascending (topmost NPC first).
     // anchor_ys[] holds the unclamped sprite screen Y — stable across frames
     // even when multiple bubbles are clamped to the same boundary.
@@ -1049,7 +1179,9 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
         sorted[j + 1] = key;
     }
 
-    for (pass = 0; pass < count; pass++) {
+    // Normal overlap chains settle in <= count passes. Allow one extra sweep
+    // if a side-driven X cascade stalls and needs to fall back to Y stacking.
+    for (pass = 0; pass < count * 2; pass++) {
         bool any = false;
 
         // Phase 1 — cascade downward: process sorted top→bottom.
@@ -1059,8 +1191,11 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
             j = sorted[k + 1];
 
             // No horizontal overlap means they're side-by-side — skip Y push.
-            if (rects[i].x + rects[i].width  + TB_BUBBLE_STACK_GAP_PX <= rects[j].x
-                || rects[j].x + rects[j].width + TB_BUBBLE_STACK_GAP_PX <= rects[i].x) {
+            if (!tb_rects_overlap_horizontally(&(rects[i]), &(rects[j]), TB_BUBBLE_STACK_GAP_PX)) {
+                continue;
+            }
+
+            if (tb_pair_prefers_x_cascade(i, j, rects, base_rects, placement_flags, allow_x_preferred_skip)) {
                 continue;
             }
 
@@ -1085,8 +1220,11 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
             i = sorted[k - 1];
 
             // No horizontal overlap — skip Y push.
-            if (rects[i].x + rects[i].width  + TB_BUBBLE_STACK_GAP_PX <= rects[j].x
-                || rects[j].x + rects[j].width + TB_BUBBLE_STACK_GAP_PX <= rects[i].x) {
+            if (!tb_rects_overlap_horizontally(&(rects[i]), &(rects[j]), TB_BUBBLE_STACK_GAP_PX)) {
+                continue;
+            }
+
+            if (tb_pair_prefers_x_cascade(i, j, rects, base_rects, placement_flags, allow_x_preferred_skip)) {
                 continue;
             }
 
@@ -1127,8 +1265,7 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
             j = x_sorted[k + 1];
 
             // Only act when the pair also overlaps vertically.
-            if (rects[i].y + rects[i].height <= rects[j].y
-                || rects[j].y + rects[j].height <= rects[i].y) {
+            if (!tb_rects_overlap_vertically(&(rects[i]), &(rects[j]))) {
                 continue;
             }
 
@@ -1151,8 +1288,7 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
             j = x_sorted[k];
             i = x_sorted[k - 1];
 
-            if (rects[i].y + rects[i].height <= rects[j].y
-                || rects[j].y + rects[j].height <= rects[i].y) {
+            if (!tb_rects_overlap_vertically(&(rects[i]), &(rects[j]))) {
                 continue;
             }
 
@@ -1170,6 +1306,10 @@ static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
         }
 
         if (!any) {
+            if (allow_x_preferred_skip && tb_has_unresolved_overlap(rects, sorted, count)) {
+                allow_x_preferred_skip = false;
+                continue;
+            }
             break;
         }
 
@@ -1284,4 +1424,3 @@ TextBubble* find_free_text_bubble(int64_t obj)
 
     return &(tb_text_bubbles[idx_to_use]);
 }
-
