@@ -62,6 +62,8 @@ set(SRCS
     "src/game/descriptions.h"
     "src/game/dialog.c"
     "src/game/dialog.h"
+    "src/game/dialog_camera.c"
+    "src/game/dialog_camera.h"
     "src/game/effect.c"
     "src/game/effect.h"
     "src/game/facade.c"
