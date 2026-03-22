@@ -14,6 +14,8 @@ void tc_clear(bool compact);
 void tc_set_option(int index, const char* str);
 int tc_handle_message(TigMessage* msg);
 int tc_check_size(const char* str);
+bool tc_is_active(void);
+TigRect tc_get_content_rect(void);
 
 // CE: shift the dialog options backdrop down by `offset` design-coord
 // pixels — used to reclaim half the visual real-estate that the cropped

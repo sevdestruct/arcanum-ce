@@ -2,6 +2,7 @@
 
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
+#include "game/tb.h"
 #include "game/gsound.h"
 #include "game/location.h"
 #include "game/name.h"
@@ -472,9 +473,9 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
-    if (z != 1.0f) {
-        // At non-unity zoom the hardware scroll optimization is broken;
-        // invalidate the full world rect to force a complete redraw.
+    if (z != 1.0f || tb_any_active()) {
+        // At non-unity zoom, or when speech bubbles are visible, the hardware
+        // scroll optimization leaves stale bubble pixels. Force a full redraw.
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
     } else {
         // Scroll the window content.
