@@ -1,6 +1,7 @@
 #include "game/tf.h"
 
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
 #include "game/object.h"
 
 /**
@@ -864,18 +865,32 @@ void tf_calc_rect(int64_t loc, int offset_x, int offset_y, TigRect* rect)
     // Retrieve screen coordinates of the location.
     location_xy(loc, &sx, &sy);
 
-    // Center it and offset by the given values.
+    // Apply tile-centering and sub-tile offsets in world space first. The
+    // world scale-blit zooms everything including these offsets, so they must
+    // be part of the anchor before zoom is applied.
     sx += offset_x + 40;
     sy += offset_y + 20;
 
-    // Center horizontally.
-    sx -= TEXT_FLOATER_WIDTH / 2;
+    // Zoom the full anchor to match where the sprite visually appears.
+    float z = iso_zoom_current();
+    if (z != 1.0f) {
+        TigRect cr;
+        int64_t cx;
+        int64_t cy;
+        gamelib_get_iso_content_rect(&cr);
+        cx = cr.width / 2;
+        cy = cr.height / 2;
+        sx = cx + (int64_t)((float)(sx - cx) * z);
+        sy = cy + (int64_t)((float)(sy - cy) * z);
+    }
 
-    // Adjust vertical position.
-    //
-    // NOTE: The 90 pixels is probably the average height of critter sprites.
-    // This adjustment makes text floater box end up right above critter head.
-    sy -= NUMBER_OF_LINES * tf_line_height + 90;
+    // NOTE: The 90 pixels is the approximate height of critter sprites at
+    // 1.0x zoom. Scaled by z so the floater stays above the head at all zoom
+    // levels as the visual sprite size grows and shrinks with zoom.
+    sy -= NUMBER_OF_LINES * tf_line_height + (int)(90 * z);
+
+    // Center the text box horizontally over the entity (fixed pixel size).
+    sx -= TEXT_FLOATER_WIDTH / 2;
 
     rect->x = (int)sx;
     rect->y = (int)sy;
