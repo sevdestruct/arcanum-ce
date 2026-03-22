@@ -145,6 +145,7 @@ void gamelib_redraw(void);
 bool gamelib_copy_version(char* long_version, char* short_version, char* locale);
 void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
+void gamelib_get_iso_content_rect(TigRect* rect);
 
 // True when the user has opted into the vanilla "snap camera to PC on
 // overlay open" behavior. See RECENTER_CAMERA_ON_OVERLAY_KEY. Defaults

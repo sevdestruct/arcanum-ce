@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "game/dialog_camera.h"
 #include "game/ai.h"
 #include "game/anim.h"
 #include "game/area.h"
@@ -470,12 +471,6 @@ void sub_412F60(int dlg)
 // 0x412FD0
 bool sub_412FD0(DialogState* state)
 {
-    int64_t pc_loc;
-    int64_t npc_loc;
-    int64_t tmp;
-    int64_t pc_loc_y;
-    int64_t npc_loc_y;
-
     if (ai_can_speak(state->npc_obj, state->pc_obj, false) != AI_SPEAK_OK) {
         return false;
     }
@@ -484,15 +479,7 @@ bool sub_412FD0(DialogState* state)
 
     if (critter_is_dead(state->npc_obj) || ai_check_kos(state->npc_obj, state->pc_obj) == AI_KOS_NO) {
         if (player_is_local_pc_obj(state->pc_obj)) {
-            pc_loc = obj_field_int64_get(state->pc_obj, OBJ_F_LOCATION);
-            npc_loc = obj_field_int64_get(state->npc_obj, OBJ_F_LOCATION);
-            location_xy(pc_loc, &tmp, &pc_loc_y);
-            location_xy(npc_loc, &tmp, &npc_loc_y);
-            if (npc_loc_y > pc_loc_y) {
-                location_origin_set(npc_loc);
-            } else {
-                location_origin_set(pc_loc);
-            }
+            dialog_camera_start(state->pc_obj, state->npc_obj);
         }
 
         state->field_17EC = state->num;
