@@ -229,13 +229,15 @@ int main(int argc, char** argv)
     game_init_info.invalidate_rect_func = iso_invalidate_rect;
     game_init_info.draw_func = iso_redraw;
 
-    iso_zoom_init();
-
     if (!gamelib_init(&game_init_info)) {
         tig_window_destroy(game_init_info.iso_window_handle);
         tig_exit();
         return EXIT_SUCCESS; // FIXME: Should be `EXIT_FAILURE`.
     }
+
+    // Must init after gamelib_init so that settings are already loaded —
+    // iso_zoom_init registers a setting and applies the loaded value.
+    iso_zoom_init();
 
     if (strstr(lpCmdLine, "-dialogcheck") != NULL) {
         dialog_check();
