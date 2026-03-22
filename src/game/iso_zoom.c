@@ -9,6 +9,7 @@ static float zoom_current = 1.0f;
 static float zoom_target = 1.0f;
 static float zoom_min = ISO_ZOOM_MIN;
 static float zoom_max = ISO_ZOOM_MAX;
+static bool zoom_available = true;
 
 static void iso_zoom_min_changed(void)
 {
@@ -63,6 +64,10 @@ void iso_zoom_ping(void)
 
 void iso_zoom_step_in(void)
 {
+    if (!zoom_available) {
+        return;
+    }
+
     zoom_target = roundf(zoom_target / ISO_ZOOM_STEP) * ISO_ZOOM_STEP + ISO_ZOOM_STEP;
     if (zoom_target > zoom_max) {
         zoom_target = zoom_max;
@@ -71,6 +76,10 @@ void iso_zoom_step_in(void)
 
 void iso_zoom_step_out(void)
 {
+    if (!zoom_available) {
+        return;
+    }
+
     zoom_target = roundf(zoom_target / ISO_ZOOM_STEP) * ISO_ZOOM_STEP - ISO_ZOOM_STEP;
     if (zoom_target < zoom_min) {
         zoom_target = zoom_min;
@@ -101,14 +110,32 @@ bool iso_zoom_is_animating(void)
     return zoom_current != zoom_target;
 }
 
+bool iso_zoom_is_available(void)
+{
+    return zoom_available;
+}
+
 void iso_zoom_reset(void)
 {
     zoom_target = 1.0f;
     zoom_current = 1.0f;
 }
 
+void iso_zoom_set_available(bool available)
+{
+    zoom_available = available;
+    if (!zoom_available) {
+        iso_zoom_reset();
+    }
+}
+
 void iso_zoom_set_target(float z)
 {
+    if (!zoom_available) {
+        iso_zoom_reset();
+        return;
+    }
+
     if (z < zoom_min) {
         z = zoom_min;
     }
