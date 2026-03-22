@@ -51,6 +51,12 @@
 #define TB_DRIFT_MAX_PX 160
 
 /**
+ * Vertical gap (screen pixels) inserted between stacked speech bubbles when
+ * the overlap resolver pushes them apart.
+ */
+#define TB_BUBBLE_STACK_GAP_PX 4
+
+/**
  * Width of the follower portrait panel (leftmost column, anchored at x=0).
  * Its active height varies with party size; tb_calc_rect queries
  * follower_ui_panel_bottom() at runtime.
@@ -97,6 +103,9 @@ typedef struct TextBubble {
 static void tb_remove_internal(TextBubble* tb);
 static void tb_get_rect(TextBubble* tb, TigRect* rect);
 static void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect);
+static int  tb_get_anchor_y(TextBubble* tb);
+static int  tb_get_safe_bottom(int rect_x, int rect_width, int rect_height);
+static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys);
 static void tb_text_duration_changed(void);
 static TextBubble* find_text_bubble(int64_t obj);
 static TextBubble* find_free_text_bubble(int64_t obj);
@@ -196,6 +205,19 @@ static ViewOptions tb_view_options;
 static int64_t tb_last_origin_x;
 static int64_t tb_last_origin_y;
 static float tb_last_zoom = 1.0f;
+
+/**
+ * Resolved screen rects from the previous frame.
+ *
+ * tb_resolve_overlaps() may move bubbles to positions that differ from what
+ * tb_calc_rect() computed (and invalidated via tb_iso_window_invalidate_rect).
+ * At 1.0× zoom the dirty-rect system only repaints specific regions, so if
+ * the resolve-adjusted position was not in the dirty list that frame the blit
+ * clips.  Storing the resolved rects and pre-invalidating them in tb_ping
+ * ensures the game world redraws those areas before tb_draw runs, so the full
+ * resolved position is always covered by a dirty rect.
+ */
+static TigRect tb_prev_resolved[MAX_TEXT_BUBBLES];
 
 /**
  * Fonts for text bubble types.
@@ -384,6 +406,17 @@ void tb_ping(tig_timestamp_t timestamp)
     int64_t oy;
     float z;
 
+    // Pre-invalidate last frame's resolved bubble positions so the game world
+    // redraws those areas before tb_draw runs this frame.  tb_resolve_overlaps
+    // may shift bubbles beyond the rect that tb_calc_rect invalidated, leaving
+    // the adjusted area outside the dirty-rect list at 1.0x zoom.  Marking the
+    // resolved rects dirty here ensures the blit always has full coverage.
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        if (tb_prev_resolved[idx].width > 0 && tb_prev_resolved[idx].height > 0) {
+            tb_iso_window_invalidate_rect(&tb_prev_resolved[idx]);
+        }
+    }
+
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         // Check if the bubble has expired.
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0
@@ -420,7 +453,8 @@ void tb_ping(tig_timestamp_t timestamp)
 void tb_draw(GameDrawInfo* draw_info)
 {
     int idx;
-    TigRect tb_rect;
+    TigRect rects[MAX_TEXT_BUBBLES];
+    int anchor_ys[MAX_TEXT_BUBBLES];
     TigRectListNode* node;
     TigRect dst_rect;
     TigRect src_rect;
@@ -436,32 +470,63 @@ void tb_draw(GameDrawInfo* draw_info)
         return;
     }
 
-    // Iterate through active text bubbles.
+    // Pass 1: compute screen rect for every bubble independently. tb_calc_rect
+    // handles anchor→screen transform, UI collision, and drift hiding.
+    // Also capture each bubble's unclamped sprite anchor Y for stable sorting.
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
-            // Get the bubble's screen rect.
-            tb_get_rect(&(tb_text_bubbles[idx]), &tb_rect);
+            tb_get_rect(&(tb_text_bubbles[idx]), &rects[idx]);
+            anchor_ys[idx] = tb_get_anchor_y(&tb_text_bubbles[idx]);
+        } else {
+            rects[idx].x = 0;
+            rects[idx].y = 0;
+            rects[idx].width = 0;
+            rects[idx].height = 0;
+            anchor_ys[idx] = 0;
+        }
+    }
 
-            // Iterate through dirty rects to check if text bubble needs to be
-            // rendered at all.
-            node = *draw_info->rects;
-            while (node != NULL) {
-                if (tig_rect_intersection(&tb_rect, &(node->rect), &dst_rect) == TIG_OK) {
-                    // Calculate source rect.
-                    src_rect.x = dst_rect.x + tb_text_bubbles[idx].rect.x - tb_rect.x;
-                    src_rect.y = dst_rect.y + tb_text_bubbles[idx].rect.y - tb_rect.y;
-                    src_rect.width = dst_rect.width;
-                    src_rect.height = dst_rect.height;
+    // Pass 2: push overlapping bubbles apart so they stack cleanly.
+    tb_resolve_overlaps(rects, anchor_ys);
 
-                    // Copy the affected portion of text bubble's video buffer
-                    // onto the window.
-                    tig_window_copy_from_vbuffer(tb_iso_window_handle,
-                        &dst_rect,
-                        tb_text_bubbles[idx].video_buffer,
-                        &src_rect);
-                }
-                node = node->next;
+    // Store resolved rects so tb_ping can pre-invalidate them next frame,
+    // guaranteeing dirty-rect coverage even at 1.0x zoom.
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        tb_prev_resolved[idx] = rects[idx];
+    }
+
+    // Pass 3: blit each bubble using the resolved screen rect.
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) == 0) {
+            continue;
+        }
+
+        TigRect* tb_rect = &rects[idx];
+
+        // Skip bubbles hidden by drift or pushed fully off-screen.
+        if (tb_rect->width == 0 || tb_rect->height == 0) {
+            continue;
+        }
+
+        // Iterate through dirty rects to check if text bubble needs to be
+        // rendered at all.
+        node = *draw_info->rects;
+        while (node != NULL) {
+            if (tig_rect_intersection(tb_rect, &(node->rect), &dst_rect) == TIG_OK) {
+                // Map the on-screen destination back to video-buffer source coords.
+                src_rect.x = dst_rect.x + tb_text_bubbles[idx].rect.x - tb_rect->x;
+                src_rect.y = dst_rect.y + tb_text_bubbles[idx].rect.y - tb_rect->y;
+                src_rect.width = dst_rect.width;
+                src_rect.height = dst_rect.height;
+
+                // Copy the affected portion of text bubble's video buffer
+                // onto the window.
+                tig_window_copy_from_vbuffer(tb_iso_window_handle,
+                    &dst_rect,
+                    tb_text_bubbles[idx].video_buffer,
+                    &src_rect);
             }
+            node = node->next;
         }
     }
 }
@@ -654,6 +719,15 @@ void tb_remove_internal(TextBubble* tb)
     flags = obj_field_int32_get(tb->obj, OBJ_F_FLAGS);
     flags &= ~OF_TEXT;
     obj_field_int32_set(tb->obj, OBJ_F_FLAGS, flags);
+
+    // Clear the stored resolved rect so tb_ping stops pre-invalidating it.
+    {
+        int slot = (int)(tb - tb_text_bubbles);
+        tb_prev_resolved[slot].x = 0;
+        tb_prev_resolved[slot].y = 0;
+        tb_prev_resolved[slot].width = 0;
+        tb_prev_resolved[slot].height = 0;
+    }
 
     // Reset the text bubble's properties.
     tb->flags = 0;
@@ -860,6 +934,256 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
             rect->width  = tb->rect.width;
             rect->height = tb->rect.height;
             tb->rendered_align = required_align;
+        }
+    }
+}
+
+/**
+ * Resolves inter-bubble overlaps without causing position inversions.
+ *
+ * Y axis: bubbles are sorted top-to-bottom, then resolved with a two-phase
+ * cascade so relative order is always preserved:
+ *   Phase 1 (top→bottom): each bubble pushes the one below it downward.
+ *   Phase 2 (bottom→top): each bubble pushes the one above it upward.
+ * When a bubble is stopped by a viewport boundary the cascade propagates to
+ * the next bubble in the sorted chain rather than inverting order.
+ *
+ * X axis: any pair that still overlaps in both axes after Y settlement is
+ * resolved symmetrically — each bubble moves half the X overlap in opposite
+ * directions, with boundary absorption.
+ *
+ * Multiple passes handle chains of three or more overlapping bubbles.
+ * Hidden bubbles (zero area) are skipped.
+ */
+
+/**
+ * Returns the sprite's screen Y anchor for bubble ordering.
+ *
+ * This is the tile+offset screen coordinate after zoom — the point the bubble
+ * attaches above — computed without any clamping.  Used as a stable sort key
+ * so relative ordering between bubbles is preserved even when multiple bubbles
+ * are clamped to the same boundary (e.g. both at vp_top).
+ */
+static int tb_get_anchor_y(TextBubble* tb)
+{
+    int64_t loc     = obj_field_int64_get(tb->obj, OBJ_F_LOCATION);
+    int     off_y   = obj_field_int32_get(tb->obj, OBJ_F_OFFSET_Y);
+    int64_t x;
+    int64_t y;
+
+    location_xy(loc, &x, &y);
+    y += off_y + 20;
+
+    float z = iso_zoom_current();
+    if (z != 1.0f) {
+        TigRect cr;
+        gamelib_get_iso_content_rect(&cr);
+        int64_t cy = cr.height / 2;
+        y = cy + (int64_t)((float)(y - cy) * z);
+    }
+
+    return (int)y;
+}
+
+/**
+ * Returns the maximum safe Y for a bubble's top edge, accounting for the
+ * bottom chrome bar and (when active) the dialogue choice box.
+ * Mirrors the bottom-bound logic in tb_calc_rect pass 2.
+ */
+static int tb_get_safe_bottom(int rect_x, int rect_width, int rect_height)
+{
+    int limit = tb_iso_content_rect.y + tb_iso_content_rect.height
+                - GAME_UI_BAR_BOTTOM - rect_height - TB_EDGE_MARGIN_PX;
+
+    if (tc_is_active()) {
+        TigRect tc = tc_get_content_rect();
+        if (rect_x < tc.x + tc.width + TB_EDGE_MARGIN_PX
+            && rect_x + rect_width > tc.x - TB_EDGE_MARGIN_PX) {
+            int tc_limit = tc.y - TB_EDGE_MARGIN_PX - rect_height;
+            if (tc_limit < limit) {
+                limit = tc_limit;
+            }
+        }
+    }
+
+    return limit;
+}
+
+static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys)
+{
+    int sorted[MAX_TEXT_BUBBLES];
+    int count = 0;
+    int i;
+    int j;
+    int k;
+    int pass;
+
+    int vp_left   = tb_iso_content_rect.x + TB_EDGE_MARGIN_PX;
+    int vp_top    = tb_iso_content_rect.y + TB_EDGE_MARGIN_PX;
+    int vp_right  = tb_iso_content_rect.x + tb_iso_content_rect.width  - TB_EDGE_MARGIN_PX;
+    int vp_bottom = tb_iso_content_rect.y + tb_iso_content_rect.height - GAME_UI_BAR_BOTTOM - TB_EDGE_MARGIN_PX;
+
+    // Build index list of visible bubbles.
+    for (i = 0; i < MAX_TEXT_BUBBLES; i++) {
+        if (rects[i].width > 0 && rects[i].height > 0) {
+            sorted[count++] = i;
+        }
+    }
+
+    if (count < 2) {
+        return;
+    }
+
+    // Sort by sprite anchor Y ascending (topmost NPC first).
+    // anchor_ys[] holds the unclamped sprite screen Y — stable across frames
+    // even when multiple bubbles are clamped to the same boundary.
+    // Insertion sort — count <= MAX_TEXT_BUBBLES (8), always cheap.
+    for (i = 1; i < count; i++) {
+        int key = sorted[i];
+        int key_y = anchor_ys[key];
+        j = i - 1;
+        while (j >= 0 && anchor_ys[sorted[j]] > key_y) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = key;
+    }
+
+    for (pass = 0; pass < count; pass++) {
+        bool any = false;
+
+        // Phase 1 — cascade downward: process sorted top→bottom.
+        // Each bubble pushes the next one down only if they overlap on both axes.
+        for (k = 0; k < count - 1; k++) {
+            i = sorted[k];
+            j = sorted[k + 1];
+
+            // No horizontal overlap means they're side-by-side — skip Y push.
+            if (rects[i].x + rects[i].width  + TB_BUBBLE_STACK_GAP_PX <= rects[j].x
+                || rects[j].x + rects[j].width + TB_BUBBLE_STACK_GAP_PX <= rects[i].x) {
+                continue;
+            }
+
+            int pen = (rects[i].y + rects[i].height + TB_BUBBLE_STACK_GAP_PX) - rects[j].y;
+            if (pen > 0) {
+                int max_j = tb_get_safe_bottom(rects[j].x, rects[j].width, rects[j].height);
+                int old_y = rects[j].y;
+                rects[j].y += pen;
+                if (rects[j].y > max_j) {
+                    rects[j].y = max_j;
+                }
+                if (rects[j].y != old_y) {
+                    any = true;
+                }
+            }
+        }
+
+        // Phase 2 — cascade upward: process sorted bottom→top.
+        // Each bubble pushes the one above it up only if they overlap on both axes.
+        for (k = count - 1; k > 0; k--) {
+            j = sorted[k];
+            i = sorted[k - 1];
+
+            // No horizontal overlap — skip Y push.
+            if (rects[i].x + rects[i].width  + TB_BUBBLE_STACK_GAP_PX <= rects[j].x
+                || rects[j].x + rects[j].width + TB_BUBBLE_STACK_GAP_PX <= rects[i].x) {
+                continue;
+            }
+
+            int pen = (rects[i].y + rects[i].height + TB_BUBBLE_STACK_GAP_PX) - rects[j].y;
+            if (pen > 0) {
+                int old_y = rects[i].y;
+                rects[i].y -= pen;
+                if (rects[i].y < vp_top) {
+                    rects[i].y = vp_top;
+                }
+                if (rects[i].y != old_y) {
+                    any = true;
+                }
+            }
+        }
+
+        // Phase 3 — build X-sorted order for cascading horizontally.
+        // Re-use the sorted[] array (already Y-sorted); build a separate
+        // x_sorted[] from the same active set.
+        int x_sorted[MAX_TEXT_BUBBLES];
+        for (k = 0; k < count; k++) {
+            x_sorted[k] = sorted[k];
+        }
+        for (i = 1; i < count; i++) {
+            int key = x_sorted[i];
+            int key_x = rects[key].x;
+            j = i - 1;
+            while (j >= 0 && rects[x_sorted[j]].x > key_x) {
+                x_sorted[j + 1] = x_sorted[j];
+                j--;
+            }
+            x_sorted[j + 1] = key;
+        }
+
+        // Phase 3a — cascade rightward: push right neighbour further right.
+        for (k = 0; k < count - 1; k++) {
+            i = x_sorted[k];
+            j = x_sorted[k + 1];
+
+            // Only act when the pair also overlaps vertically.
+            if (rects[i].y + rects[i].height <= rects[j].y
+                || rects[j].y + rects[j].height <= rects[i].y) {
+                continue;
+            }
+
+            int pen = (rects[i].x + rects[i].width + TB_BUBBLE_STACK_GAP_PX) - rects[j].x;
+            if (pen > 0) {
+                int max_j = vp_right - rects[j].width;
+                int old_x = rects[j].x;
+                rects[j].x += pen;
+                if (rects[j].x > max_j) {
+                    rects[j].x = max_j;
+                }
+                if (rects[j].x != old_x) {
+                    any = true;
+                }
+            }
+        }
+
+        // Phase 3b — cascade leftward: push left neighbour further left.
+        for (k = count - 1; k > 0; k--) {
+            j = x_sorted[k];
+            i = x_sorted[k - 1];
+
+            if (rects[i].y + rects[i].height <= rects[j].y
+                || rects[j].y + rects[j].height <= rects[i].y) {
+                continue;
+            }
+
+            int pen = (rects[i].x + rects[i].width + TB_BUBBLE_STACK_GAP_PX) - rects[j].x;
+            if (pen > 0) {
+                int old_x = rects[i].x;
+                rects[i].x -= pen;
+                if (rects[i].x < vp_left) {
+                    rects[i].x = vp_left;
+                }
+                if (rects[i].x != old_x) {
+                    any = true;
+                }
+            }
+        }
+
+        if (!any) {
+            break;
+        }
+
+        // Re-sort by anchor Y after each pass — cascade may have moved
+        // bubbles; anchor_ys preserves the stable world order.
+        for (i = 1; i < count; i++) {
+            int key = sorted[i];
+            int key_y = anchor_ys[key];
+            j = i - 1;
+            while (j >= 0 && anchor_ys[sorted[j]] > key_y) {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = key;
         }
     }
 }
