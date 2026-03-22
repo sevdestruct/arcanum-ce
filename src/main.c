@@ -17,6 +17,7 @@
 #include "game/critter.h"
 #include "game/descriptions.h"
 #include "game/dialog.h"
+#include "game/dialog_camera.h"
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
 #include "game/gmovie.h"
@@ -348,6 +349,7 @@ int main(int argc, char** argv)
     // Must init after gamelib_init so that settings are already loaded —
     // iso_zoom_init registers a setting and applies the loaded value.
     iso_zoom_init();
+    dialog_camera_init();
 
     if (strstr(lpCmdLine, "-dialogcheck") != NULL) {
         dialog_check();
@@ -671,19 +673,19 @@ void main_loop(void)
                         }
                         break;
                     case SDL_SCANCODE_EQUALS:
-                        if (!textedit_ui_is_focused()) {
+                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
                             iso_zoom_step_in();
                             gamelib_invalidate_rect(NULL);
                         }
                         break;
                     case SDL_SCANCODE_MINUS:
-                        if (!textedit_ui_is_focused()) {
+                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
                             iso_zoom_step_out();
                             gamelib_invalidate_rect(NULL);
                         }
                         break;
                     case SDL_SCANCODE_0:
-                        if (!textedit_ui_is_focused()) {
+                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
                             iso_zoom_reset();
                             gamelib_invalidate_rect(NULL);
                         }
@@ -779,7 +781,7 @@ void main_loop(void)
                                 break;
                             case SDL_SCANCODE_X:
                                 tig_mouse_get_state(&mouse_state);
-                                location_at(mouse_state.x, mouse_state.y, &mouse_loc);
+                                location_at_zoomed(mouse_state.x, mouse_state.y, iso_zoom_current(), &mouse_loc);
                                 snprintf(mouse_state_str, sizeof(mouse_state_str),
                                     "x: %d, y: %d",
                                     (int)LOCATION_GET_X(mouse_loc),
