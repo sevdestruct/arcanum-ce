@@ -6,8 +6,9 @@
 #define ISO_ZOOM_MIN  0.5f
 #define ISO_ZOOM_MAX  1.75f
 #define ISO_ZOOM_STEP 0.25f
-#define ISO_ZOOM_LERP 0.18f
+#define ISO_ZOOM_LERP 0.25f
 
+#define ISO_ZOOM_MIN_KEY "min zoom"
 #define ISO_ZOOM_MAX_KEY "max zoom"
 
 void iso_zoom_init(void);
