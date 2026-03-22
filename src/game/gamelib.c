@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "game/dialog_camera.h"
 #include "game/iso_zoom.h"
 #include "game/location.h"
 #include "game/tile.h"
@@ -915,6 +916,7 @@ bool gamelib_draw(void)
     }
 
     iso_zoom_ping();
+    dialog_camera_ping();
     z = iso_zoom_current();
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
@@ -1088,6 +1090,10 @@ bool gamelib_draw(void)
 
     // Keep rendering each frame while zoom is still lerping.
     if (iso_zoom_is_animating()) {
+        gamelib_dirty = true;
+    }
+
+    if (dialog_camera_is_animating()) {
         gamelib_dirty = true;
     }
 
@@ -1869,6 +1875,11 @@ bool gamelib_copy_version(char* long_version, char* short_version, char* locale)
 void gamelib_patch_lvl_set(const char* patch_lvl)
 {
     (void)patch_lvl;
+}
+
+void gamelib_get_iso_content_rect(TigRect* rect)
+{
+    *rect = gamelib_iso_content_rect;
 }
 
 // 0x404650

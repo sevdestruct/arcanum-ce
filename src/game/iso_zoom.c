@@ -58,3 +58,16 @@ void iso_zoom_reset(void)
 {
     zoom_target = 1.0f;
 }
+
+void iso_zoom_set_target(float z)
+{
+    if (z < ISO_ZOOM_MIN) {
+        z = ISO_ZOOM_MIN;
+    }
+
+    if (z > ISO_ZOOM_MAX) {
+        z = ISO_ZOOM_MAX;
+    }
+
+    zoom_target = z;
+}

@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "game/dialog_camera.h"
 #include "game/iso_zoom.h"
 #include "game/location.h"
 #include "game/ai.h"
@@ -4977,7 +4978,7 @@ bool intgame_mode_set(IntgameMode mode)
             combat_check_use_skill(player_get_local_pc_obj());
             break;
         case INTGAME_MODE_DIALOG:
-            sub_551A10(pc_obj);
+            dialog_camera_end(pc_obj);
             v1 = 1;
             if (v2) {
                 dialog_ui_end_dialog(player_get_local_pc_obj(), 0);

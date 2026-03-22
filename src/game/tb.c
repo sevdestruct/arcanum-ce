@@ -1,6 +1,7 @@
 #include "game/tb.h"
 
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
 #include "game/object.h"
 
 /**
@@ -66,7 +67,7 @@ static void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y
 static void tb_text_duration_changed(void);
 static TextBubble* find_text_bubble(int64_t obj);
 static TextBubble* find_free_text_bubble(int64_t obj);
-static void adjust_text_bubble_rect(TigRect* rect, TbPosition pos);
+static void adjust_text_bubble_rect(TigRect* rect, TbPosition pos, float z);
 
 /**
  * Color values (RGB) for text bubble types.
@@ -94,16 +95,35 @@ static TigRect tb_content_rect = { 0, 0, TEXT_BUBBLE_WIDTH, TEXT_BUBBLE_HEIGHT }
  *
  * 0x5B8EC0
  */
+// FIX: All rows now prefer TB_POS_TOP first. The original CE table had four
+// cells (3, 5, 6, 8) starting with a sideways position, which caused the
+// bubble to appear to the left or right even when there was ample room above
+// the NPC's head. This was made worse by viewport recentering at dialog start
+// and each new dialog line creating a fresh bubble — different cell
+// assignments on each evaluation produced inconsistent placement. The bounds
+// check already handles the genuine edge case (NPC truly at the top of the
+// screen) by falling through to the next candidate, so TOP-first is safe for
+// all zones. Fallback ordering prefers the interior side (away from the
+// nearest screen edge) when TOP does not fit.
 static TbPosition tb_placement_tbl[9][TB_POS_COUNT] = {
-    { TB_POS_TOP, TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM, TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT },
-    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_TOP_LEFT, TB_POS_RIGHT, TB_POS_LEFT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM },
-    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM, TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT },
-    { TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_TOP, TB_POS_BOTTOM, TB_POS_TOP_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_RIGHT },
+    // cell 0 (top-left):    prefer TOP, fall toward right/bottom interior
     { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM, TB_POS_BOTTOM_LEFT, TB_POS_LEFT, TB_POS_TOP_LEFT },
-    { TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_TOP, TB_POS_BOTTOM, TB_POS_TOP_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_LEFT },
-    { TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM, TB_POS_BOTTOM_RIGHT, TB_POS_RIGHT, TB_POS_TOP_RIGHT, TB_POS_TOP },
-    { TB_POS_BOTTOM, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM_LEFT, TB_POS_RIGHT, TB_POS_LEFT, TB_POS_TOP_RIGHT, TB_POS_TOP_LEFT, TB_POS_TOP },
-    { TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM, TB_POS_BOTTOM_LEFT, TB_POS_LEFT, TB_POS_TOP_LEFT, TB_POS_TOP },
+    // cell 1 (top-center):  prefer TOP, symmetric fallback
+    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_TOP_LEFT, TB_POS_RIGHT, TB_POS_LEFT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM },
+    // cell 2 (top-right):   prefer TOP, fall toward left/bottom interior
+    { TB_POS_TOP, TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM, TB_POS_BOTTOM_RIGHT, TB_POS_RIGHT, TB_POS_TOP_RIGHT },
+    // cell 3 (middle-left): prefer TOP, fall toward right interior
+    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM, TB_POS_BOTTOM_LEFT, TB_POS_LEFT, TB_POS_TOP_LEFT },
+    // cell 4 (middle-center): prefer TOP, symmetric fallback
+    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_TOP_LEFT, TB_POS_RIGHT, TB_POS_LEFT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM },
+    // cell 5 (middle-right): prefer TOP, fall toward left interior
+    { TB_POS_TOP, TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM, TB_POS_BOTTOM_RIGHT, TB_POS_RIGHT, TB_POS_TOP_RIGHT },
+    // cell 6 (bottom-left): prefer TOP, fall toward right interior
+    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_RIGHT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM, TB_POS_BOTTOM_LEFT, TB_POS_LEFT, TB_POS_TOP_LEFT },
+    // cell 7 (bottom-center): prefer TOP, symmetric fallback
+    { TB_POS_TOP, TB_POS_TOP_RIGHT, TB_POS_TOP_LEFT, TB_POS_RIGHT, TB_POS_LEFT, TB_POS_BOTTOM_RIGHT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM },
+    // cell 8 (bottom-right): prefer TOP, fall toward left interior
+    { TB_POS_TOP, TB_POS_TOP_LEFT, TB_POS_LEFT, TB_POS_BOTTOM_LEFT, TB_POS_BOTTOM, TB_POS_BOTTOM_RIGHT, TB_POS_RIGHT, TB_POS_TOP_RIGHT },
 };
 
 /**
@@ -518,6 +538,22 @@ void tb_remove(int64_t obj)
 }
 
 /**
+ * Resets the placement position of all active text bubbles to TB_POS_INVALID
+ * so they are repositioned on the next draw frame.  Call this after the camera
+ * has finished panning so bubbles are placed with the final viewport in mind.
+ */
+void tb_invalidate_positions(void)
+{
+    int idx;
+
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
+            tb_text_bubbles[idx].pos = TB_POS_INVALID;
+        }
+    }
+}
+
+/**
  * Clears all active text bubbles.
  *
  * 0x4D6320
@@ -593,9 +629,31 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     // Retrieve screen coordinates of the location.
     location_xy(loc, &x, &y);
 
-    // Center it and offset by the given values.
+    // Apply tile-centering and sub-tile offsets in world space first. The
+    // world scale-blit zooms everything including these offsets, so they must
+    // be part of the anchor before zoom is applied for the bubble to track the
+    // sprite correctly.
     x += offset_x + 40;
     y += offset_y + 20;
+
+    // Save unzoomed anchor for cell selection. The cell determines which
+    // placement direction has room. Using unzoomed coordinates keeps this
+    // stable across zoom levels so the preferred position doesn't jump.
+    int64_t cell_x = x;
+    int64_t cell_y = y;
+
+    // Zoom the full anchor to match the sprite's actual screen position.
+    float z = iso_zoom_current();
+    if (z != 1.0f) {
+        TigRect cr;
+        int64_t cx;
+        int64_t cy;
+        gamelib_get_iso_content_rect(&cr);
+        cx = cr.width / 2;
+        cy = cr.height / 2;
+        x = cx + (int64_t)((float)(x - cx) * z);
+        y = cy + (int64_t)((float)(y - cy) * z);
+    }
 
     // Check for coordinate overflow and return an empty rectangle if invalid.
     if (x < INT_MIN
@@ -617,18 +675,19 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     if (tb->pos == TB_POS_INVALID) {
         tb->pos = TB_POS_TOP;
 
-        // Calculate the screen cell based on coordinates.
+        // Calculate the screen cell using unzoomed coordinates so the
+        // preferred placement direction is stable regardless of zoom.
         cell = 0;
-        if (x >= 380) {
-            if (x >= 420) {
+        if (cell_x >= 380) {
+            if (cell_x >= 420) {
                 cell += 2;
             } else {
                 cell += 1;
             }
         }
 
-        if (y >= 190) {
-            if (y >= 290) {
+        if (cell_y >= 190) {
+            if (cell_y >= 290) {
                 cell += 6;
             } else {
                 cell += 3;
@@ -641,7 +700,7 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
             rect->y = (int)y;
 
             // Adjust the rectangle based on the current position attempt.
-            adjust_text_bubble_rect(rect, tb_placement_tbl[cell][attempt]);
+            adjust_text_bubble_rect(rect, tb_placement_tbl[cell][attempt], z);
 
             // Check if the adjusted rectangle fits within the content area.
             if (rect->x >= tb_iso_content_rect.x
@@ -654,11 +713,9 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
         }
     }
 
-    // Set the base position and apply the final adjustment.
     rect->x = (int)x;
     rect->y = (int)y;
-
-    adjust_text_bubble_rect(rect, tb->pos);
+    adjust_text_bubble_rect(rect, tb->pos, z);
 }
 
 /**
@@ -760,41 +817,47 @@ TextBubble* find_free_text_bubble(int64_t obj)
 
 /**
  * Adjusts a text bubble's rect based on its position relative to the object.
+ *
+ * The fixed pixel distances (100, 80, 55, 40, 20, 10) represent offsets
+ * relative to the sprite body and must scale with zoom so the bubble stays
+ * consistently positioned relative to the visual sprite size. Offsets that
+ * depend only on the bubble's own dimensions (rect->width/2, rect->height/2)
+ * are not scaled since the bubble is always rendered at a fixed pixel size.
  */
-void adjust_text_bubble_rect(TigRect* rect, TbPosition pos)
+void adjust_text_bubble_rect(TigRect* rect, TbPosition pos, float z)
 {
     switch (pos) {
     case TB_POS_TOP:
         rect->x -= rect->width / 2;
-        rect->y -= rect->height + 100;
+        rect->y -= rect->height + (int)(100 * z);
         break;
     case TB_POS_TOP_RIGHT:
-        rect->x += 40;
-        rect->y -= rect->height / 2 + 55;
+        rect->x += (int)(40 * z);
+        rect->y -= rect->height / 2 + (int)(55 * z);
         break;
     case TB_POS_RIGHT:
-        rect->x += 80;
+        rect->x += (int)(80 * z);
         rect->y -= rect->height / 2;
         break;
     case TB_POS_BOTTOM_RIGHT:
-        rect->x += 40;
-        rect->y += rect->height / 2 + 20;
+        rect->x += (int)(40 * z);
+        rect->y += rect->height / 2 + (int)(20 * z);
         break;
     case TB_POS_BOTTOM:
         rect->x -= rect->width / 2;
-        rect->y += 10;
+        rect->y += (int)(10 * z);
         break;
     case TB_POS_BOTTOM_LEFT:
-        rect->x -= rect->width + 40;
-        rect->y += rect->height / 2 + 20;
+        rect->x -= rect->width + (int)(40 * z);
+        rect->y += rect->height / 2 + (int)(20 * z);
         break;
     case TB_POS_LEFT:
-        rect->x -= rect->width + 80;
+        rect->x -= rect->width + (int)(80 * z);
         rect->y -= rect->height / 2;
         break;
     case TB_POS_TOP_LEFT:
-        rect->x -= rect->width + 40;
-        rect->y -= rect->height / 2 + 55;
+        rect->x -= rect->width + (int)(40 * z);
+        rect->y -= rect->height / 2 + (int)(55 * z);
         break;
     default:
         break;
