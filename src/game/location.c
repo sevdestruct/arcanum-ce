@@ -1,5 +1,7 @@
 #include "game/location.h"
 
+#include <math.h>
+
 #include "game/path.h"
 #include "game/target.h"
 
@@ -246,8 +248,8 @@ void location_zoom_adjust_screen_xy(int64_t sx, int64_t sy, float zoom, int64_t*
 {
     int64_t center_x = location_iso_content_rect.width / 2;
     int64_t center_y = location_iso_content_rect.height / 2;
-    *adj_sx = center_x + (int64_t)((sx - center_x) / zoom);
-    *adj_sy = center_y + (int64_t)((sy - center_y) / zoom);
+    *adj_sx = center_x + (int64_t)roundf((float)(sx - center_x) / zoom);
+    *adj_sy = center_y + (int64_t)roundf((float)(sy - center_y) / zoom);
 }
 
 bool location_at_zoomed(int64_t sx, int64_t sy, float zoom, int64_t* loc_ptr)

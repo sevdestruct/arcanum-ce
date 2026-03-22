@@ -1,5 +1,6 @@
 #include "game/gamelib.h"
 
+#include <math.h>
 #include <stdio.h>
 
 #include "game/dialog_camera.h"
@@ -1006,8 +1007,8 @@ bool gamelib_draw(void)
             location_origin_pixel_set(orig_ox, orig_oy);
             zoom_active = false;
 
-            src_w = (int)(ww / z);
-            src_h = (int)(wh / z);
+            src_w = (int)roundf((float)ww / z);
+            src_h = (int)roundf((float)wh / z);
             src.x = ww - src_w / 2;
             src.y = wh - src_h / 2;
             src.width = src_w;
