@@ -1,5 +1,7 @@
 #include "game/scroll.h"
 
+#include <math.h>
+
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
 #include "game/tb.h"
@@ -452,11 +454,8 @@ void scroll_by(int64_t dx, int64_t dy)
 
     z = iso_zoom_current();
     if (z != 1.0f) {
-        dx = (int64_t)(dx / z);
-        dy = (int64_t)(dy / z);
-    } else {
-        // Redraw the view to prepare for the hardware pixel-copy scroll below.
-        scroll_init_info.draw_func();
+        dx = (int64_t)roundf((float)dx / z);
+        dy = (int64_t)roundf((float)dy / z);
     }
 
     // Update the view origin and check for actual movement.
@@ -478,6 +477,9 @@ void scroll_by(int64_t dx, int64_t dy)
         // scroll optimization leaves stale bubble pixels. Force a full redraw.
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
     } else {
+        // Redraw the view to prepare for the hardware pixel-copy scroll below.
+        scroll_init_info.draw_func();
+
         // Scroll the window content.
         tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
 
