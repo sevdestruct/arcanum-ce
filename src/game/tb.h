@@ -29,5 +29,6 @@ void tb_notify_moved(int64_t obj, int64_t loc, int offset_x, int offset_y);
 void tb_remove(int64_t obj);
 void tb_clear(void);
 void tb_invalidate_positions(void);
+bool tb_any_active(void);
 
 #endif /* ARCANUM_GAME_TB_H_ */

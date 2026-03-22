@@ -1337,3 +1337,22 @@ void follower_ui_drop_down_menu_refresh(int highlighted_cmd)
         rect.y += FOLLOWER_UI_DROP_DOWN_MENU_ENTRY_HEIGHT;
     }
 }
+
+/**
+ * Returns the bottom y-coordinate of the currently occupied follower panel
+ * slots, or 0 if no followers are present. Used by tb.c to avoid placing
+ * speech bubbles over visible portrait slots.
+ */
+int follower_ui_panel_bottom(void)
+{
+    int visible;
+
+    visible = follower_ui_followers_count < FOLLOWER_UI_SLOTS
+        ? follower_ui_followers_count
+        : FOLLOWER_UI_SLOTS;
+    if (visible <= 0) {
+        return 0;
+    }
+
+    return follower_ui_button_rects[visible - 1].y + follower_ui_button_rects[visible - 1].height;
+}

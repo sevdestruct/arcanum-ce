@@ -4,6 +4,8 @@
 
 #include "game/dialog_camera.h"
 #include "game/gamelib.h"
+#include "game/tc.h"
+#include "ui/follower_ui.h"
 #include "game/iso_zoom.h"
 #include "game/object.h"
 
@@ -30,17 +32,31 @@
 #define TB_STR_MAXLEN 512
 
 /**
- * Fixed screen-pixel gap between sprite top and bubble bottom (TB_POS_TOP),
+ * Fixed screen-pixel gap between sprite top and bubble bottom,
  * zoom-independent. Clears the bubble tail with a little breathing room.
  */
 #define TB_BUBBLE_GAP_PX 10
 
 /**
- * Fixed screen-pixel gap between sprite side and bubble edge (TB_POS_LEFT /
- * TB_POS_RIGHT), zoom-independent. Larger than the top gap because pure side
- * placement needs more visual separation to read cleanly.
+ * Minimum distance between the bubble and the viewport edge / UI bars.
+ * Prevents the bubble from being flush against the screen boundary.
  */
-#define TB_SIDE_GAP_PX 20
+#define TB_EDGE_MARGIN_PX 10
+
+/**
+ * Maximum pixels the bubble may drift from its ideal position before it is
+ * hidden. Prevents it from pinning to the edge margin as the camera pans
+ * away from the NPC.
+ */
+#define TB_DRIFT_MAX_PX 160
+
+/**
+ * Width of the follower portrait panel (leftmost column, anchored at x=0).
+ * Its active height varies with party size; tb_calc_rect queries
+ * follower_ui_panel_bottom() at runtime.
+ */
+#define TB_FOLLOWER_PANEL_WIDTH 67
+
 
 typedef unsigned int TextBubbleFlags;
 
@@ -55,20 +71,6 @@ typedef unsigned int TextBubbleFlags;
  */
 #define TEXT_BUBBLE_PERMANENT 0x0002u
 
-/**
- * Describes possible positions for text bubbles relative to a game object.
- * Side positions (RIGHT/LEFT) use a dynamic y range: the bubble slides within
- * the sprite's visual height to find the best fit rather than snapping to fixed
- * upper/middle/lower variants.
- */
-typedef enum TbPosition {
-    TB_POS_INVALID = -1,
-    TB_POS_TOP,
-    TB_POS_BOTTOM,
-    TB_POS_RIGHT,
-    TB_POS_LEFT,
-    TB_POS_COUNT,
-} TbPosition;
 
 /**
  * Represents a text bubble associated with a game object.
@@ -80,18 +82,17 @@ typedef struct TextBubble {
     /* 0014 */ int duration; // Duration (in milliseconds) the bubble remains visible.
     /* 0018 */ TigVideoBuffer* video_buffer;
     /* 001C */ TigRect rect;
-    /* 002C */ TbPosition pos;
     int type;                // TB_TYPE_* — selects the correct font set on re-render
     char str[TB_STR_MAXLEN]; // original text, stored for alignment re-render
     int rendered_align;      // TB_ALIGN_* — last alignment rendered into video_buffer
 } TextBubble;
 
 // Text alignment used when rendering into the bubble's video buffer.
-// Stored per-bubble so tb_rerender_for_pos can skip the re-render when the
-// required alignment hasn't changed (e.g. camera pans but bubble stays TOP).
-#define TB_ALIGN_CENTERED 0
-#define TB_ALIGN_LEFT     1
-#define TB_ALIGN_RIGHT    2
+// Stored per-bubble so the re-render is skipped when alignment hasn't changed.
+#define TB_ALIGN_INVALID  -1
+#define TB_ALIGN_CENTERED  0
+#define TB_ALIGN_LEFT      1
+#define TB_ALIGN_RIGHT     2
 
 static void tb_remove_internal(TextBubble* tb);
 static void tb_get_rect(TextBubble* tb, TigRect* rect);
@@ -99,8 +100,6 @@ static void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y
 static void tb_text_duration_changed(void);
 static TextBubble* find_text_bubble(int64_t obj);
 static TextBubble* find_free_text_bubble(int64_t obj);
-static void adjust_text_bubble_rect(TigRect* rect, TbPosition pos, float z, int sprite_hot_y, int sprite_left_ext, int sprite_right_ext);
-static void tb_slide_side_rect(TigRect* rect, int anchor_x, int anchor_y, int sprite_hot_y, float z);
 
 /**
  * Color values (RGB) for text bubble types.
@@ -497,9 +496,8 @@ void tb_add(int64_t obj, int type, const char* str)
     tb->flags = TEXT_BUBBLE_IN_USE;
     tb->obj = obj;
     tb->rect = dirty_rect;
-    tb->pos = TB_POS_INVALID;
     tb->type = type;
-    tb->rendered_align = TB_ALIGN_CENTERED;
+    tb->rendered_align = TB_ALIGN_INVALID;
     strncpy(tb->str, str, TB_STR_MAXLEN - 1);
     tb->str[TB_STR_MAXLEN - 1] = '\0';
 
@@ -590,7 +588,7 @@ void tb_remove(int64_t obj)
 }
 
 /**
- * Resets the placement position of all active text bubbles to TB_POS_INVALID
+ * Resets the rendered alignment of all active text bubbles to TB_ALIGN_INVALID
  * so they are repositioned on the next draw frame.  Call this after the camera
  * has finished panning so bubbles are placed with the final viewport in mind.
  */
@@ -600,9 +598,26 @@ void tb_invalidate_positions(void)
 
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
-            tb_text_bubbles[idx].pos = TB_POS_INVALID;
+            tb_text_bubbles[idx].rendered_align = TB_ALIGN_INVALID;
         }
     }
+}
+
+/**
+ * Returns true if any speech bubbles are currently active.
+ * Used by the scroll system to bypass hardware scroll (which would leave
+ * stale bubble pixels) when bubbles need to be repainted clean each frame.
+ */
+bool tb_any_active(void)
+{
+    int idx;
+
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -665,52 +680,6 @@ void tb_get_rect(TextBubble* tb, TigRect* rect)
     tb_calc_rect(tb, loc, offset_x, offset_y, rect);
 }
 
-/**
- * Re-renders the bubble's video buffer with the correct text alignment for the
- * bubble's current position. Called once after placement is first determined
- * so that side bubbles use edge-aligned text rather than centered.
- *
- * RIGHT-side positions: left-aligned text (text starts at the sprite-facing edge).
- * LEFT-side positions:  right-aligned text (text ends at the sprite-facing edge).
- * TOP / BOTTOM:         centered (matches the initial render from tb_add).
- */
-static void tb_rerender_for_pos(TextBubble* tb)
-{
-    TigRect dirty_rect;
-    tig_font_handle_t* font_set;
-    int required_align;
-
-    if (tb->str[0] == '\0') {
-        return;
-    }
-
-    switch (tb->pos) {
-    case TB_POS_RIGHT:
-        font_set = tb_fonts_left;
-        required_align = TB_ALIGN_LEFT;
-        break;
-    case TB_POS_LEFT:
-        font_set = tb_fonts_right;
-        required_align = TB_ALIGN_RIGHT;
-        break;
-    default:
-        font_set = tb_fonts;
-        required_align = TB_ALIGN_CENTERED;
-        break;
-    }
-
-    // Skip if the buffer is already rendered with the correct alignment.
-    if (tb->rendered_align == required_align) {
-        return;
-    }
-
-    tig_video_buffer_fill(tb->video_buffer, &tb_content_rect, tb_background_color);
-    tig_font_push(font_set[tb->type]);
-    tig_font_write(tb->video_buffer, tb->str, &tb_content_rect, &dirty_rect);
-    tig_font_pop();
-    tb->rect = dirty_rect;
-    tb->rendered_align = required_align;
-}
 
 /**
  * Computes the text bubble's screen rectangle based on object location and
@@ -722,7 +691,6 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
 {
     int64_t x;
     int64_t y;
-    int attempt;
 
     // Retrieve screen coordinates of the location.
     location_xy(loc, &x, &y);
@@ -796,56 +764,103 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     rect->width = tb->rect.width;
     rect->height = tb->rect.height;
 
-    // Determine the bubble's position if not already set.
-    if (tb->pos == TB_POS_INVALID) {
-        tb->pos = TB_POS_TOP;
+    // Ideal position: bubble centered above sprite head.
+    int ideal_x = (int)x - rect->width / 2;
+    int ideal_y = (int)y - rect->height - (int)((float)sprite_hot_y * z) - TB_BUBBLE_GAP_PX;
 
-        // Priority: TOP first (above head, centered), then BOTTOM (below, also
-        // centered), then sides in order of available screen space — whichever
-        // side has more room is tried first. Side positions use a continuous y
-        // range (clamped within the sprite's visual height) rather than fixed
-        // upper/middle/lower snapping, so each side is one attempt that slides
-        // to the best fit.
-        int space_right = (tb_iso_content_rect.x + tb_iso_content_rect.width) - (int)x;
-        int space_left  = (int)x - tb_iso_content_rect.x;
+    // Pass 1 — base bounds (edge margin only, no UI insets).
+    int vp_left   = tb_iso_content_rect.x + TB_EDGE_MARGIN_PX;
+    int vp_right  = tb_iso_content_rect.x + tb_iso_content_rect.width  - rect->width  - TB_EDGE_MARGIN_PX;
+    int vp_top    = tb_iso_content_rect.y + TB_EDGE_MARGIN_PX;
+    int vp_bottom = tb_iso_content_rect.y + tb_iso_content_rect.height - rect->height - TB_EDGE_MARGIN_PX;
 
-        TbPosition order[TB_POS_COUNT];
-        order[0] = TB_POS_TOP;
-        order[1] = TB_POS_BOTTOM;
-        if (space_right >= space_left) {
-            order[2] = TB_POS_RIGHT;
-            order[3] = TB_POS_LEFT;
-        } else {
-            order[2] = TB_POS_LEFT;
-            order[3] = TB_POS_RIGHT;
-        }
+    rect->x = ideal_x < vp_left   ? vp_left   : (ideal_x > vp_right  ? vp_right  : ideal_x);
+    rect->y = ideal_y < vp_top    ? vp_top    : (ideal_y > vp_bottom  ? vp_bottom : ideal_y);
 
-        for (attempt = 0; attempt < TB_POS_COUNT; attempt++) {
-            rect->x = (int)x;
-            rect->y = (int)y;
-            adjust_text_bubble_rect(rect, order[attempt], z, sprite_hot_y, sprite_left_ext, sprite_right_ext);
-            if (order[attempt] == TB_POS_RIGHT || order[attempt] == TB_POS_LEFT) {
-                tb_slide_side_rect(rect, (int)x, (int)y, sprite_hot_y, z);
-            }
-            if (rect->x >= tb_iso_content_rect.x
-                && rect->y >= tb_iso_content_rect.y + GAME_UI_BAR_TOP
-                && rect->x + rect->width <= tb_iso_content_rect.x + tb_iso_content_rect.width
-                && rect->y + rect->height <= tb_iso_content_rect.y + tb_iso_content_rect.height - GAME_UI_BAR_BOTTOM) {
-                tb->pos = order[attempt];
-                break;
-            }
-        }
+    // Pass 2 — collision check against UI elements using the actual clamped
+    // position. Bounds are tightened where the bubble actually lands, then
+    // re-clamped. This handles all approach directions correctly.
 
-        // Re-render text with the correct alignment for the chosen position.
-        // Side positions use edge-aligned text; top/bottom use centered.
-        tb_rerender_for_pos(tb);
+    // Top/bottom chrome bars — span the full viewport width on all resolutions.
+    {
+        int t = tb_iso_content_rect.y + GAME_UI_BAR_TOP + TB_EDGE_MARGIN_PX;
+        int b = tb_iso_content_rect.y + tb_iso_content_rect.height
+                - GAME_UI_BAR_BOTTOM - rect->height - TB_EDGE_MARGIN_PX;
+        if (t > vp_top)    vp_top    = t;
+        if (b < vp_bottom) vp_bottom = b;
     }
 
-    rect->x = (int)x;
-    rect->y = (int)y;
-    adjust_text_bubble_rect(rect, tb->pos, z, sprite_hot_y, sprite_left_ext, sprite_right_ext);
-    if (tb->pos == TB_POS_RIGHT || tb->pos == TB_POS_LEFT) {
-        tb_slide_side_rect(rect, (int)x, (int)y, sprite_hot_y, z);
+    // Follower portrait panel (left column, variable height).
+    // Use effective_y: bars run first and raise vp_top, so the bubble may land
+    // lower than rect->y. Using the post-bar minimum y catches short bubbles
+    // that would otherwise slip into the panel zone after the y re-clamp.
+    {
+        int panel_bottom = follower_ui_panel_bottom();
+        if (panel_bottom > 0) {
+            int panel_top   = tb_iso_content_rect.y + GAME_UI_BAR_TOP;
+            int effective_y = rect->y < vp_top ? vp_top : rect->y;
+            if (rect->x < tb_iso_content_rect.x + TB_FOLLOWER_PANEL_WIDTH + TB_EDGE_MARGIN_PX
+                && effective_y + rect->height > panel_top
+                && effective_y < tb_iso_content_rect.y + panel_bottom) {
+                int l = tb_iso_content_rect.x + TB_FOLLOWER_PANEL_WIDTH + TB_EDGE_MARGIN_PX;
+                if (l > vp_left) vp_left = l;
+            }
+        }
+    }
+
+    // Dialogue choice box — only present during dialogue.
+    if (tc_is_active()) {
+        TigRect tc = tc_get_content_rect();
+        if (rect->x < tc.x + tc.width + TB_EDGE_MARGIN_PX
+            && rect->x + rect->width > tc.x - TB_EDGE_MARGIN_PX) {
+            int b = tc.y - TB_EDGE_MARGIN_PX - rect->height;
+            if (b < vp_bottom) vp_bottom = b;
+        }
+    }
+
+    // Re-clamp with tightened bounds.
+    rect->x = rect->x < vp_left   ? vp_left   : (rect->x > vp_right  ? vp_right  : rect->x);
+    rect->y = rect->y < vp_top    ? vp_top    : (rect->y > vp_bottom  ? vp_bottom : rect->y);
+
+    // Hide bubble if NPC has panned too far out of frame.
+    // The downward threshold gets an extra sprite_hot_y of slack: ideal_y is
+    // above the sprite head, so sliding the bubble down toward (or past) the
+    // sprite body is semantically natural and deserves more room than any
+    // other direction before we decide to hide.
+    int drift_horiz = TB_DRIFT_MAX_PX + rect->width / 2;
+    int drift_down  = TB_DRIFT_MAX_PX + (int)((float)sprite_hot_y * z);
+    if (rect->x - ideal_x > drift_horiz  || ideal_x - rect->x > drift_horiz
+        || rect->y - ideal_y > drift_down || ideal_y - rect->y > TB_DRIFT_MAX_PX) {
+        rect->x = 0; rect->y = 0; rect->width = 0; rect->height = 0;
+        return;
+    }
+
+    // Text alignment from bubble center vs sprite anchor.
+    // Switches from centered once bubble center is pushed past sprite edge.
+    {
+        int bubble_cx = rect->x + rect->width / 2;
+        int required_align;
+        if (bubble_cx > (int)x + (int)((float)sprite_right_ext * z))
+            required_align = TB_ALIGN_LEFT;
+        else if (bubble_cx < (int)x - (int)((float)sprite_left_ext * z))
+            required_align = TB_ALIGN_RIGHT;
+        else
+            required_align = TB_ALIGN_CENTERED;
+
+        if (required_align != tb->rendered_align && tb->str[0] != '\0') {
+            TigRect dirty_rect;
+            tig_font_handle_t* font_set = (required_align == TB_ALIGN_LEFT)  ? tb_fonts_left  :
+                                          (required_align == TB_ALIGN_RIGHT) ? tb_fonts_right :
+                                                                               tb_fonts;
+            tig_video_buffer_fill(tb->video_buffer, &tb_content_rect, tb_background_color);
+            tig_font_push(font_set[tb->type]);
+            tig_font_write(tb->video_buffer, tb->str, &tb_content_rect, &dirty_rect);
+            tig_font_pop();
+            tb->rect    = dirty_rect;
+            rect->width  = tb->rect.width;
+            rect->height = tb->rect.height;
+            tb->rendered_align = required_align;
+        }
     }
 }
 
@@ -946,54 +961,3 @@ TextBubble* find_free_text_bubble(int64_t obj)
     return &(tb_text_bubbles[idx_to_use]);
 }
 
-/**
- * Adjusts a text bubble's rect based on its position relative to the object.
- * Side positions start at TOP-equivalent y; tb_slide_side_rect is called
- * afterwards to apply the vertical and lateral viewport slide.
- */
-void adjust_text_bubble_rect(TigRect* rect, TbPosition pos, float z, int sprite_hot_y, int sprite_left_ext, int sprite_right_ext)
-{
-    switch (pos) {
-    case TB_POS_TOP:
-        rect->x -= rect->width / 2;
-        rect->y -= rect->height + (int)((float)sprite_hot_y * z) + TB_BUBBLE_GAP_PX;
-        break;
-    case TB_POS_BOTTOM:
-        rect->x -= rect->width / 2;
-        rect->y += (int)(10 * z);
-        break;
-    case TB_POS_RIGHT:
-        rect->x += (int)((float)sprite_right_ext * z) + TB_SIDE_GAP_PX;
-        rect->y -= rect->height + (int)((float)sprite_hot_y * z) + TB_BUBBLE_GAP_PX;
-        break;
-    case TB_POS_LEFT:
-        rect->x -= rect->width + (int)((float)sprite_left_ext * z) + TB_SIDE_GAP_PX;
-        rect->y -= rect->height + (int)((float)sprite_hot_y * z) + TB_BUBBLE_GAP_PX;
-        break;
-    default:
-        break;
-    }
-}
-
-/**
- * Applies the vertical slide for side bubble positions after adjust_text_bubble_rect.
- *
- * Y slides from the TOP-equivalent (highest, most head-adjacent) down to the
- * BOTTOM-equivalent under viewport top-edge pressure. This lets a single RIGHT
- * or LEFT attempt find the best visible y within the sprite's height range
- * rather than requiring multiple discrete upper/middle/lower variants.
- */
-static void tb_slide_side_rect(TigRect* rect, int anchor_x, int anchor_y, int sprite_hot_y, float z)
-{
-    int y_bot;
-    int vp_top;
-
-    (void)anchor_x;
-    (void)sprite_hot_y;
-
-    y_bot  = anchor_y + (int)(10.0f * z);
-    vp_top = tb_iso_content_rect.y + GAME_UI_BAR_TOP;
-
-    if (rect->y < vp_top) rect->y = vp_top;
-    if (rect->y > y_bot)  rect->y = y_bot;
-}
