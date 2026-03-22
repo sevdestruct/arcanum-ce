@@ -4,6 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// UI chrome bar heights in screen pixels (standard 800×600 layout).
+// Used wherever code needs to avoid placing content behind the bars.
+#define GAME_UI_BAR_TOP    41
+#define GAME_UI_BAR_BOTTOM 159
+
 // Settings keys (registered during dialog_camera_init).
 #define DIALOGUE_CAMERA_MODE_KEY "dialogue camera mode"
 // 0 = minimal pan only (default) — only moves if NPC is off-screen/clipped
