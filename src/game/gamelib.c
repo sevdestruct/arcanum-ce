@@ -389,8 +389,11 @@ bool gamelib_init(GameInitInfo* init_info)
         world_vb_info.background_color = 0;
         if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
             gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_init: zoom disabled because world video buffer allocation failed.\n");
         }
     }
+
+    iso_zoom_set_available(init_info->editor || gamelib_world_video_buffer != NULL);
 
     if (init_info->editor) {
         gamelib_draw_func = gamelib_draw_editor;
@@ -587,8 +590,11 @@ void gamelib_resize(GameResizeInfo* resize_info)
         world_vb_info.background_color = 0;
         if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
             gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_resize: zoom disabled because world video buffer allocation failed.\n");
         }
     }
+
+    iso_zoom_set_available(gamelib_draw_func != gamelib_draw_game || gamelib_world_video_buffer != NULL);
 
     for (index = 0; index < MODULE_COUNT; index++) {
         if (gamelib_modules[index].resize_func != NULL) {
