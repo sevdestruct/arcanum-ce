@@ -267,7 +267,7 @@ void light_set_iso_content_rect(const TigRect* rect)
 
 void light_preallocate_for_zoom(const TigRect* zoom_rect)
 {
-    // Temporarily widen the content rect so sub_4DDF50 creates VBs large
+    // Temporarily widen the content rect so light_buffers_init creates VBs large
     // enough to cover the 2x world_vb used during the zoom world pass.
     // dword_602E44 / dword_603418 etc. are left at the larger values after
     // the call; the original content rect is restored so that light_draw's
@@ -275,7 +275,7 @@ void light_preallocate_for_zoom(const TigRect* zoom_rect)
     // rendering.
     TigRect saved = light_iso_content_rect;
     light_iso_content_rect = *zoom_rect;
-    if (!sub_4DDF50()) {
+    if (!light_buffers_init()) {
         tig_debug_printf("light_preallocate_for_zoom: ERROR: Failed to rebuild the vbuffer!\n");
     }
     light_iso_content_rect = saved;
