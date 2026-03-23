@@ -4901,6 +4901,70 @@ static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle,
     TigRect src_rect;
     TigRect dst_rect;
     tig_art_id_t art_id;
+    int sw;
+    int sh;
+    int vw;
+    int vh;
+    int cx;
+    int cy;
+    int src_x;
+    int src_y;
+    int dst_x;
+    int dst_y;
+    int blit_w;
+    int blit_h;
+
+    if (mainmenu_ui_bg_video != NULL
+        && mainmenu_ui_bg_video_buffer != NULL
+        && tig_window_data(window_handle, &wd) == TIG_OK) {
+        sw = hrp_iso_window_width_get();
+        sh = hrp_iso_window_height_get();
+        vw = (int)mainmenu_ui_bg_video->Width;
+        vh = (int)mainmenu_ui_bg_video->Height;
+        cx = (sw - vw) / 2;
+        cy = (sh - vh) / 2;
+
+        src_x = wd.rect.x + rect->x - cx;
+        src_y = wd.rect.y + rect->y - cy;
+        dst_x = rect->x;
+        dst_y = rect->y;
+        blit_w = rect->width;
+        blit_h = rect->height;
+
+        if (src_x < 0) {
+            dst_x -= src_x;
+            blit_w += src_x;
+            src_x = 0;
+        }
+        if (src_y < 0) {
+            dst_y -= src_y;
+            blit_h += src_y;
+            src_y = 0;
+        }
+        if (src_x + blit_w > vw) {
+            blit_w = vw - src_x;
+        }
+        if (src_y + blit_h > vh) {
+            blit_h = vh - src_y;
+        }
+
+        if (blit_w > 0 && blit_h > 0) {
+            src_rect.x = src_x;
+            src_rect.y = src_y;
+            src_rect.width = blit_w;
+            src_rect.height = blit_h;
+            dst_rect.x = dst_x;
+            dst_rect.y = dst_y;
+            dst_rect.width = blit_w;
+            dst_rect.height = blit_h;
+            tig_window_copy_from_vbuffer(window_handle,
+                &dst_rect,
+                mainmenu_ui_bg_video_buffer,
+                &src_rect);
+        }
+
+        return;
+    }
 
     if (mainmenu_ui_has_custom_bg) {
         if (tig_window_data(window_handle, &wd) == TIG_OK) {
