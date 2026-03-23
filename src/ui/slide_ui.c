@@ -13,6 +13,7 @@
 #include "game/hrp.h"
 #include "game/mes.h"
 #include "game/script.h"
+#include "game/timeevent.h"
 #include "ui/mainmenu_ui.h"
 
 /**
@@ -25,14 +26,21 @@
 #define CREDITS_BG_PANEL_HEIGHT 365
 #define CREDITS_BG_PANEL_CORNER_RADIUS_X 28
 #define CREDITS_BG_PANEL_CORNER_RADIUS_Y 37
+#define LIVE_CREDITS_FADE_STEPS 12
+#define LIVE_CREDITS_FADE_DELAY_MS 16
 
 static void slide_ui_prepare(int type);
 static bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide);
 static bool slide_ui_get_assets(int slide, char* bmp_path, char* speech_path);
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
-static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y);
+static bool slide_ui_blit_custom_credits_slide_alpha(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, int alpha);
 static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handle_t window_handle);
+static bool slide_ui_blit_live_credits_slide_alpha(TigBmp* slide_bmp, tig_window_handle_t window_handle, int alpha);
+static void slide_ui_custom_credits_fade(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, bool fade_in);
+static void slide_ui_live_credits_refresh(TigBmp* slide_bmp, tig_window_handle_t window_handle, int alpha);
+static void slide_ui_live_credits_fade(TigBmp* slide_bmp, tig_window_handle_t window_handle, bool fade_in);
+static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y);
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
 static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom);
 static void slide_ui_refine_background_mask(TigBmp* slide_bmp, uint8_t* mask);
@@ -113,8 +121,13 @@ void slide_ui_start(int type)
     tig_window_handle_t window_handle;
     tig_sound_handle_t sound_handle;
     int index;
+    bool overlay_credits;
+    char custom_bg_path[TIG_MAX_PATH];
 
     slide_ui_active = true;
+    overlay_credits = type == SLIDE_UI_TYPE_CREDITS
+        && (mainmenu_ui_has_bg_video_frame()
+            || slide_ui_get_custom_credits_bg_path(custom_bg_path));
 
     // Remove all enqeueued slides.
     slide_ui_queue_clear();
@@ -131,7 +144,9 @@ void slide_ui_start(int type)
     }
 
     // Perform initial fade-out.
-    slide_ui_fade_out();
+    if (!overlay_credits) {
+        slide_ui_fade_out();
+    }
 
     // Display slides if queue is not empty.
     if (slide_ui_queue_size > 0) {
@@ -169,7 +184,7 @@ void slide_ui_start(int type)
 
     // Perform fade-in when we're presenting credits. Otherwise the caller is
     // responsible to remove fading.
-    if (type == SLIDE_UI_TYPE_CREDITS) {
+    if (type == SLIDE_UI_TYPE_CREDITS && !overlay_credits) {
         slide_ui_fade_in();
     }
 
@@ -222,6 +237,7 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
     bool custom_override;
     bool live_override;
     tig_timestamp_t start;
+    tig_timestamp_t now;
     tig_duration_t elapsed;
 
     // Set slide rect.
@@ -241,25 +257,40 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
         if (tig_bmp_create(&bmp) == TIG_OK) {
             // Put image into window.
             if (live_override) {
-                if (!slide_ui_blit_live_credits_slide(&bmp, window_handle)) {
+                if (!slide_ui_blit_live_credits_slide_alpha(&bmp, window_handle, 0)) {
                     tig_bmp_copy_to_window(&bmp, &rect, window_handle, &rect);
                 }
             } else if (custom_override) {
-                if (!slide_ui_blit_custom_credits_slide(&bmp, custom_bg_path, window_handle)) {
+                if (!slide_ui_blit_custom_credits_slide_alpha(&bmp, custom_bg_path, window_handle, 0)) {
                     TigRect dst_rect = rect;
                     tig_bmp_copy_to_window(&bmp, &rect, window_handle, &dst_rect);
                 }
             } else {
                 tig_bmp_copy_to_window(&bmp, &rect, window_handle, &rect);
             }
-            tig_bmp_destroy(&bmp);
+            if (live_override) {
+                // Start from a fully transparent content layer so the first
+                // visible frame participates in the fade instead of flashing
+                // at full opacity before the transition begins.
+                sub_51E850(window_handle);
+                tig_window_display();
+                slide_ui_live_credits_fade(&bmp, window_handle, true);
+            } else if (custom_override) {
+                // Custom credits use the same element-only fade behavior as
+                // live video backgrounds, but over a static replacement backdrop.
+                sub_51E850(window_handle);
+                tig_window_display();
+                slide_ui_custom_credits_fade(&bmp, custom_bg_path, window_handle, true);
+            } else {
+                tig_bmp_destroy(&bmp);
 
-            // Refresh screen.
-            sub_51E850(window_handle);
-            tig_window_display();
+                // Refresh screen.
+                sub_51E850(window_handle);
+                tig_window_display();
 
-            // Perform fade-in effect.
-            slide_ui_fade_in();
+                // Perform fade-in effect.
+                slide_ui_fade_in();
+            }
 
             // Play voiceover.
             speech_handle = gsound_play_voice(speech_path, 0);
@@ -297,6 +328,14 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
 
                 // Pump events.
                 tig_ping();
+                if (live_override) {
+                    tig_timer_now(&now);
+                    timeevent_ping(now);
+                    if (slide_ui_blit_live_credits_slide(&bmp, window_handle)) {
+                        sub_51E850(window_handle);
+                        tig_window_display();
+                    }
+                }
 
                 // Process input.
                 while (tig_message_dequeue(&msg) == TIG_OK) {
@@ -327,17 +366,25 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
 
             // Clean up voiceover.
             tig_sound_destroy(speech_handle);
-        }
 
-        // Clear remaining message queue.
-        while (tig_message_dequeue(&msg) == TIG_OK) {
-            if (msg.type == TIG_MESSAGE_REDRAW) {
-                gamelib_redraw();
+            // Clear remaining message queue.
+            while (tig_message_dequeue(&msg) == TIG_OK) {
+                if (msg.type == TIG_MESSAGE_REDRAW) {
+                    gamelib_redraw();
+                }
+            }
+
+            if (live_override) {
+                slide_ui_live_credits_fade(&bmp, window_handle, false);
+                tig_bmp_destroy(&bmp);
+            } else if (custom_override) {
+                slide_ui_custom_credits_fade(&bmp, custom_bg_path, window_handle, false);
+                tig_bmp_destroy(&bmp);
+            } else {
+                // Perform fade-out effect.
+                slide_ui_fade_out();
             }
         }
-
-        // Perform fade-out effect.
-        slide_ui_fade_out();
     }
 
     return cont;
@@ -365,6 +412,11 @@ static bool slide_ui_get_custom_credits_bg_path(char* bmp_path)
 }
 
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle)
+{
+    return slide_ui_blit_custom_credits_slide_alpha(slide_bmp, custom_bg_path, window_handle, 255);
+}
+
+static bool slide_ui_blit_custom_credits_slide_alpha(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, int alpha)
 {
     TigWindowData window_data;
     TigBmp custom_bg_bmp;
@@ -481,7 +533,9 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
             } else if (background_mask[y * composite_bmp.width + x] != 0) {
                 out_color = bg_color;
             } else {
-                out_color = slide_color;
+                out_color = alpha >= 255
+                    ? slide_color
+                    : tig_color_blend_alpha(slide_color, bg_color, alpha);
             }
 
             dst[0] = (uint8_t)(out_color & 0xFF);
@@ -504,56 +558,12 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
     return true;
 }
 
-static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y)
+static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handle_t window_handle)
 {
-    int width = right - left;
-    int height = bottom - top;
-    int max_radius_x;
-    int max_radius_y;
-    int dx;
-    int dy;
-    long long lhs;
-    long long rhs;
-
-    if (radius_x <= 0 || radius_y <= 0) {
-        return true;
-    }
-
-    max_radius_x = width / 2;
-    max_radius_y = height / 2;
-    if (radius_x > max_radius_x) {
-        radius_x = max_radius_x;
-    }
-    if (radius_y > max_radius_y) {
-        radius_y = max_radius_y;
-    }
-
-    // The decorative credits frame has inset oval cutouts at the top corners,
-    // so keep those areas treated as background instead of slide content.
-    if (y < top + radius_y) {
-        if (x < left + radius_x) {
-            dx = x - left;
-            dy = y - top;
-            lhs = (long long)dx * dx * radius_y * radius_y
-                + (long long)dy * dy * radius_x * radius_x;
-            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
-            return lhs >= rhs;
-        }
-
-        if (x >= right - radius_x) {
-            dx = (right - 1) - x;
-            dy = y - top;
-            lhs = (long long)dx * dx * radius_y * radius_y
-                + (long long)dy * dy * radius_x * radius_x;
-            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
-            return lhs >= rhs;
-        }
-    }
-
-    return true;
+    return slide_ui_blit_live_credits_slide_alpha(slide_bmp, window_handle, 255);
 }
 
-static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handle_t window_handle)
+static bool slide_ui_blit_live_credits_slide_alpha(TigBmp* slide_bmp, tig_window_handle_t window_handle, int alpha)
 {
     TigWindowData window_data;
     TigBmp video_bg_bmp;
@@ -567,6 +577,7 @@ static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handl
     int x;
     int y;
     uint8_t* background_mask;
+    uint32_t slide_color;
 
     memset(&video_bg_bmp, 0, sizeof(video_bg_bmp));
     memset(&composite_bmp, 0, sizeof(composite_bmp));
@@ -631,7 +642,7 @@ static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handl
     for (y = 0; y < composite_bmp.height; y++) {
         uint8_t* dst = (uint8_t*)composite_bmp.pixels + y * composite_bmp.pitch;
         for (x = 0; x < composite_bmp.width; x++) {
-            uint32_t slide_color = slide_ui_bmp_color_at(slide_bmp, x, y);
+            slide_color = slide_ui_bmp_color_at(slide_bmp, x, y);
             uint32_t bg_color = slide_ui_bmp_color_at(&video_bg_bmp, x, y);
             uint32_t out_color;
 
@@ -649,7 +660,9 @@ static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handl
             } else if (background_mask[y * composite_bmp.width + x] != 0) {
                 out_color = bg_color;
             } else {
-                out_color = slide_color;
+                out_color = alpha >= 255
+                    ? slide_color
+                    : tig_color_blend_alpha(slide_color, bg_color, alpha);
             }
 
             dst[0] = (uint8_t)(out_color & 0xFF);
@@ -671,6 +684,99 @@ static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handl
     tig_bmp_destroy(&composite_bmp);
     return true;
 }
+
+static void slide_ui_live_credits_refresh(TigBmp* slide_bmp, tig_window_handle_t window_handle, int alpha)
+{
+    tig_timestamp_t now;
+
+    tig_ping();
+    tig_timer_now(&now);
+    timeevent_ping(now);
+    if (slide_ui_blit_live_credits_slide_alpha(slide_bmp, window_handle, alpha)) {
+        sub_51E850(window_handle);
+        tig_window_display();
+    }
+}
+
+static void slide_ui_custom_credits_fade(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, bool fade_in)
+{
+    int step;
+
+    for (step = 0; step <= LIVE_CREDITS_FADE_STEPS; step++) {
+        int alpha = fade_in
+            ? (step * 255) / LIVE_CREDITS_FADE_STEPS
+            : ((LIVE_CREDITS_FADE_STEPS - step) * 255) / LIVE_CREDITS_FADE_STEPS;
+        tig_ping();
+        if (slide_ui_blit_custom_credits_slide_alpha(slide_bmp, custom_bg_path, window_handle, alpha)) {
+            sub_51E850(window_handle);
+            tig_window_display();
+        }
+        SDL_Delay(LIVE_CREDITS_FADE_DELAY_MS);
+    }
+}
+
+static void slide_ui_live_credits_fade(TigBmp* slide_bmp, tig_window_handle_t window_handle, bool fade_in)
+{
+    int step;
+
+    for (step = 0; step <= LIVE_CREDITS_FADE_STEPS; step++) {
+        int alpha = fade_in
+            ? (step * 255) / LIVE_CREDITS_FADE_STEPS
+            : ((LIVE_CREDITS_FADE_STEPS - step) * 255) / LIVE_CREDITS_FADE_STEPS;
+        slide_ui_live_credits_refresh(slide_bmp, window_handle, alpha);
+        SDL_Delay(LIVE_CREDITS_FADE_DELAY_MS);
+    }
+}
+
+static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y)
+{
+    int width = right - left;
+    int height = bottom - top;
+    int max_radius_x;
+    int max_radius_y;
+    int dx;
+    int dy;
+    long long lhs;
+    long long rhs;
+
+    if (radius_x <= 0 || radius_y <= 0) {
+        return true;
+    }
+
+    max_radius_x = width / 2;
+    max_radius_y = height / 2;
+    if (radius_x > max_radius_x) {
+        radius_x = max_radius_x;
+    }
+    if (radius_y > max_radius_y) {
+        radius_y = max_radius_y;
+    }
+
+    // The decorative credits frame has inset oval cutouts at the top corners,
+    // so keep those areas treated as background instead of slide content.
+    if (y < top + radius_y) {
+        if (x < left + radius_x) {
+            dx = x - left;
+            dy = y - top;
+            lhs = (long long)dx * dx * radius_y * radius_y
+                + (long long)dy * dy * radius_x * radius_x;
+            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
+            return lhs >= rhs;
+        }
+
+        if (x >= right - radius_x) {
+            dx = (right - 1) - x;
+            dy = y - top;
+            lhs = (long long)dx * dx * radius_y * radius_y
+                + (long long)dy * dy * radius_x * radius_x;
+            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
+            return lhs >= rhs;
+        }
+    }
+
+    return true;
+}
+
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)
 {
     int width = slide_bmp->width;
