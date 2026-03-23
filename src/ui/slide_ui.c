@@ -18,16 +18,19 @@
  * The maximum number of enqueued slides.
  */
 #define MAX_QUEUE_SIZE 100
-#define CREDITS_BG_PANEL_X 284
-#define CREDITS_BG_PANEL_Y 70
-#define CREDITS_BG_PANEL_WIDTH 251
-#define CREDITS_BG_PANEL_HEIGHT 367
+#define CREDITS_BG_PANEL_X 285
+#define CREDITS_BG_PANEL_Y 71
+#define CREDITS_BG_PANEL_WIDTH 248
+#define CREDITS_BG_PANEL_HEIGHT 365
+#define CREDITS_BG_PANEL_CORNER_RADIUS_X 28
+#define CREDITS_BG_PANEL_CORNER_RADIUS_Y 37
 
 static void slide_ui_prepare(int type);
 static bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide);
 static bool slide_ui_get_assets(int slide, char* bmp_path, size_t bmp_path_maxlen, char* speech_path, size_t speech_path_maxlen);
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
+static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y);
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
 static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom);
 static void slide_ui_refine_background_mask(TigBmp* slide_bmp, uint8_t* mask);
@@ -505,6 +508,15 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
 
             if (x < panel_left || x >= panel_right || y < panel_top || y >= panel_bottom) {
                 out_color = bg_color;
+            } else if (!slide_ui_point_in_credits_panel(x,
+                           y,
+                           panel_left,
+                           panel_top,
+                           panel_right,
+                           panel_bottom,
+                           CREDITS_BG_PANEL_CORNER_RADIUS_X,
+                           CREDITS_BG_PANEL_CORNER_RADIUS_Y)) {
+                out_color = bg_color;
             } else if (background_mask[y * comp_w + x] != 0) {
                 out_color = bg_color;
             } else {
@@ -533,6 +545,54 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
     return true;
 }
 
+static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y)
+{
+    int width = right - left;
+    int height = bottom - top;
+    int max_radius_x;
+    int max_radius_y;
+    int dx;
+    int dy;
+    long long lhs;
+    long long rhs;
+
+    if (radius_x <= 0 || radius_y <= 0) {
+        return true;
+    }
+
+    max_radius_x = width / 2;
+    max_radius_y = height / 2;
+    if (radius_x > max_radius_x) {
+        radius_x = max_radius_x;
+    }
+    if (radius_y > max_radius_y) {
+        radius_y = max_radius_y;
+    }
+
+    // The decorative credits frame has inset oval cutouts at the top corners,
+    // so keep those areas treated as background instead of slide content.
+    if (y < top + radius_y) {
+        if (x < left + radius_x) {
+            dx = x - left;
+            dy = y - top;
+            lhs = (long long)dx * dx * radius_y * radius_y
+                + (long long)dy * dy * radius_x * radius_x;
+            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
+            return lhs >= rhs;
+        }
+
+        if (x >= right - radius_x) {
+            dx = (right - 1) - x;
+            dy = y - top;
+            lhs = (long long)dx * dx * radius_y * radius_y
+                + (long long)dy * dy * radius_x * radius_x;
+            rhs = (long long)radius_x * radius_x * radius_y * radius_y;
+            return lhs >= rhs;
+        }
+    }
+
+    return true;
+}
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)
 {
     int width = slide_bmp->width;
@@ -788,7 +848,7 @@ static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y)
 
 static bool slide_ui_colors_match(uint32_t a, uint32_t b)
 {
-    const int tolerance = 18;
+    const int tolerance = 14;
     int ar = (a >> 16) & 0xFF;
     int ag = (a >> 8) & 0xFF;
     int ab = a & 0xFF;
