@@ -18,6 +18,10 @@
  * The maximum number of enqueued slides.
  */
 #define MAX_QUEUE_SIZE 100
+#define CREDITS_BG_PANEL_X 284
+#define CREDITS_BG_PANEL_Y 70
+#define CREDITS_BG_PANEL_WIDTH 251
+#define CREDITS_BG_PANEL_HEIGHT 367
 
 static void slide_ui_prepare(int type);
 static bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide);
@@ -25,6 +29,8 @@ static bool slide_ui_get_assets(int slide, char* bmp_path, char* speech_path);
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
+static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom);
+static void slide_ui_refine_background_mask(TigBmp* slide_bmp, uint8_t* mask);
 static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y);
 static bool slide_ui_colors_match(uint32_t a, uint32_t b);
 static void slide_ui_fade_out(void);
@@ -359,6 +365,10 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
     int bmp_oy;
     int src_x;
     int src_y;
+    int panel_left;
+    int panel_top;
+    int panel_right;
+    int panel_bottom;
     int x;
     int y;
     uint8_t* background_mask;
@@ -390,17 +400,42 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
         return false;
     }
 
+    panel_left = CREDITS_BG_PANEL_X;
+    panel_top = CREDITS_BG_PANEL_Y;
+    panel_right = CREDITS_BG_PANEL_X + CREDITS_BG_PANEL_WIDTH;
+    panel_bottom = CREDITS_BG_PANEL_Y + CREDITS_BG_PANEL_HEIGHT;
+
+    if (panel_left < 0) {
+        panel_left = 0;
+    }
+    if (panel_top < 0) {
+        panel_top = 0;
+    }
+    if (panel_right > window_data.rect.width) {
+        panel_right = window_data.rect.width;
+    }
+    if (panel_bottom > window_data.rect.height) {
+        panel_bottom = window_data.rect.height;
+    }
+
     background_mask = MALLOC(window_data.rect.width * window_data.rect.height);
     if (background_mask == NULL) {
         tig_bmp_destroy(&custom_bg_bmp);
         return false;
     }
 
-    if (!slide_ui_build_background_mask(slide_bmp, background_mask)) {
+    if (!slide_ui_build_background_mask_in_rect(slide_bmp,
+            background_mask,
+            panel_left,
+            panel_top,
+            panel_right,
+            panel_bottom)) {
         FREE(background_mask);
         tig_bmp_destroy(&custom_bg_bmp);
         return false;
     }
+
+    slide_ui_refine_background_mask(slide_bmp, background_mask);
 
     composite_bmp.bpp = 24;
     composite_bmp.width = window_data.rect.width;
@@ -420,7 +455,9 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
             uint32_t bg_color = slide_ui_bmp_color_at(&custom_bg_bmp, src_x + x, src_y + y);
             uint32_t out_color;
 
-            if (background_mask[y * composite_bmp.width + x] != 0) {
+            if (x < panel_left || x >= panel_right || y < panel_top || y >= panel_bottom) {
+                out_color = bg_color;
+            } else if (background_mask[y * composite_bmp.width + x] != 0) {
                 out_color = bg_color;
             } else {
                 out_color = slide_color;
@@ -524,6 +561,166 @@ static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)
     return true;
 }
 
+static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom)
+{
+    int width = slide_bmp->width;
+    int height = slide_bmp->height;
+    int queue_size = width * height;
+    int* queue;
+    int head = 0;
+    int tail = 0;
+    int x;
+    int y;
+    int i;
+    static const int offsets[4][2] = {
+        { 1, 0 },
+        { -1, 0 },
+        { 0, 1 },
+        { 0, -1 },
+    };
+
+    memset(mask, 0, width * height);
+
+    if (left < 0) {
+        left = 0;
+    }
+    if (top < 0) {
+        top = 0;
+    }
+    if (right > width) {
+        right = width;
+    }
+    if (bottom > height) {
+        bottom = height;
+    }
+
+    if (left >= right || top >= bottom) {
+        return false;
+    }
+
+    queue = MALLOC(sizeof(*queue) * queue_size);
+    if (queue == NULL) {
+        return false;
+    }
+
+    for (x = left; x < right; x++) {
+        mask[top * width + x] = 1;
+        queue[tail++] = top * width + x;
+
+        if (bottom - top > 1) {
+            mask[(bottom - 1) * width + x] = 1;
+            queue[tail++] = (bottom - 1) * width + x;
+        }
+    }
+
+    for (y = top + 1; y < bottom - 1; y++) {
+        mask[y * width + left] = 1;
+        queue[tail++] = y * width + left;
+
+        if (right - left > 1) {
+            mask[y * width + (right - 1)] = 1;
+            queue[tail++] = y * width + (right - 1);
+        }
+    }
+
+    while (head < tail) {
+        int index = queue[head++];
+        int curr_x = index % width;
+        int curr_y = index / width;
+        uint32_t base_color = slide_ui_bmp_color_at(slide_bmp, curr_x, curr_y);
+
+        for (i = 0; i < 4; i++) {
+            int nx = curr_x + offsets[i][0];
+            int ny = curr_y + offsets[i][1];
+            int nindex;
+
+            if (nx < left || nx >= right || ny < top || ny >= bottom) {
+                continue;
+            }
+
+            nindex = ny * width + nx;
+            if (mask[nindex] != 0) {
+                continue;
+            }
+
+            if (!slide_ui_colors_match(base_color, slide_ui_bmp_color_at(slide_bmp, nx, ny))) {
+                continue;
+            }
+
+            mask[nindex] = 1;
+            queue[tail++] = nindex;
+        }
+    }
+
+    FREE(queue);
+    return true;
+}
+
+static void slide_ui_refine_background_mask(TigBmp* slide_bmp, uint8_t* mask)
+{
+    int width = slide_bmp->width;
+    int height = slide_bmp->height;
+    uint8_t* refined;
+    int x;
+    int y;
+    int pass;
+
+    refined = MALLOC(width * height);
+    if (refined == NULL) {
+        return;
+    }
+
+    for (pass = 0; pass < 2; pass++) {
+        memcpy(refined, mask, width * height);
+
+        for (y = 1; y < height - 1; y++) {
+            for (x = 1; x < width - 1; x++) {
+                int index = y * width + x;
+                int masked_neighbors = 0;
+                uint32_t color;
+                bool close_to_masked_neighbor = false;
+                int dx;
+                int dy;
+
+                if (mask[index] != 0) {
+                    continue;
+                }
+
+                color = slide_ui_bmp_color_at(slide_bmp, x, y);
+
+                for (dy = -1; dy <= 1; dy++) {
+                    for (dx = -1; dx <= 1; dx++) {
+                        int neighbor_index;
+
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+
+                        neighbor_index = (y + dy) * width + (x + dx);
+                        if (mask[neighbor_index] == 0) {
+                            continue;
+                        }
+
+                        masked_neighbors++;
+                        if (slide_ui_colors_match(color,
+                                slide_ui_bmp_color_at(slide_bmp, x + dx, y + dy))) {
+                            close_to_masked_neighbor = true;
+                        }
+                    }
+                }
+
+                if (masked_neighbors >= 5 && close_to_masked_neighbor) {
+                    refined[index] = 1;
+                }
+            }
+        }
+
+        memcpy(mask, refined, width * height);
+    }
+
+    FREE(refined);
+}
+
 static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y)
 {
     if (bmp->bpp == 8) {
@@ -541,6 +738,7 @@ static uint32_t slide_ui_bmp_color_at(TigBmp* bmp, int x, int y)
 
 static bool slide_ui_colors_match(uint32_t a, uint32_t b)
 {
+    const int tolerance = 18;
     int ar = (a >> 16) & 0xFF;
     int ag = (a >> 8) & 0xFF;
     int ab = a & 0xFF;
@@ -548,9 +746,12 @@ static bool slide_ui_colors_match(uint32_t a, uint32_t b)
     int bg = (b >> 8) & 0xFF;
     int bb = b & 0xFF;
 
-    return abs(ar - br) <= 10
-        && abs(ag - bg) <= 10
-        && abs(ab - bb) <= 10;
+    // Credits slides reuse the legacy background with subtle palette variation.
+    // A slightly wider match reduces leftover background speckles when we
+    // replace that backdrop with custom art.
+    return abs(ar - br) <= tolerance
+        && abs(ag - bg) <= tolerance
+        && abs(ab - bb) <= tolerance;
 }
 
 /**
