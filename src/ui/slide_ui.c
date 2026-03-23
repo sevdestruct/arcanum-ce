@@ -727,7 +727,6 @@ static void slide_ui_live_credits_fade(TigBmp* slide_bmp, tig_window_handle_t wi
         SDL_Delay(LIVE_CREDITS_FADE_DELAY_MS);
     }
 }
-
 static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y)
 {
     int width = right - left;
@@ -776,7 +775,6 @@ static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int
 
     return true;
 }
-
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)
 {
     int width = slide_bmp->width;
