@@ -147,6 +147,7 @@ static void sub_546DD0(void);
 static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void);
 static void mainmenu_ui_blit_custom_bg_to_window(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_rect);
 static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect);
+static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect);
 static bool mainmenu_ui_load_bg_bmp(TigBmp* bmp, MainMenuWindowType type);
 static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type);
 static void mainmenu_ui_reapply_custom_bg(void);
@@ -4741,6 +4742,47 @@ static void mainmenu_ui_blit_custom_bg_at(TigBmp* bmp, tig_window_handle_t wnd, 
     tig_window_invalidate_rect(&dirty);
 }
 
+// Restore the text area from the currently active backdrop source so shared
+// morph-text entries can stay transparent over custom backgrounds.
+static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect)
+{
+    TigWindowData wd;
+    TigArtAnimData art_anim_data;
+    TigArtBlitInfo art_blit_info;
+    TigRect src_rect;
+    TigRect dst_rect;
+    tig_art_id_t art_id;
+
+    if (mainmenu_ui_has_custom_bg) {
+        if (tig_window_data(window_handle, &wd) == TIG_OK) {
+            mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, window_handle, wd.rect, *rect);
+        }
+        return;
+    }
+
+    if (main_menu_window_info[mainmenu_ui_window_type]->background_art_num == -1) {
+        return;
+    }
+
+    tig_art_interface_id_create(main_menu_window_info[mainmenu_ui_window_type]->background_art_num, 0, 0, 0, &art_id);
+    if (tig_art_anim_data(art_id, &art_anim_data) != TIG_OK) {
+        return;
+    }
+
+    src_rect.x = rect->x;
+    src_rect.y = rect->y;
+    src_rect.width = rect->width + 1;
+    src_rect.height = rect->height + 1;
+
+    dst_rect = src_rect;
+
+    art_blit_info.flags = 0;
+    art_blit_info.art_id = art_id;
+    art_blit_info.src_rect = &src_rect;
+    art_blit_info.dst_rect = &dst_rect;
+    tig_window_blit_art(window_handle, &art_blit_info);
+}
+
 static void mainmenu_ui_reapply_custom_bg(void)
 {
     TigWindowData window_data;
@@ -5098,12 +5140,7 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
 {
     TigRect text_rect;
     TigFont font_desc;
-    TigArtAnimData art_anim_data;
-    TigArtBlitInfo art_blit_info;
-    TigRect src_rect;
-    TigRect dst_rect;
     tig_font_handle_t* fonts;
-    tig_art_id_t art_id;
     int pass;
 
     text_rect = *rect;
@@ -5155,32 +5192,7 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
             }
         }
 
-        if (main_menu_window_info[mainmenu_ui_window_type]->background_art_num != -1) {
-            tig_art_interface_id_create(main_menu_window_info[mainmenu_ui_window_type]->background_art_num, 0, 0, 0, &art_id);
-            if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
-                src_rect.x = rect->x;
-                src_rect.y = rect->y;
-                src_rect.width = rect->width + 1;
-                src_rect.height = rect->height + 1;
-
-                dst_rect.x = rect->x;
-                dst_rect.y = rect->y;
-                dst_rect.width = rect->width + 1;
-                dst_rect.height = rect->height + 1;
-
-                art_blit_info.flags = 0;
-                art_blit_info.art_id = art_id;
-                art_blit_info.src_rect = &src_rect;
-                art_blit_info.dst_rect = &dst_rect;
-                tig_window_blit_art(dword_5C3624, &art_blit_info);
-                if (mainmenu_ui_has_custom_bg) {
-                    TigWindowData wd;
-                    if (tig_window_data(dword_5C3624, &wd) == TIG_OK) {
-                        mainmenu_ui_blit_custom_bg_at(&mainmenu_ui_custom_bg_bmp, dword_5C3624, wd.rect, dst_rect);
-                    }
-                }
-            }
-        }
+        mainmenu_ui_restore_text_backdrop(window_handle, rect);
 
         for (pass = 0; pass < 3; pass++) {
             tig_font_push(fonts[pass]);
