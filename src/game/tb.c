@@ -57,6 +57,12 @@
 #define TB_BUBBLE_STACK_GAP_PX 4
 
 /**
+ * Margin added to the half-sprite-width threshold before centered bubbles
+ * switch to left/right aligned text.
+ */
+#define TB_ALIGN_SWITCH_MARGIN_PX 12
+
+/**
  * Width of the follower portrait panel (leftmost column, anchored at x=0).
  * Its active height varies with party size; tb_calc_rect queries
  * follower_ui_panel_bottom() at runtime.
@@ -125,6 +131,8 @@ static bool tb_pair_prefers_x_cascade(int first,
     TextBubblePlacementFlags* placement_flags,
     bool allow_x_preferred_skip);
 static bool tb_has_unresolved_overlap(TigRect* rects, int* indices, int count);
+static void tb_collect_resolved_rects(TigRect* rects, int* anchor_ys, TextBubblePlacementFlags* placement_flags);
+static void tb_invalidate_resolved_changes(void);
 static void tb_resolve_overlaps(TigRect* rects, int* anchor_ys, TextBubblePlacementFlags* placement_flags);
 static void tb_text_duration_changed(void);
 static TextBubble* find_text_bubble(int64_t obj);
@@ -491,26 +499,7 @@ void tb_draw(GameDrawInfo* draw_info)
         return;
     }
 
-    // Pass 1: compute screen rect for every bubble independently. tb_calc_rect
-    // handles anchor→screen transform, UI collision, and drift hiding.
-    // Also capture each bubble's unclamped sprite anchor Y for stable sorting
-    // plus which screen/UI safeties clamped the preferred placement.
-    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
-        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
-            tb_get_rect_ex(&(tb_text_bubbles[idx]), &rects[idx], &placement_flags[idx]);
-            anchor_ys[idx] = tb_get_anchor_y(&tb_text_bubbles[idx]);
-        } else {
-            rects[idx].x = 0;
-            rects[idx].y = 0;
-            rects[idx].width = 0;
-            rects[idx].height = 0;
-            anchor_ys[idx] = 0;
-            placement_flags[idx] = 0;
-        }
-    }
-
-    // Pass 2: push overlapping bubbles apart so they stack cleanly.
-    tb_resolve_overlaps(rects, anchor_ys, placement_flags);
+    tb_collect_resolved_rects(rects, anchor_ys, placement_flags);
 
     // Store resolved rects so tb_ping can pre-invalidate them next frame,
     // guaranteeing dirty-rect coverage even at 1.0x zoom.
@@ -518,7 +507,7 @@ void tb_draw(GameDrawInfo* draw_info)
         tb_prev_resolved[idx] = rects[idx];
     }
 
-    // Pass 3: blit each bubble using the resolved screen rect.
+    // Blit each bubble using the resolved screen rect.
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) == 0) {
             continue;
@@ -595,6 +584,7 @@ void tb_add(int64_t obj, int type, const char* str)
     // Invalidate the screen rect as dirty.
     tb_get_rect(tb, &dirty_rect);
     tb_iso_window_invalidate_rect(&dirty_rect);
+    tb_invalidate_resolved_changes();
 }
 
 /**
@@ -689,6 +679,8 @@ void tb_invalidate_positions(void)
             tb_text_bubbles[idx].rendered_align = TB_ALIGN_INVALID;
         }
     }
+
+    tb_invalidate_resolved_changes();
 }
 
 /**
@@ -733,6 +725,7 @@ void tb_remove_internal(TextBubble* tb)
 {
     TigRect rect;
     unsigned int flags;
+    int slot;
 
     // Invalidate the bubble's screen area.
     tb_get_rect(tb, &rect);
@@ -743,18 +736,20 @@ void tb_remove_internal(TextBubble* tb)
     flags &= ~OF_TEXT;
     obj_field_int32_set(tb->obj, OBJ_F_FLAGS, flags);
 
-    // Clear the stored resolved rect so tb_ping stops pre-invalidating it.
-    {
-        int slot = (int)(tb - tb_text_bubbles);
-        tb_prev_resolved[slot].x = 0;
-        tb_prev_resolved[slot].y = 0;
-        tb_prev_resolved[slot].width = 0;
-        tb_prev_resolved[slot].height = 0;
-    }
-
     // Reset the text bubble's properties.
+    slot = (int)(tb - tb_text_bubbles);
     tb->flags = 0;
     tb->obj = OBJ_HANDLE_NULL;
+
+    // Invalidate both the previously drawn resolved rects and the survivors'
+    // newly resolved positions so 1.0x dirty-rect redraws do not leave stale
+    // fragments after removals or expiry-driven overlap changes.
+    tb_invalidate_resolved_changes();
+
+    tb_prev_resolved[slot].x = 0;
+    tb_prev_resolved[slot].y = 0;
+    tb_prev_resolved[slot].width = 0;
+    tb_prev_resolved[slot].height = 0;
 }
 
 /**
@@ -963,14 +958,18 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
         return;
     }
 
-    // Text alignment from bubble center vs sprite anchor.
-    // Switches from centered once bubble center is pushed past sprite edge.
+    // Text alignment follows the bubble center relative to half the sprite
+    // width. This keeps normal over-the-head bubbles centered, but switches to
+    // side-aligned text once the bubble is meaningfully pushed to one side.
     {
         int bubble_cx = rect->x + rect->width / 2;
+        int left_threshold = (int)x - (int)((float)sprite_left_ext * z * 0.5f) - TB_ALIGN_SWITCH_MARGIN_PX;
+        int right_threshold = (int)x + (int)((float)sprite_right_ext * z * 0.5f) + TB_ALIGN_SWITCH_MARGIN_PX;
         int required_align;
-        if (bubble_cx > (int)x + (int)((float)sprite_right_ext * z))
+
+        if (bubble_cx > right_threshold)
             required_align = TB_ALIGN_LEFT;
-        else if (bubble_cx < (int)x - (int)((float)sprite_left_ext * z))
+        else if (bubble_cx < left_threshold)
             required_align = TB_ALIGN_RIGHT;
         else
             required_align = TB_ALIGN_CENTERED;
@@ -989,6 +988,73 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
             rect->height = tb->rect.height;
             tb->rendered_align = required_align;
         }
+    }
+}
+
+/**
+ * Computes the current resolved on-screen rect for every active bubble.
+ *
+ * This runs the normal placement pass plus overlap resolution without drawing,
+ * so callers can share the same settled layout for invalidation and blitting.
+ */
+static void tb_collect_resolved_rects(TigRect* rects, int* anchor_ys, TextBubblePlacementFlags* placement_flags)
+{
+    int idx;
+
+    // Pass 1: compute screen rect for every bubble independently. tb_calc_rect
+    // handles anchor→screen transform, UI collision, and drift hiding.
+    // Also capture each bubble's unclamped sprite anchor Y for stable sorting
+    // plus which screen/UI safeties clamped the preferred placement.
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
+            tb_get_rect_ex(&(tb_text_bubbles[idx]), &rects[idx], &placement_flags[idx]);
+            anchor_ys[idx] = tb_get_anchor_y(&tb_text_bubbles[idx]);
+        } else {
+            rects[idx].x = 0;
+            rects[idx].y = 0;
+            rects[idx].width = 0;
+            rects[idx].height = 0;
+            anchor_ys[idx] = 0;
+            placement_flags[idx] = 0;
+        }
+    }
+
+    // Pass 2: push overlapping bubbles apart so they stack cleanly.
+    tb_resolve_overlaps(rects, anchor_ys, placement_flags);
+}
+
+static void tb_invalidate_resolved_changes(void)
+{
+    int idx;
+    TigRect rects[MAX_TEXT_BUBBLES];
+    int anchor_ys[MAX_TEXT_BUBBLES];
+    TextBubblePlacementFlags placement_flags[MAX_TEXT_BUBBLES];
+    TigRect dirty_rect;
+    bool had_prev;
+    bool has_curr;
+
+    // Dirty both the previously drawn resolved rects and the layout we would
+    // draw now, so 1.0x dirty-rect rendering does not miss overlap-driven
+    // bubble moves during add/remove/reset transitions.
+    tb_collect_resolved_rects(rects, anchor_ys, placement_flags);
+
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        had_prev = tb_prev_resolved[idx].width > 0 && tb_prev_resolved[idx].height > 0;
+        has_curr = rects[idx].width > 0 && rects[idx].height > 0;
+
+        if (!had_prev && !has_curr) {
+            continue;
+        }
+
+        if (had_prev && has_curr) {
+            tig_rect_union(&tb_prev_resolved[idx], &rects[idx], &dirty_rect);
+        } else if (had_prev) {
+            dirty_rect = tb_prev_resolved[idx];
+        } else {
+            dirty_rect = rects[idx];
+        }
+
+        tb_iso_window_invalidate_rect(&dirty_rect);
     }
 }
 
