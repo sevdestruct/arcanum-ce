@@ -6,6 +6,7 @@
 
 #include "bink_compat.h"
 #include "tig/bmp.h"
+#include "tig/color.h"
 
 #include "game/area.h"
 #include "game/background.h"
@@ -3698,12 +3699,17 @@ void mainmenu_ui_credits_create(void)
     dword_64C38C = true;
     slide_ui_start(SLIDE_UI_TYPE_CREDITS);
     if (mainmenu_ui_active && mainmenu_ui_window_type == MM_WINDOW_MAINMENU) {
-        if (!mainmenu_ui_reload_custom_bg(MM_WINDOW_MAINMENU)) {
-            mainmenu_ui_reapply_custom_bg();
+        if (mainmenu_ui_has_bg_video_frame()) {
+            mainmenu_ui_bg_video_present_current_frame();
+            mainmenu_ui_bg_video_schedule_tick();
+        } else {
+            if (!mainmenu_ui_reload_custom_bg(MM_WINDOW_MAINMENU)) {
+                mainmenu_ui_reapply_custom_bg();
+            }
+            sub_549960();
+            mainmenu_ui_draw_version();
+            tig_window_display();
         }
-        sub_549960();
-        mainmenu_ui_draw_version();
-        tig_window_display();
     }
 
     if (mainmenu_ui_active) {
@@ -5341,6 +5347,105 @@ static bool mainmenu_ui_bg_video_matches_window_type(MainMenuWindowType type)
     }
 
     return strcmp(mainmenu_ui_bg_video_path, path) == 0;
+}
+
+bool mainmenu_ui_has_bg_video_frame(void)
+{
+    return mainmenu_ui_bg_video != NULL
+        && mainmenu_ui_bg_video_buffer != NULL;
+}
+
+bool mainmenu_ui_capture_bg_video_bmp_for_window(tig_window_handle_t window_handle, TigBmp* bmp)
+{
+    TigWindowData wd;
+    TigVideoBufferData vbd;
+    uint8_t* dst_row;
+    int sw;
+    int sh;
+    int vw;
+    int vh;
+    int cx;
+    int cy;
+    int x;
+    int y;
+
+    if (!mainmenu_ui_has_bg_video_frame()) {
+        return false;
+    }
+
+    if (tig_window_data(window_handle, &wd) != TIG_OK) {
+        return false;
+    }
+
+    bmp->bpp = 24;
+    bmp->width = wd.rect.width;
+    bmp->height = wd.rect.height;
+    bmp->pitch = bmp->width * 3;
+    bmp->pixels = MALLOC(bmp->pitch * bmp->height);
+    if (bmp->pixels == NULL) {
+        return false;
+    }
+
+    memset(bmp->pixels, 0, bmp->pitch * bmp->height);
+
+    if (tig_video_buffer_lock(mainmenu_ui_bg_video_buffer) != TIG_OK) {
+        tig_bmp_destroy(bmp);
+        return false;
+    }
+
+    if (tig_video_buffer_data(mainmenu_ui_bg_video_buffer, &vbd) != TIG_OK) {
+        tig_video_buffer_unlock(mainmenu_ui_bg_video_buffer);
+        tig_bmp_destroy(bmp);
+        return false;
+    }
+
+    sw = hrp_iso_window_width_get();
+    sh = hrp_iso_window_height_get();
+    vw = (int)mainmenu_ui_bg_video->Width;
+    vh = (int)mainmenu_ui_bg_video->Height;
+    cx = (sw - vw) / 2;
+    cy = (sh - vh) / 2;
+
+    for (y = 0; y < bmp->height; y++) {
+        int screen_y = wd.rect.y + y;
+        int video_y = screen_y - cy;
+        dst_row = (uint8_t*)bmp->pixels + y * bmp->pitch;
+
+        if (video_y < 0 || video_y >= vbd.height) {
+            continue;
+        }
+
+        for (x = 0; x < bmp->width; x++) {
+            int screen_x = wd.rect.x + x;
+            int video_x = screen_x - cx;
+            tig_color_t color;
+
+            if (video_x < 0 || video_x >= vbd.width) {
+                dst_row += 3;
+                continue;
+            }
+
+            switch (vbd.bpp) {
+            case 32:
+                color = vbd.surface_data.p32[video_y * (vbd.pitch / 4) + video_x];
+                break;
+            case 16:
+                color = vbd.surface_data.p16[video_y * (vbd.pitch / 2) + video_x];
+                break;
+            default:
+                dst_row += 3;
+                continue;
+            }
+
+            dst_row[0] = (uint8_t)tig_color_get_blue(color);
+            dst_row[1] = (uint8_t)tig_color_get_green(color);
+            dst_row[2] = (uint8_t)tig_color_get_red(color);
+            dst_row += 3;
+        }
+    }
+
+    tig_video_buffer_unlock(mainmenu_ui_bg_video_buffer);
+    return true;
 }
 
 static void mainmenu_ui_bg_video_resume_if_needed(void)

@@ -13,6 +13,7 @@
 #include "game/hrp.h"
 #include "game/mes.h"
 #include "game/script.h"
+#include "ui/mainmenu_ui.h"
 
 /**
  * The maximum number of enqueued slides.
@@ -31,6 +32,7 @@ static bool slide_ui_get_assets(int slide, char* bmp_path, char* speech_path);
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
 static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y);
+static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handle_t window_handle);
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
 static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom);
 static void slide_ui_refine_background_mask(TigBmp* slide_bmp, uint8_t* mask);
@@ -218,6 +220,7 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
     bool cont = true;
     bool stop;
     bool custom_override;
+    bool live_override;
     tig_timestamp_t start;
     tig_duration_t elapsed;
 
@@ -231,11 +234,17 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
         strcpy(bmp.name, bmp_path);
         custom_override = type == SLIDE_UI_TYPE_CREDITS
             && slide_ui_get_custom_credits_bg_path(custom_bg_path);
+        live_override = type == SLIDE_UI_TYPE_CREDITS
+            && mainmenu_ui_has_bg_video_frame();
 
         // Load image.
         if (tig_bmp_create(&bmp) == TIG_OK) {
             // Put image into window.
-            if (custom_override) {
+            if (live_override) {
+                if (!slide_ui_blit_live_credits_slide(&bmp, window_handle)) {
+                    tig_bmp_copy_to_window(&bmp, &rect, window_handle, &rect);
+                }
+            } else if (custom_override) {
                 if (!slide_ui_blit_custom_credits_slide(&bmp, custom_bg_path, window_handle)) {
                     TigRect dst_rect = rect;
                     tig_bmp_copy_to_window(&bmp, &rect, window_handle, &dst_rect);
@@ -541,6 +550,125 @@ static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int
         }
     }
 
+    return true;
+}
+
+static bool slide_ui_blit_live_credits_slide(TigBmp* slide_bmp, tig_window_handle_t window_handle)
+{
+    TigWindowData window_data;
+    TigBmp video_bg_bmp;
+    TigBmp composite_bmp;
+    TigRect src_rect;
+    TigRect dst_rect;
+    int panel_left;
+    int panel_top;
+    int panel_right;
+    int panel_bottom;
+    int x;
+    int y;
+    uint8_t* background_mask;
+
+    memset(&video_bg_bmp, 0, sizeof(video_bg_bmp));
+    memset(&composite_bmp, 0, sizeof(composite_bmp));
+
+    if (!mainmenu_ui_capture_bg_video_bmp_for_window(window_handle, &video_bg_bmp)) {
+        return false;
+    }
+
+    if (tig_window_data(window_handle, &window_data) != TIG_OK) {
+        tig_bmp_destroy(&video_bg_bmp);
+        return false;
+    }
+
+    panel_left = CREDITS_BG_PANEL_X;
+    panel_top = CREDITS_BG_PANEL_Y;
+    panel_right = CREDITS_BG_PANEL_X + CREDITS_BG_PANEL_WIDTH;
+    panel_bottom = CREDITS_BG_PANEL_Y + CREDITS_BG_PANEL_HEIGHT;
+
+    if (panel_left < 0) {
+        panel_left = 0;
+    }
+    if (panel_top < 0) {
+        panel_top = 0;
+    }
+    if (panel_right > window_data.rect.width) {
+        panel_right = window_data.rect.width;
+    }
+    if (panel_bottom > window_data.rect.height) {
+        panel_bottom = window_data.rect.height;
+    }
+
+    background_mask = MALLOC(window_data.rect.width * window_data.rect.height);
+    if (background_mask == NULL) {
+        tig_bmp_destroy(&video_bg_bmp);
+        return false;
+    }
+
+    if (!slide_ui_build_background_mask_in_rect(slide_bmp,
+            background_mask,
+            panel_left,
+            panel_top,
+            panel_right,
+            panel_bottom)) {
+        FREE(background_mask);
+        tig_bmp_destroy(&video_bg_bmp);
+        return false;
+    }
+
+    slide_ui_refine_background_mask(slide_bmp, background_mask);
+
+    composite_bmp.bpp = 24;
+    composite_bmp.width = window_data.rect.width;
+    composite_bmp.height = window_data.rect.height;
+    composite_bmp.pitch = composite_bmp.width * 3;
+    composite_bmp.pixels = MALLOC(composite_bmp.pitch * composite_bmp.height);
+    if (composite_bmp.pixels == NULL) {
+        FREE(background_mask);
+        tig_bmp_destroy(&video_bg_bmp);
+        return false;
+    }
+
+    for (y = 0; y < composite_bmp.height; y++) {
+        uint8_t* dst = (uint8_t*)composite_bmp.pixels + y * composite_bmp.pitch;
+        for (x = 0; x < composite_bmp.width; x++) {
+            uint32_t slide_color = slide_ui_bmp_color_at(slide_bmp, x, y);
+            uint32_t bg_color = slide_ui_bmp_color_at(&video_bg_bmp, x, y);
+            uint32_t out_color;
+
+            if (x < panel_left || x >= panel_right || y < panel_top || y >= panel_bottom) {
+                out_color = bg_color;
+            } else if (!slide_ui_point_in_credits_panel(x,
+                           y,
+                           panel_left,
+                           panel_top,
+                           panel_right,
+                           panel_bottom,
+                           CREDITS_BG_PANEL_CORNER_RADIUS_X,
+                           CREDITS_BG_PANEL_CORNER_RADIUS_Y)) {
+                out_color = bg_color;
+            } else if (background_mask[y * composite_bmp.width + x] != 0) {
+                out_color = bg_color;
+            } else {
+                out_color = slide_color;
+            }
+
+            dst[0] = (uint8_t)(out_color & 0xFF);
+            dst[1] = (uint8_t)((out_color >> 8) & 0xFF);
+            dst[2] = (uint8_t)((out_color >> 16) & 0xFF);
+            dst += 3;
+        }
+    }
+
+    src_rect.x = 0;
+    src_rect.y = 0;
+    src_rect.width = composite_bmp.width;
+    src_rect.height = composite_bmp.height;
+    dst_rect = src_rect;
+    tig_bmp_copy_to_window(&composite_bmp, &src_rect, window_handle, &dst_rect);
+
+    FREE(background_mask);
+    tig_bmp_destroy(&video_bg_bmp);
+    tig_bmp_destroy(&composite_bmp);
     return true;
 }
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask)

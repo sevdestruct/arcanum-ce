@@ -4,6 +4,7 @@
 #include "game/context.h"
 #include "game/mes.h"
 #include "game/timeevent.h"
+#include "tig/bmp.h"
 #include "ui/types.h"
 
 typedef enum MainMenuFont {
@@ -102,5 +103,7 @@ void sub_549A40(void);
 void sub_549A50(void);
 int sub_549A60(void);
 void sub_549A70(void);
+bool mainmenu_ui_has_bg_video_frame(void);
+bool mainmenu_ui_capture_bg_video_bmp_for_window(tig_window_handle_t window_handle, TigBmp* bmp);
 
 #endif /* ARCANUM_UI_MAINMENU_UI_H_ */
