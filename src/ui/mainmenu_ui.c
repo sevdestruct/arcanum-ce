@@ -4709,7 +4709,7 @@ static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* pat
         /* MM_WINDOW_SAVE_GAME            */ { "art/ui/savegame_bg", NULL },
         /* MM_WINDOW_LAST_SAVE_GAME       */ { "art/ui/savegame_bg", NULL },
         /* MM_WINDOW_INTRO                */ { "art/ui/intro_bg", NULL },
-        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art/ui/newchar_bg", NULL },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art/ui/newchar_bg", "art/ui/mainmenu_bg" },
         /* MM_WINDOW_NEW_CHAR             */ { "art/ui/newchar_bg", NULL },
         /* MM_WINDOW_PREGEN_CHAR          */ { "art/ui/newchar_bg", NULL },
         /* MM_WINDOW_CHAREDIT             */ { "art/ui/charedit_bg", NULL },
