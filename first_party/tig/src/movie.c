@@ -5,6 +5,7 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3_mixer/SDL_mixer.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "tig/color.h"
 #include "tig/core.h"
@@ -14,6 +15,7 @@
 #include "tig/window.h"
 
 static bool tig_movie_do_frame(bool* presented);
+typedef struct SdlMixerSoundData SdlMixerSoundData;
 
 // 0x62B2BC
 static HBINK tig_movie_bink;
@@ -24,8 +26,12 @@ static int tig_movie_screen_height;
 static int tig_movie_display_width;
 static int tig_movie_display_height;
 static tig_timestamp_t tig_movie_next_frame_due_ms;
+static bool tig_movie_audio_master_sync;
+static bool tig_movie_frame_pending;
+static int64_t tig_movie_pending_frame_time_ms;
+static SdlMixerSoundData* tig_movie_active_sound_data;
 
-typedef struct SdlMixerSoundData {
+struct SdlMixerSoundData {
     u8* buffer;
     u32 buffer_size;
     u32 max_queued_bytes;
@@ -35,7 +41,7 @@ typedef struct SdlMixerSoundData {
     bool started;
     float volume;
     MIX_StereoGains pan;
-} SdlMixerSoundData;
+};
 
 static BINKSNDOPEN BINKCALL SdlMixerSystemOpen(void* param);
 static s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u32 flags, HBINK bnk);
@@ -54,6 +60,10 @@ static void unref_mixer(void);
 static tig_timestamp_t tig_movie_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms);
 static bool tig_movie_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due);
 static unsigned int tig_movie_time_until_ms(tig_timestamp_t now, tig_timestamp_t due);
+static bool tig_movie_path_uses_audio_master_sync(const char* path);
+static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms);
+static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ms, int64_t audio_clock_ms);
+static void tig_movie_fill_audio_master_queue(void);
 
 static MIX_Mixer* mixer;
 static int mixer_refcount;
@@ -94,6 +104,9 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
         return TIG_ERR_INVALID_PARAM;
     }
 
+    tig_movie_audio_master_sync = tig_movie_path_uses_audio_master_sync(path);
+    tig_movie_frame_pending = false;
+    tig_movie_pending_frame_time_ms = -1;
     bink_open_flags |= BINKSNDTRACK;
 
     if (sound_track >= 0) {
@@ -132,6 +145,7 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
 
     if (tig_video_buffer_create(&vb_create_info, &tig_movie_video_buffer) != TIG_OK) {
         BinkClose(tig_movie_bink);
+        tig_movie_audio_master_sync = false;
         return TIG_ERR_GENERIC;
     }
 
@@ -196,6 +210,10 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     BinkClose(tig_movie_bink);
     tig_movie_bink = NULL;
     tig_movie_next_frame_due_ms = 0;
+    tig_movie_audio_master_sync = false;
+    tig_movie_frame_pending = false;
+    tig_movie_pending_frame_time_ms = -1;
+    tig_movie_active_sound_data = NULL;
 
     tig_window_invalidate_rect(NULL);
 
@@ -227,6 +245,8 @@ bool tig_movie_do_frame(bool* presented)
     TigVideoBufferData video_buffer_data;
     TigRect src_rect;
     TigRect dst_rect;
+    int64_t audio_clock_ms;
+    int64_t frame_time_ms;
     tig_timestamp_t now_ms;
     unsigned frame_ms;
 
@@ -242,13 +262,19 @@ bool tig_movie_do_frame(bool* presented)
         : 33;
 
     tig_timer_now(&now_ms);
+    if (tig_movie_audio_master_sync) {
+        tig_movie_fill_audio_master_queue();
+    }
+
     if (tig_movie_next_frame_due_ms != 0
         && tig_movie_time_is_in_future(now_ms, tig_movie_next_frame_due_ms)) {
         return true;
     }
 
-    if (!BinkWait(tig_movie_bink)) {
-        BinkDoFrame(tig_movie_bink);
+    if (!tig_movie_frame_pending && !BinkWait(tig_movie_bink)) {
+        if (BinkDoFrame(tig_movie_bink) < 0) {
+            return false;
+        }
 
         if (tig_video_buffer_lock(tig_movie_video_buffer) != TIG_OK) {
             return false;
@@ -278,6 +304,17 @@ bool tig_movie_do_frame(bool* presented)
             3);
 
         tig_video_buffer_unlock(tig_movie_video_buffer);
+        tig_movie_frame_pending = true;
+        tig_movie_pending_frame_time_ms = -1;
+        if (tig_movie_audio_master_sync) {
+            if (bink_compat_get_frame_time_ms(tig_movie_bink, &frame_time_ms)) {
+                tig_movie_pending_frame_time_ms = frame_time_ms;
+            }
+        }
+    }
+
+    if (tig_movie_frame_pending) {
+        int64_t presented_frame_time_ms = tig_movie_pending_frame_time_ms;
 
         // Blit buffer to screen, scaling down if needed to fit within screen
         // dimensions while preserving aspect ratio.
@@ -286,10 +323,27 @@ bool tig_movie_do_frame(bool* presented)
         *presented = true;
 
         BinkNextFrame(tig_movie_bink);
-        tig_movie_next_frame_due_ms = tig_movie_schedule_next_frame_due(
-            now_ms,
-            tig_movie_next_frame_due_ms,
-            frame_ms);
+        tig_movie_frame_pending = false;
+        tig_movie_pending_frame_time_ms = -1;
+        if (tig_movie_audio_master_sync) {
+            unsigned int delay_ms = frame_ms;
+
+            if (presented_frame_time_ms >= 0
+                && tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
+                delay_ms = tig_movie_compute_audio_master_delay_ms(
+                    frame_ms,
+                    presented_frame_time_ms,
+                    audio_clock_ms);
+            }
+
+            tig_movie_next_frame_due_ms = now_ms + delay_ms;
+            tig_movie_fill_audio_master_queue();
+        } else {
+            tig_movie_next_frame_due_ms = tig_movie_schedule_next_frame_due(
+                now_ms,
+                tig_movie_next_frame_due_ms,
+                frame_ms);
+        }
     }
 
     return true;
@@ -327,7 +381,6 @@ s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u3
     src_spec.freq = (int)freq;
     src_spec.format = SDL_AUDIO_S16LE;
     MIX_GetMixerFormat(mixer, &dst_spec);
-
     snddata->buffer_size = freq * (u32)chans * (u32)(bits / 8);
     if (snddata->buffer_size < 65536) {
         snddata->buffer_size = 65536;
@@ -363,6 +416,7 @@ s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u3
     snddata->volume = 1.0f;
     snddata->pan.left = 0.5f;
     snddata->pan.right = 0.5f;
+    tig_movie_active_sound_data = snddata;
     setup_track(snd);
 
     snd->Latency = 64;
@@ -493,6 +547,10 @@ void BINKCALL SdlMixerClose(struct BINKSND* snd)
 {
     SdlMixerSoundData* snddata = (SdlMixerSoundData*)snd->snddata;
 
+    if (tig_movie_active_sound_data == snddata) {
+        tig_movie_active_sound_data = NULL;
+    }
+
     MIX_DestroyTrack(snddata->track);
     SDL_DestroyAudioStream(snddata->stream);
     SDL_free(snddata->buffer);
@@ -570,4 +628,126 @@ unsigned int tig_movie_time_until_ms(tig_timestamp_t now, tig_timestamp_t due)
 {
     int32_t delta = (int32_t)(due - now);
     return delta > 0 ? (unsigned int)delta : 0;
+}
+
+static bool tig_movie_path_uses_audio_master_sync(const char* path)
+{
+    const char* ext;
+
+    if (path == NULL) {
+        return false;
+    }
+
+    ext = strrchr(path, '.');
+    if (ext == NULL) {
+        return false;
+    }
+
+    return SDL_strcasecmp(ext, ".mp4") == 0
+        || SDL_strcasecmp(ext, ".m4v") == 0
+        || SDL_strcasecmp(ext, ".mov") == 0
+        || SDL_strcasecmp(ext, ".webm") == 0;
+}
+
+static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms)
+{
+    SdlMixerSoundData* snddata;
+    Sint64 frames;
+    Sint64 playback_ms;
+
+    if (audio_clock_ms == NULL) {
+        return false;
+    }
+
+    snddata = tig_movie_active_sound_data;
+    if (snddata == NULL || snddata->track == NULL) {
+        return false;
+    }
+
+    frames = MIX_GetTrackPlaybackPosition(snddata->track);
+    if (frames < 0) {
+        return false;
+    }
+
+    playback_ms = MIX_TrackFramesToMS(snddata->track, frames);
+    if (playback_ms < 0) {
+        return false;
+    }
+
+    *audio_clock_ms = (int64_t)playback_ms;
+    return true;
+}
+
+static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ms, int64_t audio_clock_ms)
+{
+    int64_t diff_ms;
+    int64_t delay_ms;
+    int64_t sync_threshold_ms;
+
+    diff_ms = frame_time_ms - audio_clock_ms;
+    delay_ms = frame_ms;
+    sync_threshold_ms = frame_ms;
+
+    if (sync_threshold_ms < 10) {
+        sync_threshold_ms = 10;
+    } else if (sync_threshold_ms > 100) {
+        sync_threshold_ms = 100;
+    }
+
+    /* Follow ffplay's general approach: keep the nominal frame cadence and
+     * apply only bounded corrections when video drifts ahead/behind audio,
+     * instead of driving every frame directly from the raw audio clock. */
+    if (diff_ms > sync_threshold_ms) {
+        delay_ms += diff_ms;
+        if (delay_ms > (int64_t)frame_ms * 2) {
+            delay_ms = (int64_t)frame_ms * 2;
+        }
+    } else if (diff_ms < -sync_threshold_ms) {
+        delay_ms += diff_ms;
+        if (delay_ms < 1) {
+            delay_ms = 1;
+        }
+    }
+
+    if (delay_ms < 1) {
+        delay_ms = 1;
+    }
+
+    return (unsigned int)delay_ms;
+}
+
+static void tig_movie_fill_audio_master_queue(void)
+{
+    SdlMixerSoundData* snddata;
+    int queued_bytes;
+    int target_bytes;
+    int attempts;
+
+    snddata = tig_movie_active_sound_data;
+    if (!tig_movie_audio_master_sync || snddata == NULL || snddata->stream == NULL) {
+        return;
+    }
+
+    queued_bytes = SDL_GetAudioStreamQueued(snddata->stream);
+    if (queued_bytes < 0) {
+        return;
+    }
+
+    target_bytes = (int)(snddata->buffer_size * 2);
+    if (target_bytes > (int)snddata->max_queued_bytes) {
+        target_bytes = (int)snddata->max_queued_bytes;
+    }
+
+    attempts = 0;
+    while (queued_bytes < target_bytes && attempts < 16) {
+        if (!bink_compat_pump_audio(tig_movie_bink)) {
+            break;
+        }
+
+        queued_bytes = SDL_GetAudioStreamQueued(snddata->stream);
+        if (queued_bytes < 0) {
+            break;
+        }
+        attempts++;
+    }
 }
