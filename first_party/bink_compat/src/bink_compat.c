@@ -306,6 +306,7 @@ typedef struct BinkFFmpeg {
     int aud_stream;
     AVFrame* display_frame;
     AVFrame* decode_frame;
+    AVFrame* decode_audio_frame;
     AVPacket* pkt;
     BinkFFmpegQueuedFrame* queued_frames;
     int queued_frame_count;
@@ -428,16 +429,12 @@ static bool bink_ffmpeg_dequeue_video_frame(BinkFFmpeg* bff)
 
 static void bink_ffmpeg_decode_audio_packet(BinkFFmpeg* bff)
 {
-    AVFrame* af;
-
     avcodec_send_packet(bff->aud_ctx, bff->pkt);
     av_packet_unref(bff->pkt);
 
-    af = av_frame_alloc();
-    while (af != NULL && avcodec_receive_frame(bff->aud_ctx, af) == 0) {
-        bink_ffmpeg_feed_audio(bff, af);
+    while (avcodec_receive_frame(bff->aud_ctx, bff->decode_audio_frame) == 0) {
+        bink_ffmpeg_feed_audio(bff, bff->decode_audio_frame);
     }
-    av_frame_free(&af);
 }
 
 static bool bink_ffmpeg_drain_video_frames(BinkFFmpeg* bff)
@@ -523,13 +520,11 @@ static bool bink_ffmpeg_pump(BinkFFmpeg* bff, int packet_budget, bool stop_after
             avcodec_send_packet(bff->vid_ctx, NULL);
             progressed |= bink_ffmpeg_drain_video_frames(bff);
             if (bff->aud_ctx != NULL) {
-                AVFrame* af = av_frame_alloc();
                 avcodec_send_packet(bff->aud_ctx, NULL);
-                while (af != NULL && avcodec_receive_frame(bff->aud_ctx, af) == 0) {
-                    bink_ffmpeg_feed_audio(bff, af);
+                while (avcodec_receive_frame(bff->aud_ctx, bff->decode_audio_frame) == 0) {
+                    bink_ffmpeg_feed_audio(bff, bff->decode_audio_frame);
                     progressed = true;
                 }
-                av_frame_free(&af);
             }
             break;
         }
@@ -770,8 +765,9 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
 
     bff->display_frame = av_frame_alloc();
     bff->decode_frame = av_frame_alloc();
+    bff->decode_audio_frame = av_frame_alloc();
     bff->pkt = av_packet_alloc();
-    if (!bff->display_frame || !bff->decode_frame || !bff->pkt) {
+    if (!bff->display_frame || !bff->decode_frame || !bff->decode_audio_frame || !bff->pkt) {
         BinkClose((HBINK)bff);
         return NULL;
     }
@@ -855,6 +851,7 @@ void BINKCALL BinkClose(HBINK bnk)
     swr_free(&bff->swr);
     av_frame_free(&bff->display_frame);
     av_frame_free(&bff->decode_frame);
+    av_frame_free(&bff->decode_audio_frame);
     av_packet_free(&bff->pkt);
     bink_ffmpeg_clear_queued_frames(bff);
     av_freep(&bff->queued_frames);
