@@ -4,11 +4,13 @@
 
 #include <SDL3/SDL_timer.h>
 #include <SDL3_mixer/SDL_mixer.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "tig/color.h"
 #include "tig/core.h"
+#include "tig/debug.h"
 #include "tig/kb.h"
 #include "tig/message.h"
 #include "tig/video.h"
@@ -16,20 +18,7 @@
 
 static bool tig_movie_do_frame(bool* presented);
 typedef struct SdlMixerSoundData SdlMixerSoundData;
-
-// 0x62B2BC
-static HBINK tig_movie_bink;
-
-static TigVideoBuffer* tig_movie_video_buffer;
-static int tig_movie_screen_width;
-static int tig_movie_screen_height;
-static int tig_movie_display_width;
-static int tig_movie_display_height;
-static tig_timestamp_t tig_movie_next_frame_due_ms;
-static bool tig_movie_audio_master_sync;
-static bool tig_movie_frame_pending;
-static int64_t tig_movie_pending_frame_time_ms;
-static SdlMixerSoundData* tig_movie_active_sound_data;
+typedef struct TigMovieProfileStats TigMovieProfileStats;
 
 struct SdlMixerSoundData {
     u8* buffer;
@@ -42,6 +31,44 @@ struct SdlMixerSoundData {
     float volume;
     MIX_StereoGains pan;
 };
+
+struct TigMovieProfileStats {
+    bool enabled;
+    Uint64 window_start_ns;
+    Uint64 last_due_ns;
+    Uint64 do_frame_total_ns;
+    Uint64 do_frame_max_ns;
+    Uint64 copy_total_ns;
+    Uint64 copy_max_ns;
+    Uint64 blit_total_ns;
+    Uint64 blit_max_ns;
+    Uint64 fill_audio_total_ns;
+    Uint64 fill_audio_max_ns;
+    Uint64 presented_frames;
+    Uint64 do_frame_calls;
+    Uint64 copy_calls;
+    Uint64 blit_calls;
+    Uint64 fill_audio_calls;
+    Uint64 dropped_frames;
+    Uint64 late_frames;
+    int max_queued_audio_bytes;
+    int max_queued_video_frames;
+};
+
+// 0x62B2BC
+static HBINK tig_movie_bink;
+
+static TigVideoBuffer* tig_movie_video_buffer;
+static int tig_movie_screen_width;
+static int tig_movie_screen_height;
+static int tig_movie_display_width;
+static int tig_movie_display_height;
+static tig_timestamp_t tig_movie_next_frame_due_ms;
+static bool tig_movie_audio_master_sync;
+static bool tig_movie_frame_pending;
+static int64_t tig_movie_pending_frame_time_ns;
+static SdlMixerSoundData* tig_movie_active_sound_data;
+static TigMovieProfileStats tig_movie_profile_stats;
 
 static BINKSNDOPEN BINKCALL SdlMixerSystemOpen(void* param);
 static s32 BINKCALL SdlMixerOpen(struct BINKSND* snd, u32 freq, s32 bits, s32 chans, u32 flags, HBINK bnk);
@@ -62,8 +89,19 @@ static bool tig_movie_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due
 static unsigned int tig_movie_time_until_ms(tig_timestamp_t now, tig_timestamp_t due);
 static bool tig_movie_path_uses_audio_master_sync(const char* path);
 static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms);
-static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ms, int64_t audio_clock_ms);
+static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ns, int64_t audio_clock_ms);
 static void tig_movie_fill_audio_master_queue(void);
+static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns);
+static void tig_movie_profile_init(bool enabled);
+static bool tig_movie_profile_enabled(void);
+static void tig_movie_profile_record(Uint64* total, Uint64* max, Uint64 duration_ns, Uint64* calls);
+static void tig_movie_profile_note_presented(void);
+static void tig_movie_profile_note_drop(void);
+static void tig_movie_profile_note_late(void);
+static void tig_movie_profile_note_queue_depths(void);
+static void tig_movie_profile_note_due(void);
+static void tig_movie_profile_maybe_log(void);
+static bool tig_movie_getenv_bool(const char* name, bool default_value);
 
 static MIX_Mixer* mixer;
 static int mixer_refcount;
@@ -106,7 +144,9 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
 
     tig_movie_audio_master_sync = tig_movie_path_uses_audio_master_sync(path);
     tig_movie_frame_pending = false;
-    tig_movie_pending_frame_time_ms = -1;
+    tig_movie_pending_frame_time_ns = -1;
+    tig_movie_profile_init(tig_movie_audio_master_sync
+        && tig_movie_getenv_bool("ARCANUM_FFMPEG_PROFILE", false));
     bink_open_flags |= BINKSNDTRACK;
 
     if (sound_track >= 0) {
@@ -120,7 +160,6 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     }
 
     tig_movie_next_frame_due_ms = 0;
-
     /* Compute display size: scale down to fit screen, never upscale. */
     {
         int vid_w = (int)tig_movie_bink->Width;
@@ -212,8 +251,9 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     tig_movie_next_frame_due_ms = 0;
     tig_movie_audio_master_sync = false;
     tig_movie_frame_pending = false;
-    tig_movie_pending_frame_time_ms = -1;
+    tig_movie_pending_frame_time_ns = -1;
     tig_movie_active_sound_data = NULL;
+    tig_movie_profile_init(false);
 
     tig_window_invalidate_rect(NULL);
 
@@ -245,9 +285,10 @@ bool tig_movie_do_frame(bool* presented)
     TigVideoBufferData video_buffer_data;
     TigRect src_rect;
     TigRect dst_rect;
-    int64_t audio_clock_ms;
-    int64_t frame_time_ms;
+    int64_t frame_time_ns;
     tig_timestamp_t now_ms;
+    Uint64 start_ns;
+    Uint64 end_ns;
     unsigned frame_ms;
 
     *presented = false;
@@ -262,19 +303,26 @@ bool tig_movie_do_frame(bool* presented)
         : 33;
 
     tig_timer_now(&now_ms);
-    if (tig_movie_audio_master_sync) {
-        tig_movie_fill_audio_master_queue();
-    }
-
     if (tig_movie_next_frame_due_ms != 0
         && tig_movie_time_is_in_future(now_ms, tig_movie_next_frame_due_ms)) {
         return true;
     }
 
+    if (tig_movie_audio_master_sync) {
+        tig_movie_fill_audio_master_queue();
+    }
+
     if (!tig_movie_frame_pending && !BinkWait(tig_movie_bink)) {
+        start_ns = SDL_GetTicksNS();
         if (BinkDoFrame(tig_movie_bink) < 0) {
             return false;
         }
+        end_ns = SDL_GetTicksNS();
+        tig_movie_profile_record(
+            &(tig_movie_profile_stats.do_frame_total_ns),
+            &(tig_movie_profile_stats.do_frame_max_ns),
+            end_ns - start_ns,
+            &(tig_movie_profile_stats.do_frame_calls));
 
         if (tig_video_buffer_lock(tig_movie_video_buffer) != TIG_OK) {
             return false;
@@ -295,6 +343,7 @@ bool tig_movie_do_frame(bool* presented)
         dst_rect.height = tig_movie_display_height;
 
         // Copy movie pixels to the video buffer.
+        start_ns = SDL_GetTicksNS();
         BinkCopyToBuffer(tig_movie_bink,
             video_buffer_data.surface_data.pixels,
             video_buffer_data.pitch,
@@ -302,41 +351,122 @@ bool tig_movie_do_frame(bool* presented)
             0,
             0,
             3);
+        end_ns = SDL_GetTicksNS();
+        tig_movie_profile_record(
+            &(tig_movie_profile_stats.copy_total_ns),
+            &(tig_movie_profile_stats.copy_max_ns),
+            end_ns - start_ns,
+            &(tig_movie_profile_stats.copy_calls));
 
         tig_video_buffer_unlock(tig_movie_video_buffer);
         tig_movie_frame_pending = true;
-        tig_movie_pending_frame_time_ms = -1;
+        tig_movie_pending_frame_time_ns = -1;
         if (tig_movie_audio_master_sync) {
-            if (bink_compat_get_frame_time_ms(tig_movie_bink, &frame_time_ms)) {
-                tig_movie_pending_frame_time_ms = frame_time_ms;
+            if (bink_compat_get_frame_time_ns(tig_movie_bink, &frame_time_ns)) {
+                tig_movie_pending_frame_time_ns = frame_time_ns;
             }
         }
     }
 
+    while (tig_movie_frame_pending
+        && tig_movie_audio_master_sync
+        && tig_movie_should_drop_pending_frame(frame_ms, tig_movie_pending_frame_time_ns)) {
+        tig_movie_profile_note_drop();
+        BinkNextFrame(tig_movie_bink);
+        tig_movie_frame_pending = false;
+        tig_movie_pending_frame_time_ns = -1;
+
+        start_ns = SDL_GetTicksNS();
+        if (BinkDoFrame(tig_movie_bink) < 0) {
+            return false;
+        }
+        end_ns = SDL_GetTicksNS();
+        tig_movie_profile_record(
+            &(tig_movie_profile_stats.do_frame_total_ns),
+            &(tig_movie_profile_stats.do_frame_max_ns),
+            end_ns - start_ns,
+            &(tig_movie_profile_stats.do_frame_calls));
+
+        if (tig_video_buffer_lock(tig_movie_video_buffer) != TIG_OK) {
+            return false;
+        }
+
+        if (tig_video_buffer_data(tig_movie_video_buffer, &video_buffer_data) != TIG_OK) {
+            return false;
+        }
+
+        src_rect.x = 0;
+        src_rect.y = 0;
+        src_rect.width = video_buffer_data.width;
+        src_rect.height = video_buffer_data.height;
+
+        dst_rect.x = (tig_movie_screen_width - tig_movie_display_width) / 2;
+        dst_rect.y = (tig_movie_screen_height - tig_movie_display_height) / 2;
+        dst_rect.width = tig_movie_display_width;
+        dst_rect.height = tig_movie_display_height;
+
+        start_ns = SDL_GetTicksNS();
+        BinkCopyToBuffer(tig_movie_bink,
+            video_buffer_data.surface_data.pixels,
+            video_buffer_data.pitch,
+            video_buffer_data.height,
+            0,
+            0,
+            3);
+        end_ns = SDL_GetTicksNS();
+        tig_movie_profile_record(
+            &(tig_movie_profile_stats.copy_total_ns),
+            &(tig_movie_profile_stats.copy_max_ns),
+            end_ns - start_ns,
+            &(tig_movie_profile_stats.copy_calls));
+
+        tig_video_buffer_unlock(tig_movie_video_buffer);
+        tig_movie_frame_pending = true;
+        tig_movie_pending_frame_time_ns = -1;
+        if (bink_compat_get_frame_time_ns(tig_movie_bink, &frame_time_ns)) {
+            tig_movie_pending_frame_time_ns = frame_time_ns;
+        }
+    }
+
     if (tig_movie_frame_pending) {
-        int64_t presented_frame_time_ms = tig_movie_pending_frame_time_ms;
+        int64_t presented_frame_time_ns = tig_movie_pending_frame_time_ns;
 
         // Blit buffer to screen, scaling down if needed to fit within screen
         // dimensions while preserving aspect ratio.
+        start_ns = SDL_GetTicksNS();
         tig_video_blit_scaled(tig_movie_video_buffer, &src_rect, &dst_rect);
+        end_ns = SDL_GetTicksNS();
+        tig_movie_profile_record(
+            &(tig_movie_profile_stats.blit_total_ns),
+            &(tig_movie_profile_stats.blit_max_ns),
+            end_ns - start_ns,
+            &(tig_movie_profile_stats.blit_calls));
 
         *presented = true;
+        tig_movie_profile_note_presented();
 
         BinkNextFrame(tig_movie_bink);
         tig_movie_frame_pending = false;
-        tig_movie_pending_frame_time_ms = -1;
+        tig_movie_pending_frame_time_ns = -1;
         if (tig_movie_audio_master_sync) {
             unsigned int delay_ms = frame_ms;
 
-            if (presented_frame_time_ms >= 0
-                && tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
-                delay_ms = tig_movie_compute_audio_master_delay_ms(
-                    frame_ms,
-                    presented_frame_time_ms,
-                    audio_clock_ms);
+            if (presented_frame_time_ns >= 0) {
+                int64_t audio_clock_ms;
+
+                if (tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
+                    delay_ms = tig_movie_compute_audio_master_delay_ms(
+                        frame_ms,
+                        presented_frame_time_ns,
+                        audio_clock_ms);
+                }
             }
 
-            tig_movie_next_frame_due_ms = now_ms + delay_ms;
+            tig_movie_next_frame_due_ms = tig_movie_schedule_next_frame_due(
+                now_ms,
+                tig_movie_next_frame_due_ms,
+                delay_ms);
+            tig_movie_profile_note_due();
             tig_movie_fill_audio_master_queue();
         } else {
             tig_movie_next_frame_due_ms = tig_movie_schedule_next_frame_due(
@@ -345,6 +475,8 @@ bool tig_movie_do_frame(bool* presented)
                 frame_ms);
         }
     }
+
+    tig_movie_profile_maybe_log();
 
     return true;
 }
@@ -649,11 +781,36 @@ static bool tig_movie_path_uses_audio_master_sync(const char* path)
         || SDL_strcasecmp(ext, ".webm") == 0;
 }
 
+static bool tig_movie_getenv_bool(const char* name, bool default_value)
+{
+    const char* value;
+
+    value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return default_value;
+    }
+
+    if (SDL_strcasecmp(value, "0") == 0
+        || SDL_strcasecmp(value, "false") == 0
+        || SDL_strcasecmp(value, "off") == 0
+        || SDL_strcasecmp(value, "no") == 0) {
+        return false;
+    }
+
+    if (SDL_strcasecmp(value, "1") == 0
+        || SDL_strcasecmp(value, "true") == 0
+        || SDL_strcasecmp(value, "on") == 0
+        || SDL_strcasecmp(value, "yes") == 0) {
+        return true;
+    }
+
+    return default_value;
+}
+
 static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms)
 {
     SdlMixerSoundData* snddata;
     Sint64 frames;
-    Sint64 playback_ms;
 
     if (audio_clock_ms == NULL) {
         return false;
@@ -669,44 +826,40 @@ static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms)
         return false;
     }
 
-    playback_ms = MIX_TrackFramesToMS(snddata->track, frames);
-    if (playback_ms < 0) {
-        return false;
-    }
-
-    *audio_clock_ms = (int64_t)playback_ms;
-    return true;
+    *audio_clock_ms = (int64_t)MIX_TrackFramesToMS(snddata->track, frames);
+    return *audio_clock_ms >= 0;
 }
 
-static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ms, int64_t audio_clock_ms)
+static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ns, int64_t audio_clock_ms)
 {
     int64_t diff_ms;
     int64_t delay_ms;
-    int64_t sync_threshold_ms;
+    int64_t drift_limit_ms;
 
-    diff_ms = frame_time_ms - audio_clock_ms;
-    delay_ms = frame_ms;
-    sync_threshold_ms = frame_ms;
+    diff_ms = (frame_time_ns / (int64_t)SDL_NS_PER_MS) - audio_clock_ms;
+    delay_ms = (int64_t)frame_ms;
 
-    if (sync_threshold_ms < 10) {
-        sync_threshold_ms = 10;
-    } else if (sync_threshold_ms > 100) {
-        sync_threshold_ms = 100;
+    /* To avoid jarring visual stutters when the video drifts from the audio clock,
+     * we apply smooth, constant micro-corrections. We limit the maximum per-frame
+     * time adjustment to a fraction of the nominal frame time.
+     */
+    drift_limit_ms = (int64_t)frame_ms / 4;
+    if (drift_limit_ms < 2) {
+        drift_limit_ms = 2;
     }
 
-    /* Follow ffplay's general approach: keep the nominal frame cadence and
-     * apply only bounded corrections when video drifts ahead/behind audio,
-     * instead of driving every frame directly from the raw audio clock. */
-    if (diff_ms > sync_threshold_ms) {
-        delay_ms += diff_ms;
-        if (delay_ms > (int64_t)frame_ms * 2) {
-            delay_ms = (int64_t)frame_ms * 2;
+    if (diff_ms > 0) {
+        int64_t adjustment = diff_ms;
+        if (adjustment > drift_limit_ms) {
+            adjustment = drift_limit_ms;
         }
-    } else if (diff_ms < -sync_threshold_ms) {
-        delay_ms += diff_ms;
-        if (delay_ms < 1) {
-            delay_ms = 1;
+        delay_ms += adjustment;
+    } else if (diff_ms < 0) {
+        int64_t adjustment = -diff_ms;
+        if (adjustment > drift_limit_ms) {
+            adjustment = drift_limit_ms;
         }
+        delay_ms -= adjustment;
     }
 
     if (delay_ms < 1) {
@@ -716,18 +869,166 @@ static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_m
     return (unsigned int)delay_ms;
 }
 
+static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns)
+{
+    int64_t audio_clock_ms;
+    int64_t frame_time_ms;
+
+    if (frame_time_ns < 0) {
+        return false;
+    }
+
+    if (!tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
+        return false;
+    }
+
+    frame_time_ms = frame_time_ns / (int64_t)SDL_NS_PER_MS;
+
+    /* We give the smooth-catch-up logic a chance to reel in mild drifts.
+     * We only hard-drop the frame if we are monstrously behind (e.g. > 3 frames)
+     * so that we don't introduce jarring visual stutters on a mild audio clock jitter.
+     */
+    if (audio_clock_ms - frame_time_ms > (int64_t)frame_ms * 3) {
+        tig_movie_profile_note_late();
+        return true;
+    }
+
+    return false;
+}
+
+static void tig_movie_profile_init(bool enabled)
+{
+    memset(&tig_movie_profile_stats, 0, sizeof(tig_movie_profile_stats));
+    tig_movie_profile_stats.enabled = enabled;
+    tig_movie_profile_stats.window_start_ns = SDL_GetTicksNS();
+}
+
+static bool tig_movie_profile_enabled(void)
+{
+    return tig_movie_profile_stats.enabled;
+}
+
+static void tig_movie_profile_record(Uint64* total, Uint64* max, Uint64 duration_ns, Uint64* calls)
+{
+    if (!tig_movie_profile_enabled()) {
+        return;
+    }
+
+    *total += duration_ns;
+    if (duration_ns > *max) {
+        *max = duration_ns;
+    }
+    (*calls)++;
+}
+
+static void tig_movie_profile_note_presented(void)
+{
+    if (tig_movie_profile_enabled()) {
+        tig_movie_profile_stats.presented_frames++;
+    }
+}
+
+static void tig_movie_profile_note_drop(void)
+{
+    if (tig_movie_profile_enabled()) {
+        tig_movie_profile_stats.dropped_frames++;
+    }
+}
+
+static void tig_movie_profile_note_late(void)
+{
+    if (tig_movie_profile_enabled()) {
+        tig_movie_profile_stats.late_frames++;
+    }
+}
+
+static void tig_movie_profile_note_queue_depths(void)
+{
+    int queued_video_frames;
+
+    if (!tig_movie_profile_enabled()) {
+        return;
+    }
+
+    queued_video_frames = bink_compat_get_queued_video_frames(tig_movie_bink);
+    if (queued_video_frames > tig_movie_profile_stats.max_queued_video_frames) {
+        tig_movie_profile_stats.max_queued_video_frames = queued_video_frames;
+    }
+}
+
+static void tig_movie_profile_note_due(void)
+{
+    if (tig_movie_profile_enabled()) {
+        tig_movie_profile_stats.last_due_ns = SDL_GetTicksNS();
+    }
+}
+
+static void tig_movie_profile_maybe_log(void)
+{
+    Uint64 now_ns;
+    Uint64 window_ns;
+    double do_frame_avg_ms;
+    double copy_avg_ms;
+    double blit_avg_ms;
+    double fill_audio_avg_ms;
+
+    if (!tig_movie_profile_enabled()) {
+        return;
+    }
+
+    now_ns = SDL_GetTicksNS();
+    window_ns = now_ns - tig_movie_profile_stats.window_start_ns;
+    if (window_ns < SDL_NS_PER_SECOND) {
+        return;
+    }
+
+    do_frame_avg_ms = tig_movie_profile_stats.do_frame_calls > 0
+        ? ((double)tig_movie_profile_stats.do_frame_total_ns / (double)tig_movie_profile_stats.do_frame_calls) / 1000000.0
+        : 0.0;
+    copy_avg_ms = tig_movie_profile_stats.copy_calls > 0
+        ? ((double)tig_movie_profile_stats.copy_total_ns / (double)tig_movie_profile_stats.copy_calls) / 1000000.0
+        : 0.0;
+    blit_avg_ms = tig_movie_profile_stats.blit_calls > 0
+        ? ((double)tig_movie_profile_stats.blit_total_ns / (double)tig_movie_profile_stats.blit_calls) / 1000000.0
+        : 0.0;
+    fill_audio_avg_ms = tig_movie_profile_stats.fill_audio_calls > 0
+        ? ((double)tig_movie_profile_stats.fill_audio_total_ns / (double)tig_movie_profile_stats.fill_audio_calls) / 1000000.0
+        : 0.0;
+
+    tig_debug_printf(
+        "tig_movie_profile: frames=%llu drops=%llu late=%llu qaudio_max=%d qvideo_max=%d do=%.3f/%.3f copy=%.3f/%.3f blit=%.3f/%.3f audio=%.3f/%.3f\n",
+        (unsigned long long)tig_movie_profile_stats.presented_frames,
+        (unsigned long long)tig_movie_profile_stats.dropped_frames,
+        (unsigned long long)tig_movie_profile_stats.late_frames,
+        tig_movie_profile_stats.max_queued_audio_bytes,
+        tig_movie_profile_stats.max_queued_video_frames,
+        do_frame_avg_ms,
+        (double)tig_movie_profile_stats.do_frame_max_ns / 1000000.0,
+        copy_avg_ms,
+        (double)tig_movie_profile_stats.copy_max_ns / 1000000.0,
+        blit_avg_ms,
+        (double)tig_movie_profile_stats.blit_max_ns / 1000000.0,
+        fill_audio_avg_ms,
+        (double)tig_movie_profile_stats.fill_audio_max_ns / 1000000.0);
+
+    tig_movie_profile_init(true);
+}
+
 static void tig_movie_fill_audio_master_queue(void)
 {
     SdlMixerSoundData* snddata;
     int queued_bytes;
     int target_bytes;
     int attempts;
+    Uint64 start_ns;
+    Uint64 end_ns;
 
     snddata = tig_movie_active_sound_data;
     if (!tig_movie_audio_master_sync || snddata == NULL || snddata->stream == NULL) {
         return;
     }
 
+    start_ns = SDL_GetTicksNS();
     queued_bytes = SDL_GetAudioStreamQueued(snddata->stream);
     if (queued_bytes < 0) {
         return;
@@ -750,4 +1051,15 @@ static void tig_movie_fill_audio_master_queue(void)
         }
         attempts++;
     }
+
+    if (queued_bytes > tig_movie_profile_stats.max_queued_audio_bytes) {
+        tig_movie_profile_stats.max_queued_audio_bytes = queued_bytes;
+    }
+    tig_movie_profile_note_queue_depths();
+    end_ns = SDL_GetTicksNS();
+    tig_movie_profile_record(
+        &(tig_movie_profile_stats.fill_audio_total_ns),
+        &(tig_movie_profile_stats.fill_audio_max_ns),
+        end_ns - start_ns,
+        &(tig_movie_profile_stats.fill_audio_calls));
 }
