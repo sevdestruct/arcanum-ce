@@ -73,9 +73,9 @@ void BINKCALL BinkSetSoundTrack(unsigned track);
 int BINKCALL BinkWait(HBINK bnk);
 void BINKCALL BinkRewind(HBINK bnk);
 
-bool bink_compat_get_frame_time_ms(HBINK bnk, int64_t* frame_time_ms);
-bool bink_compat_get_audio_buffered_end_ms(HBINK bnk, int64_t* audio_time_ms);
+bool bink_compat_get_frame_time_ns(HBINK bnk, int64_t* frame_time_ns);
 bool bink_compat_pump_audio(HBINK bnk);
+int bink_compat_get_queued_video_frames(HBINK bnk);
 
 bool bink_compat_init(void);
 void bink_compat_exit(void);
