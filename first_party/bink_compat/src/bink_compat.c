@@ -67,6 +67,7 @@ typedef void (*PFN_sws_freeContext)(struct SwsContext* sws_context);
 typedef void (*PFN_swr_free)(struct SwrContext** s);
 typedef AVFrame* (*PFN_av_frame_alloc)(void);
 typedef void (*PFN_av_frame_free)(AVFrame** frame);
+typedef int (*PFN_av_frame_ref)(AVFrame* dst, const AVFrame* src);
 typedef AVPacket* (*PFN_av_packet_alloc)(void);
 typedef void (*PFN_av_packet_free)(AVPacket** pkt);
 typedef void (*PFN_avcodec_free_context)(AVCodecContext** avctx);
@@ -98,6 +99,7 @@ static PFN_sws_freeContext p_sws_freeContext;
 static PFN_swr_free p_swr_free;
 static PFN_av_frame_alloc p_av_frame_alloc;
 static PFN_av_frame_free p_av_frame_free;
+static PFN_av_frame_ref p_av_frame_ref;
 static PFN_av_packet_alloc p_av_packet_alloc;
 static PFN_av_packet_free p_av_packet_free;
 static PFN_avcodec_free_context p_avcodec_free_context;
@@ -140,6 +142,7 @@ static void bink_ffmpeg_unload(void)
     p_swr_free = NULL;
     p_av_frame_alloc = NULL;
     p_av_frame_free = NULL;
+    p_av_frame_ref = NULL;
     p_av_packet_alloc = NULL;
     p_av_packet_free = NULL;
     p_avcodec_free_context = NULL;
@@ -220,6 +223,7 @@ static bool bink_ffmpeg_load(void)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_swresample_module, swr_free)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avutil_module, av_frame_alloc)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avutil_module, av_frame_free)
+        || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avutil_module, av_frame_ref)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avcodec_module, av_packet_alloc)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avcodec_module, av_packet_free)
         || !BINK_FFMPEG_LOAD_PROC(g_ffmpeg_avcodec_module, avcodec_free_context)
@@ -257,6 +261,7 @@ static bool bink_ffmpeg_load(void)
 #define swr_free p_swr_free
 #define av_frame_alloc p_av_frame_alloc
 #define av_frame_free p_av_frame_free
+#define av_frame_ref p_av_frame_ref
 #define av_packet_alloc p_av_packet_alloc
 #define av_packet_free p_av_packet_free
 #define avcodec_free_context p_avcodec_free_context
@@ -286,6 +291,11 @@ static BINKSNDSYSOPEN g_snd_sys_open;
 static void* g_snd_sys_param;
 static bool g_ffmpeg_backend_available = true;
 
+typedef struct BinkFFmpegQueuedFrame {
+    AVFrame* frame;
+    int64_t time_ms;
+} BinkFFmpegQueuedFrame;
+
 /* Internal per-instance state wrapping the public BINK header. */
 typedef struct BinkFFmpeg {
     struct BINK pub; /* must be first — HBINK aliases this */
@@ -294,37 +304,322 @@ typedef struct BinkFFmpeg {
     AVCodecContext* aud_ctx;
     int vid_stream;
     int aud_stream;
-    AVFrame* frame;
+    AVFrame* display_frame;
+    AVFrame* decode_frame;
     AVPacket* pkt;
+    BinkFFmpegQueuedFrame* queued_frames;
+    int queued_frame_count;
+    int queued_frame_capacity;
     struct SwsContext* sws;
     struct SwrContext* swr;
     int64_t vid_start_pts; /* stream PTS of first frame, for seeking */
     uint8_t* audio_scratch;
     int audio_scratch_size;
+    uint8_t* pending_audio;
+    int pending_audio_size;
+    int pending_audio_capacity;
+    int64_t current_frame_time_ms;
+    int64_t audio_buffered_end_ms;
+    bool demux_eof;
     /* Embedded BINKSND filled by the caller's sound system open function. */
     BINKSND snd_buf;
     bool has_snd;
+    bool precise_timing;
 } BinkFFmpeg;
+
+static int64_t bink_ffmpeg_stream_time_ms(AVStream* stream, int64_t pts)
+{
+    int64_t start_pts;
+    double seconds;
+
+    if (pts == AV_NOPTS_VALUE) {
+        return -1;
+    }
+
+    start_pts = stream->start_time != AV_NOPTS_VALUE ? stream->start_time : 0;
+    if (pts < start_pts) {
+        pts = start_pts;
+    }
+
+    seconds = (double)(pts - start_pts) * av_q2d(stream->time_base);
+    if (seconds < 0.0) {
+        seconds = 0.0;
+    }
+
+    return (int64_t)(seconds * 1000.0 + 0.5);
+}
+
+static void bink_ffmpeg_note_video_frame(BinkFFmpeg* bff)
+{
+    int64_t pts;
+
+    pts = bff->display_frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = bff->display_frame->pts;
+    }
+
+    bff->current_frame_time_ms = bink_ffmpeg_stream_time_ms(
+        bff->fmt_ctx->streams[bff->vid_stream],
+        pts);
+}
+
+static void bink_ffmpeg_note_audio_frame(BinkFFmpeg* bff, AVFrame* audio_frame)
+{
+    int64_t pts;
+    int64_t end_ms;
+
+    pts = audio_frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = audio_frame->pts;
+    }
+    if (pts == AV_NOPTS_VALUE) {
+        return;
+    }
+
+    end_ms = bink_ffmpeg_stream_time_ms(
+        bff->fmt_ctx->streams[bff->aud_stream],
+        pts + audio_frame->nb_samples);
+    if (end_ms > bff->audio_buffered_end_ms) {
+        bff->audio_buffered_end_ms = end_ms;
+    }
+}
+
+static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame);
+static bool bink_ffmpeg_flush_pending_audio(BinkFFmpeg* bff);
+
+static void bink_ffmpeg_clear_queued_frames(BinkFFmpeg* bff)
+{
+    int index;
+
+    for (index = 0; index < bff->queued_frame_count; index++) {
+        av_frame_free(&bff->queued_frames[index].frame);
+    }
+
+    bff->queued_frame_count = 0;
+}
+
+static bool bink_ffmpeg_enqueue_video_frame(BinkFFmpeg* bff, AVFrame* frame)
+{
+    BinkFFmpegQueuedFrame* new_items;
+    AVFrame* copy;
+    int new_capacity;
+
+    if (bff->queued_frame_count == bff->queued_frame_capacity) {
+        new_capacity = bff->queued_frame_capacity == 0
+            ? 8
+            : bff->queued_frame_capacity * 2;
+        new_items = av_realloc(
+            bff->queued_frames,
+            (size_t)new_capacity * sizeof(*new_items));
+        if (new_items == NULL) {
+            return false;
+        }
+
+        bff->queued_frames = new_items;
+        bff->queued_frame_capacity = new_capacity;
+    }
+
+    copy = av_frame_alloc();
+    if (copy == NULL) {
+        return false;
+    }
+
+    if (av_frame_ref(copy, frame) < 0) {
+        av_frame_free(&copy);
+        return false;
+    }
+
+    bff->queued_frames[bff->queued_frame_count].frame = copy;
+    bff->queued_frames[bff->queued_frame_count].time_ms = bink_ffmpeg_stream_time_ms(
+        bff->fmt_ctx->streams[bff->vid_stream],
+        copy->best_effort_timestamp != AV_NOPTS_VALUE ? copy->best_effort_timestamp : copy->pts);
+    bff->queued_frame_count++;
+    return true;
+}
+
+static bool bink_ffmpeg_dequeue_video_frame(BinkFFmpeg* bff)
+{
+    BinkFFmpegQueuedFrame queued;
+
+    if (bff->queued_frame_count == 0) {
+        return false;
+    }
+
+    queued = bff->queued_frames[0];
+    if (bff->queued_frame_count > 1) {
+        memmove(
+            bff->queued_frames,
+            bff->queued_frames + 1,
+            (size_t)(bff->queued_frame_count - 1) * sizeof(*bff->queued_frames));
+    }
+    bff->queued_frame_count--;
+
+    av_frame_free(&bff->display_frame);
+    bff->display_frame = queued.frame;
+    bff->current_frame_time_ms = queued.time_ms;
+    return true;
+}
+
+static void bink_ffmpeg_decode_audio_packet(BinkFFmpeg* bff)
+{
+    AVFrame* af;
+
+    avcodec_send_packet(bff->aud_ctx, bff->pkt);
+    av_packet_unref(bff->pkt);
+
+    af = av_frame_alloc();
+    while (af != NULL && avcodec_receive_frame(bff->aud_ctx, af) == 0) {
+        bink_ffmpeg_feed_audio(bff, af);
+    }
+    av_frame_free(&af);
+}
+
+static bool bink_ffmpeg_drain_video_frames(BinkFFmpeg* bff)
+{
+    bool queued_video;
+
+    queued_video = false;
+
+    while (avcodec_receive_frame(bff->vid_ctx, bff->decode_frame) == 0) {
+        if (!bink_ffmpeg_enqueue_video_frame(bff, bff->decode_frame)) {
+            break;
+        }
+        queued_video = true;
+    }
+
+    return queued_video;
+}
+
+static bool bink_ffmpeg_flush_pending_audio(BinkFFmpeg* bff)
+{
+    BINKSND* snd;
+    bool wrote_audio;
+
+    snd = &bff->snd_buf;
+    wrote_audio = false;
+
+    while (bff->pending_audio_size > 0) {
+        u8* addr;
+        u32 len;
+        int chunk_bytes;
+
+        if (!bff->has_snd || !snd->Ready || !snd->Lock || !snd->Unlock) {
+            break;
+        }
+
+        if (!snd->Ready(snd)) {
+            break;
+        }
+
+        if (!snd->Lock(snd, &addr, &len)) {
+            break;
+        }
+
+        chunk_bytes = bff->pending_audio_size;
+        if ((u32)chunk_bytes > len) {
+            chunk_bytes = (int)len;
+        }
+
+        memcpy(addr, bff->pending_audio, (size_t)chunk_bytes);
+        snd->Unlock(snd, (u32)chunk_bytes);
+        wrote_audio = true;
+
+        bff->pending_audio_size -= chunk_bytes;
+        if (bff->pending_audio_size > 0) {
+            memmove(
+                bff->pending_audio,
+                bff->pending_audio + chunk_bytes,
+                (size_t)bff->pending_audio_size);
+        }
+    }
+
+    return wrote_audio;
+}
+
+static bool bink_ffmpeg_pump(BinkFFmpeg* bff, int packet_budget, bool stop_after_video)
+{
+    int ret;
+    bool progressed;
+
+    if (!bff->precise_timing || bff->demux_eof) {
+        return false;
+    }
+
+    progressed = bink_ffmpeg_flush_pending_audio(bff);
+    if (bff->pending_audio_size > 0) {
+        return progressed;
+    }
+
+    while (packet_budget-- > 0) {
+        ret = av_read_frame(bff->fmt_ctx, bff->pkt);
+        if (ret < 0) {
+            bff->demux_eof = true;
+            avcodec_send_packet(bff->vid_ctx, NULL);
+            progressed |= bink_ffmpeg_drain_video_frames(bff);
+            if (bff->aud_ctx != NULL) {
+                AVFrame* af = av_frame_alloc();
+                avcodec_send_packet(bff->aud_ctx, NULL);
+                while (af != NULL && avcodec_receive_frame(bff->aud_ctx, af) == 0) {
+                    bink_ffmpeg_feed_audio(bff, af);
+                    progressed = true;
+                }
+                av_frame_free(&af);
+            }
+            break;
+        }
+
+        if (bff->pkt->stream_index == bff->aud_stream && bff->aud_ctx) {
+            bink_ffmpeg_decode_audio_packet(bff);
+            progressed = true;
+        } else if (bff->pkt->stream_index == bff->vid_stream) {
+            avcodec_send_packet(bff->vid_ctx, bff->pkt);
+            av_packet_unref(bff->pkt);
+            if (bink_ffmpeg_drain_video_frames(bff)) {
+                progressed = true;
+            }
+            if (stop_after_video && bff->queued_frame_count > 0) {
+                break;
+            }
+        } else {
+            av_packet_unref(bff->pkt);
+        }
+    }
+
+    return progressed;
+}
+
+static bool bink_ffmpeg_ensure_video_frame(BinkFFmpeg* bff)
+{
+    while (bff->queued_frame_count == 0 && !bff->demux_eof) {
+        if (!bink_ffmpeg_pump(bff, 32, true)) {
+            break;
+        }
+    }
+
+    return bff->queued_frame_count > 0;
+}
+
+static bool bink_ffmpeg_pump_audio(BinkFFmpeg* bff)
+{
+    return bink_ffmpeg_pump(bff, 16, false);
+}
 
 /* Feed one audio frame worth of PCM to the BINKSND callbacks. */
 static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
 {
     BINKSND* snd = &bff->snd_buf;
-    uint8_t* addr;
     uint8_t* out_data[1];
     int out_capacity_samples;
     int out_samples;
     int bytes_per_sample;
-    int bytes_remaining;
-    int chunk_bytes;
-    uint8_t* src;
+    int bytes_total;
 
     if (!bff->has_snd || !snd->Ready || !snd->Lock || !snd->Unlock) {
         return;
     }
 
-    if (!snd->Ready(snd)) {
-        return;
+    if (bff->pending_audio_size > 0) {
+        bink_ffmpeg_flush_pending_audio(bff);
     }
 
     bytes_per_sample = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16) * (int)snd->chans;
@@ -365,30 +660,35 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
         return;
     }
 
-    bytes_remaining = out_samples * bytes_per_sample;
-    src = bff->audio_scratch;
+    bytes_total = out_samples * bytes_per_sample;
+    if (bff->pending_audio_size + bytes_total > bff->pending_audio_capacity) {
+        int new_capacity;
+        uint8_t* new_buffer;
 
-    while (bytes_remaining > 0) {
-        u32 len;
+        new_capacity = bff->pending_audio_capacity > 0
+            ? bff->pending_audio_capacity
+            : 65536;
+        while (new_capacity < bff->pending_audio_size + bytes_total) {
+            new_capacity *= 2;
+        }
 
-        if (!snd->Ready(snd)) {
+        new_buffer = av_realloc(bff->pending_audio, (size_t)new_capacity);
+        if (new_buffer == NULL) {
             return;
         }
+        bff->pending_audio = new_buffer;
+        bff->pending_audio_capacity = new_capacity;
+    }
 
-        if (!snd->Lock(snd, &addr, &len)) {
-            return;
-        }
+    memcpy(
+        bff->pending_audio + bff->pending_audio_size,
+        bff->audio_scratch,
+        (size_t)bytes_total);
+    bff->pending_audio_size += bytes_total;
+    bink_ffmpeg_flush_pending_audio(bff);
 
-        chunk_bytes = bytes_remaining;
-        if ((u32)chunk_bytes > len) {
-            chunk_bytes = (int)len;
-        }
-
-        memcpy(addr, src, (size_t)chunk_bytes);
-        snd->Unlock(snd, (u32)chunk_bytes);
-
-        src += chunk_bytes;
-        bytes_remaining -= chunk_bytes;
+    if (bff->precise_timing) {
+        bink_ffmpeg_note_audio_frame(bff, audio_frame);
     }
 }
 
@@ -503,9 +803,10 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
         }
     }
 
-    bff->frame = av_frame_alloc();
+    bff->display_frame = av_frame_alloc();
+    bff->decode_frame = av_frame_alloc();
     bff->pkt = av_packet_alloc();
-    if (!bff->frame || !bff->pkt) {
+    if (!bff->display_frame || !bff->decode_frame || !bff->pkt) {
         BinkClose((HBINK)bff);
         return NULL;
     }
@@ -533,6 +834,10 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
     }
 
     bff->vid_start_pts = (vs->start_time != AV_NOPTS_VALUE) ? vs->start_time : 0;
+    bff->current_frame_time_ms = -1;
+    bff->audio_buffered_end_ms = 0;
+    bff->precise_timing = bff->aud_ctx != NULL
+        && vs->codecpar->codec_id != AV_CODEC_ID_BINKVIDEO;
 
     return (HBINK)bff;
 }
@@ -581,10 +886,14 @@ void BINKCALL BinkClose(HBINK bnk)
         bff->snd_buf.Close(&bff->snd_buf);
     }
     av_freep(&bff->audio_scratch);
+    av_freep(&bff->pending_audio);
     sws_freeContext(bff->sws);
     swr_free(&bff->swr);
-    av_frame_free(&bff->frame);
+    av_frame_free(&bff->display_frame);
+    av_frame_free(&bff->decode_frame);
     av_packet_free(&bff->pkt);
+    bink_ffmpeg_clear_queued_frames(bff);
+    av_freep(&bff->queued_frames);
     if (bff->aud_ctx) avcodec_free_context(&bff->aud_ctx);
     if (bff->vid_ctx) avcodec_free_context(&bff->vid_ctx);
     if (bff->fmt_ctx) avformat_close_input(&bff->fmt_ctx);
@@ -608,7 +917,7 @@ int BINKCALL BinkCopyToBuffer(HBINK bnk, void* dest, int destpitch, unsigned des
         (void)destheight;
         (void)flags;
 
-        if (!bff || !bff->frame || !bff->sws || !bff->vid_ctx) {
+        if (!bff || !bff->display_frame || !bff->sws || !bff->vid_ctx) {
             return -1;
         }
 
@@ -622,7 +931,7 @@ int BINKCALL BinkCopyToBuffer(HBINK bnk, void* dest, int destpitch, unsigned des
         dst_linesize[0] = destpitch;
 
         sws_scale(bff->sws,
-            (const uint8_t* const*)bff->frame->data, bff->frame->linesize,
+            (const uint8_t* const*)bff->display_frame->data, bff->display_frame->linesize,
             0, bff->vid_ctx->height,
             &dst_ptr, dst_linesize);
 
@@ -655,8 +964,20 @@ int BINKCALL BinkDoFrame(HBINK bnk)
 
     if (!bff) return -1;
 
+    if (bff->precise_timing) {
+        if (!bink_ffmpeg_ensure_video_frame(bff)) {
+            return -1;
+        }
+
+        if (!bink_ffmpeg_dequeue_video_frame(bff)) {
+            return -1;
+        }
+
+        return 0;
+    }
+
     /* Drain any already-decoded video frame first. */
-    ret = avcodec_receive_frame(bff->vid_ctx, bff->frame);
+    ret = avcodec_receive_frame(bff->vid_ctx, bff->display_frame);
     if (ret == 0) {
         return 0;
     }
@@ -667,7 +988,7 @@ int BINKCALL BinkDoFrame(HBINK bnk)
         if (ret < 0) {
             /* EOF or error — flush decoders. */
             avcodec_send_packet(bff->vid_ctx, NULL);
-            avcodec_receive_frame(bff->vid_ctx, bff->frame);
+            avcodec_receive_frame(bff->vid_ctx, bff->display_frame);
             if (bff->aud_ctx) {
                 AVFrame* af = av_frame_alloc();
                 avcodec_send_packet(bff->aud_ctx, NULL);
@@ -682,19 +1003,11 @@ int BINKCALL BinkDoFrame(HBINK bnk)
         if (bff->pkt->stream_index == bff->vid_stream) {
             avcodec_send_packet(bff->vid_ctx, bff->pkt);
             av_packet_unref(bff->pkt);
-            if (avcodec_receive_frame(bff->vid_ctx, bff->frame) == 0) {
+            if (avcodec_receive_frame(bff->vid_ctx, bff->display_frame) == 0) {
                 return 0;
             }
         } else if (bff->pkt->stream_index == bff->aud_stream && bff->aud_ctx) {
-            avcodec_send_packet(bff->aud_ctx, bff->pkt);
-            av_packet_unref(bff->pkt);
-            {
-                AVFrame* af = av_frame_alloc();
-                while (avcodec_receive_frame(bff->aud_ctx, af) == 0) {
-                    bink_ffmpeg_feed_audio(bff, af);
-                }
-                av_frame_free(&af);
-            }
+            bink_ffmpeg_decode_audio_packet(bff);
         } else {
             av_packet_unref(bff->pkt);
         }
@@ -715,6 +1028,12 @@ void BINKCALL BinkNextFrame(HBINK bnk)
     BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
     if (bff) {
         bff->pub.FrameNum++;
+        if (bff->precise_timing) {
+            av_frame_free(&bff->display_frame);
+            bff->display_frame = av_frame_alloc();
+            bff->current_frame_time_ms = -1;
+            bink_ffmpeg_pump_audio(bff);
+        }
     }
 #endif
 }
@@ -817,10 +1136,62 @@ void BINKCALL BinkRewind(HBINK bnk)
             swr_convert(bff->swr, NULL, 0, NULL, 0);
         }
     }
+    av_frame_free(&bff->display_frame);
+    bff->display_frame = av_frame_alloc();
+    av_frame_free(&bff->decode_frame);
+    bff->decode_frame = av_frame_alloc();
+    bff->current_frame_time_ms = -1;
+    bff->audio_buffered_end_ms = 0;
+    bff->demux_eof = false;
+    bff->pending_audio_size = 0;
+    bink_ffmpeg_clear_queued_frames(bff);
     bff->pub.FrameNum = 0;
 #else
     (void)bnk;
 #endif
+}
+
+bool bink_compat_get_frame_time_ms(HBINK bnk, int64_t* frame_time_ms)
+{
+#ifdef HAVE_FFMPEG
+    BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
+
+    if (bff != NULL && bff->precise_timing && frame_time_ms != NULL) {
+        *frame_time_ms = bff->current_frame_time_ms;
+        return *frame_time_ms >= 0;
+    }
+#endif
+    (void)bnk;
+    (void)frame_time_ms;
+    return false;
+}
+
+bool bink_compat_get_audio_buffered_end_ms(HBINK bnk, int64_t* audio_time_ms)
+{
+#ifdef HAVE_FFMPEG
+    BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
+
+    if (bff != NULL && bff->precise_timing && audio_time_ms != NULL) {
+        *audio_time_ms = bff->audio_buffered_end_ms;
+        return true;
+    }
+#endif
+    (void)bnk;
+    (void)audio_time_ms;
+    return false;
+}
+
+bool bink_compat_pump_audio(HBINK bnk)
+{
+#ifdef HAVE_FFMPEG
+    BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
+
+    if (bff != NULL && bff->precise_timing) {
+        return bink_ffmpeg_pump_audio(bff);
+    }
+#endif
+    (void)bnk;
+    return false;
 }
 
 bool bink_compat_init(void)
