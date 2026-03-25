@@ -778,7 +778,8 @@ static bool tig_movie_path_uses_audio_master_sync(const char* path)
     return SDL_strcasecmp(ext, ".mp4") == 0
         || SDL_strcasecmp(ext, ".m4v") == 0
         || SDL_strcasecmp(ext, ".mov") == 0
-        || SDL_strcasecmp(ext, ".webm") == 0;
+        || SDL_strcasecmp(ext, ".webm") == 0
+        || SDL_strcasecmp(ext, ".bik") == 0;
 }
 
 static bool tig_movie_getenv_bool(const char* name, bool default_value)
