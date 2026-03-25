@@ -1,6 +1,7 @@
 #include "ui/mainmenu_ui.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -171,6 +172,8 @@ static void mainmenu_ui_bg_video_resume_if_needed(void);
 static void mainmenu_ui_bg_video_present_current_frame(void);
 static void mainmenu_ui_bg_video_schedule_tick(void);
 static void mainmenu_ui_bg_video_redraw_foreground(void);
+static bool mainmenu_ui_bg_video_trace_enabled(void);
+static void mainmenu_ui_bg_video_trace(const char* stage, tig_timestamp_t now_ms, unsigned int frame_ms, tig_duration_t wait_ms, bool active);
 static tig_timestamp_t mainmenu_ui_schedule_next_frame_due(tig_timestamp_t now, tig_timestamp_t previous_due, unsigned int frame_ms);
 static bool mainmenu_ui_time_is_in_future(tig_timestamp_t now, tig_timestamp_t due);
 static unsigned int mainmenu_ui_time_until_ms(tig_timestamp_t now, tig_timestamp_t due);
@@ -250,7 +253,13 @@ static TigVideoBuffer* mainmenu_ui_bg_video_buffer = NULL;
 static char mainmenu_ui_bg_video_path[TIG_MAX_PATH];
 static tig_timestamp_t mainmenu_ui_bg_video_last_tick_ms = 0;
 static tig_timestamp_t mainmenu_ui_bg_video_next_frame_due_ms = 0;
+static bool mainmenu_ui_bg_video_rewind_pending = false;
 static bool mainmenu_ui_bg_video_preserve_on_close = false;
+static bool mainmenu_ui_bg_video_trace_active = false;
+static unsigned int mainmenu_ui_bg_video_trace_seq = 0;
+/* Wake slightly ahead of the nominal due time so the tick-early path can
+ * absorb timer jitter instead of arriving late at loop boundaries. */
+#define MAINMENU_BG_VIDEO_WAKE_SLACK_MS 2
 /* Quit-to-menu resets real-time events, so resume preserved video on the next
  * steady-state main-menu loop instead of inside the nested quit flow. */
 static bool mainmenu_ui_bg_video_resume_pending = false;
@@ -5323,6 +5332,7 @@ static void mainmenu_ui_bg_video_stop(void)
     mainmenu_ui_bg_video_path[0] = '\0';
     mainmenu_ui_bg_video_last_tick_ms = 0;
     mainmenu_ui_bg_video_next_frame_due_ms = 0;
+    mainmenu_ui_bg_video_rewind_pending = false;
     mainmenu_ui_bg_video_preserve_on_close = false;
     mainmenu_ui_bg_video_resume_pending = false;
 }
@@ -5546,6 +5556,41 @@ static void mainmenu_ui_bg_video_present_current_frame(void)
     mainmenu_ui_bg_video_redraw_foreground();
 }
 
+static bool mainmenu_ui_bg_video_trace_enabled(void)
+{
+    const char* value;
+
+    value = getenv("ARCANUM_FFMPEG_LOOP_TRACE");
+    if (value == NULL || *value == '\0') {
+        return false;
+    }
+
+    return strcmp(value, "0") != 0
+        && strcmp(value, "false") != 0
+        && strcmp(value, "off") != 0
+        && strcmp(value, "no") != 0;
+}
+
+static void mainmenu_ui_bg_video_trace(const char* stage, tig_timestamp_t now_ms, unsigned int frame_ms, tig_duration_t wait_ms, bool active)
+{
+    if (!mainmenu_ui_bg_video_trace_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+        "mainmenu_loop_trace seq=%u stage=%s now_ms=%u due_ms=%u last_tick_ms=%u frame_ms=%u wait_ms=%u frame_num=%u frames=%u active=%d\n",
+        mainmenu_ui_bg_video_trace_seq,
+        stage,
+        (unsigned int)now_ms,
+        (unsigned int)mainmenu_ui_bg_video_next_frame_due_ms,
+        (unsigned int)mainmenu_ui_bg_video_last_tick_ms,
+        frame_ms,
+        (unsigned int)wait_ms,
+        mainmenu_ui_bg_video != NULL ? mainmenu_ui_bg_video->FrameNum : 0,
+        mainmenu_ui_bg_video != NULL ? mainmenu_ui_bg_video->Frames : 0,
+        active ? 1 : 0);
+}
+
 static void mainmenu_ui_bg_video_schedule_tick(void)
 {
     TimeEvent next_te;
@@ -5564,11 +5609,22 @@ static void mainmenu_ui_bg_video_schedule_tick(void)
 
     tig_timer_now(&now_ms);
     wait_ms = frame_ms;
-    if (mainmenu_ui_bg_video_next_frame_due_ms != 0) {
+    if (mainmenu_ui_bg_video_rewind_pending) {
+        wait_ms = 1;
+    } else if (mainmenu_ui_bg_video_next_frame_due_ms != 0) {
+        unsigned int remaining_ms;
+
         wait_ms = 1;
         if (mainmenu_ui_time_is_in_future(now_ms, mainmenu_ui_bg_video_next_frame_due_ms)) {
-            wait_ms = mainmenu_ui_time_until_ms(now_ms, mainmenu_ui_bg_video_next_frame_due_ms);
+            remaining_ms = mainmenu_ui_time_until_ms(now_ms, mainmenu_ui_bg_video_next_frame_due_ms);
+            if (remaining_ms > MAINMENU_BG_VIDEO_WAKE_SLACK_MS) {
+                wait_ms = remaining_ms - MAINMENU_BG_VIDEO_WAKE_SLACK_MS;
+            }
         }
+    }
+
+    if (mainmenu_ui_bg_video_trace_active) {
+        mainmenu_ui_bg_video_trace("schedule", now_ms, frame_ms, wait_ms, true);
     }
 
     next_te.type = TIMEEVENT_TYPE_MAINMENU;
@@ -5661,11 +5717,30 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
         : 33;
 
     tig_timer_now(&now_ms);
+    if (mainmenu_ui_bg_video_rewind_pending) {
+        if (mainmenu_ui_bg_video_trace_active) {
+            mainmenu_ui_bg_video_trace("rewind-deferred-begin", now_ms, frame_ms, 0, true);
+        }
+        BinkRewind(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video_rewind_pending = false;
+        tig_timer_now(&now_ms);
+        if (mainmenu_ui_bg_video_trace_active) {
+            mainmenu_ui_bg_video_trace("rewind-deferred-end", now_ms, frame_ms, 0, true);
+        }
+    }
+
     if (mainmenu_ui_bg_video_next_frame_due_ms != 0
         && mainmenu_ui_time_is_in_future(now_ms, mainmenu_ui_bg_video_next_frame_due_ms)) {
+        if (mainmenu_ui_bg_video_trace_active) {
+            mainmenu_ui_bg_video_trace("tick-early", now_ms, frame_ms, 0, true);
+        }
         goto reschedule;
     }
     mainmenu_ui_bg_video_last_tick_ms = now_ms;
+
+    if (mainmenu_ui_bg_video_trace_active) {
+        mainmenu_ui_bg_video_trace("tick-ready", now_ms, frame_ms, 0, true);
+    }
 
     /* Catch up loop: If the UI thread stalled (e.g. credits crossfade) and we are
      * multiple frames behind real-time, drop stale frames by advancing the decoder
@@ -5679,15 +5754,26 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
         
         if (BinkDoFrame(mainmenu_ui_bg_video) < 0) {
             BinkRewind(mainmenu_ui_bg_video);
+            mainmenu_ui_bg_video_next_frame_due_ms = 0;
+            break;
         } else if (mainmenu_ui_bg_video->Frames > 0
             && mainmenu_ui_bg_video->FrameNum >= mainmenu_ui_bg_video->Frames) {
             BinkRewind(mainmenu_ui_bg_video);
+            mainmenu_ui_bg_video_next_frame_due_ms = 0;
+            break;
         }
     }
 
     if (BinkWait(mainmenu_ui_bg_video)) {
         /* Decoder not ready — try again shortly. */
+        if (mainmenu_ui_bg_video_trace_active) {
+            mainmenu_ui_bg_video_trace("wait-not-ready", now_ms, frame_ms, 0, true);
+        }
         goto reschedule;
+    }
+
+    if (mainmenu_ui_bg_video_trace_active) {
+        mainmenu_ui_bg_video_trace("wait-ready", now_ms, frame_ms, 0, true);
     }
 
     bool at_eof = (BinkDoFrame(mainmenu_ui_bg_video) < 0);
@@ -5706,10 +5792,26 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
     mainmenu_ui_bg_video_present_current_frame();
 
     if (at_eof) {
+        mainmenu_ui_bg_video_trace_seq++;
+        mainmenu_ui_bg_video_trace_active = true;
+        mainmenu_ui_bg_video_trace("present-eof", now_ms, frame_ms, 0, true);
         /* EOF — rewind after presenting the last frame so there is no black
-         * flash. Handles Frames==0 (unknown count) and frame-count mismatches. */
-        BinkRewind(mainmenu_ui_bg_video);
+         * flash.  Advance next_frame_due_ms here (goto reschedule skips the
+         * normal update below) so schedule_tick computes the correct remaining
+         * wait time and the next tick fires right on schedule while the
+         * rewound decoder primes frame 0 in the background. */
+        mainmenu_ui_bg_video_next_frame_due_ms = mainmenu_ui_schedule_next_frame_due(
+            now_ms,
+            mainmenu_ui_bg_video_next_frame_due_ms,
+            frame_ms);
+        mainmenu_ui_bg_video_trace("rewind-eof", now_ms, frame_ms, 0, true);
+        mainmenu_ui_bg_video_rewind_pending = true;
         goto reschedule;
+    }
+
+    if (mainmenu_ui_bg_video_trace_active) {
+        mainmenu_ui_bg_video_trace("present-post-rewind", now_ms, frame_ms, 0, true);
+        mainmenu_ui_bg_video_trace_active = false;
     }
 
     BinkNextFrame(mainmenu_ui_bg_video);
@@ -5718,10 +5820,14 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
         mainmenu_ui_bg_video_next_frame_due_ms,
         frame_ms);
 
-    /* Loop seamlessly at end. */
+    /* Loop seamlessly at end.  next_frame_due_ms was just updated above, so
+     * schedule_tick will fire at the right time after the non-blocking rewind. */
     if (mainmenu_ui_bg_video->Frames > 0
         && mainmenu_ui_bg_video->FrameNum >= mainmenu_ui_bg_video->Frames) {
-        BinkRewind(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video_trace_seq++;
+        mainmenu_ui_bg_video_trace_active = true;
+        mainmenu_ui_bg_video_trace("rewind-frame-count", now_ms, frame_ms, 0, true);
+        mainmenu_ui_bg_video_rewind_pending = true;
     }
 
 reschedule:

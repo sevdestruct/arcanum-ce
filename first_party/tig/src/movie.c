@@ -160,11 +160,13 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
     }
 
     tig_movie_next_frame_due_ms = 0;
-    /* Compute display size: scale down to fit screen, never upscale. */
+    /* Compute display size: scale down to fit screen, never upscale.
+     * TIG_MOVIE_NO_SCALE bypasses this and plays at native resolution. */
     {
         int vid_w = (int)tig_movie_bink->Width;
         int vid_h = (int)tig_movie_bink->Height;
-        if (vid_w <= tig_movie_screen_width && vid_h <= tig_movie_screen_height) {
+        if ((movie_flags & TIG_MOVIE_NO_SCALE) != 0
+            || (vid_w <= tig_movie_screen_width && vid_h <= tig_movie_screen_height)) {
             tig_movie_display_width = vid_w;
             tig_movie_display_height = vid_h;
         } else {
@@ -176,11 +178,16 @@ int tig_movie_play(const char* path, TigMovieFlags movie_flags, int sound_track)
         }
     }
 
+    /* Tell the decoder to output directly at display dimensions. The sws step
+     * will scale+convert in one pass, so the video buffer and subsequent blit
+     * operate on display-sized pixels rather than the full native resolution. */
+    BinkSetOutputSize(tig_movie_bink, tig_movie_display_width, tig_movie_display_height);
+
     vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
     vb_create_info.background_color = 0;
     vb_create_info.color_key = 0;
-    vb_create_info.width = tig_movie_bink->Width;
-    vb_create_info.height = tig_movie_bink->Height;
+    vb_create_info.width = tig_movie_display_width;
+    vb_create_info.height = tig_movie_display_height;
 
     if (tig_video_buffer_create(&vb_create_info, &tig_movie_video_buffer) != TIG_OK) {
         BinkClose(tig_movie_bink);
@@ -435,8 +442,9 @@ bool tig_movie_do_frame(bool* presented)
     if (tig_movie_frame_pending) {
         int64_t presented_frame_time_ns = tig_movie_pending_frame_time_ns;
 
-        // Blit buffer to screen, scaling down if needed to fit within screen
-        // dimensions while preserving aspect ratio.
+        // Blit buffer to screen. The buffer is already at display dimensions
+        // (scaled by BinkSetOutputSize during sws conversion), so src and dst
+        // sizes match and SDL performs no actual scaling — just a positioned copy.
         start_ns = SDL_GetTicksNS();
         tig_video_blit_scaled(tig_movie_video_buffer, &src_rect, &dst_rect);
         end_ns = SDL_GetTicksNS();

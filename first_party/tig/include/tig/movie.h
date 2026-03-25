@@ -13,6 +13,9 @@ typedef unsigned int TigMovieFlags;
 #define TIG_MOVIE_FADE_IN 0x02u
 #define TIG_MOVIE_FADE_OUT 0x04u
 #define TIG_MOVIE_NO_FINAL_FLIP 0x08u
+// Play at native resolution — skip scale-to-fit. Set automatically when the
+// override file is named with a `_native` suffix (e.g. `50000_native.mp4`).
+#define TIG_MOVIE_NO_SCALE 0x10u
 
 // Initializes movie system.
 int tig_movie_init(TigInitInfo* init_info);

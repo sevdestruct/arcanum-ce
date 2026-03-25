@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN 1
@@ -27,6 +29,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
@@ -323,7 +326,106 @@ typedef struct BinkFFmpeg {
     BINKSND snd_buf;
     bool has_snd;
     bool precise_timing;
+    /* True after BinkRewind seeds the decoder with the first packets of the
+     * new loop. While set, BinkWait polls for frame 0 readiness so the UI can
+     * retry shortly instead of blocking inside BinkDoFrame at the seam. */
+    bool rewind_primed;
+    /* Set when BinkWait already received frame 0 into display_frame after a
+     * rewind. BinkDoFrame then returns it immediately on the next tick. */
+    bool has_preloaded_display_frame;
+    /* Trace flags/state for rewind-to-first-frame timing diagnostics. */
+    bool rewind_first_frame_ready;
+    bool loop_trace_enabled;
+    uint64_t rewind_trace_seq;
+    int64_t rewind_trace_start_us;
+    int rewind_trace_wait_calls;
+    /* Desired output dimensions for sws. Set via BinkSetOutputSize(); defaults
+     * to the native video dimensions. When set to a smaller display size the
+     * sws step scales and converts in one pass, eliminating the large
+     * intermediate buffer and the SDL scale blit. */
+    int out_w;
+    int out_h;
 } BinkFFmpeg;
+
+static bool bink_ffmpeg_strieq(const char* a, const char* b)
+{
+    unsigned char ca;
+    unsigned char cb;
+
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+
+    while (*a != '\0' && *b != '\0') {
+        ca = (unsigned char)*a++;
+        cb = (unsigned char)*b++;
+        if (tolower(ca) != tolower(cb)) {
+            return false;
+        }
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+static bool bink_ffmpeg_getenv_bool(const char* name, bool default_value)
+{
+    const char* value;
+
+    value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return default_value;
+    }
+
+    if (bink_ffmpeg_strieq(value, "0")
+        || bink_ffmpeg_strieq(value, "false")
+        || bink_ffmpeg_strieq(value, "off")
+        || bink_ffmpeg_strieq(value, "no")) {
+        return false;
+    }
+
+    if (bink_ffmpeg_strieq(value, "1")
+        || bink_ffmpeg_strieq(value, "true")
+        || bink_ffmpeg_strieq(value, "on")
+        || bink_ffmpeg_strieq(value, "yes")) {
+        return true;
+    }
+
+    return default_value;
+}
+
+static void bink_ffmpeg_trace_loop(BinkFFmpeg* bff, const char* stage, const char* fmt, ...)
+{
+    va_list args;
+    int64_t elapsed_us;
+
+    if (bff == NULL || !bff->loop_trace_enabled) {
+        return;
+    }
+
+    elapsed_us = -1;
+    if (bff->rewind_trace_start_us != 0) {
+        elapsed_us = av_gettime_relative() - bff->rewind_trace_start_us;
+    }
+
+    fprintf(stderr,
+        "bink_compat: loop_trace seq=%llu stage=%s elapsed_us=%lld frame_num=%u queued=%d polls=%d rewind_primed=%d",
+        (unsigned long long)bff->rewind_trace_seq,
+        stage != NULL ? stage : "?",
+        (long long)elapsed_us,
+        bff->pub.FrameNum,
+        bff->queued_frame_count,
+        bff->rewind_trace_wait_calls,
+        bff->rewind_primed ? 1 : 0);
+
+    if (fmt != NULL && *fmt != '\0') {
+        fprintf(stderr, " ");
+        va_start(args, fmt);
+        vfprintf(stderr, fmt, args);
+        va_end(args);
+    }
+
+    fprintf(stderr, "\n");
+}
 
 static int64_t bink_ffmpeg_stream_time_ns(AVStream* stream, int64_t pts)
 {
@@ -435,17 +537,23 @@ static void bink_ffmpeg_decode_audio_packet(BinkFFmpeg* bff)
     }
 }
 
-static bool bink_ffmpeg_drain_video_frames(BinkFFmpeg* bff)
+/* Drain decoded video frames from the codec into the queue.
+ * max_frames limits how many are pulled; pass -1 for unlimited (EOF flush). */
+static bool bink_ffmpeg_drain_video_frames(BinkFFmpeg* bff, int max_frames)
 {
     bool queued_video;
+    int drained;
 
     queued_video = false;
+    drained = 0;
 
-    while (avcodec_receive_frame(bff->vid_ctx, bff->decode_frame) == 0) {
+    while ((max_frames < 0 || drained < max_frames)
+        && avcodec_receive_frame(bff->vid_ctx, bff->decode_frame) == 0) {
         if (!bink_ffmpeg_enqueue_video_frame(bff, bff->decode_frame)) {
             break;
         }
         queued_video = true;
+        drained++;
     }
 
     return queued_video;
@@ -516,7 +624,7 @@ static bool bink_ffmpeg_pump(BinkFFmpeg* bff, int packet_budget, bool stop_after
         if (ret < 0) {
             bff->demux_eof = true;
             avcodec_send_packet(bff->vid_ctx, NULL);
-            progressed |= bink_ffmpeg_drain_video_frames(bff);
+            progressed |= bink_ffmpeg_drain_video_frames(bff, -1); /* EOF: flush all */
             if (bff->aud_ctx != NULL) {
                 avcodec_send_packet(bff->aud_ctx, NULL);
                 while (avcodec_receive_frame(bff->aud_ctx, bff->decode_audio_frame) == 0) {
@@ -533,7 +641,7 @@ static bool bink_ffmpeg_pump(BinkFFmpeg* bff, int packet_budget, bool stop_after
         } else if (bff->pkt->stream_index == bff->vid_stream) {
             avcodec_send_packet(bff->vid_ctx, bff->pkt);
             av_packet_unref(bff->pkt);
-            if (bink_ffmpeg_drain_video_frames(bff)) {
+            if (bink_ffmpeg_drain_video_frames(bff, 1)) { /* 1 per packet: prevents burst queuing */
                 progressed = true;
             }
             if (stop_after_video && bff->queued_frame_count > 0) {
@@ -550,6 +658,9 @@ static bool bink_ffmpeg_pump(BinkFFmpeg* bff, int packet_budget, bool stop_after
 static bool bink_ffmpeg_ensure_video_frame(BinkFFmpeg* bff)
 {
     while (bff->queued_frame_count == 0 && !bff->demux_eof) {
+        if (bink_ffmpeg_drain_video_frames(bff, 1)) {
+            break;
+        }
         if (!bink_ffmpeg_pump(bff, 32, true)) {
             break;
         }
@@ -678,6 +789,25 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
     }
 
     avcodec_parameters_to_context(bff->vid_ctx, vs->codecpar);
+
+    /* Default output dimensions to native video size; caller may override via
+     * BinkSetOutputSize() before the first BinkCopyToBuffer call to have sws
+     * scale and convert in one pass instead of outputting a full-res buffer
+     * that the display layer then has to scale down. */
+    bff->out_w = bff->vid_ctx->width;
+    bff->out_h = bff->vid_ctx->height;
+
+    /* Enable multi-threaded video decode.
+     * thread_count=2 gives a healthy 2× throughput improvement for H.264/HEVC
+     * while keeping the FF_THREAD_FRAME pipeline depth at just 1 extra frame.
+     * Higher counts (or 0=auto) can build a deep pipeline that causes cascading
+     * frame drops after any game-loop stall, and introduces a noticeable gap
+     * when BinkRewind re-primes the pipeline at loop points.
+     * FF_THREAD_SLICE also enabled for codecs that support intra-frame
+     * parallelism (MPEG-2, some HEVC); it has zero pipeline latency. */
+    bff->vid_ctx->thread_count = 2;
+    bff->vid_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
     if (avcodec_open2(bff->vid_ctx, vcodec, NULL) < 0) {
         avcodec_free_context(&bff->vid_ctx);
         avformat_close_input(&bff->fmt_ctx);
@@ -685,13 +815,20 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
         return NULL;
     }
 
-    /* Swscale context: any source format -> BGRA. We use SWS_POINT because we
-     * don't strictly scale here, we just convert color spaces (YUV420P -> BGRA).
-     * This often unlocks accelerated paths that SWS_FAST_BILINEAR misses. */
-    bff->sws = sws_getContext(
-        bff->vid_ctx->width, bff->vid_ctx->height, bff->vid_ctx->pix_fmt,
-        bff->vid_ctx->width, bff->vid_ctx->height, AV_PIX_FMT_BGRA,
-        SWS_POINT, NULL, NULL, NULL);
+    /* Swscale context: convert (and optionally scale) from the source pixel
+     * format to BGRA at the requested output dimensions.  SWS_POINT is used
+     * for 1:1 colour-space conversion because it avoids the interpolation
+     * kernel overhead; when out_w/out_h differ from the native dimensions
+     * (i.e. a scale is requested) we fall back to SWS_BILINEAR. */
+    {
+        int sws_flags = (bff->out_w == bff->vid_ctx->width
+            && bff->out_h == bff->vid_ctx->height)
+            ? SWS_POINT : SWS_BILINEAR;
+        bff->sws = sws_getContext(
+            bff->vid_ctx->width, bff->vid_ctx->height, bff->vid_ctx->pix_fmt,
+            bff->out_w, bff->out_h, AV_PIX_FMT_BGRA,
+            sws_flags, NULL, NULL, NULL);
+    }
     if (!bff->sws) {
         avcodec_free_context(&bff->vid_ctx);
         avformat_close_input(&bff->fmt_ctx);
@@ -780,6 +917,7 @@ static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
     bff->current_frame_time_ns = -1;
     bff->precise_timing = bff->aud_ctx != NULL
         && vs->codecpar->codec_id != AV_CODEC_ID_BINKVIDEO;
+    bff->loop_trace_enabled = bink_ffmpeg_getenv_bool("ARCANUM_FFMPEG_LOOP_TRACE", false);
 
     return (HBINK)bff;
 }
@@ -811,6 +949,40 @@ static BINKOPENMILES _BinkOpenMiles;
 static BINKSETSOUNDSYSTEM _BinkSetSoundSystem;
 static BINKSETSOUNDTRACK _BinkSetSoundTrack;
 static BINKWAIT _BinkWait;
+
+/* Set the pixel dimensions that BinkCopyToBuffer will output to.  Call this
+ * after BinkOpen() and before the first BinkDoFrame() call.  When the
+ * requested size differs from the native video dimensions, libswscale will
+ * rescale during the colour-conversion step so that the caller's video buffer
+ * (and subsequent SDL blit) can be sized to the smaller display dimensions
+ * rather than to the full native video resolution. */
+void BinkSetOutputSize(HBINK bnk, int w, int h)
+{
+#ifdef HAVE_FFMPEG
+    BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
+    if (!bff || w <= 0 || h <= 0) return;
+    if (w == bff->out_w && h == bff->out_h) return;
+
+    bff->out_w = w;
+    bff->out_h = h;
+
+    /* Recreate the sws context with the new output dimensions. */
+    if (bff->sws) {
+        sws_freeContext(bff->sws);
+        bff->sws = NULL;
+    }
+    {
+        int sws_flags = (w == bff->vid_ctx->width && h == bff->vid_ctx->height)
+            ? SWS_POINT : SWS_BILINEAR;
+        bff->sws = sws_getContext(
+            bff->vid_ctx->width, bff->vid_ctx->height, bff->vid_ctx->pix_fmt,
+            w, h, AV_PIX_FMT_BGRA,
+            sws_flags, NULL, NULL, NULL);
+    }
+#else
+    (void)bnk; (void)w; (void)h;
+#endif
+}
 
 void BINKCALL BinkClose(HBINK bnk)
 {
@@ -910,6 +1082,28 @@ int BINKCALL BinkDoFrame(HBINK bnk)
 
     if (!bff) return -1;
 
+    if (bff->queued_frame_count > 0) {
+        if (!bink_ffmpeg_dequeue_video_frame(bff)) {
+            return -1;
+        }
+
+        if (bff->rewind_first_frame_ready) {
+            bink_ffmpeg_trace_loop(bff, "doframe-consume-queued", NULL);
+            bff->rewind_first_frame_ready = false;
+        }
+
+        return 0;
+    }
+
+    if (bff->has_preloaded_display_frame) {
+        bff->has_preloaded_display_frame = false;
+        if (bff->rewind_first_frame_ready) {
+            bink_ffmpeg_trace_loop(bff, "doframe-consume-preloaded", NULL);
+            bff->rewind_first_frame_ready = false;
+        }
+        return 0;
+    }
+
     if (bff->precise_timing) {
         if (!bink_ffmpeg_ensure_video_frame(bff)) {
             return -1;
@@ -917,6 +1111,11 @@ int BINKCALL BinkDoFrame(HBINK bnk)
 
         if (!bink_ffmpeg_dequeue_video_frame(bff)) {
             return -1;
+        }
+
+        if (bff->rewind_first_frame_ready) {
+            bink_ffmpeg_trace_loop(bff, "doframe-consume-queued", NULL);
+            bff->rewind_first_frame_ready = false;
         }
 
         return 0;
@@ -932,9 +1131,25 @@ int BINKCALL BinkDoFrame(HBINK bnk)
     while (1) {
         ret = av_read_frame(bff->fmt_ctx, bff->pkt);
         if (ret < 0) {
-            /* EOF or error — flush decoders. */
-            avcodec_send_packet(bff->vid_ctx, NULL);
-            avcodec_receive_frame(bff->vid_ctx, bff->display_frame);
+            /* EOF or error — flush any buffered decoder frames before
+             * reporting end-of-stream. Frame-threaded decode can have more
+             * than one tail frame pending here. */
+            if (!bff->demux_eof) {
+                bff->demux_eof = true;
+                avcodec_send_packet(bff->vid_ctx, NULL);
+                bink_ffmpeg_drain_video_frames(bff, -1);
+                if (avcodec_receive_frame(bff->vid_ctx, bff->display_frame) == 0) {
+                    return 0;
+                }
+            }
+
+            if (bff->queued_frame_count > 0) {
+                if (!bink_ffmpeg_dequeue_video_frame(bff)) {
+                    return -1;
+                }
+                return 0;
+            }
+
             if (bff->aud_ctx) {
                 AVFrame* af = av_frame_alloc();
                 avcodec_send_packet(bff->aud_ctx, NULL);
@@ -1054,9 +1269,57 @@ int BINKCALL BinkWait(HBINK bnk)
     }
 #endif
 #ifdef HAVE_FFMPEG
-    /* Caller-side pacing handles timing on non-Windows. */
-    (void)bnk;
-    return 0;
+    BinkFFmpeg* bff = (BinkFFmpeg*)bnk;
+
+    if (bff == NULL) {
+        return -1;
+    }
+
+    /* Preserve legacy "always ready" behaviour except for the one place we
+     * care about: immediately after a rewind, when calling BinkDoFrame too
+     * early can block waiting for frame 0 and create a visible loop seam. */
+    if (!bff->rewind_primed) {
+        return 0;
+    }
+
+    if (bff->precise_timing) {
+        if (bff->queued_frame_count > 0
+            || bink_ffmpeg_drain_video_frames(bff, 1)) {
+            bff->rewind_primed = false;
+            bff->rewind_first_frame_ready = true;
+            bink_ffmpeg_trace_loop(bff, "wait-ready-queued", NULL);
+            return 0;
+        }
+
+        bff->rewind_trace_wait_calls++;
+        if (bff->rewind_trace_wait_calls <= 4
+            || (bff->rewind_trace_wait_calls % 8) == 0) {
+            bink_ffmpeg_trace_loop(bff, "wait-not-ready-queued", NULL);
+        }
+        return 1;
+    }
+
+    if (bff->has_preloaded_display_frame) {
+        bff->rewind_primed = false;
+        bff->rewind_first_frame_ready = true;
+        bink_ffmpeg_trace_loop(bff, "wait-ready-preloaded", NULL);
+        return 0;
+    }
+
+    if (avcodec_receive_frame(bff->vid_ctx, bff->display_frame) == 0) {
+        bff->has_preloaded_display_frame = true;
+        bff->rewind_primed = false;
+        bff->rewind_first_frame_ready = true;
+        bink_ffmpeg_trace_loop(bff, "wait-ready-display", NULL);
+        return 0;
+    }
+
+    bff->rewind_trace_wait_calls++;
+    if (bff->rewind_trace_wait_calls <= 4
+        || (bff->rewind_trace_wait_calls % 8) == 0) {
+        bink_ffmpeg_trace_loop(bff, "wait-not-ready-display", NULL);
+    }
+    return 1;
 #endif
     (void)bnk;
     return -1;
@@ -1090,6 +1353,42 @@ void BINKCALL BinkRewind(HBINK bnk)
     bff->pending_audio_size = 0;
     bink_ffmpeg_clear_queued_frames(bff);
     bff->pub.FrameNum = 0;
+    bff->rewind_primed = false;
+    bff->has_preloaded_display_frame = false;
+    bff->rewind_first_frame_ready = false;
+    bff->rewind_trace_wait_calls = 0;
+    bff->rewind_trace_start_us = 0;
+
+    /* Seed the decode pipeline for the new loop without blocking.
+     * We send thread_count video packets to the decoder and return
+     * immediately. The decode threads run during the idle window between
+     * this rewind and the next BinkWait/BinkDoFrame call, which can then
+     * poll for an already-finished frame instead of stalling the UI thread. */
+    if (bff->vid_ctx->thread_count > 1) {
+        int sent = 0;
+        while (sent < bff->vid_ctx->thread_count + 1) {
+            int ret = av_read_frame(bff->fmt_ctx, bff->pkt);
+            if (ret < 0) break;
+            if (bff->pkt->stream_index == bff->vid_stream) {
+                avcodec_send_packet(bff->vid_ctx, bff->pkt);
+                av_packet_unref(bff->pkt);
+                sent++;
+            } else if (bff->pkt->stream_index == bff->aud_stream && bff->aud_ctx) {
+                avcodec_send_packet(bff->aud_ctx, bff->pkt);
+                av_packet_unref(bff->pkt);
+            } else {
+                av_packet_unref(bff->pkt);
+            }
+        }
+        if (sent > 0) {
+            bff->rewind_trace_seq++;
+            bff->rewind_trace_start_us = av_gettime_relative();
+            bff->rewind_primed = true;
+            bink_ffmpeg_trace_loop(bff, "rewind-primed", "sent=%d thread_count=%d", sent, bff->vid_ctx->thread_count);
+        } else {
+            bink_ffmpeg_trace_loop(bff, "rewind-unprimed", "sent=0 thread_count=%d", bff->vid_ctx->thread_count);
+        }
+    }
 #else
     (void)bnk;
 #endif
