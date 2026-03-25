@@ -314,8 +314,6 @@ typedef struct BinkFFmpeg {
     struct SwsContext* sws;
     struct SwrContext* swr;
     int64_t vid_start_pts; /* stream PTS of first frame, for seeking */
-    uint8_t* audio_scratch;
-    int audio_scratch_size;
     uint8_t* pending_audio;
     int pending_audio_size;
     int pending_audio_capacity;
@@ -573,7 +571,7 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
     int out_capacity_samples;
     int out_samples;
     int bytes_per_sample;
-    int bytes_total;
+    int capacity_bytes;
 
     if (!bff->has_snd || !snd->Ready || !snd->Lock || !snd->Unlock) {
         return;
@@ -593,19 +591,28 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
         return;
     }
 
-    if (out_capacity_samples * bytes_per_sample > bff->audio_scratch_size) {
-        uint8_t* new_buffer = av_realloc(
-            bff->audio_scratch,
-            (size_t)out_capacity_samples * (size_t)bytes_per_sample);
+    capacity_bytes = out_capacity_samples * bytes_per_sample;
+
+    if (bff->pending_audio_size + capacity_bytes > bff->pending_audio_capacity) {
+        int new_capacity;
+        uint8_t* new_buffer;
+
+        new_capacity = bff->pending_audio_capacity > 0
+            ? bff->pending_audio_capacity
+            : 65536;
+        while (new_capacity < bff->pending_audio_size + capacity_bytes) {
+            new_capacity *= 2;
+        }
+
+        new_buffer = av_realloc(bff->pending_audio, (size_t)new_capacity);
         if (new_buffer == NULL) {
             return;
         }
-
-        bff->audio_scratch = new_buffer;
-        bff->audio_scratch_size = out_capacity_samples * bytes_per_sample;
+        bff->pending_audio = new_buffer;
+        bff->pending_audio_capacity = new_capacity;
     }
 
-    out_data[0] = bff->audio_scratch;
+    out_data[0] = bff->pending_audio + bff->pending_audio_size;
 
     /* Convert the full decoded audio frame up front so large Bink audio
      * packets keep their original timing instead of being truncated to the
@@ -621,33 +628,8 @@ static void bink_ffmpeg_feed_audio(BinkFFmpeg* bff, AVFrame* audio_frame)
         return;
     }
 
-    bytes_total = out_samples * bytes_per_sample;
-    if (bff->pending_audio_size + bytes_total > bff->pending_audio_capacity) {
-        int new_capacity;
-        uint8_t* new_buffer;
-
-        new_capacity = bff->pending_audio_capacity > 0
-            ? bff->pending_audio_capacity
-            : 65536;
-        while (new_capacity < bff->pending_audio_size + bytes_total) {
-            new_capacity *= 2;
-        }
-
-        new_buffer = av_realloc(bff->pending_audio, (size_t)new_capacity);
-        if (new_buffer == NULL) {
-            return;
-        }
-        bff->pending_audio = new_buffer;
-        bff->pending_audio_capacity = new_capacity;
-    }
-
-    memcpy(
-        bff->pending_audio + bff->pending_audio_size,
-        bff->audio_scratch,
-        (size_t)bytes_total);
-    bff->pending_audio_size += bytes_total;
+    bff->pending_audio_size += out_samples * bytes_per_sample;
     bink_ffmpeg_flush_pending_audio(bff);
-
 }
 
 static HBINK bink_ffmpeg_open_impl(const char* name, unsigned flags)
@@ -845,7 +827,6 @@ void BINKCALL BinkClose(HBINK bnk)
     if (bff->has_snd && bff->snd_buf.Close) {
         bff->snd_buf.Close(&bff->snd_buf);
     }
-    av_freep(&bff->audio_scratch);
     av_freep(&bff->pending_audio);
     sws_freeContext(bff->sws);
     swr_free(&bff->swr);
