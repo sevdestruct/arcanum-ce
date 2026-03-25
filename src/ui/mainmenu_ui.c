@@ -5667,6 +5667,24 @@ static bool mainmenu_ui_bg_video_tick(TimeEvent* te_in)
     }
     mainmenu_ui_bg_video_last_tick_ms = now_ms;
 
+    /* Catch up loop: If the UI thread stalled (e.g. credits crossfade) and we are
+     * multiple frames behind real-time, drop stale frames by advancing the decoder
+     * without actually painting them to the screen buffer. */
+    while (mainmenu_ui_bg_video_next_frame_due_ms > 0
+        && !mainmenu_ui_time_is_in_future(now_ms, mainmenu_ui_bg_video_next_frame_due_ms)
+        && (unsigned int)(now_ms - mainmenu_ui_bg_video_next_frame_due_ms) > frame_ms * 2) {
+        
+        BinkNextFrame(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video_next_frame_due_ms += frame_ms;
+        
+        if (BinkDoFrame(mainmenu_ui_bg_video) < 0) {
+            BinkRewind(mainmenu_ui_bg_video);
+        } else if (mainmenu_ui_bg_video->Frames > 0
+            && mainmenu_ui_bg_video->FrameNum >= mainmenu_ui_bg_video->Frames) {
+            BinkRewind(mainmenu_ui_bg_video);
+        }
+    }
+
     if (BinkWait(mainmenu_ui_bg_video)) {
         /* Decoder not ready — try again shortly. */
         goto reschedule;

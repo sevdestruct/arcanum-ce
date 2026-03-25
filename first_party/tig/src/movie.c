@@ -91,7 +91,7 @@ static bool tig_movie_path_uses_audio_master_sync(const char* path);
 static bool tig_movie_get_audio_clock_ms(int64_t* audio_clock_ms);
 static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_ms, int64_t frame_time_ns, int64_t audio_clock_ms);
 static void tig_movie_fill_audio_master_queue(void);
-static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns);
+static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns, tig_timestamp_t now_ms);
 static void tig_movie_profile_init(bool enabled);
 static bool tig_movie_profile_enabled(void);
 static void tig_movie_profile_record(Uint64* total, Uint64* max, Uint64 duration_ns, Uint64* calls);
@@ -370,11 +370,15 @@ bool tig_movie_do_frame(bool* presented)
 
     while (tig_movie_frame_pending
         && tig_movie_audio_master_sync
-        && tig_movie_should_drop_pending_frame(frame_ms, tig_movie_pending_frame_time_ns)) {
+        && tig_movie_should_drop_pending_frame(frame_ms, tig_movie_pending_frame_time_ns, now_ms)) {
         tig_movie_profile_note_drop();
         BinkNextFrame(tig_movie_bink);
         tig_movie_frame_pending = false;
         tig_movie_pending_frame_time_ns = -1;
+
+        if (tig_movie_next_frame_due_ms > 0) {
+            tig_movie_next_frame_due_ms += frame_ms;
+        }
 
         start_ns = SDL_GetTicksNS();
         if (BinkDoFrame(tig_movie_bink) < 0) {
@@ -870,7 +874,7 @@ static unsigned int tig_movie_compute_audio_master_delay_ms(unsigned int frame_m
     return (unsigned int)delay_ms;
 }
 
-static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns)
+static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t frame_time_ns, tig_timestamp_t now_ms)
 {
     int64_t audio_clock_ms;
     int64_t frame_time_ms;
@@ -879,19 +883,30 @@ static bool tig_movie_should_drop_pending_frame(unsigned int frame_ms, int64_t f
         return false;
     }
 
-    if (!tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
+    if (tig_movie_get_audio_clock_ms(&audio_clock_ms)) {
+        frame_time_ms = frame_time_ns / (int64_t)SDL_NS_PER_MS;
+
+        /* We give the smooth-catch-up logic a chance to reel in mild drifts.
+         * We only hard-drop the frame if we are monstrously behind (e.g. > 3 frames)
+         * so that we don't introduce jarring visual stutters on a mild audio clock jitter.
+         */
+        if (audio_clock_ms - frame_time_ms > (int64_t)frame_ms * 3) {
+            tig_movie_profile_note_late();
+            return true;
+        }
         return false;
     }
 
-    frame_time_ms = frame_time_ns / (int64_t)SDL_NS_PER_MS;
-
-    /* We give the smooth-catch-up logic a chance to reel in mild drifts.
-     * We only hard-drop the frame if we are monstrously behind (e.g. > 3 frames)
-     * so that we don't introduce jarring visual stutters on a mild audio clock jitter.
+    /* Fallback: Muted videos (e.g. background loops) have no audio clock.
+     * We drop frames against the wall-clock schedule to maintain real-time speed.
+     * If the main game thread stalls due to a heavy crossfade or CPU load, discarding
+     * frames ensures the video timeline catches up natively without playing in slow-motion.
      */
-    if (audio_clock_ms - frame_time_ms > (int64_t)frame_ms * 3) {
-        tig_movie_profile_note_late();
-        return true;
+    if (tig_movie_next_frame_due_ms > 0 && !tig_movie_time_is_in_future(now_ms, tig_movie_next_frame_due_ms)) {
+        if ((unsigned int)(now_ms - tig_movie_next_frame_due_ms) > frame_ms * 2) {
+            tig_movie_profile_note_late();
+            return true;
+        }
     }
 
     return false;
