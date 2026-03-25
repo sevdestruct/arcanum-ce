@@ -99,11 +99,23 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
         static const char* const video_exts[] = { ".mp4", ".bik" };
         int i;
         char candidate[TIG_MAX_PATH];
+        // Check for a `_native` suffixed file first. If found, native
+        // resolution is used (no scale-to-fit).
         for (i = 0; i < (int)(sizeof(video_exts) / sizeof(video_exts[0])); i++) {
-            snprintf(candidate, sizeof(candidate), "data/videos/%s%s", base_noext, video_exts[i]);
+            snprintf(candidate, sizeof(candidate), "data/videos/%s_native%s", base_noext, video_exts[i]);
             if (tig_file_extract(candidate, temp_path)) {
+                flags |= GAME_MOVIE_NO_SCALE;
                 found = true;
                 break;
+            }
+        }
+        if (!found) {
+            for (i = 0; i < (int)(sizeof(video_exts) / sizeof(video_exts[0])); i++) {
+                snprintf(candidate, sizeof(candidate), "data/videos/%s%s", base_noext, video_exts[i]);
+                if (tig_file_extract(candidate, temp_path)) {
+                    found = true;
+                    break;
+                }
             }
         }
     }
@@ -134,6 +146,10 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
 
     if ((flags & GAME_MOVIE_NO_FINAL_FLIP) != 0) {
         movie_flags |= TIG_MOVIE_NO_FINAL_FLIP;
+    }
+
+    if ((flags & GAME_MOVIE_NO_SCALE) != 0) {
+        movie_flags |= TIG_MOVIE_NO_SCALE;
     }
 
     // Play the movie. This is a blocking call, which will return when movie
