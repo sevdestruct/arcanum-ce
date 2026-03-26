@@ -16,12 +16,15 @@
 
 #define SCROLL_DIAG_X 4
 #define SCROLL_DIAG_Y 2
+#define SCROLL_LEASH_SPRING_START_RATIO 0.7f
+#define SCROLL_LEASH_SPRING_MIN_SCALE 0.2f
 
 static void scroll_by(int64_t dx, int64_t dy);
 static void scroll_origin_changed(int64_t loc);
 static void scroll_speed_changed(void);
 static bool scroll_cursor_art_set(tig_art_id_t art_id);
 static void scroll_refresh_clamped_view(void);
+static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit);
 
 /**
  * The minimum time (in milliseconds) between scroll updates.
@@ -118,6 +121,47 @@ static void scroll_refresh_clamped_view(void)
     if (!scroll_init_info.editor) {
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
     }
+}
+
+static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit)
+{
+    int spring_start;
+    int adjusted;
+    float t;
+    float scale;
+
+    if (delta == 0 || limit <= 0 || next_dist <= current_dist) {
+        return delta;
+    }
+
+    spring_start = (int)roundf((float)limit * SCROLL_LEASH_SPRING_START_RATIO);
+    if (spring_start >= limit) {
+        spring_start = limit - 1;
+    }
+
+    if (current_dist < spring_start) {
+        return delta;
+    }
+
+    if (current_dist >= limit) {
+        return 0;
+    }
+
+    t = (float)(limit - current_dist) / (float)(limit - spring_start);
+    if (t < 0.0f) {
+        t = 0.0f;
+    } else if (t > 1.0f) {
+        t = 1.0f;
+    }
+
+    scale = SCROLL_LEASH_SPRING_MIN_SCALE
+        + (1.0f - SCROLL_LEASH_SPRING_MIN_SCALE) * t;
+    adjusted = (int)roundf((float)delta * scale);
+    if (adjusted == 0) {
+        adjusted = delta > 0 ? 1 : -1;
+    }
+
+    return adjusted;
 }
 
 /**
@@ -230,6 +274,10 @@ void scroll_start(int direction)
     int64_t center_y;
     int viewport_center_x;
     int viewport_center_y;
+    int current_hor;
+    int current_vert;
+    int hor_limit;
+    int vert_limit;
     int hor;
     int vert;
     bool blocked;
@@ -315,6 +363,19 @@ void scroll_start(int direction)
     // Calculate viewport center.
     viewport_center_x = scroll_iso_content_rect.width / 2;
     viewport_center_y = scroll_iso_content_rect.height / 2;
+    current_hor = abs(viewport_center_x - (int)center_x);
+    current_vert = abs(viewport_center_y - (int)center_y);
+    hor_limit = 80 * distance;
+    vert_limit = 40 * distance;
+
+    dx = scroll_apply_leash_spring_component(dx,
+        current_hor,
+        abs(viewport_center_x - dx - (int)center_x),
+        hor_limit);
+    dy = scroll_apply_leash_spring_component(dy,
+        current_vert,
+        abs(viewport_center_y - dy - (int)center_y),
+        vert_limit);
 
     // Calculate horizontal and vertical distance (in pixels) from the scroll
     // center.
@@ -322,7 +383,7 @@ void scroll_start(int direction)
     vert = abs(viewport_center_y - dy - (int)center_y);
 
     // Check if scrolling is within perception-based limits.
-    if (hor < 80 * distance && vert < 40 * distance) {
+    if (hor < hor_limit && vert < vert_limit) {
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
         scroll_by(dx, dy);
@@ -344,7 +405,7 @@ void scroll_start(int direction)
     blocked = false;
 
     // Adjust direction if horizontal distance exceeds scroll distance limit.
-    if (hor >= 80 * distance) {
+    if (hor >= hor_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP_RIGHT:
             direction = SCROLL_DIRECTION_UP;
@@ -370,7 +431,7 @@ void scroll_start(int direction)
     }
 
     // Adjust direction if vertical distance exceeds scroll distance limit.
-    if (vert >= 40 * distance) {
+    if (vert >= vert_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP:
         case SCROLL_DIRECTION_DOWN:
@@ -394,6 +455,15 @@ void scroll_start(int direction)
             break;
         }
     }
+
+    dx = scroll_apply_leash_spring_component(dx,
+        current_hor,
+        abs(viewport_center_x - dx - (int)center_x),
+        hor_limit);
+    dy = scroll_apply_leash_spring_component(dy,
+        current_vert,
+        abs(viewport_center_y - dy - (int)center_y),
+        vert_limit);
 
     // Perform scroll unless blocked.
     if (!blocked) {
