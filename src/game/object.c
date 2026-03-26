@@ -1,6 +1,7 @@
 #include "game/object.h"
 
 #include <inttypes.h>
+#include <math.h>
 
 #include "game/ai.h"
 #include "game/anim.h"
@@ -10,6 +11,7 @@
 #include "game/effect.h"
 #include "game/gamelib.h"
 #include "game/gsound.h"
+#include "game/iso_zoom.h"
 #include "game/item.h"
 #include "game/light.h"
 #include "game/map.h"
@@ -97,6 +99,7 @@ static bool sub_443880(TigRect* rect, tig_art_id_t art_id);
 static bool load_reaction_colors(void);
 static void sub_444270(int64_t obj, int a2);
 static void object_lighting_changed(void);
+static void object_get_effective_iso_content_rect_ex(TigRect* rect);
 
 // 0x5A548C
 static int dword_5A548C[8] = {
@@ -305,6 +308,28 @@ void object_set_iso_content_rect(const TigRect* rect)
     object_iso_content_rect_ex.height = rect->height + 512;
     qword_5E2F50 = rect->width / 40 / 2 + 2;
     qword_5E2E60 = rect->height / 20 / 2 + 2;
+}
+
+static void object_get_effective_iso_content_rect_ex(TigRect* rect)
+{
+    *rect = object_iso_content_rect_ex;
+
+    float z = iso_zoom_current();
+    if (z >= 1.0f) {
+        return;
+    }
+
+    int expanded_width = (int)ceilf((float)object_iso_content_rect.width / z);
+    int expanded_height = (int)ceilf((float)object_iso_content_rect.height / z);
+    int expanded_x = object_iso_content_rect.x
+        + (object_iso_content_rect.width - expanded_width) / 2;
+    int expanded_y = object_iso_content_rect.y
+        + (object_iso_content_rect.height - expanded_height) / 2;
+
+    rect->x = expanded_x - 256;
+    rect->y = expanded_y - 256;
+    rect->width = expanded_width + 512;
+    rect->height = expanded_height + 512;
 }
 
 // 0x43A650
@@ -2041,6 +2066,7 @@ void object_get_rect(int64_t obj, unsigned int flags, TigRect* rect)
     unsigned int render_flags;
     int idx;
     TigRect extra_rect;
+    TigRect effective_content_rect_ex;
 
     obj_flags = obj_field_int32_get(obj, OBJ_F_FLAGS);
     if ((flags & 0x8) == 0 && (obj_flags & dword_5E2F88) != 0) {
@@ -2077,10 +2103,12 @@ void object_get_rect(int64_t obj, unsigned int flags, TigRect* rect)
         loc_y = 0;
     }
 
-    if ((int)loc_x < object_iso_content_rect_ex.x
-        || (int)loc_y < object_iso_content_rect_ex.y
-        || (int)loc_x >= object_iso_content_rect_ex.x + object_iso_content_rect_ex.width
-        || (int)loc_y >= object_iso_content_rect_ex.y + object_iso_content_rect_ex.height) {
+    object_get_effective_iso_content_rect_ex(&effective_content_rect_ex);
+
+    if ((int)loc_x < effective_content_rect_ex.x
+        || (int)loc_y < effective_content_rect_ex.y
+        || (int)loc_x >= effective_content_rect_ex.x + effective_content_rect_ex.width
+        || (int)loc_y >= effective_content_rect_ex.y + effective_content_rect_ex.height) {
         rect->x = 0;
         rect->y = 0;
         rect->width = 0;

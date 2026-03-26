@@ -21,6 +21,7 @@ static void scroll_by(int64_t dx, int64_t dy);
 static void scroll_origin_changed(int64_t loc);
 static void scroll_speed_changed(void);
 static bool scroll_cursor_art_set(tig_art_id_t art_id);
+static void scroll_refresh_clamped_view(void);
 
 /**
  * The minimum time (in milliseconds) between scroll updates.
@@ -107,6 +108,17 @@ static int scroll_distance;
  * 0x5D11C8
  */
 static ScrollFunc* scroll_func;
+
+/**
+ * Forces a viewport refresh when a scroll attempt is clamped by the leash or
+ * map bounds.
+ */
+static void scroll_refresh_clamped_view(void)
+{
+    if (!scroll_init_info.editor) {
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    }
+}
 
 /**
  * Called when the game is initialized.
@@ -423,6 +435,8 @@ void scroll_start(int direction)
             break;
         }
     }
+
+    scroll_refresh_clamped_view();
 }
 
 /**
@@ -465,6 +479,7 @@ void scroll_by(int64_t dx, int64_t dy)
 
     // Exit if no actual movement occurred (at map edges).
     if (old_origin_x == new_origin_x && old_origin_y == new_origin_y) {
+        scroll_refresh_clamped_view();
         return;
     }
 

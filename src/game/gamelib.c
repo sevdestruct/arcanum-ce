@@ -864,8 +864,15 @@ void gamelib_get_view_options(ViewOptions* view_options)
 void gamelib_invalidate_rect(TigRect* rect)
 {
     TigRect dirty_rect;
+    bool zoom_active;
 
-    if (rect != NULL) {
+    zoom_active = (iso_zoom_current() != 1.0f)
+        && (gamelib_world_video_buffer != NULL)
+        && (gamelib_draw_func == gamelib_draw_game);
+
+    if (zoom_active) {
+        dirty_rect = gamelib_iso_content_rect;
+    } else if (rect != NULL) {
         dirty_rect = *rect;
 
         if (tig_rect_intersection(&dirty_rect, &gamelib_iso_content_rect, &dirty_rect) != TIG_OK) {
