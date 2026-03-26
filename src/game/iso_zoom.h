@@ -10,6 +10,7 @@
 
 #define ISO_ZOOM_MIN_KEY "min zoom"
 #define ISO_ZOOM_MAX_KEY "max zoom"
+#define ISO_ZOOM_ENABLED_KEY "zoom enabled"
 
 void iso_zoom_init(void);
 void iso_zoom_ping(void);

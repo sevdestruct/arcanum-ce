@@ -50,10 +50,30 @@ static bool cam_zoom_saved;
 static bool cam_zoom_restore_pending;
 static float cam_zoom_restore_target;
 
+static bool dialog_camera_npc_fits_after_pan(int64_t dx,
+    int64_t dy,
+    int64_t npc_zsx,
+    int64_t npc_zsy,
+    float z,
+    TigRect* cr,
+    int pad_side,
+    int npc_pad_top,
+    int pad_bot)
+{
+    float final_npc_x = (float)npc_zsx + (float)dx * z;
+    float final_npc_y = (float)npc_zsy + (float)dy * z;
+
+    return final_npc_x >= (float)pad_side
+        && final_npc_x <= (float)(cr->width - pad_side)
+        && final_npc_y >= (float)npc_pad_top
+        && final_npc_y <= (float)(cr->height - pad_bot);
+}
+
 void dialog_camera_init(void)
 {
     settings_register(&settings, DIALOGUE_CAMERA_MODE_KEY,       "0", NULL);
     settings_register(&settings, DIALOGUE_CAMERA_TWEEN_BACK_KEY, "0", NULL);
+    settings_register(&settings, DIALOGUE_CAMERA_ZOOM_TO_FIT_KEY, "1", NULL);
     cam_tween_active = false;
     cam_zoom_saved = false;
     cam_dialog_zoom_floor = ISO_ZOOM_MAX;
@@ -87,6 +107,18 @@ static void compute_target(int64_t pc_loc, int64_t npc_loc, int mode,
 
     int64_t cx = cr.width  / 2;
     int64_t cy = cr.height / 2;
+    bool zoom_fit_blocked = false;
+    bool zoom_to_fit_enabled = settings_get_value(&settings, DIALOGUE_CAMERA_ZOOM_TO_FIT_KEY) != 0;
+    int64_t npc_center_dx;
+    int64_t npc_center_dy;
+    int64_t fallback_dx = 0;
+    int64_t fallback_dy = 0;
+    int64_t candidate_dx = 0;
+    int64_t candidate_dy = 0;
+    float npc_min_dx = 0.0f;
+    float npc_max_dx = 0.0f;
+    float npc_min_dy = 0.0f;
+    float npc_max_dy = 0.0f;
 
     *out_dx = 0;
     *out_dy = 0;
@@ -141,6 +173,9 @@ static void compute_target(int64_t pc_loc, int64_t npc_loc, int mode,
         && (z * (sp_y + y_head_coeff) > y_avail);
 
     if (need_zoom_x || need_zoom_y) {
+        if (!zoom_to_fit_enabled || !iso_zoom_is_available()) {
+            zoom_fit_blocked = true;
+        } else {
         float zx = need_zoom_x
             ? ((float)cr.width - (float)(pad_side * 2)) / sp_x
             : 1e9f;  // sentinel: x axis doesn't constrain zoom
@@ -164,7 +199,11 @@ static void compute_target(int64_t pc_loc, int64_t npc_loc, int mode,
             pc_pad_top  = DIALOGUE_CAM_UI_TOP + aesthetic_y;
             pad_bot     = DIALOGUE_CAM_UI_BOT + aesthetic_y;
         }
+        }
     }
+
+    npc_center_dx = cx - npc_sx;
+    npc_center_dy = (cy + (int64_t)((float)(npc_pad_top - pad_bot) / (2.0f * z))) - npc_sy;
 
     // Compute zoomed screen positions for the final settled z.
     // location_xy returns unzoomed world-pixel screen coords; apply the zoom
@@ -175,61 +214,100 @@ static void compute_target(int64_t pc_loc, int64_t npc_loc, int mode,
     int64_t pc_zsx  = cx + (int64_t)((float)(pc_sx  - cx) * z);
     int64_t pc_zsy  = cy + (int64_t)((float)(pc_sy  - cy) * z);
 
-    switch (mode) {
-    case 0: {
-        // Minimal pan: find the smallest pan that keeps both NPC and player
-        // inside the padding zone simultaneously.
-        //
-        // For each axis, compute the valid-pan range for each character
-        // (world pixels) then intersect.  Pick the value in the intersection
-        // closest to zero (minimum movement).  If there is no intersection,
-        // pan alone cannot fit both — the zoom-to-fit block above handles it.
-        float npc_min_dx = (float)(pad_side - npc_zsx) / z;
-        float npc_max_dx = (float)((cr.width - pad_side) - npc_zsx) / z;
+    // Shared NPC-safe pan bounds, plus the minimal NPC-priority fallback used
+    // whenever a framing mode cannot fully honor its preferred target.
+    npc_min_dx = (float)(pad_side - npc_zsx) / z;
+    npc_max_dx = (float)((cr.width - pad_side) - npc_zsx) / z;
+    {
         float pc_min_dx  = (float)(pad_side - pc_zsx) / z;
         float pc_max_dx  = (float)((cr.width - pad_side) - pc_zsx) / z;
         float lo_dx = npc_min_dx > pc_min_dx ? npc_min_dx : pc_min_dx;
         float hi_dx = npc_max_dx < pc_max_dx ? npc_max_dx : pc_max_dx;
         if (lo_dx <= hi_dx) {
-            if      (0.0f < lo_dx) *out_dx = (int64_t)lo_dx;
-            else if (0.0f > hi_dx) *out_dx = (int64_t)hi_dx;
-            // else 0 is already valid — no x movement needed
+            if      (0.0f < lo_dx) fallback_dx = (int64_t)lo_dx;
+            else if (0.0f > hi_dx) fallback_dx = (int64_t)hi_dx;
         } else {
-            // No intersection: NPC takes priority.
-            if      (npc_zsx < pad_side)            *out_dx = (int64_t)npc_min_dx;
-            else if (npc_zsx > cr.width - pad_side) *out_dx = (int64_t)npc_max_dx;
+            if      (npc_zsx < pad_side)            fallback_dx = (int64_t)npc_min_dx;
+            else if (npc_zsx > cr.width - pad_side) fallback_dx = (int64_t)npc_max_dx;
         }
+    }
 
-        // NPC uses npc_pad_top (bubble clearance); PC uses pc_pad_top (no bubble).
-        float npc_min_dy = (float)(npc_pad_top - npc_zsy) / z;
-        float npc_max_dy = (float)((cr.height - pad_bot) - npc_zsy) / z;
+    npc_min_dy = (float)(npc_pad_top - npc_zsy) / z;
+    npc_max_dy = (float)((cr.height - pad_bot) - npc_zsy) / z;
+    {
         float pc_min_dy  = (float)(pc_pad_top  - pc_zsy)  / z;
         float pc_max_dy  = (float)((cr.height - pad_bot) - pc_zsy)  / z;
         float lo_dy = npc_min_dy > pc_min_dy ? npc_min_dy : pc_min_dy;
         float hi_dy = npc_max_dy < pc_max_dy ? npc_max_dy : pc_max_dy;
         if (lo_dy <= hi_dy) {
-            if      (0.0f < lo_dy) *out_dy = (int64_t)lo_dy;
-            else if (0.0f > hi_dy) *out_dy = (int64_t)hi_dy;
+            if      (0.0f < lo_dy) fallback_dy = (int64_t)lo_dy;
+            else if (0.0f > hi_dy) fallback_dy = (int64_t)hi_dy;
         } else {
-            if      (npc_zsy < npc_pad_top)              *out_dy = (int64_t)npc_min_dy;
-            else if (npc_zsy > cr.height - pad_bot)      *out_dy = (int64_t)npc_max_dy;
+            if      (npc_zsy < npc_pad_top)         fallback_dy = (int64_t)npc_min_dy;
+            else if (npc_zsy > cr.height - pad_bot) fallback_dy = (int64_t)npc_max_dy;
         }
-        break;
     }
+
+    switch (mode) {
+    case 0:
+        break;
     case 1:
-        // Center on NPC.  Centering is correct in world space.  The vertical
-        // bias is divided by z so it represents the same screen-pixel offset
-        // regardless of zoom.
-        *out_dx = cx - npc_sx;
-        *out_dy = (cy + (int64_t)((float)(npc_pad_top - pad_bot) / (2.0f * z))) - npc_sy;
+        // Center on midpoint between player and NPC, same vertical bias.
+        candidate_dx = cx - (pc_sx + npc_sx) / 2;
+        candidate_dy = (cy + (int64_t)((float)(npc_pad_top - pad_bot) / (2.0f * z))) - (pc_sy + npc_sy) / 2;
         break;
     case 2:
-        // Center on midpoint between player and NPC, same vertical bias.
-        *out_dx = cx - (pc_sx + npc_sx) / 2;
-        *out_dy = (cy + (int64_t)((float)(npc_pad_top - pad_bot) / (2.0f * z))) - (pc_sy + npc_sy) / 2;
+        // Center on NPC.  The vertical bias is divided by z so it represents
+        // the same screen-pixel offset regardless of zoom.
+        candidate_dx = npc_center_dx;
+        candidate_dy = npc_center_dy;
+        break;
+    case 3:
+        // Center on player, matching the legacy-feeling framing mode, but
+        // clamp toward that target so the NPC speaker remains properly framed.
+        candidate_dx = cx - pc_sx;
+        candidate_dy = cy - pc_sy;
+        if ((float)candidate_dx < npc_min_dx) {
+            candidate_dx = (int64_t)npc_min_dx;
+        } else if ((float)candidate_dx > npc_max_dx) {
+            candidate_dx = (int64_t)npc_max_dx;
+        }
+        if ((float)candidate_dy < npc_min_dy) {
+            candidate_dy = (int64_t)npc_min_dy;
+        } else if ((float)candidate_dy > npc_max_dy) {
+            candidate_dy = (int64_t)npc_max_dy;
+        }
         break;
     default:
         break;
+    }
+
+    if (mode == 0) {
+        *out_dx = fallback_dx;
+        *out_dy = fallback_dy;
+    } else if (mode == 3) {
+        // Player-center mode should always move as far toward centering the
+        // player as the NPC-safe bounds allow, rather than collapsing to the
+        // minimal fallback just because exact centering is impossible.
+        *out_dx = candidate_dx;
+        *out_dy = candidate_dy;
+    } else if (zoom_fit_blocked
+        || !dialog_camera_npc_fits_after_pan(candidate_dx,
+               candidate_dy,
+               npc_zsx,
+               npc_zsy,
+               z,
+               &cr,
+               pad_side,
+               npc_pad_top,
+               pad_bot)) {
+        // Shared fallback for non-minimal modes: keep the NPC speaker and
+        // bubble cleanly framed with the same NPC-priority logic as mode 0.
+        *out_dx = fallback_dx;
+        *out_dy = fallback_dy;
+    } else {
+        *out_dx = candidate_dx;
+        *out_dy = candidate_dy;
     }
 
     // Suppress unused warning — tmp used by location_xy via pc_loc/npc_loc

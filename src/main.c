@@ -57,6 +57,17 @@ static void main_loop(void);
 static void handle_mouse_scroll(void);
 static void handle_keyboard_scroll(void);
 static void build_cmd_line(char* dst, size_t size, int argc, char** argv);
+static void handle_zoom_key_press(SDL_Scancode scancode);
+static void handle_zoom_key_release(SDL_Scancode scancode);
+static void handle_zoom_key_repeat(void);
+
+#define ZOOM_KEY_REPEAT_INITIAL_DELAY_MS 300
+#define ZOOM_KEY_REPEAT_INTERVAL_SLOW_MS 110
+#define ZOOM_KEY_REPEAT_INTERVAL_FAST_MS 70
+
+static SDL_Scancode zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+static tig_timestamp_t zoom_repeat_next_ms;
+static int zoom_repeat_count = 0;
 
 // 0x59A040
 static float gamma = 1.0f;
@@ -391,6 +402,7 @@ void main_loop(void)
 
         tig_ping();
         gamelib_ping();
+        handle_zoom_key_repeat();
         iso_redraw();
         tig_window_display();
 
@@ -424,6 +436,12 @@ void main_loop(void)
                 // CE: Toggle highlight mode when Left Alt is pressed.
                 if (message.data.keyboard.scancode == SDL_SCANCODE_LALT) {
                     object_highlight_mode_set(message.data.keyboard.pressed);
+                }
+
+                if (message.data.keyboard.pressed) {
+                    handle_zoom_key_press(message.data.keyboard.scancode);
+                } else {
+                    handle_zoom_key_release(message.data.keyboard.scancode);
                 }
 
                 if (!message.data.keyboard.pressed) {
@@ -509,18 +527,6 @@ void main_loop(void)
                             iso_interface_refresh();
                             intgame_draw_bar(INTGAME_BAR_HEALTH);
                             intgame_draw_bar(INTGAME_BAR_FATIGUE);
-                        }
-                        break;
-                    case SDL_SCANCODE_EQUALS:
-                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
-                            iso_zoom_step_in();
-                            gamelib_invalidate_rect(NULL);
-                        }
-                        break;
-                    case SDL_SCANCODE_MINUS:
-                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
-                            iso_zoom_step_out();
-                            gamelib_invalidate_rect(NULL);
                         }
                         break;
                     case SDL_SCANCODE_0:
@@ -713,6 +719,78 @@ void main_loop(void)
             handle_mouse_scroll();
         }
     }
+}
+
+static void handle_zoom_key_press(SDL_Scancode scancode)
+{
+    tig_timestamp_t now;
+
+    if (textedit_ui_is_focused() || !iso_zoom_is_available()) {
+        return;
+    }
+
+    switch (scancode) {
+    case SDL_SCANCODE_EQUALS:
+        iso_zoom_step_in();
+        break;
+    case SDL_SCANCODE_MINUS:
+        iso_zoom_step_out();
+        break;
+    default:
+        return;
+    }
+
+    gamelib_invalidate_rect(NULL);
+    zoom_repeat_scancode = scancode;
+    zoom_repeat_count = 0;
+    tig_timer_now(&now);
+    zoom_repeat_next_ms = now + ZOOM_KEY_REPEAT_INITIAL_DELAY_MS;
+}
+
+static void handle_zoom_key_release(SDL_Scancode scancode)
+{
+    if (zoom_repeat_scancode == scancode) {
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        zoom_repeat_count = 0;
+    }
+}
+
+static void handle_zoom_key_repeat(void)
+{
+    tig_timestamp_t now;
+
+    if (zoom_repeat_scancode == SDL_SCANCODE_UNKNOWN) {
+        return;
+    }
+
+    if (textedit_ui_is_focused() || !iso_zoom_is_available()) {
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        return;
+    }
+
+    tig_timer_now(&now);
+    if ((int)(now - zoom_repeat_next_ms) < 0) {
+        return;
+    }
+
+    switch (zoom_repeat_scancode) {
+    case SDL_SCANCODE_EQUALS:
+        iso_zoom_step_in();
+        break;
+    case SDL_SCANCODE_MINUS:
+        iso_zoom_step_out();
+        break;
+    default:
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        return;
+    }
+
+    gamelib_invalidate_rect(NULL);
+    zoom_repeat_count++;
+    zoom_repeat_next_ms = now
+        + (zoom_repeat_count < 2
+            ? ZOOM_KEY_REPEAT_INTERVAL_SLOW_MS
+            : ZOOM_KEY_REPEAT_INTERVAL_FAST_MS);
 }
 
 // 0x401F50
