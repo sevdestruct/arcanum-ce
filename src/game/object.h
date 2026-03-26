@@ -94,6 +94,7 @@ extern int64_t object_hover_obj;
 
 bool object_init(GameInitInfo* init_info);
 void object_resize(GameResizeInfo* resize_info);
+void object_set_iso_content_rect(const TigRect* rect);
 void object_reset(void);
 void object_exit(void);
 void object_ping(tig_timestamp_t timestamp);

@@ -126,5 +126,6 @@ void gamelib_redraw(void);
 bool gamelib_copy_version(char* long_version, char* short_version, char* locale);
 void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
+void gamelib_get_iso_content_rect(TigRect* rect);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

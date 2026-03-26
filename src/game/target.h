@@ -204,6 +204,7 @@ int sub_4F2C60(int64_t* obj_ptr);
 void target_descriptor_set_loc(TargetDescriptor* td, int64_t loc);
 void target_descriptor_set_obj(TargetDescriptor* td, int64_t obj);
 bool target_pick_at_screen_xy(int x, int y, TargetDescriptor* td, bool fullscreen);
+bool target_pick_at_virtual_xy(int x, int y, TargetDescriptor* td, bool fullscreen);
 bool target_pick_at_screen_xy_ex(int x, int y, TargetDescriptor* td, uint64_t tgt, bool fullscreen);
 uint64_t target_last_rejection_get(void);
 bool target_context_evaluate(TargetContext* ctx);

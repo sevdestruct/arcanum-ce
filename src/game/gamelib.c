@@ -1,6 +1,12 @@
 #include "game/gamelib.h"
 
+#include <math.h>
 #include <stdio.h>
+
+#include "game/dialog_camera.h"
+#include "game/iso_zoom.h"
+#include "game/location.h"
+#include "game/tile.h"
 
 #include "game/ai.h"
 #include "game/anim.h"
@@ -304,6 +310,10 @@ Settings settings;
 // 0x739E7C
 TigVideoBuffer* gamelib_scratch_video_buffer;
 
+static TigVideoBuffer* gamelib_world_video_buffer = NULL;
+static TigVideoBuffer* gamelib_iso_window_vb = NULL;
+static bool gamelib_zoom_world_pass_active = false;
+
 // 0x4020F0
 bool gamelib_init(GameInitInfo* init_info)
 {
@@ -368,6 +378,23 @@ bool gamelib_init(GameInitInfo* init_info)
         return false;
     }
 
+    tig_window_vbid_get(init_info->iso_window_handle, &gamelib_iso_window_vb);
+
+    if (!init_info->editor) {
+        TigVideoBufferCreateInfo world_vb_info;
+        world_vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        world_vb_info.width = window_data.rect.width * 2;
+        world_vb_info.height = window_data.rect.height * 2;
+        world_vb_info.color_key = 0;
+        world_vb_info.background_color = 0;
+        if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
+            gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_init: zoom disabled because world video buffer allocation failed.\n");
+        }
+    }
+
+    iso_zoom_set_available(init_info->editor || gamelib_world_video_buffer != NULL);
+
     if (init_info->editor) {
         gamelib_draw_func = gamelib_draw_editor;
     } else {
@@ -392,6 +419,11 @@ bool gamelib_init(GameInitInfo* init_info)
                 return false;
             }
         }
+    }
+
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
     }
 
     return true;
@@ -478,6 +510,11 @@ void gamelib_exit(void)
         gamelib_scratch_video_buffer = NULL;
     }
 
+    if (gamelib_world_video_buffer != NULL) {
+        tig_video_buffer_destroy(gamelib_world_video_buffer);
+        gamelib_world_video_buffer = NULL;
+    }
+
     if (tig_file_is_directory("Save\\Current")) {
         if (!tig_file_empty_directory("Save\\Current")) {
             // FIXME: Typo in function name, this is definitely not
@@ -537,10 +574,37 @@ void gamelib_resize(GameResizeInfo* resize_info)
         return;
     }
 
+    tig_window_vbid_get(resize_info->window_handle, &gamelib_iso_window_vb);
+
+    if (gamelib_world_video_buffer != NULL) {
+        tig_video_buffer_destroy(gamelib_world_video_buffer);
+        gamelib_world_video_buffer = NULL;
+    }
+
+    if (gamelib_draw_func == gamelib_draw_game) {
+        TigVideoBufferCreateInfo world_vb_info;
+        world_vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        world_vb_info.width = gamelib_iso_content_rect.width * 2;
+        world_vb_info.height = gamelib_iso_content_rect.height * 2;
+        world_vb_info.color_key = 0;
+        world_vb_info.background_color = 0;
+        if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
+            gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_resize: zoom disabled because world video buffer allocation failed.\n");
+        }
+    }
+
+    iso_zoom_set_available(gamelib_draw_func != gamelib_draw_game || gamelib_world_video_buffer != NULL);
+
     for (index = 0; index < MODULE_COUNT; index++) {
         if (gamelib_modules[index].resize_func != NULL) {
             gamelib_modules[index].resize_func(resize_info);
         }
+    }
+
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
     }
 
     if (gamelib_dirty_rects_head != NULL) {
@@ -841,6 +905,14 @@ bool gamelib_draw(void)
     SectorRect sector_rect;
     SectorListNode* sectors;
     GameDrawInfo draw_info;
+    float z;
+    bool zoom_active;
+    TigRect orig_content_rect;
+    TigRect orig_content_rect_ex;
+    int64_t orig_ox;
+    int64_t orig_oy;
+    int ww;
+    int wh;
 
     if (gamelib_renderlock_cnt <= 0) {
         return false;
@@ -850,7 +922,39 @@ bool gamelib_draw(void)
         return false;
     }
 
+    iso_zoom_ping();
+    dialog_camera_ping();
+    z = iso_zoom_current();
+    zoom_active = (z != 1.0f)
+        && (gamelib_world_video_buffer != NULL)
+        && (gamelib_draw_func == gamelib_draw_game);
+
     in_draw = true;
+
+    if (zoom_active) {
+        orig_content_rect = gamelib_iso_content_rect;
+        orig_content_rect_ex = gamelib_iso_content_rect_ex;
+        location_origin_get(&orig_ox, &orig_oy);
+        ww = orig_content_rect.width;
+        wh = orig_content_rect.height;
+
+        gamelib_iso_content_rect.x = 0;
+        gamelib_iso_content_rect.y = 0;
+        gamelib_iso_content_rect.width = ww * 2;
+        gamelib_iso_content_rect.height = wh * 2;
+
+        gamelib_iso_content_rect_ex.x = -256;
+        gamelib_iso_content_rect_ex.y = -256;
+        gamelib_iso_content_rect_ex.width = ww * 2 + 512;
+        gamelib_iso_content_rect_ex.height = wh * 2 + 512;
+
+        location_origin_pixel_set(orig_ox + ww / 2, orig_oy + wh / 2);
+
+        tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_world_video_buffer);
+        tile_set_render_target(gamelib_world_video_buffer);
+
+        tig_video_buffer_fill(gamelib_world_video_buffer, NULL, 0);
+    }
 
     if (location_screen_rect_to_loc_rect(&gamelib_iso_content_rect_ex, &loc_rect)) {
         if (gamelib_view_options.type == VIEW_TYPE_ISOMETRIC) {
@@ -863,20 +967,125 @@ bool gamelib_draw(void)
         draw_info.sector_rect = &sector_rect;
         draw_info.sectors = sectors;
         draw_info.rects = &gamelib_dirty_rects_head;
+        if (zoom_active) {
+            // Force a full world-VB redraw: tile_draw_iso uses dirty rects as
+            // input, so a partial rect would leave unpainted black regions.
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                tig_rect_node_destroy(node);
+                node = next;
+            }
+            gamelib_dirty_rects_head = tig_rect_node_create();
+            if (gamelib_dirty_rects_head != NULL) {
+                gamelib_dirty_rects_head->rect.x = 0;
+                gamelib_dirty_rects_head->rect.y = 0;
+                gamelib_dirty_rects_head->rect.width = ww * 2;
+                gamelib_dirty_rects_head->rect.height = wh * 2;
+                gamelib_dirty_rects_head->next = NULL;
+            }
+            tig_window_set_invalidate_suppressed(true);
+            gamelib_zoom_world_pass_active = true;
+            TigRect zoom_content_rect = { 0, 0, ww * 2, wh * 2 };
+            object_set_iso_content_rect(&zoom_content_rect);
+            light_set_iso_content_rect(&zoom_content_rect);
+        }
         gamelib_draw_func(&draw_info);
+        if (zoom_active) {
+            gamelib_zoom_world_pass_active = false;
+            tig_window_set_invalidate_suppressed(false);
+            object_set_iso_content_rect(&orig_content_rect);
+            light_set_iso_content_rect(&orig_content_rect);
+        }
         sector_list_destroy(sectors);
 
-        node = gamelib_dirty_rects_head;
-        while (node != NULL) {
-            next = node->next;
-            rect = node->rect;
-            rect.x += gamelib_window_rect_x;
-            rect.y += gamelib_window_rect_y;
-            tig_window_invalidate_rect(&rect);
-            tig_rect_node_destroy(node);
-            node = next;
+        if (zoom_active) {
+            int src_w;
+            int src_h;
+            TigRect src;
+            TigRect dst;
+            TigVideoBufferBlitInfo blit = { 0 };
+
+            tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+            tile_set_render_target(gamelib_iso_window_vb);
+            gamelib_iso_content_rect = orig_content_rect;
+            gamelib_iso_content_rect_ex = orig_content_rect_ex;
+            location_origin_pixel_set(orig_ox, orig_oy);
+            zoom_active = false;
+
+            src_w = (int)roundf((float)ww / z);
+            src_h = (int)roundf((float)wh / z);
+            src.x = ww - src_w / 2;
+            src.y = wh - src_h / 2;
+            src.width = src_w;
+            src.height = src_h;
+            dst.x = 0;
+            dst.y = 0;
+            dst.width = ww;
+            dst.height = wh;
+            blit.src_video_buffer = gamelib_world_video_buffer;
+            blit.src_rect = &src;
+            blit.dst_video_buffer = gamelib_iso_window_vb;
+            blit.dst_rect = &dst;
+            tig_video_buffer_blit(&blit);
+
+            // Re-run fixed-screen HUD draws (tc/tf/tb) directly onto
+            // iso_window_vb at normal viewport coordinates. They rendered into
+            // world_vb at fixed coords outside the scale-blit src rect, so
+            // they would have been clipped away. We stamp them on top here.
+            {
+                TigRectListNode hud_node;
+                TigRectListNode* hud_head;
+                GameDrawInfo hud_info;
+
+                hud_node.rect = orig_content_rect;
+                hud_node.next = NULL;
+                hud_head = &hud_node;
+
+                memset(&hud_info, 0, sizeof(hud_info));
+                hud_info.rects = &hud_head;
+
+                if (tig_video_3d_begin_scene() == TIG_OK) {
+                    tb_draw(&hud_info);
+                    tf_draw(&hud_info);
+                    tc_draw(&hud_info);
+                    tig_video_3d_end_scene();
+                }
+            }
+
+            // Discard gamelib dirty rects (world-VB-space coords) and do a
+            // single full-viewport compositor invalidate instead.
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                tig_rect_node_destroy(node);
+                node = next;
+            }
+            gamelib_dirty_rects_head = NULL;
+            tig_window_invalidate_rect(NULL);
+        } else {
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                rect = node->rect;
+                rect.x += gamelib_window_rect_x;
+                rect.y += gamelib_window_rect_y;
+                tig_window_invalidate_rect(&rect);
+                tig_rect_node_destroy(node);
+                node = next;
+            }
         }
         ret = true;
+    }
+
+    if (zoom_active) {
+        tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+        tile_set_render_target(gamelib_iso_window_vb);
+        gamelib_iso_content_rect = orig_content_rect;
+        gamelib_iso_content_rect_ex = orig_content_rect_ex;
+        location_origin_pixel_set(orig_ox, orig_oy);
+        object_set_iso_content_rect(&orig_content_rect);
+        light_set_iso_content_rect(&orig_content_rect);
     }
 
     gamelib_dirty_rects_head = gamelib_pending_dirty_rects_head;
@@ -884,6 +1093,15 @@ bool gamelib_draw(void)
 
     if (gamelib_dirty_rects_head == NULL) {
         gamelib_dirty = false;
+    }
+
+    // Keep rendering each frame while zoom is still lerping.
+    if (iso_zoom_is_animating()) {
+        gamelib_dirty = true;
+    }
+
+    if (dialog_camera_is_animating()) {
+        gamelib_dirty = true;
     }
 
     in_draw = false;
@@ -1666,6 +1884,11 @@ void gamelib_patch_lvl_set(const char* patch_lvl)
     (void)patch_lvl;
 }
 
+void gamelib_get_iso_content_rect(TigRect* rect)
+{
+    *rect = gamelib_iso_content_rect;
+}
+
 // 0x404650
 const char* gamelib_get_locale(void)
 {
@@ -1699,9 +1922,11 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         sub_43C690(draw_info);
         object_draw(draw_info);
         roof_draw(draw_info);
-        tb_draw(draw_info);
-        tf_draw(draw_info);
-        tc_draw(draw_info);
+        if (!gamelib_zoom_world_pass_active) {
+            tb_draw(draw_info);
+            tf_draw(draw_info);
+            tc_draw(draw_info);
+        }
         tig_video_3d_end_scene();
     }
 }

@@ -609,6 +609,16 @@ int tc_check_size(const char* str)
     return width;
 }
 
+bool tc_is_active(void)
+{
+    return tc_active;
+}
+
+TigRect tc_get_content_rect(void)
+{
+    return tc_content_rect;
+}
+
 /**
  * Renders the text conversation.
  *

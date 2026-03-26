@@ -285,6 +285,8 @@ int tig_font_write(TigVideoBuffer* video_buffer, const char* str, const TigRect*
 
                 if ((tig_font_stack[tig_font_stack_index]->flags & TIG_FONT_CENTERED) != 0) {
                     dx = (rect->width - line_width) / 2;
+                } else if ((tig_font_stack[tig_font_stack_index]->flags & TIG_FONT_RIGHT) != 0) {
+                    dx = rect->width - line_width;
                 } else {
                     dx = 0;
                 }
