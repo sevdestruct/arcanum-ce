@@ -10,6 +10,15 @@ static float zoom_target = 1.0f;
 static float zoom_min = ISO_ZOOM_MIN;
 static float zoom_max = ISO_ZOOM_MAX;
 static bool zoom_available = true;
+static bool zoom_enabled = true;
+
+static void iso_zoom_enabled_changed(void)
+{
+    zoom_enabled = settings_get_value(&settings, ISO_ZOOM_ENABLED_KEY) != 0;
+    if (!iso_zoom_is_available()) {
+        iso_zoom_reset();
+    }
+}
 
 static void iso_zoom_min_changed(void)
 {
@@ -40,6 +49,9 @@ void iso_zoom_init(void)
     zoom_target = 1.0f;
     zoom_min = ISO_ZOOM_MIN;
     zoom_max = ISO_ZOOM_MAX;
+    zoom_enabled = true;
+    settings_register(&settings, ISO_ZOOM_ENABLED_KEY, "1", iso_zoom_enabled_changed);
+    iso_zoom_enabled_changed();  // apply value already loaded from arcanum.cfg
     settings_register(&settings, ISO_ZOOM_MIN_KEY, "0.5", iso_zoom_min_changed);
     iso_zoom_min_changed();  // apply value already loaded from arcanum.cfg
     settings_register(&settings, ISO_ZOOM_MAX_KEY, "1.75", iso_zoom_max_changed);
@@ -112,7 +124,7 @@ bool iso_zoom_is_animating(void)
 
 bool iso_zoom_is_available(void)
 {
-    return zoom_available;
+    return zoom_available && zoom_enabled;
 }
 
 void iso_zoom_reset(void)
