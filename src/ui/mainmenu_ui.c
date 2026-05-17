@@ -4900,32 +4900,47 @@ static void mainmenu_ui_free_custom_bg(void)
 
 static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* path)
 {
+    /* Base names for each menu screen (no directory prefix, no extension).
+     * The search loop below tries each name under both art/ui/ (DAT archive
+     * layout) and art/ (common loose-file drop location). */
     static const char* candidates[MM_WINDOW_COUNT][2] = {
         /* MM_WINDOW_0                    */ { NULL, NULL },
         /* MM_WINDOW_1                    */ { NULL, NULL },
-        /* MM_WINDOW_MAINMENU             */ { "art/ui/mainmenu_bg", NULL },
-        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art/ui/inmenu_bg", "art/ui/mainmenu_bg" },
-        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art/ui/inmenu_locked_bg", "art/ui/mainmenu_bg" },
-        /* MM_WINDOW_SINGLE_PLAYER        */ { "art/ui/singleplayer_bg", "art/ui/mainmenu_bg" },
-        /* MM_WINDOW_OPTIONS              */ { "art/ui/options_bg", NULL },
-        /* MM_WINDOW_LOAD_GAME            */ { "art/ui/loadgame_bg", NULL },
-        /* MM_WINDOW_SAVE_GAME            */ { "art/ui/savegame_bg", NULL },
-        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art/ui/savegame_bg", NULL },
-        /* MM_WINDOW_INTRO                */ { "art/ui/intro_bg", NULL },
-        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art/ui/newchar_bg", "art/ui/mainmenu_bg" },
-        /* MM_WINDOW_NEW_CHAR             */ { "art/ui/newchar_bg", NULL },
-        /* MM_WINDOW_PREGEN_CHAR          */ { "art/ui/newchar_bg", NULL },
-        /* MM_WINDOW_CHAREDIT             */ { "art/ui/charedit_bg", NULL },
-        /* MM_WINDOW_SHOP                 */ { "art/ui/shop_bg", NULL },
-        /* MM_WINDOW_CREDITS              */ { "art/ui/credits_bg", "art/ui/mainmenu_bg" },
+        /* MM_WINDOW_MAINMENU             */ { "mainmenu_bg", NULL },
+        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "inmenu_bg", "mainmenu_bg" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "inmenu_locked_bg", "mainmenu_bg" },
+        /* MM_WINDOW_SINGLE_PLAYER        */ { "singleplayer_bg", "mainmenu_bg" },
+        /* MM_WINDOW_OPTIONS              */ { "options_bg", NULL },
+        /* MM_WINDOW_LOAD_GAME            */ { "loadgame_bg", NULL },
+        /* MM_WINDOW_SAVE_GAME            */ { "savegame_bg", NULL },
+        /* MM_WINDOW_LAST_SAVE_GAME       */ { "savegame_bg", NULL },
+        /* MM_WINDOW_INTRO                */ { "intro_bg", NULL },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "newchar_bg", "mainmenu_bg" },
+        /* MM_WINDOW_NEW_CHAR             */ { "newchar_bg", NULL },
+        /* MM_WINDOW_PREGEN_CHAR          */ { "newchar_bg", NULL },
+        /* MM_WINDOW_CHAREDIT             */ { "charedit_bg", NULL },
+        /* MM_WINDOW_SHOP                 */ { "shop_bg", NULL },
+        /* MM_WINDOW_CREDITS              */ { "credits_bg", "mainmenu_bg" },
         /* MM_WINDOW_26                   */ { NULL, NULL },
+    };
+    /* Directory prefixes to search, in priority order. */
+    static const char* prefixes[] = {
+        "art/ui/",
+        "art/",
     };
     static const char* extensions[] = {
         ".mp4",
         ".bik",
     };
+    /* Suffixes to try in order: _native first (no scale-to-fit), then bare. */
+    static const char* suffixes[] = {
+        "_native",
+        "",
+    };
     char candidate[TIG_MAX_PATH];
     int candidate_index;
+    int prefix_index;
+    int suffix_index;
     int extension_index;
 
     if (path == NULL || type < 0 || type >= MM_WINDOW_COUNT) {
@@ -4939,14 +4954,20 @@ static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* pat
             break;
         }
 
-        for (extension_index = 0; extension_index < SDL_arraysize(extensions); extension_index++) {
-            snprintf(candidate,
-                sizeof(candidate),
-                "%s%s",
-                candidates[type][candidate_index],
-                extensions[extension_index]);
-            if (tig_file_extract(candidate, path)) {
-                return true;
+        for (prefix_index = 0; prefix_index < SDL_arraysize(prefixes); prefix_index++) {
+            for (suffix_index = 0; suffix_index < SDL_arraysize(suffixes); suffix_index++) {
+                for (extension_index = 0; extension_index < SDL_arraysize(extensions); extension_index++) {
+                    snprintf(candidate,
+                        sizeof(candidate),
+                        "%s%s%s%s",
+                        prefixes[prefix_index],
+                        candidates[type][candidate_index],
+                        suffixes[suffix_index],
+                        extensions[extension_index]);
+                    if (tig_file_extract(candidate, path)) {
+                        return true;
+                    }
+                }
             }
         }
     }
