@@ -8407,6 +8407,104 @@ void intgame_big_window_unlock(void)
     tig_window_hide(intgame_big_window_handle);
 }
 
+bool intgame_big_window_screen_rect(TigRect* rect)
+{
+    TigWindowData wd;
+
+    if (intgame_big_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return false;
+    }
+    if (tig_window_data(intgame_big_window_handle, &wd) != TIG_OK) {
+        return false;
+    }
+    *rect = wd.rect;
+    return true;
+}
+
+// Re-push the big overlay window to the top of its z-class so it sits above
+// any subsequently created MIDDLE-class siblings (e.g. the main-menu backdrop
+// for the charedit step of character creation).
+void intgame_big_window_promote(void)
+{
+    if (intgame_big_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    tig_window_move_on_top(intgame_big_window_handle);
+}
+
+// Re-push both iso-interface HUD strips to the top of their z-class.
+// Used after the custom-UI backdrop window is created so the strips
+// (which were created earlier and are therefore older in MIDDLE class)
+// don't get covered by the backdrop. Lets the original mainmenu art's
+// chromakey knockouts reveal the strip content (rotwin / info bar)
+// underneath, the way upstream's z-compositing intended.
+void intgame_iso_strips_promote(void)
+{
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_move_on_top(dword_64C4F8[i]);
+        }
+    }
+}
+
+// Fully hide both iso-interface HUD strips.  Unlike intgame_hide(), which
+// leaves the bottom strip visible (moved up to align with main-menu chrome
+// covers and reused as the menu's rotwin / info-bar band), this hides
+// both strips outright.  Used by chrome-less menus (Save / Load) where the
+// would-be band would otherwise float visibly below the panel as "HUD
+// showing through" the menu.
+void intgame_iso_strips_hide_full(void)
+{
+    int i;
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    for (i = 0; i < 2; i++) {
+        if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_hide(dword_64C4F8[i]);
+        }
+    }
+}
+
+// Force the iso (game-world) window visible.  intgame_hide() hides the
+// iso window — so when a pause-menu chain (ESC → Save / Load) hands off
+// into a chrome-less menu, the world would otherwise stay hidden behind
+// the panel as a black flood.  Pair with intgame_iso_strips_hide_full()
+// to get a clean "panel over live game" composite.
+void intgame_iso_world_show(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C52C != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_show(dword_64C52C);
+    }
+}
+
+// Re-apply the moved-and-shown state of intgame_hide() for the bottom iso
+// strip, so chrome-bearing menus (pause menu, etc.) get their band back
+// after a transition through a chrome-less menu hid both strips.  The top
+// strip stays hidden (matches intgame_hide()).
+void intgame_iso_strips_show_as_band(void)
+{
+    TigRect rect;
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_hide(dword_64C4F8[0]);
+    }
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        rect = intgame_interface_window_frames[1];
+        hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
+        tig_window_move(dword_64C4F8[1], rect.x, rect.y);
+        if (!intgame_is_compact_interface()) {
+            tig_window_show(dword_64C4F8[1]);
+        }
+    }
+}
+
 // 0x557370
 void sub_557370(int64_t source_obj, int64_t target_obj)
 {
@@ -8615,6 +8713,11 @@ bool intgame_create_iso_window(tig_window_handle_t* window_handle_ptr)
 bool intgame_is_compact_interface(void)
 {
     return intgame_compact_interface;
+}
+
+bool intgame_iso_interface_is_created(void)
+{
+    return intgame_iso_interface_created;
 }
 
 // 0x5578D0
