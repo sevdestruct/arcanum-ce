@@ -92,12 +92,11 @@ static int pfog_height = 0;
  * Regenerated lazily when pfog_dirty is true. */
 static uint8_t* pfog_alpha_mask = NULL;
 
-/* Scratch buffers for the separable box blur.
- * pfog_blur_h: game pixels after horizontal blur pass.
- * pfog_blur_v: pfog_blur_h after vertical blur + dim (final foggy pixels).
- * Both are pfog_width * pfog_height uint32_t. */
+/* Scratch buffer for the horizontal blur pass (flat, pfog_width * pfog_height
+ * uint32_t).  pfog_blur_v_vb holds the dimmed/blurred fog pixels as a tig
+ * video buffer so the final composite can use tig_video_buffer_blit_alpha_mask. */
 static uint32_t* pfog_blur_h = NULL;
-static uint32_t* pfog_blur_v = NULL;
+static TigVideoBuffer* pfog_blur_v_vb = NULL;
 
 /* Per-column channel accumulators for the cache-friendly row-major vertical
  * blur pass.  Allocated once per buffer size (pfog_width elements each). */
@@ -129,7 +128,10 @@ static void pfog_free_buffers(void)
 {
     free(pfog_alpha_mask); pfog_alpha_mask = NULL;
     free(pfog_blur_h);     pfog_blur_h     = NULL;
-    free(pfog_blur_v);     pfog_blur_v     = NULL;
+    if (pfog_blur_v_vb != NULL) {
+        tig_video_buffer_destroy(pfog_blur_v_vb);
+        pfog_blur_v_vb = NULL;
+    }
     free(pfog_col_r);      pfog_col_r      = NULL;
     free(pfog_col_g);      pfog_col_g      = NULL;
     free(pfog_col_b);      pfog_col_b      = NULL;
@@ -137,16 +139,26 @@ static void pfog_free_buffers(void)
 
 static bool pfog_alloc_buffers(int w, int h)
 {
+    TigVideoBufferCreateInfo vb_create_info;
+
     pfog_free_buffers();
 
     pfog_alpha_mask = (uint8_t*)malloc((size_t)w * (size_t)h * sizeof(uint8_t));
     pfog_blur_h     = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
-    pfog_blur_v     = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
     pfog_col_r      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
     pfog_col_g      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
     pfog_col_b      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
 
-    if (!pfog_alpha_mask || !pfog_blur_h || !pfog_blur_v
+    vb_create_info.flags            = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+    vb_create_info.width            = w;
+    vb_create_info.height           = h;
+    vb_create_info.background_color = 0;
+    vb_create_info.color_key        = 0;
+    if (tig_video_buffer_create(&vb_create_info, &pfog_blur_v_vb) != TIG_OK) {
+        pfog_blur_v_vb = NULL;
+    }
+
+    if (!pfog_alpha_mask || !pfog_blur_h || pfog_blur_v_vb == NULL
         || !pfog_col_r || !pfog_col_g || !pfog_col_b) {
         pfog_free_buffers();
         return false;
@@ -294,7 +306,7 @@ static void pfog_blur_pass_h(const uint32_t* src, int src_pitch_words,
  * dim_pct: 0 = solid black, 100 = no dimming.
  */
 static void pfog_blur_pass_v_dim(const uint32_t* src_flat,
-                                  uint32_t* dst_flat,
+                                  uint32_t* dst, int dst_pitch_words,
                                   int w, int h, int radius, int dim_pct)
 {
     int x, y;
@@ -336,7 +348,7 @@ static void pfog_blur_pass_v_dim(const uint32_t* src_flat,
         }
 
         count = current_bot - current_top + 1;
-        drow  = dst_flat + (size_t)y * w;
+        drow  = dst + (size_t)y * dst_pitch_words;
         for (x = 0; x < w; x++) {
             uint8_t r = (uint8_t)((pfog_col_r[x] / count) * dim_pct / 100);
             uint8_t g = (uint8_t)((pfog_col_g[x] / count) * dim_pct / 100);
@@ -464,49 +476,49 @@ void perception_fog_draw(TigVideoBuffer* game_vb)
     pitch_words = vbd.pitch / 4; /* uint32_t elements per row */
     blur_enabled = pfog_cfg_blur && pfog_cfg_blur_radius > 0;
 
-    if (blur_enabled) {
-        /* Blur path: build the dimmed/blurred fog buffer, then alpha-composite
-         * it onto the game frame using the elliptical mask. */
+    if (blur_enabled && pfog_blur_v_vb != NULL) {
+        /* Blur path: H-blur reads game pixels while game_vb is locked, then
+         * V-blur+dim writes into pfog_blur_v_vb under its own lock; finally
+         * tig_video_buffer_blit_alpha_mask alpha-composites pfog_blur_v_vb
+         * onto game_vb through the elliptical mask. */
+        TigVideoBufferData vbd_fog;
+        TigRect rect;
+
         pfog_blur_pass_h(src_pixels, pitch_words,
                          pfog_blur_h, pfog_width, pfog_height,
                          pfog_cfg_blur_radius);
-        pfog_blur_pass_v_dim(pfog_blur_h, pfog_blur_v,
-                             pfog_width, pfog_height,
-                             pfog_cfg_blur_radius,
-                             pfog_cfg_dim_pct);
 
-        for (y = 0; y < pfog_height; y++) {
-            uint32_t*       drow = src_pixels + (size_t)y * pitch_words;
-            const uint8_t*  mrow = pfog_alpha_mask + (size_t)y * pfog_width;
-            const uint32_t* frow = pfog_blur_v + (size_t)y * pfog_width;
-
-            for (x = 0; x < pfog_width; x++) {
-                int alpha = mrow[x];
-                uint32_t game_px;
-                uint32_t fog_px;
-
-                if (alpha == 0) {
-                    continue;
-                }
-                game_px = drow[x];
-                fog_px  = frow[x];
-
-                if (alpha >= 255) {
-                    drow[x] = fog_px;
-                } else {
-                    int inv = 255 - alpha;
-                    drow[x] = PIXEL_MAKE(
-                        (uint8_t)((PIXEL_R(game_px) * inv + PIXEL_R(fog_px) * alpha) / 255),
-                        (uint8_t)((PIXEL_G(game_px) * inv + PIXEL_G(fog_px) * alpha) / 255),
-                        (uint8_t)((PIXEL_B(game_px) * inv + PIXEL_B(fog_px) * alpha) / 255));
-                }
+        if (tig_video_buffer_lock(pfog_blur_v_vb) == TIG_OK) {
+            if (tig_video_buffer_data(pfog_blur_v_vb, &vbd_fog) == TIG_OK
+                && vbd_fog.pixels != NULL
+                && vbd_fog.pitch > 0) {
+                pfog_blur_pass_v_dim(pfog_blur_h,
+                                     (uint32_t*)vbd_fog.pixels, vbd_fog.pitch / 4,
+                                     pfog_width, pfog_height,
+                                     pfog_cfg_blur_radius,
+                                     pfog_cfg_dim_pct);
             }
+            tig_video_buffer_unlock(pfog_blur_v_vb);
         }
-    } else {
-        /* Solid-dark fast path: fog = game * dim/100, so
-         *   out = game*(1-α) + fog*α = game * (25500 - α*(100-dim)) / 25500.
-         * Skip the intermediate fog buffer and fold dim+composite into one
-         * per-pixel multiplier. */
+
+        /* Drop our outer lock so the masked-blit can take its own; SDL
+         * lock_count is recursive, but this keeps the call symmetric. */
+        tig_video_buffer_unlock(game_vb);
+
+        rect.x = 0;
+        rect.y = 0;
+        rect.width  = pfog_width;
+        rect.height = pfog_height;
+        tig_video_buffer_blit_alpha_mask(pfog_blur_v_vb, game_vb,
+                                          &rect, pfog_alpha_mask, pfog_width);
+        return;
+    }
+
+    /* Solid-dark fast path: fog = game * dim/100, so
+     *   out = game*(1-α) + fog*α = game * (25500 - α*(100-dim)) / 25500.
+     * Skip the intermediate fog buffer and fold dim+composite into one
+     * per-pixel multiplier. */
+    {
         int neg_dim = 100 - pfog_cfg_dim_pct;
         for (y = 0; y < pfog_height; y++) {
             uint32_t*      drow = src_pixels + (size_t)y * pitch_words;

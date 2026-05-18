@@ -136,6 +136,13 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color);
 int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t tint_color, TigVideoBufferTintMode mode);
+// CE: Composite src onto dst using a per-pixel uint8_t alpha mask.
+// For each pixel in rect:
+//   dst[xy] = lerp(dst[xy], src[xy], mask[xy] / 255)
+// Mask values are src opacity (0 = keep dst, 255 = full src). src and dst
+// must share dimensions; rect specifies the region in both. mask_pitch is
+// the row stride of the mask buffer in bytes.
+int tig_video_buffer_blit_alpha_mask(TigVideoBuffer* src_video_buffer, TigVideoBuffer* dst_video_buffer, const TigRect* rect, const uint8_t* mask, int mask_pitch);
 int tig_video_buffer_save_to_bmp(TigVideoBufferSaveToBmpInfo* save_info);
 int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_buffer_ptr, unsigned int flags);
 
