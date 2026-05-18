@@ -112,6 +112,23 @@ static bool pfog_dirty = true;
  * Used to skip the composite pass when the fog area is entirely off-screen. */
 static bool pfog_has_fog = false;
 
+/* Smoothly-animated leash limits used for mask geometry.  Lerps each frame
+ * toward the live scroll_perception_pixel_limits() values so Perception
+ * changes glide instead of snapping.  Zoom already lerps inside iso_zoom,
+ * so we read iso_zoom_current() directly. */
+static float pfog_displayed_hor  = 0.0f;
+static float pfog_displayed_vert = 0.0f;
+#define PFOG_LIMITS_LERP 0.25f
+
+/* Bounding box of the outer fog ellipse on screen (after the last
+ * regenerate).  Used to skip writing alpha bytes for pixels guaranteed to be
+ * at max_alpha (outside the outer ellipse — set in bulk by memset). */
+static int pfog_outer_bbox_x1 = 0;
+static int pfog_outer_bbox_y1 = 0;
+static int pfog_outer_bbox_x2 = 0;
+static int pfog_outer_bbox_y2 = 0;
+static uint8_t pfog_last_max_alpha = 0;
+
 /* -------------------------------------------------------------------------
  * Helper macros for XRGB8888 pixel packing
  * ---------------------------------------------------------------------- */
@@ -158,27 +175,76 @@ static bool pfog_alloc_buffers(int w, int h)
 }
 
 /**
- * Rebuild pfog_alpha_mask using the current player screen position, zoom
- * level, and perception pixel limits.
+ * Lerp pfog_displayed_hor/vert toward the live perception leash limits.
+ * Marks the mask dirty while the lerp is still moving so the next draw
+ * regenerates with the interpolated radius.  Called once per draw.
+ */
+static void pfog_advance_tween(void)
+{
+    int target_hor;
+    int target_vert;
+    float dh;
+    float dv;
+
+    scroll_perception_pixel_limits(&target_hor, &target_vert);
+
+    dh = (float)target_hor  - pfog_displayed_hor;
+    dv = (float)target_vert - pfog_displayed_vert;
+
+    /* Snap when within half a pixel — avoids endless tiny lerps. */
+    if (fabsf(dh) < 0.5f) {
+        if (pfog_displayed_hor != (float)target_hor) {
+            pfog_displayed_hor = (float)target_hor;
+            pfog_dirty = true;
+        }
+    } else {
+        pfog_displayed_hor += dh * PFOG_LIMITS_LERP;
+        pfog_dirty = true;
+    }
+
+    if (fabsf(dv) < 0.5f) {
+        if (pfog_displayed_vert != (float)target_vert) {
+            pfog_displayed_vert = (float)target_vert;
+            pfog_dirty = true;
+        }
+    } else {
+        pfog_displayed_vert += dv * PFOG_LIMITS_LERP;
+        pfog_dirty = true;
+    }
+}
+
+/**
+ * Rebuild pfog_alpha_mask using the (tweened) leash limits, the current
+ * zoom (which lerps internally), and the player's screen position.
+ *
+ * Bulk-initialises the mask to max_alpha (the constant value for the region
+ * outside the outer ellipse), then only iterates pixels inside the outer
+ * ellipse bbox where the alpha actually varies.  Uses squared-distance
+ * comparisons to skip sqrtf for pixels clearly inside the inner ellipse
+ * (alpha=0) or clearly outside the outer ellipse (alpha=max_alpha).
  */
 static void pfog_regenerate_mask(void)
 {
-    int hor_limit, vert_limit;
     int player_sx, player_sy;
     float z;
     float ha, va;
     float inner_r, outer_r;
+    float inner_r2, outer_r2;
+    int bbox_x1, bbox_y1, bbox_x2, bbox_y2;
     int x, y;
-    bool any_fog = false;
     uint8_t max_alpha;
 
     pfog_dirty = false;
 
-    scroll_perception_pixel_limits(&hor_limit, &vert_limit);
-    if (hor_limit <= 0 || vert_limit <= 0) {
+    if (pfog_displayed_hor <= 0.0f || pfog_displayed_vert <= 0.0f) {
         /* ScrollDist=0: no leash, no fog. */
         memset(pfog_alpha_mask, 0, (size_t)pfog_width * (size_t)pfog_height);
         pfog_has_fog = false;
+        pfog_outer_bbox_x1 = 0;
+        pfog_outer_bbox_y1 = 0;
+        pfog_outer_bbox_x2 = 0;
+        pfog_outer_bbox_y2 = 0;
+        pfog_last_max_alpha = 0;
         return;
     }
 
@@ -201,42 +267,66 @@ static void pfog_regenerate_mask(void)
         player_sy = (int)(vp_cy + ((float)player_sy - vp_cy) * z + 0.5f);
     }
 
-    /* Semi-axes of the fog ellipse in screen pixels. */
-    ha = (float)hor_limit  * z;
-    va = (float)vert_limit * z;
+    /* Semi-axes of the fog ellipse in screen pixels (tweened). */
+    ha = pfog_displayed_hor  * z;
+    va = pfog_displayed_vert * z;
 
     inner_r   = (float)pfog_cfg_inner_pct / 100.0f;
     outer_r   = (float)pfog_cfg_outer_pct / 100.0f;
+    inner_r2  = inner_r * inner_r;
+    outer_r2  = outer_r * outer_r;
     max_alpha = (uint8_t)((float)pfog_cfg_alpha_pct * 255.0f / 100.0f + 0.5f);
 
-    for (y = 0; y < pfog_height; y++) {
-        uint8_t* row = pfog_alpha_mask + y * pfog_width;
-        float dy  = (float)(y - player_sy) / va;
-        float dy2 = dy * dy;
+    /* Bulk-fill: everywhere outside the outer ellipse gets full opacity.
+     * Only the pixels inside the outer ellipse bbox need per-pixel work. */
+    memset(pfog_alpha_mask, max_alpha,
+        (size_t)pfog_width * (size_t)pfog_height);
 
-        for (x = 0; x < pfog_width; x++) {
+    /* Outer ellipse bbox in viewport pixels, clipped to the buffer. */
+    bbox_x1 = player_sx - (int)(ha * outer_r) - 1;
+    bbox_y1 = player_sy - (int)(va * outer_r) - 1;
+    bbox_x2 = player_sx + (int)(ha * outer_r) + 2;
+    bbox_y2 = player_sy + (int)(va * outer_r) + 2;
+    if (bbox_x1 < 0)            bbox_x1 = 0;
+    if (bbox_y1 < 0)            bbox_y1 = 0;
+    if (bbox_x2 > pfog_width)   bbox_x2 = pfog_width;
+    if (bbox_y2 > pfog_height)  bbox_y2 = pfog_height;
+
+    for (y = bbox_y1; y < bbox_y2; y++) {
+        uint8_t* row = pfog_alpha_mask + y * pfog_width;
+        float dy   = (float)(y - player_sy) / va;
+        float dy2  = dy * dy;
+
+        for (x = bbox_x1; x < bbox_x2; x++) {
             float dx = (float)(x - player_sx) / ha;
-            float d  = sqrtf(dx * dx + dy2);
+            float d2 = dx * dx + dy2;
             uint8_t alpha;
 
-            if (d <= inner_r) {
+            if (d2 <= inner_r2) {
                 alpha = 0;
-            } else if (d >= outer_r) {
+            } else if (d2 >= outer_r2) {
                 alpha = max_alpha;
-                any_fog = true;
             } else {
+                float d = sqrtf(d2);
                 float t = (d - inner_r) / (outer_r - inner_r);
                 /* Smooth step: t*t*(3 - 2*t) */
                 t = t * t * (3.0f - 2.0f * t);
                 alpha = (uint8_t)(t * (float)max_alpha + 0.5f);
-                if (alpha > 0) any_fog = true;
             }
 
             row[x] = alpha;
         }
     }
 
-    pfog_has_fog = any_fog;
+    /* If max_alpha is 0, the entire mask is zero (fog is invisible).
+     * Otherwise some pixel has alpha > 0 — anywhere outside the outer
+     * ellipse (memset region) and in the smoothstep band. */
+    pfog_has_fog = (max_alpha > 0);
+    pfog_outer_bbox_x1 = bbox_x1;
+    pfog_outer_bbox_y1 = bbox_y1;
+    pfog_outer_bbox_x2 = bbox_x2;
+    pfog_outer_bbox_y2 = bbox_y2;
+    pfog_last_max_alpha = max_alpha;
 }
 
 /**
@@ -435,6 +525,10 @@ void perception_fog_draw(TigVideoBuffer* game_vb)
     if (!pfog_cfg_enabled || pfog_alpha_mask == NULL || game_vb == NULL) {
         return;
     }
+
+    /* Tween perception limits toward target each frame; marks dirty if the
+     * displayed values moved.  Zoom-driven dirty bits come from iso_zoom_ping. */
+    pfog_advance_tween();
 
     /* Rebuild the elliptical mask if perception, zoom, or player pos changed. */
     if (pfog_dirty) {
