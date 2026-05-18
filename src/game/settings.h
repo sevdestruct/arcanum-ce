@@ -1,6 +1,8 @@
 #ifndef ARCANUM_GAME_SETTINGS_H_
 #define ARCANUM_GAME_SETTINGS_H_
 
+#include <stdbool.h>
+
 #include "game/obj.h"
 
 typedef unsigned int SettingsFlags;
@@ -14,6 +16,8 @@ typedef struct SettingsEntry {
     /* 0004 */ char* value;
     /* 0008 */ SettingsValueChangedFunc value_changed_func;
     /* 000C */ struct SettingsEntry* next;
+    /* transient: used by settings_save to track which keys were written */
+    bool written;
 } SettingsEntry;
 
 typedef struct Settings {
