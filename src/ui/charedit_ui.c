@@ -1288,6 +1288,51 @@ void charedit_refresh(void)
     }
 }
 
+// Re-push the charedit windows to the top of their z-class so they sit above
+// any sibling that was created later (e.g. the main-menu backdrop). The four
+// tab sub-windows share the same screen rect and are layered by z-order; the
+// active tab (tracked by dword_64E01C: 0=skills, 1=tech, 2=spells, 3=scheme)
+// must end up on top so its content is the one that's visible.
+void charedit_promote_overlay(void)
+{
+    tig_window_handle_t active = TIG_WINDOW_HANDLE_INVALID;
+
+    intgame_big_window_promote();
+
+    switch (dword_64E01C) {
+    case 1:
+        active = charedit_tech_win;
+        break;
+    case 2:
+        active = charedit_spells_win;
+        break;
+    case 3:
+        active = charedit_scheme_win;
+        break;
+    case 0:
+    default:
+        active = charedit_skills_win;
+        break;
+    }
+
+    // Promote the inactive tabs first so the active one ends up on top.
+    if (charedit_scheme_win != TIG_WINDOW_HANDLE_INVALID && charedit_scheme_win != active) {
+        tig_window_move_on_top(charedit_scheme_win);
+    }
+    if (charedit_spells_win != TIG_WINDOW_HANDLE_INVALID && charedit_spells_win != active) {
+        tig_window_move_on_top(charedit_spells_win);
+    }
+    if (charedit_tech_win != TIG_WINDOW_HANDLE_INVALID && charedit_tech_win != active) {
+        tig_window_move_on_top(charedit_tech_win);
+    }
+    if (charedit_skills_win != TIG_WINDOW_HANDLE_INVALID && charedit_skills_win != active) {
+        tig_window_move_on_top(charedit_skills_win);
+    }
+    if (active != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_move_on_top(active);
+    }
+}
+
 // 0x55A240
 void charedit_refresh_basic_info(void)
 {
