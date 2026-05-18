@@ -721,14 +721,30 @@ void scroll_perception_pixel_limits(int* hor_out, int* vert_out)
 }
 
 /**
- * Returns the current scroll center (player tile center) in viewport
- * screen pixel coordinates.
+ * Returns the local PC's current rendered position in viewport screen
+ * pixel coordinates, including the per-object walk-animation offset.
  *
- * Matches the half-tile offset used in scroll_start().
+ * scroll_center is tile-quantized (only updates on tile-boundary crossings),
+ * so using it for the fog ellipse centre would step the fog one tile at a
+ * time.  The PC's OBJ_F_OFFSET_X/Y fields advance every animation frame
+ * while walking — sourcing from them produces a smoothly-following centre.
+ *
+ * Falls back to scroll_center when no PC is available (e.g. main menu).
  */
 void scroll_get_player_screen_pos(int* sx, int* sy)
 {
+    int64_t pc_obj = player_get_local_pc_obj();
     int64_t cx, cy;
+
+    if (pc_obj != OBJ_HANDLE_NULL) {
+        int64_t loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+        int ox = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X);
+        int oy = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y);
+        location_xy(loc, &cx, &cy);
+        *sx = (int)cx + 40 + ox;
+        *sy = (int)cy + 20 + oy;
+        return;
+    }
 
     location_xy(scroll_center, &cx, &cy);
     *sx = (int)cx + 40;

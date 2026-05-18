@@ -1,5 +1,6 @@
 #include "game/perception_fog.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,12 @@ static float pfog_displayed_hor  = 0.0f;
 static float pfog_displayed_vert = 0.0f;
 #define PFOG_LIMITS_LERP 0.25f
 
+/* Last player screen position fed to the mask.  scroll_set_center only fires
+ * on tile-boundary crossings, but the player's walk-animation offset moves
+ * every frame; we compare here to mark the mask dirty between tile crosses. */
+static int pfog_last_player_sx = INT_MIN;
+static int pfog_last_player_sy = INT_MIN;
+
 /* Bounding box of the outer fog ellipse on screen (after the last
  * regenerate).  Used to skip writing alpha bytes for pixels guaranteed to be
  * at max_alpha (outside the outer ellipse — set in bulk by memset). */
@@ -210,6 +217,19 @@ static void pfog_advance_tween(void)
     } else {
         pfog_displayed_vert += dv * PFOG_LIMITS_LERP;
         pfog_dirty = true;
+    }
+
+    /* Detect per-animation-frame player position changes (walk offset
+     * updates without crossing a tile boundary). */
+    {
+        int player_sx, player_sy;
+        scroll_get_player_screen_pos(&player_sx, &player_sy);
+        if (player_sx != pfog_last_player_sx
+            || player_sy != pfog_last_player_sy) {
+            pfog_last_player_sx = player_sx;
+            pfog_last_player_sy = player_sy;
+            pfog_dirty = true;
+        }
     }
 }
 
