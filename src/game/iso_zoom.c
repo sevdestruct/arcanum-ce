@@ -144,6 +144,10 @@ void iso_zoom_reset(void)
 {
     zoom_target = 1.0f;
     zoom_current = 1.0f;
+    /* Snap-reset bypasses the animation in iso_zoom_ping, which is where the
+     * fog dirty-mark normally lives.  Mark it here so the mask regenerates
+     * for the new zoom level on the next draw. */
+    perception_fog_mark_dirty();
 }
 
 void iso_zoom_set_available(bool available)
