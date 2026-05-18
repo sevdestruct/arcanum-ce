@@ -157,6 +157,8 @@ set(SRCS
     "src/game/party.h"
     "src/game/path.c"
     "src/game/path.h"
+    "src/game/perception_fog.c"
+    "src/game/perception_fog.h"
     "src/game/player.c"
     "src/game/player.h"
     "src/game/portal.c"

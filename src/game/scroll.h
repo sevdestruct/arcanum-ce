@@ -36,6 +36,8 @@ void scroll_stop(void);
 void scroll_fps_set(int fps);
 void scroll_distance_set(int distance);
 int scroll_distance_get(void);
+void scroll_perception_pixel_limits(int* hor_out, int* vert_out);
+void scroll_get_player_screen_pos(int* sx, int* sy);
 void scroll_set_center(int64_t location);
 void scroll_set_scroll_func(ScrollFunc func);
 

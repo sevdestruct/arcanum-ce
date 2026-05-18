@@ -8,9 +8,10 @@
 #define ISO_ZOOM_STEP 0.25f
 #define ISO_ZOOM_LERP 0.25f
 
-#define ISO_ZOOM_MIN_KEY "min zoom"
-#define ISO_ZOOM_MAX_KEY "max zoom"
-#define ISO_ZOOM_ENABLED_KEY "zoom enabled"
+#define ISO_ZOOM_MIN_KEY      "min zoom"
+#define ISO_ZOOM_MAX_KEY      "max zoom"
+#define ISO_ZOOM_ENABLED_KEY  "zoom enabled"
+#define ISO_ZOOM_FLOOR_KEY    "zoom floor"
 
 void iso_zoom_init(void);
 void iso_zoom_ping(void);
@@ -24,5 +25,6 @@ bool iso_zoom_is_available(void);
 void iso_zoom_reset(void);
 void iso_zoom_set_available(bool available);
 void iso_zoom_set_target(float z);
+void iso_zoom_update_perception_floor(int vp_w, int vp_h, int hor_limit, int vert_limit);
 
 #endif /* ARCANUM_GAME_ISO_ZOOM_H_ */

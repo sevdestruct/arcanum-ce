@@ -4,13 +4,16 @@
 #include <stdlib.h>
 
 #include "game/gamelib.h"
+#include "game/perception_fog.h"
 
 static float zoom_current = 1.0f;
 static float zoom_target = 1.0f;
 static float zoom_min = ISO_ZOOM_MIN;
+static float zoom_min_config = ISO_ZOOM_MIN; /* user-config floor, preserved across perception updates */
 static float zoom_max = ISO_ZOOM_MAX;
 static bool zoom_available = true;
 static bool zoom_enabled = true;
+static bool zoom_floor_enabled = true; /* perception-based zoom floor on/off toggle */
 
 static void iso_zoom_enabled_changed(void)
 {
@@ -27,6 +30,7 @@ static void iso_zoom_min_changed(void)
         float v = (float)atof(val);
         if (v > 0.0f && v <= 1.0f) {
             zoom_min = v;
+            zoom_min_config = v; /* remember user's configured floor */
         }
     }
 }
@@ -40,6 +44,11 @@ static void iso_zoom_max_changed(void)
             zoom_max = v;
         }
     }
+}
+
+static void iso_zoom_floor_changed(void)
+{
+    zoom_floor_enabled = settings_get_value(&settings, ISO_ZOOM_FLOOR_KEY) != 0;
 }
 
 
@@ -56,6 +65,8 @@ void iso_zoom_init(void)
     iso_zoom_min_changed();  // apply value already loaded from arcanum.cfg
     settings_register(&settings, ISO_ZOOM_MAX_KEY, "1.75", iso_zoom_max_changed);
     iso_zoom_max_changed();  // apply value already loaded from arcanum.cfg
+    settings_register(&settings, ISO_ZOOM_FLOOR_KEY, "1", iso_zoom_floor_changed);
+    iso_zoom_floor_changed();  // apply value already loaded from arcanum.cfg
 }
 
 void iso_zoom_ping(void)
@@ -68,9 +79,11 @@ void iso_zoom_ping(void)
             // screen flush. Force a full invalidate so the non-zoom render
             // path actually runs and updates the screen after the snap.
             gamelib_invalidate_rect(NULL);
+            perception_fog_mark_dirty(); /* zoom settled — fog ellipse size changed */
         }
     } else {
         zoom_current += diff * ISO_ZOOM_LERP;
+        perception_fog_mark_dirty(); /* zoom is animating — fog ellipse changes each frame */
     }
 }
 
@@ -163,4 +176,77 @@ void iso_zoom_set_target(float z)
     }
 
     zoom_target = z;
+}
+
+/**
+ * Called every frame from gamelib_draw to enforce a Perception-based minimum
+ * zoom level.
+ *
+ * When ScrollDist is non-zero the player's Perception stat limits how far the
+ * camera may scroll.  This function converts those same pixel limits into a
+ * minimum zoom value so the player cannot zoom out far enough to see beyond
+ * the leash boundary.
+ *
+ * hor_limit / vert_limit are the leash half-extents in world pixels returned
+ * by scroll_perception_pixel_limits().  Pass 0,0 to disable the perception
+ * floor (e.g. when ScrollDist=0).
+ */
+void iso_zoom_update_perception_floor(int vp_w, int vp_h, int hor_limit, int vert_limit)
+{
+    float z_floor;
+    float candidate;
+
+    if (hor_limit <= 0 || vert_limit <= 0 || !zoom_floor_enabled) {
+        /* ScrollDist=0, no player, or floor toggled off: restore config min. */
+        if (zoom_min != zoom_min_config) {
+            zoom_min = zoom_min_config;
+            perception_fog_mark_dirty(); /* leash disabled — fog should clear */
+        }
+        /* Snap target up if it fell below the (now-restored) floor. */
+        if (zoom_target < zoom_min) {
+            iso_zoom_set_target(zoom_min);
+        }
+        if (zoom_current < zoom_min) {
+            zoom_current = zoom_min;
+        }
+        return;
+    }
+
+    /* z must be large enough that the visible half-span <= leash limit.
+     * visible_half_w = (vp_w/2) / z  <=  hor_limit  =>  z >= (vp_w/2)/hor_limit
+     * visible_half_h = (vp_h/2) / z  <=  vert_limit =>  z >= (vp_h/2)/vert_limit
+     * Take the more restrictive of the two axes.
+     */
+    z_floor = (float)(vp_w / 2) / (float)hor_limit;
+    candidate = (float)(vp_h / 2) / (float)vert_limit;
+    if (candidate > z_floor) {
+        z_floor = candidate;
+    }
+
+    /* Clamp to valid zoom range.  Never drop below the user's configured
+     * minimum; never exceed the configured maximum (happens for very low
+     * perception characters on high-res screens). */
+    if (z_floor < zoom_min_config) {
+        z_floor = zoom_min_config;
+    }
+    if (z_floor < ISO_ZOOM_MIN) {
+        z_floor = ISO_ZOOM_MIN;
+    }
+    if (z_floor > zoom_max) {
+        z_floor = zoom_max;
+    }
+
+    /* Only update and mark dirty when the floor actually changes. */
+    if (z_floor != zoom_min) {
+        zoom_min = z_floor;
+        perception_fog_mark_dirty(); /* perception stat changed — fog ellipse resized */
+
+        /* Snap existing target/current if they are now below the new floor. */
+        if (zoom_target < zoom_min) {
+            iso_zoom_set_target(zoom_min);
+        }
+        if (zoom_current < zoom_min) {
+            zoom_current = zoom_min;
+        }
+    }
 }

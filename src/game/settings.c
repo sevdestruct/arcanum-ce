@@ -96,36 +96,105 @@ void settings_load(Settings* settings)
 /**
  * Saves settings to the associated file.
  *
+ * Performs a comment-preserving round-trip: the existing file is read
+ * line-by-line and re-emitted verbatim, except that recognised key=value
+ * lines have their value updated in-place.  Any keys that were not already
+ * present in the file are appended at the end.  Comment lines and blank
+ * lines are passed through unchanged.
+ *
  * 0x438C20
  */
 void settings_save(Settings* settings)
 {
-    FILE* stream;
+    FILE* in;
+    FILE* out;
     SettingsEntry* curr;
+    char tmp_path[512];
+    char line[512];
+    char key_buf[256];
+    char* sep;
+    char* p;
+    size_t key_len;
 
     // Ensure there is something worth saving.
     if (settings->entries == NULL) {
         return;
     }
 
-    // Only save settings have been changed.
+    // Only save if settings have been changed.
     if ((settings->flags & SETTINGS_CHANGED) == 0) {
         return;
     }
 
-    stream = fopen(settings->path, "wt");
-    if (stream == NULL) {
-        // Something's wrong, this should not normally happen.
-        return;
-    }
-
+    // Mark all entries as not-yet-written so we can detect new keys.
     curr = settings->entries;
     while (curr != NULL) {
-        fprintf(stream, "%s=%s\n", curr->key, curr->value);
+        curr->written = false;
         curr = curr->next;
     }
 
-    fclose(stream);
+    // Build a temp path alongside the real file.
+    SDL_snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", settings->path);
+
+    out = fopen(tmp_path, "wt");
+    if (out == NULL) {
+        return;
+    }
+
+    // Pass 1: copy existing file, updating values for known keys in-place.
+    in = fopen(settings->path, "rt");
+    if (in != NULL) {
+        while (fgets(line, sizeof(line), in) != NULL) {
+            sep = strchr(line, '=');
+            if (sep != NULL) {
+                // Extract and trim the key portion.
+                key_len = (size_t)(sep - line);
+                if (key_len < sizeof(key_buf)) {
+                    memcpy(key_buf, line, key_len);
+                    key_buf[key_len] = '\0';
+                    settings_trim(key_buf);
+
+                    curr = settings_find(settings, key_buf);
+                    if (curr != NULL) {
+                        // Preserve any leading whitespace/comment prefix before
+                        // the key, then write the updated value.
+                        p = line;
+                        while (*p && p < sep) {
+                            // Find start of key (skip leading spaces).
+                            if (!SDL_isspace((unsigned char)*p)) break;
+                            fputc(*p, out);
+                            p++;
+                        }
+                        fprintf(out, "%s=%s\n", curr->key, curr->value);
+                        curr->written = true;
+                        continue;
+                    }
+                }
+            }
+            // Comment, blank line, or unrecognised key — pass through as-is.
+            fputs(line, out);
+            // Ensure line ends with newline (fgets keeps it, but guard anyway).
+            if (line[0] != '\0' && line[strlen(line) - 1] != '\n') {
+                fputc('\n', out);
+            }
+        }
+        fclose(in);
+    }
+
+    // Pass 2: append any keys that were not present in the original file.
+    curr = settings->entries;
+    while (curr != NULL) {
+        if (!curr->written) {
+            fprintf(out, "%s=%s\n", curr->key, curr->value);
+        }
+        curr = curr->next;
+    }
+
+    fclose(out);
+
+    // Atomically replace the original file with the updated temp file.
+    remove(settings->path);
+    rename(tmp_path, settings->path);
 
     // FIX: Settings synchronized to disk, unset `SETTINGS_CHANGED`.
     settings->flags &= ~SETTINGS_CHANGED;
@@ -323,10 +392,12 @@ void settings_trim(char* str)
     memmove(str, curr, len + 1); // FIX: Instead of `memcpy`.
 
     // Remove trailing whitespace.
-    if (len > 0) {
-        curr = str + len;
-        while (SDL_isspace(*curr)) {
-            *curr-- = '\0';
-        }
+    // FIX: start at the last character (str+len-1), not the null terminator
+    // (str+len). The original code started at the null terminator, so
+    // SDL_isspace('\0') was always false and trailing '\n'/'\r'/spaces were
+    // never stripped — causing values to be stored with a trailing newline,
+    // which produced extra blank lines in the saved file.
+    while (len > 0 && SDL_isspace((unsigned char)str[len - 1])) {
+        str[--len] = '\0';
     }
 }
