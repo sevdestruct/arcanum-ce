@@ -3823,7 +3823,11 @@ void mainmenu_ui_intro_create(void)
 {
     mainmenu_ui_window_type = MM_WINDOW_INTRO;
     gmovie_play(1, 0, 0);
-    gmovie_play(7, 0, 0);
+    // Suppress tig_movie_play's terminal fill-black+flip so the last intro
+    // frame stays on screen during the menu-build. The bg-video first frame
+    // then paints over it via mainmenu_ui_bg_video_present_current_frame,
+    // making the intro→menu handoff appear as one continuous video.
+    gmovie_play(7, GAME_MOVIE_NO_FINAL_FLIP, 0);
     mainmenu_ui_num_windows++;
     mainmenu_ui_pop_window_stack();
     mainmenu_ui_window_type = MM_WINDOW_SINGLE_PLAYER;
