@@ -2,6 +2,7 @@
 #define BINK_COMPAT_H_
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,9 +58,16 @@ typedef struct BINK {
     unsigned Height;
     unsigned Frames;
     unsigned FrameNum;
+    unsigned FrameDurationMs; /* milliseconds per frame; 0 = unknown (use 33ms default) */
 } BINK;
 
 void BINKCALL BinkClose(HBINK bnk);
+// Set the pixel dimensions that BinkCopyToBuffer will write to. Call after
+// BinkOpen() and before the first BinkDoFrame(). When w/h are smaller than
+// the native video resolution, libswscale scales during colour conversion so
+// the caller's video buffer (and the subsequent SDL blit) can use display
+// dimensions rather than native video dimensions.
+void BinkSetOutputSize(HBINK bnk, int w, int h);
 int BINKCALL BinkCopyToBuffer(HBINK bnk, void* dest, int destpitch, unsigned destheight, unsigned destx, unsigned desty, unsigned flags);
 int BINKCALL BinkDDSurfaceType(void* lpDDS);
 int BINKCALL BinkDoFrame(HBINK bnk);
@@ -69,6 +77,11 @@ BINKSNDOPEN BINKCALL BinkOpenMiles(void* param);
 int BINKCALL BinkSetSoundSystem(BINKSNDSYSOPEN open, void* param);
 void BINKCALL BinkSetSoundTrack(unsigned track);
 int BINKCALL BinkWait(HBINK bnk);
+void BINKCALL BinkRewind(HBINK bnk);
+
+bool bink_compat_get_frame_time_ns(HBINK bnk, int64_t* frame_time_ns);
+bool bink_compat_pump_audio(HBINK bnk);
+int bink_compat_get_queued_video_frames(HBINK bnk);
 
 bool bink_compat_init(void);
 void bink_compat_exit(void);
