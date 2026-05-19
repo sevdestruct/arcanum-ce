@@ -8,6 +8,7 @@
 #include "game/curse.h"
 #include "game/description.h"
 #include "game/effect.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/item.h"
 #include "game/location.h"
@@ -651,8 +652,12 @@ void logbook_ui_create(void)
     tig_button_radio_group_create(LOGBOOK_UI_TAB_COUNT, button_handles, logbook_ui_tab);
 
     // Center viewport on the player (so that the lens display proper
-    // surroundings).
-    location_origin_set(obj_field_int64_get(logbook_ui_obj, OBJ_F_LOCATION));
+    // surroundings). Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — many
+    // players prefer to keep their current scroll position when popping
+    // an overlay open.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(logbook_ui_obj, OBJ_F_LOCATION));
+    }
 
     // Enable the PC lens.
     pc_lens.window_handle = logbook_ui_window;

@@ -336,6 +336,11 @@ bool gamelib_init(GameInitInfo* init_info)
         8,
         128);
 
+    // CE: Opt-in for vanilla "snap camera to PC on overlay open". Default
+    // off — opening Inventory / Logbook / Schematic / Written / Options
+    // (in-play) / Charedit no longer yanks the view back to the player.
+    settings_register(&settings, RECENTER_CAMERA_ON_OVERLAY_KEY, "0", NULL);
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 
@@ -1707,6 +1712,14 @@ const char* gamelib_get_locale(void)
     }
 
     return "en";
+}
+
+// CE: Read the RECENTER_CAMERA_ON_OVERLAY_KEY setting. Wraps the int
+// settings value as a bool — the overlay screens use this to decide
+// whether to snap the camera back to the PC on open.
+bool gamelib_recenter_camera_on_overlay(void)
+{
+    return settings_get_value(&settings, RECENTER_CAMERA_ON_OVERLAY_KEY) != 0;
 }
 
 // 0x4046F0

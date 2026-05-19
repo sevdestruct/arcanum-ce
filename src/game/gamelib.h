@@ -34,6 +34,13 @@
 // panel regions so the world peeks through. Defaults to 1 (enabled).
 #define TRANSLUCENT_BLACK_UI_KEY "translucent black ui"
 
+// When enabled, opening an overlay screen (Logbook, Inventory, Schematic,
+// Written, Options-while-in-play, Charedit) snaps the camera back to the
+// PC's location before showing the panel. Defaulted off — many players
+// find the snap disruptive (you can't open Inventory mid-scroll without
+// losing your place). Set to "1" to restore the vanilla behavior.
+#define RECENTER_CAMERA_ON_OVERLAY_KEY "recenter camera on overlay"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
@@ -131,5 +138,10 @@ void gamelib_redraw(void);
 bool gamelib_copy_version(char* long_version, char* short_version, char* locale);
 void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
+
+// True when the user has opted into the vanilla "snap camera to PC on
+// overlay open" behavior. See RECENTER_CAMERA_ON_OVERLAY_KEY. Defaults
+// to false.
+bool gamelib_recenter_camera_on_overlay(void);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

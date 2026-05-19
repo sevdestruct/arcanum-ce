@@ -1154,7 +1154,11 @@ bool charedit_open(int64_t obj, ChareditMode mode)
     }
 
     charedit_refresh_internal();
-    location_origin_set(obj_field_int64_get(charedit_obj, OBJ_F_LOCATION));
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off so opening
+    // the character sheet doesn't yank the camera back to the PC.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(charedit_obj, OBJ_F_LOCATION));
+    }
 
     pc_lens.window_handle = charedit_window_handle;
     pc_lens.rect = &stru_5C8930;
