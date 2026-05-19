@@ -1119,6 +1119,81 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
     return TIG_OK;
 }
 
+// CE: Composite src onto dst using a per-pixel uint8_t alpha mask.
+// See video.h for the contract.
+int tig_video_buffer_blit_alpha_mask(TigVideoBuffer* src_video_buffer, TigVideoBuffer* dst_video_buffer, const TigRect* rect, const uint8_t* mask, int mask_pitch)
+{
+    TigRect bounds;
+    TigRect clipped;
+    int rc;
+    int x;
+    int y;
+
+    if (src_video_buffer == NULL || dst_video_buffer == NULL
+        || rect == NULL || mask == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    if (src_video_buffer->frame.width != dst_video_buffer->frame.width
+        || src_video_buffer->frame.height != dst_video_buffer->frame.height) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    bounds.x = 0;
+    bounds.y = 0;
+    bounds.width = dst_video_buffer->frame.width;
+    bounds.height = dst_video_buffer->frame.height;
+    rc = tig_rect_intersection(rect, &bounds, &clipped);
+    if (rc != TIG_OK) {
+        return TIG_OK;
+    }
+
+    rc = tig_video_buffer_lock(src_video_buffer);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+    rc = tig_video_buffer_lock(dst_video_buffer);
+    if (rc != TIG_OK) {
+        tig_video_buffer_unlock(src_video_buffer);
+        return rc;
+    }
+
+    for (y = 0; y < clipped.height; ++y) {
+        const uint32_t* srow = (uint32_t*)((uint8_t*)src_video_buffer->surface->pixels
+            + src_video_buffer->surface->pitch * (y + clipped.y))
+            + clipped.x;
+        uint32_t* drow = (uint32_t*)((uint8_t*)dst_video_buffer->surface->pixels
+            + dst_video_buffer->surface->pitch * (y + clipped.y))
+            + clipped.x;
+        const uint8_t* mrow = mask + (size_t)mask_pitch * (y + clipped.y) + clipped.x;
+
+        for (x = 0; x < clipped.width; ++x) {
+            int alpha = mrow[x];
+            uint32_t spx;
+            uint32_t dpx;
+            int inv;
+
+            if (alpha == 0) {
+                continue;
+            }
+            spx = srow[x];
+            if (alpha >= 255) {
+                drow[x] = spx;
+                continue;
+            }
+            dpx = drow[x];
+            inv = 255 - alpha;
+            drow[x] = (((((dpx >> 16) & 0xFF) * inv + ((spx >> 16) & 0xFF) * alpha) / 255) << 16)
+                    | (((((dpx >>  8) & 0xFF) * inv + ((spx >>  8) & 0xFF) * alpha) / 255) <<  8)
+                    |  ((( (dpx        & 0xFF) * inv +  (spx        & 0xFF) * alpha) / 255));
+        }
+    }
+
+    tig_video_buffer_unlock(dst_video_buffer);
+    tig_video_buffer_unlock(src_video_buffer);
+    return TIG_OK;
+}
+
 // 0x522F30
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color)
 {
