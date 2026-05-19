@@ -1989,6 +1989,10 @@ bool wmap_ui_message_filter(TigMessage* msg)
             }
 
             if (intgame_pc_lens_check_pt_unscale(msg->data.mouse.x, msg->data.mouse.y)) {
+                // CE: Recenter on the PC — the lens is a "back to player"
+                // button so a lens-click close always returns to the PC,
+                // even when recenter-camera-on-overlay is off.
+                intgame_recenter_on_pc();
                 wmap_ui_close();
                 return true;
             }

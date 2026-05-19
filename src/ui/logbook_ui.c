@@ -715,6 +715,10 @@ bool logbook_ui_message_filter(TigMessage* msg)
         // Clicking on the PC lens closes logbook UI.
         if (msg->data.mouse.event == TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP
             && intgame_pc_lens_check_pt(msg->data.mouse.x, msg->data.mouse.y)) {
+            // CE: Recenter on the PC — the lens is a "back to player"
+            // button so clicking it always implies returning to the PC,
+            // even when recenter-camera-on-overlay is off.
+            intgame_recenter_on_pc();
             logbook_ui_close();
             return true;
         }

@@ -18,6 +18,7 @@
 #include "game/item_effect.h"
 #include "game/level.h"
 #include "game/light.h"
+#include "game/location.h"
 #include "game/magictech.h"
 #include "game/map.h"
 #include "game/mt_item.h"
@@ -4639,19 +4640,45 @@ void intgame_pc_lens_redraw(void)
     TigArtBlitInfo blit_info;
     TigRect src_rect;
     TigRect dst_rect;
+    TigRect lens_src_rect;
 
     if (intgame_pc_lens_video_buffer != NULL) {
+        // CE: Default is to copy whatever is at screen center — vanilla
+        // behavior, correct when the camera is centered on the PC.
+        lens_src_rect = intgame_pc_lens_dst_rect;
+
+        // CE: PC_LENS_FOLLOWS_PLAYER_KEY: when the camera has been panned
+        // away from the PC (i.e. recenter-camera-on-overlay is off and the
+        // player scrolled before opening an overlay), shift the source rect
+        // so the lens widget still shows the PC. The PC's current screen
+        // position is (center - dx, center - dy) where (dx, dy) is the
+        // scroll vector needed to re-center on the PC. The lens dst rect is
+        // pre-centered on the screen, so subtracting (dx, dy) from its
+        // origin lands the source rect on the PC.
+        if (gamelib_pc_lens_follows_player()) {
+            int64_t pc_obj = player_get_local_pc_obj();
+            if (pc_obj != OBJ_HANDLE_NULL) {
+                int64_t pc_loc;
+                int64_t dx;
+                int64_t dy;
+                pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+                location_calc_dist_from_screen_center(pc_loc, &dx, &dy);
+                lens_src_rect.x = intgame_pc_lens_dst_rect.x - (int)dx;
+                lens_src_rect.y = intgame_pc_lens_dst_rect.y - (int)dy;
+            }
+        }
+
         tig_window_copy(intgame_pc_lens.window_handle,
             intgame_pc_lens.rect,
             dword_64C52C,
-            &intgame_pc_lens_dst_rect);
+            &lens_src_rect);
 
         src_rect.x = 0;
         src_rect.y = 0;
         src_rect.width = intgame_pc_lens.rect->width;
         src_rect.height = intgame_pc_lens.rect->height;
 
-        if (tig_window_copy_to_vbuffer(dword_64C52C, &intgame_pc_lens_dst_rect, intgame_pc_lens_video_buffer, &src_rect) == TIG_OK) {
+        if (tig_window_copy_to_vbuffer(dword_64C52C, &lens_src_rect, intgame_pc_lens_video_buffer, &src_rect) == TIG_OK) {
             dst_rect = src_rect;
             dst_rect.x = intgame_pc_lens.rect->x;
             dst_rect.y = intgame_pc_lens.rect->y;
@@ -4972,6 +4999,15 @@ void sub_551910(TigMessage* msg)
 IntgameMode intgame_mode_get(void)
 {
     return intgame_mode_stack[intgame_mode_stack_size];
+}
+
+// CE: Public wrapper around sub_551A10 for overlay screens that close on
+// a PC-lens click. The lens widget is a "back to the player" button, so
+// clicking it should always recenter the iso camera on the PC — even when
+// the recenter-camera-on-overlay opt-in is off.
+void intgame_recenter_on_pc(void)
+{
+    sub_551A10(player_get_local_pc_obj());
 }
 
 // 0x551A10

@@ -719,6 +719,8 @@ bool schematic_ui_message_filter(TigMessage* msg)
         // Clicking on the PC lens closes schematic UI.
         if (msg->data.mouse.event == TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP
             && intgame_pc_lens_check_pt(msg->data.mouse.x, msg->data.mouse.y)) {
+            // CE: Recenter on the PC — see logbook_ui for rationale.
+            intgame_recenter_on_pc();
             schematic_ui_close();
             return true;
         }

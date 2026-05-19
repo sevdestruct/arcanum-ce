@@ -341,6 +341,12 @@ bool gamelib_init(GameInitInfo* init_info)
     // (in-play) / Charedit no longer yanks the view back to the player.
     settings_register(&settings, RECENTER_CAMERA_ON_OVERLAY_KEY, "0", NULL);
 
+    // CE: PC lens widget tracks the player even when the camera is panned.
+    // Defaults on — the lens is logically a "back to the player" button so
+    // it should always show the player. Set to "0" for vanilla behavior
+    // (lens copies whatever is at screen center).
+    settings_register(&settings, PC_LENS_FOLLOWS_PLAYER_KEY, "1", NULL);
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 
@@ -1720,6 +1726,12 @@ const char* gamelib_get_locale(void)
 bool gamelib_recenter_camera_on_overlay(void)
 {
     return settings_get_value(&settings, RECENTER_CAMERA_ON_OVERLAY_KEY) != 0;
+}
+
+// CE: Read the PC_LENS_FOLLOWS_PLAYER_KEY setting.
+bool gamelib_pc_lens_follows_player(void)
+{
+    return settings_get_value(&settings, PC_LENS_FOLLOWS_PLAYER_KEY) != 0;
 }
 
 // 0x4046F0

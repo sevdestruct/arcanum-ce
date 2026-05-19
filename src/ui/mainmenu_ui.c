@@ -5783,6 +5783,10 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                     //     real click): fall back to pop-to-parent.
                     if (options_ui_load_module()) {
                         if (stru_5C36B0[mainmenu_ui_type][0]) {
+                            // CE: Recenter on the PC — see logbook_ui for
+                            // rationale. No-op when there is no local PC
+                            // (pre-game main menu).
+                            intgame_recenter_on_pc();
                             sub_5412D0();
                         } else {
                             gsound_play_sfx(0, 1);
@@ -5794,6 +5798,8 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                 break;
             case MM_WINDOW_LOAD_GAME:
                 if (intgame_pc_lens_check_pt_unscale(msg->data.mouse.x, msg->data.mouse.y)) {
+                    // CE: Recenter on the PC — see logbook_ui for rationale.
+                    intgame_recenter_on_pc();
                     if (dword_64C450) {
                         sub_5412D0();
                     } else {
@@ -5804,6 +5810,8 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                 break;
             case MM_WINDOW_SAVE_GAME:
                 if (intgame_pc_lens_check_pt_unscale(msg->data.mouse.x, msg->data.mouse.y)) {
+                    // CE: Recenter on the PC — see logbook_ui for rationale.
+                    intgame_recenter_on_pc();
                     sub_5412D0();
                     return true;
                 }

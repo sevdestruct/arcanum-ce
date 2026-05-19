@@ -103,6 +103,12 @@ void intgame_pc_lens_do(PcLensMode mode, PcLens* pc_lens);
 bool intgame_pc_lens_check_pt(int x, int y);
 bool intgame_pc_lens_check_pt_unscale(int x, int y);
 bool intgame_should_dismiss_overlay_click(int screen_x, int screen_y, const TigRect* menu_rect);
+
+// CE: Snap the iso camera back to the local PC. Used by overlay screens
+// that close via a PC-lens click — the lens widget acts as a "back to
+// the player" button, so clicking it implies "take me back to the PC"
+// even when the recenter-camera-on-overlay setting is off.
+void intgame_recenter_on_pc(void);
 void intgame_pc_lens_redraw(void);
 void iso_interface_refresh(void);
 bool sub_5517A0(TigMessage* msg);
