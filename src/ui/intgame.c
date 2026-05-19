@@ -949,6 +949,20 @@ static void (*dword_64C6D4)(UiMessage* ui_message);
 // 0x64C6D8
 static int dword_64C6D8;
 
+// CE: Double-click-to-run tracker. A second left-click within
+// INTGAME_DOUBLE_CLICK_MS and within INTGAME_DOUBLE_CLICK_TILE_RADIUS
+// tiles of the first click's destination upgrades the move to a run —
+// same effect as Ctrl+click without needing the modifier. Tile-radius
+// tolerance (not exact equality) absorbs natural cursor jitter between
+// fast clicks. Shared between MAIN and DIALOG intgame modes via the
+// intgame_handle_pc_loc_click() helper. Cleared in intgame_reset so
+// save/load and scene transitions can't carry stale state.
+#define INTGAME_DOUBLE_CLICK_MS 500
+#define INTGAME_DOUBLE_CLICK_TILE_RADIUS 1
+static tig_timestamp_t intgame_last_left_click_time;
+static int64_t intgame_last_left_click_loc;
+static bool intgame_last_left_click_valid;
+
 // 0x64C6DC
 static bool intgame_fullscreen_forced;
 
@@ -1038,6 +1052,7 @@ void intgame_reset(void)
     int index;
 
     dword_64C6D8 = 0;
+    intgame_last_left_click_valid = false;
     intgame_refresh_cursor();
     hotkey_ui_reset_recent_actions();
     intgame_clock_process_callback(NULL);
@@ -2677,6 +2692,75 @@ bool handle_button_unhover(TigMessage* msg)
     return false;
 }
 
+// CE: Unified PC-move click handler shared between MAIN and DIALOG
+// intgame modes. Translates a left-button-down on a map tile into the
+// appropriate motion goal (walk / run) based on:
+//
+//   - Held modifier: Ctrl or NumLock (the vanilla "run" modifier).
+//   - Double-click detection: a second left-click within
+//     INTGAME_DOUBLE_CLICK_MS and INTGAME_DOUBLE_CLICK_TILE_RADIUS
+//     tiles of the first click's destination — same effect as Ctrl
+//     without needing the modifier.
+//   - ALWAYS_RUN_KEY: when on, plain clicks already run via
+//     anim_goal_move_to_tile's internal upgrade — the run modifier
+//     is a no-op in that mode (matches vanilla).
+//
+// Walk→run transitions use anim_upgrade_walk_to_run when an in-flight
+// walk is upgraded, which sets the run flag + forces art_id and
+// pause_time to the run animation on the same frame (no "walks a
+// beat before running" lag). Falls back to anim_goal_run_to_tile if
+// the in-place upgrade can't apply (no active walk goal, encumbered,
+// multiplayer).
+static void intgame_handle_pc_loc_click(int64_t pc_obj, int64_t loc)
+{
+    bool is_double_click;
+    bool wants_run;
+    tig_timestamp_t now;
+
+    // Detect double-click against the persistent tracker.
+    tig_timer_now(&now);
+    is_double_click = false;
+    if (intgame_last_left_click_valid
+        && tig_timer_elapsed(intgame_last_left_click_time) <= INTGAME_DOUBLE_CLICK_MS) {
+        int dx = (int)LOCATION_GET_X(loc) - (int)LOCATION_GET_X(intgame_last_left_click_loc);
+        int dy = (int)LOCATION_GET_Y(loc) - (int)LOCATION_GET_Y(intgame_last_left_click_loc);
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if ((dx > dy ? dx : dy) <= INTGAME_DOUBLE_CLICK_TILE_RADIUS) {
+            is_double_click = true;
+        }
+    }
+    intgame_last_left_click_time = now;
+    intgame_last_left_click_loc = loc;
+    intgame_last_left_click_valid = true;
+
+    // Decide intent.
+    wants_run = (tig_kb_get_modifier(SDL_KMOD_CTRL)
+                    || tig_kb_get_modifier(SDL_KMOD_NUM)
+                    || is_double_click)
+        && !settings_get_value(&settings, ALWAYS_RUN_KEY);
+
+    if (wants_run) {
+        // Try the in-place graceful upgrade first. It sets the run flag
+        // on any in-flight walk goal AND force-updates the visual art
+        // and per-tile pause so the gait change is visible/effective on
+        // this very frame. Returns false if there's no walk to upgrade
+        // (e.g. PC is idle, or encumbered, or MP) — fall back to the
+        // standard fresh-goal path in those cases.
+        if (!anim_upgrade_walk_to_run(pc_obj, loc)) {
+            anim_goal_run_to_tile(pc_obj, loc);
+        }
+    } else {
+        anim_goal_move_to_tile(pc_obj, loc);
+    }
+
+    // Preserve the existing same-frame chained-click guard.
+    if (dword_64C6D8) {
+        sub_436CF0();
+    }
+    dword_64C6D8 = true;
+}
+
 // 0x54DE50
 void intgame_process_event(TigMessage* msg)
 {
@@ -2734,18 +2818,7 @@ void intgame_process_event(TigMessage* msg)
                             }
                         } else if (critter_is_active(pc_obj)
                             && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
-                            if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
-                                    || tig_kb_get_modifier(SDL_KMOD_NUM))
-                                && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                                anim_goal_run_to_tile(pc_obj, td.loc);
-                            } else {
-                                anim_goal_move_to_tile(pc_obj, td.loc);
-                            }
-
-                            if (dword_64C6D8) {
-                                sub_436CF0();
-                            }
-                            dword_64C6D8 = true;
+                            intgame_handle_pc_loc_click(pc_obj, td.loc);
                         }
                     } else if (!dword_64C6D8) {
                         sub_54ED30(&td);
@@ -3016,18 +3089,7 @@ void intgame_process_event(TigMessage* msg)
                         && !inven_ui_drag_item_obj_get()
                         && !critter_is_dead(pc_obj)
                         && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
-                        if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
-                                || tig_kb_get_modifier(SDL_KMOD_NUM))
-                            && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                            anim_goal_run_to_tile(pc_obj, td.loc);
-                        } else {
-                            anim_goal_move_to_tile(pc_obj, td.loc);
-                        }
-
-                        if (dword_64C6D8) {
-                            sub_436CF0();
-                        }
-                        dword_64C6D8 = true;
+                        intgame_handle_pc_loc_click(pc_obj, td.loc);
                     }
                 }
                 break;
