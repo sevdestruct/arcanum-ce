@@ -5,6 +5,7 @@
 #include "game/ai.h"
 #include "game/critter.h"
 #include "game/dialog.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/hrp.h"
 #include "game/item.h"
@@ -1053,7 +1054,11 @@ bool inven_ui_create(int64_t pc_obj, int64_t target_obj, int mode)
     inven_ui_target_inventory_scrollbar_create();
     redraw_inven(true);
     inven_ui_drag_item_obj = OBJ_HANDLE_NULL;
-    location_origin_set(obj_field_int64_get(inven_ui_pc_obj, OBJ_F_LOCATION));
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off keeps the
+    // viewport wherever the player had it scrolled.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(inven_ui_pc_obj, OBJ_F_LOCATION));
+    }
 
     pc_lens.window_handle = inven_ui_window_handle;
     if (inven_ui_mode == INVEN_UI_MODE_INVENTORY

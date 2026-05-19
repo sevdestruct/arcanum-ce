@@ -4423,7 +4423,14 @@ void intgame_pc_lens_do(PcLensMode mode, PcLens* pc_lens)
         }
         break;
     case PC_LENS_MODE_PASSTHROUGH:
-        sub_551A10(player_get_local_pc_obj());
+        // CE: sub_551A10() snaps the iso viewport back to the PC so the
+        // lens always shows the player's surroundings. Gated on
+        // RECENTER_CAMERA_ON_OVERLAY_KEY — default off, the lens just
+        // shows whatever's currently centered on screen so the player
+        // can pan and still open overlays without losing their scroll.
+        if (gamelib_recenter_camera_on_overlay()) {
+            sub_551A10(player_get_local_pc_obj());
+        }
 
         intgame_pc_lens.window_handle = pc_lens->window_handle;
         intgame_pc_lens.art_id = pc_lens->art_id;

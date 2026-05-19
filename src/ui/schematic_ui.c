@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "game/critter.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/item.h"
 #include "game/mes.h"
@@ -657,8 +658,11 @@ void schematic_ui_create(void)
     schematic_ui_redraw();
 
     // Center viewport on the player (so that the lens display proper
-    // surroundings).
-    location_origin_set(obj_field_int64_get(schematic_ui_primary_obj, OBJ_F_LOCATION));
+    // surroundings). Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default
+    // off keeps the viewport where the player had it.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(schematic_ui_primary_obj, OBJ_F_LOCATION));
+    }
 
     // Enable the PC lens.
     pc_lens.window_handle = schematic_ui_window;
