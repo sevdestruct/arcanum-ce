@@ -13356,6 +13356,32 @@ bool anim_goal_move_to_tile(int64_t obj, int64_t loc)
 
     run_info = &(anim_run_info[stru_5A1908.slot_num]);
 
+    // CE: Force a fresh goal when the new target is far from the
+    // in-progress one. The soft update-in-place path (below) just sets
+    // the replan flag and trusts the path system to notice on a later
+    // tick — which leaves the critter finishing the current waypoint
+    // step before turning. For meaningful redirects this feels laggy.
+    // Force-cancel + fresh-goal forces an immediate path recompute.
+    // Near reroutes still take the soft path so small destination
+    // tweaks don't stutter.
+    {
+        int64_t cur = run_info->goals[0].params[AGDATA_TARGET_TILE].loc;
+        int dx = (int)LOCATION_GET_X(loc) - (int)LOCATION_GET_X(cur);
+        int dy = (int)LOCATION_GET_Y(loc) - (int)LOCATION_GET_Y(cur);
+        const int ANIM_REROUTE_THRESHOLD = 3;
+        if (dx * dx + dy * dy >= ANIM_REROUTE_THRESHOLD * ANIM_REROUTE_THRESHOLD) {
+            sub_44D500(&goal_data, obj, AG_MOVE_TO_TILE);
+            goal_data.params[AGDATA_TARGET_TILE].loc = loc;
+            if (!sub_424070(obj, 3, false, false)) {
+                return false;
+            }
+            if (!anim_goal_add(&goal_data, &stru_5A1908)) {
+                return false;
+            }
+            return true;
+        }
+    }
+
     if (run_info->goals[0].params[AGDATA_TARGET_TILE].loc == loc) {
         return true;
     }
@@ -13523,6 +13549,28 @@ bool anim_goal_run_to_tile(int64_t obj, int64_t loc)
     }
 
     run_info = &(anim_run_info[stru_5A1908.slot_num]);
+
+    // CE: Force a fresh goal when the new target is far from the
+    // in-progress one. Mirror of the same logic in
+    // anim_goal_move_to_tile — see comment there for rationale.
+    {
+        int64_t cur = run_info->goals[0].params[AGDATA_TARGET_TILE].loc;
+        int dx = (int)LOCATION_GET_X(loc) - (int)LOCATION_GET_X(cur);
+        int dy = (int)LOCATION_GET_Y(loc) - (int)LOCATION_GET_Y(cur);
+        const int ANIM_REROUTE_THRESHOLD = 3;
+        if (dx * dx + dy * dy >= ANIM_REROUTE_THRESHOLD * ANIM_REROUTE_THRESHOLD) {
+            sub_44D500(&goal_data, obj, AG_RUN_TO_TILE);
+            goal_data.params[AGDATA_TARGET_TILE].loc = loc;
+            if (!sub_424070(obj, 3, false, false)) {
+                return false;
+            }
+            if (!anim_goal_add(&goal_data, &stru_5A1908)) {
+                return false;
+            }
+            return true;
+        }
+    }
+
     run_info->flags |= 0x40;
 
     // TODO: Looks wrong, checking for 0 immediately after OR'ing 0x40.
@@ -13584,6 +13632,88 @@ bool anim_goal_run_to_tile(int64_t obj, int64_t loc)
     if (run_info->flags == 0
         && critter_encumbrance_level_get(run_info->anim_obj) < ENCUMBRANCE_LEVEL_SIGNIFICANT) {
         run_info->flags |= 0x40;
+    }
+
+    return true;
+}
+
+// CE: Convert an in-flight walk into a run mid-motion, without the
+// goal-interrupt + path-recompute overhead that the fresh-goal path
+// pays. Used by the click handler when the user upgrades from walk to
+// run (Ctrl+click or double-click) while a walk is already in flight.
+//
+// What this fixes: the player perceives the walk→run transition as
+// "walks several steps before transitioning to run" because the
+// engine's move handler (sub_425740) caches art_id at goal-step entry
+// and doesn't re-poll the run flag until it re-enters — which can be
+// multiple tiles later at walking cadence. We bypass that by:
+//
+//   1. Setting run_info->flags |= 0x40 on the existing goal so the
+//      engine's future polls of the flag agree we're running.
+//   2. Force-setting OBJ_F_CURRENT_AID to the RUN animation art with
+//      a frame reset, so the visible character switches gait on this
+//      very frame instead of waiting for the engine to update art.
+//   3. Updating pause_time to the RUN art's fps so per-tile cadence
+//      jumps to run speed immediately. Without this the character
+//      would visually run but still cross tiles at walk pace until
+//      the next goal-step entry refreshes pause_time.
+//
+// If a new destination is supplied, the goal's target loc is updated
+// and the path replan bit is set (path system picks it up on its
+// next tick — same soft-replan path used by the existing "already
+// running" branch in anim_goal_run_to_tile).
+//
+// Returns false if the conversion can't happen (not currently
+// walking, encumbered, art-data lookup failed, etc.) — caller should
+// fall back to anim_goal_run_to_tile() which will create a fresh
+// goal via the heavier interrupt-and-recreate path.
+//
+// Single-player only. Multiplayer needs a wire packet for in-place
+// goal mutation and that's not worth adding for a quality-of-life
+// fix; MP callers fall back to the fresh-goal path automatically.
+bool anim_upgrade_walk_to_run(int64_t obj, int64_t loc)
+{
+    AnimRunInfo* run_info;
+    tig_art_id_t art_id;
+    TigArtAnimData art_anim_data;
+
+    if (tig_net_is_active()) {
+        return false;
+    }
+
+    if (!anim_is_current_goal_type(obj, AG_MOVE_TO_TILE, &stru_5A1908)) {
+        return false;
+    }
+
+    run_info = &(anim_run_info[stru_5A1908.slot_num]);
+
+    if (critter_encumbrance_level_get(run_info->anim_obj) >= ENCUMBRANCE_LEVEL_SIGNIFICANT) {
+        return false;
+    }
+
+    // 1. Logical: mark as running so engine's polls agree.
+    run_info->flags |= 0x40;
+
+    // 2. Visual: switch art to RUN now, frame 0 for a clean handoff.
+    art_id = obj_field_int32_get(obj, OBJ_F_CURRENT_AID);
+    if (tig_art_id_anim_get(art_id) == TIG_ART_ANIM_WALK) {
+        art_id = tig_art_id_anim_set(art_id, TIG_ART_ANIM_RUN);
+        art_id = tig_art_id_frame_set(art_id, 0);
+        object_set_current_aid(obj, art_id);
+
+        // 3. Cadence: refresh per-tile pause from RUN art's fps so the
+        //    speed change matches the visual change.
+        if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK
+            && art_anim_data.fps > 0) {
+            run_info->pause_time.milliseconds = 1000 / art_anim_data.fps;
+        }
+    }
+
+    // 4. New destination: update target + soft replan via path.flags |= 0x04
+    //    (same mechanism the existing "already running" branch uses).
+    if (run_info->goals[0].params[AGDATA_TARGET_TILE].loc != loc) {
+        run_info->goals[0].params[AGDATA_TARGET_TILE].loc = loc;
+        run_info->path.flags |= 0x04;
     }
 
     return true;

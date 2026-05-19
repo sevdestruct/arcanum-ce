@@ -103,6 +103,12 @@ bool anim_goal_animate_loop(int64_t obj);
 bool anim_goal_move_to_tile(int64_t obj, int64_t loc);
 bool sub_433A00(int64_t obj, int64_t loc, bool a3);
 bool anim_goal_run_to_tile(int64_t obj, int64_t loc);
+// CE: Convert an in-flight AG_MOVE_TO_TILE into a run in place — sets
+// the run flag on the existing goal AND force-updates the critter's
+// art_id and pause_time so the gait change is visible on the same
+// frame. Returns false if not currently walking, encumbered, or in
+// multiplayer (caller should fall back to anim_goal_run_to_tile).
+bool anim_upgrade_walk_to_run(int64_t obj, int64_t loc);
 bool sub_434030(int64_t obj, int64_t loc);
 bool anim_goal_move_near_tile(int64_t source_obj, int64_t target_loc, int range);
 bool anim_goal_run_near_tile(int64_t source_obj, int64_t target_loc, int range);
