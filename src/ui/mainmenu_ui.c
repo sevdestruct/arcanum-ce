@@ -2181,7 +2181,11 @@ void mainmenu_ui_create_options(void)
     if (stru_5C36B0[mainmenu_ui_type][0]) {
         pc_obj = player_get_local_pc_obj();
         loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
-        location_origin_set(loc);
+        // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off keeps
+        // the player's scroll position when opening in-play Options.
+        if (gamelib_recenter_camera_on_overlay()) {
+            location_origin_set(loc);
+        }
         intgame_pc_lens_do(PC_LENS_MODE_PASSTHROUGH, &pc_lens);
     } else {
         // Pre-game (main menu) Options has no PC to look at — hide the lens
@@ -2361,7 +2365,9 @@ void mainmenu_ui_load_game_create(void)
     pc_lens.rect = &stru_5C4780;
     tig_art_interface_id_create(746, 0, 0, 0, &(pc_lens.art_id));
 
-    if (pc_obj != OBJ_HANDLE_NULL) {
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off keeps the
+    // viewport where the player had it when opening Load Game.
+    if (pc_obj != OBJ_HANDLE_NULL && gamelib_recenter_camera_on_overlay()) {
         location_origin_set(obj_field_int64_get(pc_obj, OBJ_F_LOCATION));
     }
 
@@ -3120,7 +3126,9 @@ void mainmenu_ui_save_game_create(void)
     pc_lens.rect = &stru_5C4780;
     tig_art_interface_id_create(746, 0, 0, 0, &(pc_lens.art_id));
 
-    if (pc_obj != OBJ_HANDLE_NULL) {
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off preserves
+    // the player's scroll position when opening Save Game.
+    if (pc_obj != OBJ_HANDLE_NULL && gamelib_recenter_camera_on_overlay()) {
         location_origin_set(obj_field_int64_get(pc_obj, OBJ_F_LOCATION));
     }
 
@@ -5250,16 +5258,27 @@ void mainmenu_ui_create_window_func(bool should_display)
     // circuits when no iso interface ever existed, so the fresh-boot
     // main-menu case stays a no-op.
     if (is_hires) {
+        // Chrome-less panel: hide the iso HUD strip band entirely.
+        //   - Save / Load / Last-Save on ANY path — those panels live on
+        //     mainmenu_bg (or the game world for shortcut access) and
+        //     never want a HUD band.
+        //   - Options whenever a game is in session — both the pause-menu
+        //     route AND the shortcut route. The user expects Options to
+        //     "draw over" without a HUD band; main-menu Options (no game)
+        //     already has no live strip to worry about.
+        //
+        // Everything else (new-char / pregen / charedit / pause menu /
+        // misc. menus) keeps the band visible: the bar cover chromakey
+        // lets it show through and provides the in-game chrome look —
+        // restoring the regression where new-char lost the HUD strip.
         bool chrome_less_panel = save_load_screen
-            || (mainmenu_ui_window_type == MM_WINDOW_OPTIONS && shortcut_path);
+            || (mainmenu_ui_window_type == MM_WINDOW_OPTIONS && is_in_game);
         if (chrome_less_panel) {
             intgame_iso_strips_hide_full();
             if (skip_hires_scaffold) {
                 intgame_iso_world_show();
             }
-        } else if (is_in_game) {
-            // Chrome-bearing in-game menus get the band restored. Pre-game
-            // main-menu screens have no live strips to show as a band.
+        } else {
             intgame_iso_strips_show_as_band();
         }
     }

@@ -2,6 +2,7 @@
 
 #include "game/critter.h"
 #include "game/descriptions.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/hrp.h"
 #include "game/location.h"
@@ -576,10 +577,13 @@ void written_ui_create(void)
     written_ui_draw_background(494, 0, 0);
 
     // Center viewport on the player (so that the lens display proper
-    // surroundings).
-    obj = player_get_local_pc_obj();
-    location = obj_field_int64_get(obj, OBJ_F_LOCATION);
-    location_origin_set(location);
+    // surroundings). Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default
+    // off doesn't disturb the player's scroll.
+    if (gamelib_recenter_camera_on_overlay()) {
+        obj = player_get_local_pc_obj();
+        location = obj_field_int64_get(obj, OBJ_F_LOCATION);
+        location_origin_set(location);
+    }
 
     // Enable the PC lens.
     pc_lens.window_handle = written_ui_window;
