@@ -1,5 +1,7 @@
 #include "ui/gameuilib.h"
 
+#include <string.h>
+
 #include "game/gamelib.h"
 #include "game/target.h"
 #include "ui/anim_ui.h"
@@ -72,6 +74,9 @@ typedef struct GameUiLibModule {
     GameUiResizeFunc resize_func;
 } GameUiLibModule;
 
+static bool gameuilib_custom_ui_cache_load(const char* const* candidates);
+static void gameuilib_custom_ui_cache_reset(void);
+
 /**
  * 0x5C2AE0
  */
@@ -130,6 +135,11 @@ static bool gameuilib_initialized;
  */
 static bool gameuilib_mod_loaded;
 
+static TigVideoBuffer* gameuilib_custom_ui_vb;
+static int gameuilib_custom_ui_width;
+static int gameuilib_custom_ui_height;
+static char gameuilib_custom_ui_bmp_path[TIG_MAX_PATH];
+
 /**
  * Called when the game is initialized.
  *
@@ -185,6 +195,7 @@ void gameuilib_exit(void)
         }
     }
 
+    gameuilib_custom_ui_cache_reset();
     gameuilib_initialized = false;
 }
 
@@ -272,6 +283,115 @@ void gameuilib_mod_unload(void)
     }
 
     gameuilib_mod_loaded = false;
+    gameuilib_custom_ui_cache_reset();
+}
+
+bool gameuilib_custom_ui_blit(tig_window_handle_t window_handle, const TigRect* canvas_rect, const TigRect* dst_rect, const char* const* candidates)
+{
+    TigRect canvas;
+    TigRect dst;
+    TigRect src;
+    int src_x;
+    int src_y;
+    int dst_x;
+    int dst_y;
+    int blit_w;
+    int blit_h;
+
+    if (canvas_rect == NULL || dst_rect == NULL || !gameuilib_custom_ui_cache_load(candidates)) {
+        return false;
+    }
+
+    canvas = *canvas_rect;
+    dst = *dst_rect;
+    src_x = dst.x - canvas.x + (gameuilib_custom_ui_width - canvas.width) / 2;
+    src_y = dst.y - canvas.y + (gameuilib_custom_ui_height - canvas.height) / 2;
+    dst_x = dst.x;
+    dst_y = dst.y;
+    blit_w = dst.width;
+    blit_h = dst.height;
+
+    if (src_x < 0) {
+        dst_x -= src_x;
+        blit_w += src_x;
+        src_x = 0;
+    }
+
+    if (src_y < 0) {
+        dst_y -= src_y;
+        blit_h += src_y;
+        src_y = 0;
+    }
+
+    if (src_x + blit_w > gameuilib_custom_ui_width) {
+        blit_w = gameuilib_custom_ui_width - src_x;
+    }
+
+    if (src_y + blit_h > gameuilib_custom_ui_height) {
+        blit_h = gameuilib_custom_ui_height - src_y;
+    }
+
+    if (blit_w <= 0 || blit_h <= 0) {
+        return false;
+    }
+
+    src.x = src_x;
+    src.y = src_y;
+    src.width = blit_w;
+    src.height = blit_h;
+
+    dst.x = dst_x;
+    dst.y = dst_y;
+    dst.width = blit_w;
+    dst.height = blit_h;
+
+    tig_window_copy_from_vbuffer(window_handle, &dst, gameuilib_custom_ui_vb, &src);
+    return true;
+}
+
+static bool gameuilib_custom_ui_cache_load(const char* const* candidates)
+{
+    int index;
+    TigVideoBuffer* vb;
+    TigVideoBufferData vb_data;
+
+    if (candidates == NULL) {
+        return false;
+    }
+
+    for (index = 0; candidates[index] != NULL; index++) {
+        if (gameuilib_custom_ui_vb != NULL
+            && strcmp(gameuilib_custom_ui_bmp_path, candidates[index]) == 0) {
+            return true;
+        }
+
+        if (tig_video_buffer_load_from_bmp(candidates[index], &vb, 0x01) == TIG_OK) {
+            if (tig_video_buffer_data(vb, &vb_data) != TIG_OK) {
+                tig_video_buffer_destroy(vb);
+                continue;
+            }
+            gameuilib_custom_ui_cache_reset();
+            gameuilib_custom_ui_vb = vb;
+            gameuilib_custom_ui_width = vb_data.width;
+            gameuilib_custom_ui_height = vb_data.height;
+            strncpy(gameuilib_custom_ui_bmp_path, candidates[index], sizeof(gameuilib_custom_ui_bmp_path) - 1);
+            gameuilib_custom_ui_bmp_path[sizeof(gameuilib_custom_ui_bmp_path) - 1] = '\0';
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void gameuilib_custom_ui_cache_reset(void)
+{
+    if (gameuilib_custom_ui_vb != NULL) {
+        tig_video_buffer_destroy(gameuilib_custom_ui_vb);
+        gameuilib_custom_ui_vb = NULL;
+    }
+    gameuilib_custom_ui_width = 0;
+    gameuilib_custom_ui_height = 0;
+    gameuilib_custom_ui_bmp_path[0] = '\0';
 }
 
 /**

@@ -1,6 +1,7 @@
 #include "ui/mainmenu_ui.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include <tig/tig.h>
 
@@ -143,6 +144,14 @@ static bool main_menu_button_create(MainMenuButtonInfo* info, int width, int hei
 static bool main_menu_button_create_ex(MainMenuButtonInfo* info, int width, int height, unsigned int flags);
 static void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str, TigRect* rect, unsigned int flags);
 static void sub_546DD0(void);
+static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void);
+static void mainmenu_ui_blit_custom_bg_to_window(tig_window_handle_t wnd, TigRect win_rect);
+static void mainmenu_ui_blit_custom_bg_at(tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect);
+static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect);
+static bool mainmenu_ui_load_bg_vb(MainMenuWindowType type);
+static void mainmenu_ui_free_custom_bg(void);
+static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type);
+static void mainmenu_ui_reapply_custom_bg(void);
 static void mainmenu_ui_create_shared_radio_buttons(void);
 static bool mainmenu_ui_message_filter(TigMessage* msg);
 static void mainmenu_ui_refresh_button_text(int btn, unsigned int flags);
@@ -191,6 +200,19 @@ static bool dword_5C3620 = true;
 
 // 0x5C3624
 static tig_window_handle_t mainmenu_ui_window_handle = TIG_WINDOW_HANDLE_INVALID;
+
+static tig_window_handle_t mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+static TigVideoBuffer* mainmenu_ui_custom_bg_vb = NULL;
+static int mainmenu_ui_custom_bg_width = 0;
+static int mainmenu_ui_custom_bg_height = 0;
+static bool mainmenu_ui_has_custom_bg = false;
+// True when the loaded BMP is a generic fallback (e.g. mainmenu_bg.bmp used
+// for a screen that lacks its own bespoke file). In that case the BMP fills
+// the backdrop behind the stock menu art but must NOT overlay the menu's own
+// window / bar covers, otherwise it paints over the screen-specific art.
+static bool mainmenu_ui_custom_bg_is_fallback = false;
+static MainMenuWindowType mainmenu_ui_custom_bg_window_type = MM_WINDOW_0;
+static bool mainmenu_ui_custom_bg_window_type_override = false;
 
 // 0x5C3628
 static TigRect mainmenu_ui_window_rect = { 0, 0, 800, 600 };
@@ -1557,7 +1579,14 @@ void mainmenu_ui_start(MainMenuType type)
         // CE: Hide main interface to prevent world view and top/bottom bars
         // to be visible while mainmenu is being presented (visible on custom
         // resolutions).
-        intgame_hide();
+        //
+        // Exception: the in-game Options shortcut (O key) is meant to draw
+        // over the live game UI with a knockout for the bottom HUD info bar,
+        // matching the original 800x600 layout. Keep the in-game interface
+        // visible so the HUD stays where it is behind the options panel.
+        if (type != MM_TYPE_OPTIONS) {
+            intgame_hide();
+        }
 
         if (type != MM_TYPE_OPTIONS) {
             sub_45B320();
@@ -1625,7 +1654,13 @@ void mainmenu_ui_start_at_window(MainMenuWindowType window_type)
     }
 
     mainmenu_ui_num_windows = 0;
-    intgame_hide();
+    // Don't call intgame_hide() here — it hides the iso (game-world) window
+    // which would leave a black flood behind the menu instead of the live
+    // game. This mirrors mainmenu_ui_start's `type != MM_TYPE_OPTIONS` gate,
+    // since these in-game shortcut targets (Options / Save / Load) all want
+    // to draw over the live game. The iso HUD strips are handled separately
+    // by intgame_iso_strips_hide_full() inside mainmenu_ui_create_window_func
+    // when skip_hires_scaffold is true.
 
     tig_art_interface_id_create(0, 0, 0, 0, &art_id);
     tig_mouse_cursor_set_art_id(art_id);
@@ -2146,7 +2181,11 @@ void mainmenu_ui_create_options(void)
     if (stru_5C36B0[mainmenu_ui_type][0]) {
         pc_obj = player_get_local_pc_obj();
         loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
-        location_origin_set(loc);
+        // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off keeps
+        // the player's scroll position when opening in-play Options.
+        if (gamelib_recenter_camera_on_overlay()) {
+            location_origin_set(loc);
+        }
         intgame_pc_lens_do(PC_LENS_MODE_PASSTHROUGH, &pc_lens);
     } else {
         // Pre-game (main menu) Options has no PC to look at — hide the lens
@@ -2326,7 +2365,9 @@ void mainmenu_ui_load_game_create(void)
     pc_lens.rect = &stru_5C4780;
     tig_art_interface_id_create(746, 0, 0, 0, &(pc_lens.art_id));
 
-    if (pc_obj != OBJ_HANDLE_NULL) {
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off keeps the
+    // viewport where the player had it when opening Load Game.
+    if (pc_obj != OBJ_HANDLE_NULL && gamelib_recenter_camera_on_overlay()) {
         location_origin_set(obj_field_int64_get(pc_obj, OBJ_F_LOCATION));
     }
 
@@ -2454,20 +2495,55 @@ bool mainmenu_ui_load_game_button_released(tig_button_handle_t button_handle)
 }
 
 // 0x5424F0
+// Shared double-click tracking for the save / load slot list. A second
+// click within MAINMENU_UI_DOUBLE_CLICK_MS on the same row of the same
+// window fires the OK action (Load or Save) just like clicking the
+// confirm button.
+#define MAINMENU_UI_DOUBLE_CLICK_MS 400
+static tig_timestamp_t mainmenu_ui_savelist_last_click_time;
+static int mainmenu_ui_savelist_last_click_row = -1;
+static MainMenuWindowType mainmenu_ui_savelist_last_click_window = MM_WINDOW_0;
+
+static bool mainmenu_ui_savelist_register_click(int row)
+{
+    tig_timestamp_t now;
+    bool double_click;
+
+    tig_timer_now(&now);
+    double_click = row >= 0
+        && row == mainmenu_ui_savelist_last_click_row
+        && mainmenu_ui_savelist_last_click_window == mainmenu_ui_window_type
+        && tig_timer_elapsed(mainmenu_ui_savelist_last_click_time) <= MAINMENU_UI_DOUBLE_CLICK_MS;
+    mainmenu_ui_savelist_last_click_time = now;
+    mainmenu_ui_savelist_last_click_row = row;
+    mainmenu_ui_savelist_last_click_window = mainmenu_ui_window_type;
+    return double_click;
+}
+
 void mainmenu_ui_load_game_mouse_up(int x, int y)
 {
     MainMenuWindowInfo* window;
+    int row;
+    bool double_click;
 
     (void)x;
 
     window = main_menu_window_info[mainmenu_ui_window_type];
-    window->selected_index = window->top_index + y / 20;
-    if (window->selected_index >= window->cnt) {
-        window->selected_index = -1;
+    row = window->top_index + y / 20;
+    if (row >= window->cnt) {
+        row = -1;
     }
+
+    double_click = mainmenu_ui_savelist_register_click(row);
+
+    window->selected_index = row;
     sub_542560();
     window->refresh_func(NULL);
     scrollbar_ui_control_redraw(stru_64C220);
+
+    if (double_click) {
+        sub_5480C0(2);
+    }
 }
 
 // 0x542560
@@ -2525,6 +2601,12 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
         tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
+        if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+            TigWindowData wd;
+            if (tig_window_data(mainmenu_ui_window_handle, &wd) == TIG_OK) {
+                mainmenu_ui_blit_custom_bg_at(mainmenu_ui_window_handle, wd.rect, dst_rect);
+            }
+        }
     }
 
     if (rect == NULL
@@ -3044,7 +3126,9 @@ void mainmenu_ui_save_game_create(void)
     pc_lens.rect = &stru_5C4780;
     tig_art_interface_id_create(746, 0, 0, 0, &(pc_lens.art_id));
 
-    if (pc_obj != OBJ_HANDLE_NULL) {
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off preserves
+    // the player's scroll position when opening Save Game.
+    if (pc_obj != OBJ_HANDLE_NULL && gamelib_recenter_camera_on_overlay()) {
         location_origin_set(obj_field_int64_get(pc_obj, OBJ_F_LOCATION));
     }
 
@@ -3220,17 +3304,28 @@ bool mainmenu_ui_save_game_button_released(tig_button_handle_t button_handle)
 void mainmenu_ui_save_game_mouse_up(int x, int y)
 {
     MainMenuWindowInfo* window;
+    int row;
+    bool double_click;
 
     (void)x;
 
     window = main_menu_window_info[mainmenu_ui_window_type];
-    window->selected_index = window->top_index + y / 20;
-    if (window->selected_index >= window->cnt) {
-        window->selected_index = window->cnt - 1;
+    row = window->top_index + y / 20;
+    if (row >= window->cnt) {
+        row = window->cnt - 1;
     }
+
+    double_click = mainmenu_ui_savelist_register_click(row);
+
+    window->selected_index = row;
     sub_544290();
     window->refresh_func(NULL);
     scrollbar_ui_control_redraw(stru_64C220);
+
+    if (double_click) {
+        // Double-click on a save slot = press the Save button.
+        sub_5480C0(2);
+    }
 }
 
 // 0x543990
@@ -3271,6 +3366,12 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
         art_blit_info.src_rect = &src_rect;
         art_blit_info.dst_rect = &dst_rect;
         tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
+        if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+            TigWindowData wd;
+            if (tig_window_data(mainmenu_ui_window_handle, &wd) == TIG_OK) {
+                mainmenu_ui_blit_custom_bg_at(mainmenu_ui_window_handle, wd.rect, dst_rect);
+            }
+        }
     }
 
     if (rect == NULL
@@ -3670,9 +3771,20 @@ void mainmenu_ui_credits_create(void)
     mainmenu_ui_num_windows++;
     mainmenu_ui_pop_window_stack();
     mainmenu_ui_window_type = MM_WINDOW_MAINMENU;
+    mainmenu_ui_custom_bg_window_type = MM_WINDOW_CREDITS;
+    mainmenu_ui_custom_bg_window_type_override = true;
     mainmenu_ui_open();
+    mainmenu_ui_custom_bg_window_type_override = false;
     dword_64C38C = true;
     slide_ui_start(SLIDE_UI_TYPE_CREDITS);
+    if (mainmenu_ui_active && mainmenu_ui_window_type == MM_WINDOW_MAINMENU) {
+        if (!mainmenu_ui_reload_custom_bg(MM_WINDOW_MAINMENU)) {
+            mainmenu_ui_reapply_custom_bg();
+        }
+        sub_549960();
+        mainmenu_ui_draw_version();
+        tig_window_display();
+    }
 
     if (mainmenu_ui_active) {
         if (main_menu_window_info[mainmenu_ui_window_type]->refresh_func != NULL) {
@@ -4452,6 +4564,12 @@ void mainmenu_ui_charedit_refresh(TigRect* rect)
     pc_obj = player_get_local_pc_obj();
     if (!charedit_open(pc_obj, dword_64C454)) {
         mainmenu_ui_close(true);
+    } else {
+        // Backdrop is created earlier in the same z-class. Promote the
+        // charedit base window AND each tab sub-window (skills / tech /
+        // spells / scheme) so they all sit above the backdrop, with the
+        // sub-windows ending up above the base for their tab content.
+        charedit_promote_overlay();
     }
     dword_64C454 = CHAREDIT_MODE_3;
 }
@@ -4536,6 +4654,10 @@ void mainmenu_ui_shop_refresh(TigRect* rect)
         sub_5412D0();
         return;
     }
+
+    // Backdrop is created earlier in the same z-class; bring the inventory
+    // window forward so its panel art isn't obscured.
+    intgame_big_window_promote();
 }
 
 // 0x5461A0
@@ -4576,6 +4698,14 @@ bool main_menu_button_create_ex(MainMenuButtonInfo* info, int width, int height,
             return false;
         }
 
+        // Save / Load screens skip the bottom bar covers; buttons parented
+        // to those covers have no host window. Report success without
+        // creating the button so callers don't treat it as a fatal error.
+        if (mainmenu_ui_bottom_bar_cover_window_handles[index] == TIG_WINDOW_HANDLE_INVALID) {
+            info->button_handle = TIG_BUTTON_HANDLE_INVALID;
+            return true;
+        }
+
         button_data.window_handle = mainmenu_ui_bottom_bar_cover_window_handles[index];
         button_data.x -= mainmenu_ui_bottom_bar_cover_rects[index].x;
     } else {
@@ -4608,6 +4738,269 @@ void mainmenu_ui_create_window(void)
     mainmenu_ui_create_window_func(true);
 }
 
+// Each entry: { primary file, fallback file (or NULL) }.
+// Screens that share the main menu look fall back to mainmenu_bg.bmp when
+// no bespoke file is present.  Screens with two NULLs use original game art.
+static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void)
+{
+    if (mainmenu_ui_custom_bg_window_type_override) {
+        return mainmenu_ui_custom_bg_window_type;
+    }
+
+    return mainmenu_ui_window_type;
+}
+
+static bool mainmenu_ui_load_bg_vb(MainMenuWindowType type)
+{
+    static const char* candidates[MM_WINDOW_COUNT][2] = {
+        /* MM_WINDOW_0                    */ { NULL, NULL },
+        /* MM_WINDOW_1                    */ { NULL, NULL },
+        /* MM_WINDOW_MAINMENU             */ { "art\\ui\\mainmenu_bg.bmp", NULL },
+        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art\\ui\\inmenu_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art\\ui\\inmenu_locked_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_SINGLE_PLAYER        */ { "art\\ui\\singleplayer_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_OPTIONS              */ { "art\\ui\\options_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_LOAD_GAME            */ { "art\\ui\\loadgame_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_SAVE_GAME            */ { "art\\ui\\savegame_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art\\ui\\savegame_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_INTRO                */ { "art\\ui\\intro_bg.bmp", NULL },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art\\ui\\newchar_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_NEW_CHAR             */ { "art\\ui\\newchar_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_PREGEN_CHAR          */ { "art\\ui\\newchar_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_CHAREDIT             */ { "art\\ui\\charedit_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_SHOP                 */ { "art\\ui\\shop_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_CREDITS              */ { "art\\ui\\credits_bg.bmp", "art\\ui\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_26                   */ { NULL, NULL },
+    };
+    int i;
+    TigVideoBuffer* vb;
+    TigVideoBufferData vb_data;
+
+    if (type < 0 || type >= MM_WINDOW_COUNT) {
+        return false;
+    }
+
+    for (i = 0; i < 2; i++) {
+        if (candidates[type][i] == NULL) {
+            break;
+        }
+        if (tig_video_buffer_load_from_bmp(candidates[type][i], &vb, 0x01) == TIG_OK) {
+            if (tig_video_buffer_data(vb, &vb_data) != TIG_OK) {
+                tig_video_buffer_destroy(vb);
+                continue;
+            }
+            mainmenu_ui_free_custom_bg();
+            mainmenu_ui_custom_bg_vb = vb;
+            mainmenu_ui_custom_bg_width = vb_data.width;
+            mainmenu_ui_custom_bg_height = vb_data.height;
+            // Only suppress the menu-window overlay when a fallback BMP is
+            // serving a screen whose stock art has critical UI (portrait /
+            // race / stats / save-slot list / options controls / ...).
+            // Other screens (in-play menu, credits, single-player splash,
+            // ...) intentionally let any loaded custom bg replace their
+            // decorative stock art.
+            mainmenu_ui_custom_bg_is_fallback = (i > 0)
+                && (type == MM_WINDOW_NEW_CHAR
+                    || type == MM_WINDOW_PREGEN_CHAR
+                    || type == MM_WINDOW_CHAREDIT
+                    || type == MM_WINDOW_SHOP
+                    || type == MM_WINDOW_OPTIONS
+                    || type == MM_WINDOW_LOAD_GAME
+                    || type == MM_WINDOW_SAVE_GAME
+                    || type == MM_WINDOW_LAST_SAVE_GAME);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void mainmenu_ui_free_custom_bg(void)
+{
+    if (mainmenu_ui_custom_bg_vb != NULL) {
+        tig_video_buffer_destroy(mainmenu_ui_custom_bg_vb);
+        mainmenu_ui_custom_bg_vb = NULL;
+    }
+    mainmenu_ui_custom_bg_width = 0;
+    mainmenu_ui_custom_bg_height = 0;
+}
+
+static bool mainmenu_ui_reload_custom_bg(MainMenuWindowType type)
+{
+    if (!mainmenu_ui_load_bg_vb(type)) {
+        return false;
+    }
+
+    mainmenu_ui_has_custom_bg = true;
+    mainmenu_ui_reapply_custom_bg();
+
+    return true;
+}
+
+static void mainmenu_ui_blit_custom_bg_to_window(tig_window_handle_t wnd, TigRect win_rect)
+{
+    int sw = hrp_iso_window_width_get();
+    int sh = hrp_iso_window_height_get();
+    int bw = mainmenu_ui_custom_bg_width;
+    int bh = mainmenu_ui_custom_bg_height;
+    int bmp_ox = (sw - bw) / 2;
+    int bmp_oy = (sh - bh) / 2;
+    int src_x = win_rect.x - bmp_ox;
+    int src_y = win_rect.y - bmp_oy;
+    int dst_x = 0;
+    int dst_y = 0;
+    int blit_w = win_rect.width;
+    int blit_h = win_rect.height;
+    TigRect src_r;
+    TigRect dst_r;
+
+    if (mainmenu_ui_custom_bg_vb == NULL) {
+        return;
+    }
+
+    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
+    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
+    if (src_x + blit_w > bw) { blit_w = bw - src_x; }
+    if (src_y + blit_h > bh) { blit_h = bh - src_y; }
+
+    if (blit_w <= 0 || blit_h <= 0) {
+        return;
+    }
+
+    src_r.x = src_x;
+    src_r.y = src_y;
+    src_r.width = blit_w;
+    src_r.height = blit_h;
+    dst_r.x = dst_x;
+    dst_r.y = dst_y;
+    dst_r.width = blit_w;
+    dst_r.height = blit_h;
+    tig_window_copy_from_vbuffer(wnd, &dst_r, mainmenu_ui_custom_bg_vb, &src_r);
+}
+
+// Blit the custom background art to a sub-rect of a window.
+// win_screen_rect: the window's screen rect (used to map to BMP coordinates).
+// local_rect: destination rect in window-local coordinates.
+static void mainmenu_ui_blit_custom_bg_at(tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect)
+{
+    int sw = hrp_iso_window_width_get();
+    int sh = hrp_iso_window_height_get();
+    int bw = mainmenu_ui_custom_bg_width;
+    int bh = mainmenu_ui_custom_bg_height;
+    int bmp_ox = (sw - bw) / 2;
+    int bmp_oy = (sh - bh) / 2;
+    int sx = win_screen_rect.x + local_rect.x;
+    int sy = win_screen_rect.y + local_rect.y;
+    int src_x = sx - bmp_ox;
+    int src_y = sy - bmp_oy;
+    int dst_x = local_rect.x;
+    int dst_y = local_rect.y;
+    int blit_w = local_rect.width;
+    int blit_h = local_rect.height;
+    TigRect src_r;
+    TigRect dst_r;
+
+    if (mainmenu_ui_custom_bg_vb == NULL) {
+        return;
+    }
+
+    if (src_x < 0) { dst_x -= src_x; blit_w += src_x; src_x = 0; }
+    if (src_y < 0) { dst_y -= src_y; blit_h += src_y; src_y = 0; }
+    if (src_x + blit_w > bw) { blit_w = bw - src_x; }
+    if (src_y + blit_h > bh) { blit_h = bh - src_y; }
+
+    if (blit_w <= 0 || blit_h <= 0) {
+        return;
+    }
+
+    src_r.x = src_x;
+    src_r.y = src_y;
+    src_r.width = blit_w;
+    src_r.height = blit_h;
+    dst_r.x = dst_x;
+    dst_r.y = dst_y;
+    dst_r.width = blit_w;
+    dst_r.height = blit_h;
+    tig_window_copy_from_vbuffer(wnd, &dst_r, mainmenu_ui_custom_bg_vb, &src_r);
+}
+
+// Restore the text area from the currently active backdrop source so shared
+// morph-text entries can stay transparent over custom backgrounds.
+static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect)
+{
+    TigWindowData wd;
+    TigArtAnimData art_anim_data;
+    TigArtBlitInfo art_blit_info;
+    TigRect src_rect;
+    TigRect dst_rect;
+    tig_art_id_t art_id;
+
+    if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+        if (tig_window_data(window_handle, &wd) == TIG_OK) {
+            mainmenu_ui_blit_custom_bg_at(window_handle, wd.rect, *rect);
+        }
+        return;
+    }
+
+    if (main_menu_window_info[mainmenu_ui_window_type]->background_art_num == -1) {
+        return;
+    }
+
+    tig_art_interface_id_create(main_menu_window_info[mainmenu_ui_window_type]->background_art_num, 0, 0, 0, &art_id);
+    if (tig_art_anim_data(art_id, &art_anim_data) != TIG_OK) {
+        return;
+    }
+
+    src_rect.x = rect->x;
+    src_rect.y = rect->y;
+    src_rect.width = rect->width + 1;
+    src_rect.height = rect->height + 1;
+
+    dst_rect = src_rect;
+
+    art_blit_info.flags = 0;
+    art_blit_info.art_id = art_id;
+    art_blit_info.src_rect = &src_rect;
+    art_blit_info.dst_rect = &dst_rect;
+    tig_window_blit_art(window_handle, &art_blit_info);
+}
+
+static void mainmenu_ui_reapply_custom_bg(void)
+{
+    TigWindowData window_data;
+    int idx;
+
+    if (!mainmenu_ui_has_custom_bg) {
+        return;
+    }
+
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(mainmenu_ui_backdrop_handle, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_backdrop_handle, window_data.rect);
+    }
+
+    if (mainmenu_ui_custom_bg_is_fallback) {
+        return;
+    }
+
+    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(mainmenu_ui_window_handle, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_window_handle, window_data.rect);
+    }
+
+    for (idx = 0; idx < SDL_arraysize(mainmenu_ui_bottom_bar_cover_window_handles); idx++) {
+        if (mainmenu_ui_bottom_bar_cover_window_handles[idx] != TIG_WINDOW_HANDLE_INVALID
+            && tig_window_data(mainmenu_ui_bottom_bar_cover_window_handles[idx], &window_data) == TIG_OK) {
+            mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_bottom_bar_cover_window_handles[idx], window_data.rect);
+        }
+    }
+
+    if (mainmenu_ui_top_bar_cover_window_handle != TIG_WINDOW_HANDLE_INVALID
+        && tig_window_data(mainmenu_ui_top_bar_cover_window_handle, &window_data) == TIG_OK) {
+        mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_top_bar_cover_window_handle, window_data.rect);
+    }
+}
+
 // 0x546340
 void mainmenu_ui_create_window_func(bool should_display)
 {
@@ -4625,6 +5018,8 @@ void mainmenu_ui_create_window_func(bool should_display)
     tig_art_id_t art_id;
     tig_font_handle_t font;
     tig_window_handle_t window_handle;
+    mainmenu_ui_has_custom_bg = false;
+    mainmenu_ui_custom_bg_is_fallback = false;
     bool v1 = false;
     int idx;
     int rc;
@@ -4637,6 +5032,117 @@ void mainmenu_ui_create_window_func(bool should_display)
         return;
     }
 
+    // Hi-res mode adds a backdrop + top/bottom bar covers around the 800x600
+    // menu panel.  At native 800x600 there's no extra scaffolding to skip —
+    // the original chrome is exactly the menu — so all the recent "show over
+    // game world" / chrome-skipping logic only applies in hi-res mode. At
+    // 800x600, behavior stays vanilla.
+    bool is_hires = (hrp_iso_window_width_get() > 800
+        || hrp_iso_window_height_get() > 600);
+
+    // "In-game" uses stru_5C36B0[type][0] — the menu flavor's "exit to
+    // game" flag — rather than intgame_iso_interface_is_created().
+    // The latter never gets cleared (iso_interface_destroy doesn't reset
+    // the flag), so it can read `true` from main-menu Load Game after a
+    // game has previously run.
+    //
+    // "Shortcut path" means the user invoked the menu via an in-game
+    // keyboard shortcut (Cmd+Shift+S, Cmd+O, plain O) — which routes
+    // through mainmenu_ui_start_at_window() and sets type=MM_TYPE_OPTIONS.
+    // The pause-menu chain goes through mainmenu_ui_start(MM_TYPE_IN_PLAY)
+    // instead and keeps type=MM_TYPE_IN_PLAY across window transitions.
+    bool is_in_game = stru_5C36B0[mainmenu_ui_type][0];
+    bool shortcut_path = is_in_game && mainmenu_ui_type == MM_TYPE_OPTIONS;
+    bool save_load_screen = (mainmenu_ui_window_type == MM_WINDOW_SAVE_GAME
+        || mainmenu_ui_window_type == MM_WINDOW_LOAD_GAME
+        || mainmenu_ui_window_type == MM_WINDOW_LAST_SAVE_GAME);
+
+    // Skip the hi-res backdrop ONLY for in-game shortcuts:
+    //   - Cmd+Shift+S / Cmd+O / plain O → render over the live game.
+    //
+    // Pause-menu → Save/Load and main-menu → Load both KEEP the backdrop
+    // (with mainmenu_bg art, per the override in the backdrop block) —
+    // the user wants them to paint over mainmenu_bg, not the game world
+    // and not the chrome-painted loadgame_bg / savegame_bg.
+    bool skip_hires_scaffold = is_hires
+        && shortcut_path
+        && (save_load_screen
+            || mainmenu_ui_window_type == MM_WINDOW_OPTIONS);
+
+    // Skip the cosmetic top/bottom bar covers around Save / Load / Last-
+    // Save at hi-res, regardless of how the screen was reached. There's
+    // never a HUD info-bar use case for those screens, so the cover band
+    // is always pure cosmetic chrome that the user wants gone.
+    // At 800x600 those covers ARE the vanilla menu chrome — keep them.
+    bool skip_bar_covers = is_hires && save_load_screen;
+
+    if (!skip_hires_scaffold
+        && (hrp_iso_window_width_get() > 800 || hrp_iso_window_height_get() > 600)) {
+        TigWindowData backdrop_data;
+        MainMenuWindowType backdrop_bg_type;
+        // Not ALWAYS_ON_TOP: the per-screen mainmenu_ui_window is itself
+        // ALWAYS_ON_TOP and sits above the backdrop. For CHAREDIT (no main
+        // window — uses intgame_big_window), we move the big window to the
+        // top of its z-class so it lands above this backdrop.
+        backdrop_data.flags = TIG_WINDOW_MESSAGE_FILTER;
+        backdrop_data.rect.x = 0;
+        backdrop_data.rect.y = 0;
+        backdrop_data.rect.width = hrp_iso_window_width_get();
+        backdrop_data.rect.height = hrp_iso_window_height_get();
+        backdrop_data.background_color = tig_color_make(0, 0, 0);
+        backdrop_data.color_key = tig_color_make(0, 0, 0);
+        backdrop_data.message_filter = mainmenu_ui_message_filter;
+        // For chrome-less Save / Load (main-menu Load Game in particular),
+        // skip the per-screen *_bg.bmp art and force the plain mainmenu_bg
+        // backdrop. The screen-specific arts (loadgame_bg / savegame_bg)
+        // have the HUD chrome painted into them; using them as the backdrop
+        // would re-introduce the "bottom HUD" the bar-cover skip just
+        // removed. Plain mainmenu_bg is what the user wants showing behind
+        // the panel here.
+        backdrop_bg_type = skip_bar_covers
+            ? MM_WINDOW_MAINMENU
+            : mainmenu_ui_bg_window_type_resolve();
+        if (tig_window_create(&backdrop_data, &mainmenu_ui_backdrop_handle) == TIG_OK) {
+            if (mainmenu_ui_load_bg_vb(backdrop_bg_type)) {
+                mainmenu_ui_has_custom_bg = true;
+                // The per-window panel overlay (later down the function)
+                // blits this same custom bg through the panel's chromakeys
+                // when !is_fallback. For Save / Load that overlay would
+                // paint mainmenu_bg through the panel — also unwanted.
+                // Mark it as fallback to suppress the overlay; the backdrop
+                // alone carries the mainmenu_bg art.
+                if (skip_bar_covers) {
+                    mainmenu_ui_custom_bg_is_fallback = true;
+                }
+                mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_backdrop_handle, backdrop_data.rect);
+            }
+        }
+        // The backdrop is newer in MIDDLE z-class than the iso-interface
+        // strips, so it would otherwise occlude them. Promote the strips
+        // above the backdrop so the menu art's chromakey knockouts reveal
+        // the strip content (rotwin / info bar / counters) underneath the
+        // way upstream's z-compositing always did.
+        //
+        // Exceptions — DON'T promote:
+        //
+        //  - Pre-game Options (main menu flavor, no game in session):
+        //    nothing meaningful to show in the strip, and the panel is
+        //    cropped down by 157px so any visible strip would just hang
+        //    in empty space. Let the backdrop cover it.
+        //
+        //  - Save / Load / Last-Save (any path): we don't want the HUD
+        //    band visible. If a previous game session populated the
+        //    strip windows, promoting them above the backdrop would
+        //    bleed the HUD through the mainmenu_bg backdrop. The
+        //    strip-management block further down does the explicit
+        //    hide; skipping promote here avoids a brief visible flash.
+        if ((mainmenu_ui_window_type != MM_WINDOW_OPTIONS
+                || stru_5C36B0[mainmenu_ui_type][0])
+            && !save_load_screen) {
+            intgame_iso_strips_promote();
+        }
+    }
+
     window = main_menu_window_info[mainmenu_ui_window_type];
     if (window->background_art_num != -1) {
         tig_art_interface_id_create(window->background_art_num, 0, 0, 0, &art_id);
@@ -4647,6 +5153,27 @@ void mainmenu_ui_create_window_func(bool should_display)
                 mainmenu_ui_window_rect = mainmenu_ui_window_partial_rect;
                 v1 = true;
             }
+        }
+
+        // The Options panel is a single 800x600 art whose bottom 157px is
+        // decorative filler (knockout where the rotwin would normally show
+        // through). Nothing in Options drives content into that band, so
+        // crop it off — the menu becomes 800x443 and the surrounding area
+        // shows the backdrop / world through cleanly.
+        //
+        // Save / Load are *not* single-art panels — they're composited
+        // from a top bar (art 336), a partial 800x400 main panel, and the
+        // 800x159 bottom bar covers (art 335). The bottom covers are the
+        // decorative rotwin band there, and they're skipped separately
+        // below; we must NOT crop the main panel itself or its slot list
+        // gets clipped.
+        //
+        // Hi-res only — at native 800x600 the panel IS the screen and the
+        // bottom 157px is the legitimate (vanilla) info-bar area.
+        if (is_hires
+            && mainmenu_ui_window_type == MM_WINDOW_OPTIONS
+            && mainmenu_ui_window_rect.height > 157) {
+            mainmenu_ui_window_rect.height -= 157;
         }
 
         if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
@@ -4678,16 +5205,89 @@ void mainmenu_ui_create_window_func(bool should_display)
             }
 
             tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
+            if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+                mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_window_handle, window_data.rect);
+            }
         }
     } else {
         v1 = true;
+    }
+
+    if (skip_hires_scaffold) {
+        v1 = false;
+    }
+
+    // skip_bar_covers is declared near the top of the function so the
+    // backdrop block can consult it. Skip BOTH the decorative top bar
+    // (header) and the bottom bar covers (where the rotwin / info bar
+    // would normally appear) for Save / Load / Last-Save — those screens
+    // don't use the info bar and the surrounding bands are purely
+    // cosmetic chrome that conflicts with the user's preferred "panel
+    // over game world / mainmenu_bg" look. Hi-res only — at 800x600 those
+    // bar covers ARE the vanilla menu chrome.
+
+    // Manage the iso-interface HUD strips. intgame_hide() (run when the
+    // menu opens via the pause-menu chain) leaves the bottom strip
+    // visible and moved up so it acts as the menu's rotwin / info-bar
+    // band — the live game's bottom HUD essentially shows through the
+    // menu's chrome gap.
+    //
+    // - Save/Load (any path) and shortcut Options: fully hide both
+    //   strips. We don't want the HUD band visible over the panel
+    //   regardless of whether the backdrop is mainmenu_bg or absent.
+    //
+    // - Other in-game chrome menus (pause menu itself, etc.): keep the
+    //   band visible (it's the menu's info-bar slot).
+    //
+    // The iso (game-world) window is force-shown only when we're
+    // skipping the backdrop (shortcut path), since the pause-menu
+    // chain's intgame_hide() hides the iso window — and we want the
+    // shortcut path to actually reveal the game world behind. For
+    // pause-path Save/Load we *don't* re-show it: the mainmenu_bg
+    // backdrop is what should appear, and the iso world stays masked.
+    //
+    // Hi-res only — at 800x600 the strip geometry coincides with the
+    // menu's bar covers, so vanilla intgame_hide() already produces the
+    // right composite.
+    //
+    // The chrome-less branch (Save/Load any path, shortcut Options) is
+    // NOT gated on is_in_game: if a game ran earlier in this launch and
+    // was exited to main menu, the iso strip windows persist and would
+    // bleed the HUD band through a main-menu Load Game backdrop. Hide
+    // them defensively here. intgame_iso_strips_hide_full() short-
+    // circuits when no iso interface ever existed, so the fresh-boot
+    // main-menu case stays a no-op.
+    if (is_hires) {
+        // Chrome-less panel: hide the iso HUD strip band entirely.
+        //   - Save / Load / Last-Save on ANY path — those panels live on
+        //     mainmenu_bg (or the game world for shortcut access) and
+        //     never want a HUD band.
+        //   - Options whenever a game is in session — both the pause-menu
+        //     route AND the shortcut route. The user expects Options to
+        //     "draw over" without a HUD band; main-menu Options (no game)
+        //     already has no live strip to worry about.
+        //
+        // Everything else (new-char / pregen / charedit / pause menu /
+        // misc. menus) keeps the band visible: the bar cover chromakey
+        // lets it show through and provides the in-game chrome look —
+        // restoring the regression where new-char lost the HUD strip.
+        bool chrome_less_panel = save_load_screen
+            || (mainmenu_ui_window_type == MM_WINDOW_OPTIONS && is_in_game);
+        if (chrome_less_panel) {
+            intgame_iso_strips_hide_full();
+            if (skip_hires_scaffold) {
+                intgame_iso_world_show();
+            }
+        } else {
+            intgame_iso_strips_show_as_band();
+        }
     }
 
     if (v1) {
         v1 = false;
 
         tig_art_interface_id_create(335, 0, 0, 0, &art_id);
-        if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
+        if (!skip_bar_covers && tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
             window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP | TIG_WINDOW_MESSAGE_FILTER;
             window_data.background_color = art_anim_data.color_key;
             window_data.color_key = art_anim_data.color_key;
@@ -4722,13 +5322,16 @@ void mainmenu_ui_create_window_func(bool should_display)
                 }
 
                 tig_window_blit_art(mainmenu_ui_bottom_bar_cover_window_handles[idx], &art_blit_info);
+                if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+                    mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_bottom_bar_cover_window_handles[idx], window_data.rect);
+                }
 
                 v1 = true;
             }
         }
 
         tig_art_interface_id_create(336, 0, 0, 0, &art_id);
-        if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
+        if (!skip_bar_covers && tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
             window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP | TIG_WINDOW_MESSAGE_FILTER;
             window_data.rect = mainmenu_ui_top_bar_cover_rect;
             window_data.background_color = art_anim_data.color_key;
@@ -4759,7 +5362,14 @@ void mainmenu_ui_create_window_func(bool should_display)
             }
 
             tig_window_blit_art(mainmenu_ui_top_bar_cover_window_handle, &art_blit_info);
-        } else {
+            if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
+                mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_top_bar_cover_window_handle, window_data.rect);
+            }
+        } else if (!skip_bar_covers) {
+            // Only treat a missing top bar cover as fatal when we *expected*
+            // to draw chrome. skip_bar_covers (Save / Load / Last-Save)
+            // deliberately omits the bar covers, so the "no art" branch is
+            // the success path there.
             if (!v1) {
                 tig_debug_printf("mainmenu_ui_create_window_func: ERROR: tig_art_anim_data2 failed!\n");
                 exit(EXIT_SUCCESS); // FIXME: Should be `EXIT_FAILURE`.
@@ -4835,6 +5445,16 @@ void mainmenu_ui_create_window_func(bool should_display)
                 exit(EXIT_FAILURE);
             }
             window_handle = mainmenu_ui_bottom_bar_cover_window_handles[j];
+
+            // Save / Load screens may skip the bottom bar covers entirely
+            // (see `skip_bottom_bar_covers` above). In that case the cover
+            // handle is INVALID and any button parented to it must also be
+            // skipped — otherwise `tig_button_create` would fail and the
+            // unconditional exit below would crash the process.
+            if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+                button->button_handle = TIG_BUTTON_HANDLE_INVALID;
+                continue;
+            }
         } else {
             window_handle = mainmenu_ui_window_handle;
         }
@@ -4905,12 +5525,7 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
 {
     TigRect text_rect;
     TigFont font_desc;
-    TigArtAnimData art_anim_data;
-    TigArtBlitInfo art_blit_info;
-    TigRect src_rect;
-    TigRect dst_rect;
     tig_font_handle_t* fonts;
-    tig_art_id_t art_id;
     int pass;
 
     text_rect = *rect;
@@ -4962,26 +5577,7 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
             }
         }
 
-        if (main_menu_window_info[mainmenu_ui_window_type]->background_art_num != -1) {
-            tig_art_interface_id_create(main_menu_window_info[mainmenu_ui_window_type]->background_art_num, 0, 0, 0, &art_id);
-            if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
-                src_rect.x = rect->x;
-                src_rect.y = rect->y;
-                src_rect.width = rect->width + 1;
-                src_rect.height = rect->height + 1;
-
-                dst_rect.x = rect->x;
-                dst_rect.y = rect->y;
-                dst_rect.width = rect->width + 1;
-                dst_rect.height = rect->height + 1;
-
-                art_blit_info.flags = 0;
-                art_blit_info.art_id = art_id;
-                art_blit_info.src_rect = &src_rect;
-                art_blit_info.dst_rect = &dst_rect;
-                tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
-            }
-        }
+        mainmenu_ui_restore_text_backdrop(window_handle, rect);
 
         for (pass = 0; pass < 3; pass++) {
             tig_font_push(fonts[pass]);
@@ -5023,6 +5619,16 @@ void sub_546DD0(void)
         if (mainmenu_ui_top_bar_cover_window_handle != TIG_WINDOW_HANDLE_INVALID
             && tig_window_destroy(mainmenu_ui_top_bar_cover_window_handle) == TIG_OK) {
             mainmenu_ui_top_bar_cover_window_handle = TIG_WINDOW_HANDLE_INVALID;
+        }
+
+        if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
+            && tig_window_destroy(mainmenu_ui_backdrop_handle) == TIG_OK) {
+            mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+        }
+
+        if (mainmenu_ui_has_custom_bg) {
+            mainmenu_ui_free_custom_bg();
+            mainmenu_ui_has_custom_bg = false;
         }
 
         mainmenu_ui_active = false;
@@ -5165,6 +5771,10 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                     //     real click): fall back to pop-to-parent.
                     if (options_ui_load_module()) {
                         if (stru_5C36B0[mainmenu_ui_type][0]) {
+                            // CE: Recenter on the PC — see logbook_ui for
+                            // rationale. No-op when there is no local PC
+                            // (pre-game main menu).
+                            intgame_recenter_on_pc();
                             sub_5412D0();
                         } else {
                             gsound_play_sfx(0, 1);
@@ -5176,6 +5786,8 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                 break;
             case MM_WINDOW_LOAD_GAME:
                 if (intgame_pc_lens_check_pt_unscale(msg->data.mouse.x, msg->data.mouse.y)) {
+                    // CE: Recenter on the PC — see logbook_ui for rationale.
+                    intgame_recenter_on_pc();
                     if (dword_64C450) {
                         sub_5412D0();
                     } else {
@@ -5186,6 +5798,8 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                 break;
             case MM_WINDOW_SAVE_GAME:
                 if (intgame_pc_lens_check_pt_unscale(msg->data.mouse.x, msg->data.mouse.y)) {
+                    // CE: Recenter on the PC — see logbook_ui for rationale.
+                    intgame_recenter_on_pc();
                     sub_5412D0();
                     return true;
                 }

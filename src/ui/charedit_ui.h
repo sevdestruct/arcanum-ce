@@ -17,6 +17,7 @@ bool charedit_open(int64_t obj, ChareditMode mode);
 void charedit_close(void);
 bool charedit_is_created(void);
 void charedit_refresh(void);
+void charedit_promote_overlay(void);
 void charedit_error_not_enough_character_points(void);
 void charedit_error_not_enough_level(void);
 void charedit_error_not_enough_intelligence(void);

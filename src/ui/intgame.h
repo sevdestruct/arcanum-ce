@@ -103,6 +103,12 @@ void intgame_pc_lens_do(PcLensMode mode, PcLens* pc_lens);
 bool intgame_pc_lens_check_pt(int x, int y);
 bool intgame_pc_lens_check_pt_unscale(int x, int y);
 bool intgame_should_dismiss_overlay_click(int screen_x, int screen_y, const TigRect* menu_rect);
+
+// CE: Snap the iso camera back to the local PC. Used by overlay screens
+// that close via a PC-lens click — the lens widget acts as a "back to
+// the player" button, so clicking it implies "take me back to the PC"
+// even when the recenter-camera-on-overlay setting is off.
+void intgame_recenter_on_pc(void);
 void intgame_pc_lens_redraw(void);
 void iso_interface_refresh(void);
 bool sub_5517A0(TigMessage* msg);
@@ -138,6 +144,12 @@ void intgame_notify_item_inserted_or_removed(int64_t item_obj, bool removed, int
 void intgame_refresh_health_bar(int64_t obj);
 bool intgame_big_window_lock(TigWindowMessageFilterFunc func, tig_window_handle_t* window_handle_ptr);
 void intgame_big_window_unlock(void);
+bool intgame_big_window_screen_rect(TigRect* rect);
+void intgame_big_window_promote(void);
+void intgame_iso_strips_promote(void);
+void intgame_iso_strips_hide_full(void);
+void intgame_iso_strips_show_as_band(void);
+void intgame_iso_world_show(void);
 void sub_557370(int64_t source_obj, int64_t target_obj);
 void intgame_there_is_nothing_to_loot(void);
 void sub_5576B0(void);
@@ -149,6 +161,7 @@ void intgame_set_iso_window_width(int width);
 void intgame_set_iso_window_height(int height);
 bool intgame_create_iso_window(tig_window_handle_t* window_handle_ptr);
 bool intgame_is_compact_interface(void);
+bool intgame_iso_interface_is_created(void);
 void intgame_set_fullscreen(void);
 void intgame_toggle_interface(void);
 RotatingWindowType iso_interface_window_get_3(void);

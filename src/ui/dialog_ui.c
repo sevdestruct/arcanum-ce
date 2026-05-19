@@ -8,6 +8,7 @@
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/dialog.h"
+#include "game/dialog_camera.h"
 #include "game/gsound.h"
 #include "game/obj_private.h"
 #include "game/player.h"
@@ -294,6 +295,9 @@ bool dialog_ui_process_option(DialogUiEntry* entry, int option)
 
     switch (entry->state.field_17E8) {
     case 0:
+        if (is_pc) {
+            dialog_camera_start(entry->state.pc_obj, entry->state.npc_obj);
+        }
         dialog_ui_display(entry);
         break;
     case 1:

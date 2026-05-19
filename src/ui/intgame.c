@@ -2,6 +2,9 @@
 
 #include <stdio.h>
 
+#include "game/dialog_camera.h"
+#include "game/iso_zoom.h"
+#include "game/location.h"
 #include "game/ai.h"
 #include "game/anim.h"
 #include "game/bless.h"
@@ -18,6 +21,7 @@
 #include "game/item_effect.h"
 #include "game/level.h"
 #include "game/light.h"
+#include "game/location.h"
 #include "game/magictech.h"
 #include "game/map.h"
 #include "game/mt_item.h"
@@ -158,6 +162,7 @@ static void iso_interface_window_enable(RotatingWindowType window_type);
 static void intgame_mt_spells_enable(void);
 static int find_interface_window_index(int x, int y);
 static void sub_5517F0(void);
+static bool intgame_adjust_mouse_for_zoom(int x, int y, int* adj_x, int* adj_y);
 static bool sub_5518C0(int x, int y);
 static void sub_551910(TigMessage* msg);
 static void sub_551A10(int64_t obj);
@@ -2778,7 +2783,7 @@ void intgame_process_event(TigMessage* msg)
                             sub_4B4320(pc_obj);
 
                             tig_mouse_get_state(&mouse_state);
-                            if (location_at(mouse_state.x, mouse_state.y, &loc)
+                            if (location_at_zoomed(mouse_state.x, mouse_state.y, iso_zoom_current(), &loc)
                                 && sub_5517A0(msg)) {
                                 int64_t pc_loc;
                                 tig_art_id_t aid;
@@ -2800,6 +2805,12 @@ void intgame_process_event(TigMessage* msg)
                         sub_575770();
                         intgame_refresh_cursor();
                     }
+                }
+                break;
+            case TIG_MESSAGE_MOUSE_WHEEL:
+                if (iso_zoom_is_available()) {
+                    iso_zoom_wheel(msg->data.mouse.dy);
+                    gamelib_invalidate_rect(NULL);
                 }
                 break;
             case TIG_MESSAGE_MOUSE_IDLE:
@@ -2849,7 +2860,15 @@ void intgame_process_event(TigMessage* msg)
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
                 if (!inven_ui_is_created()) {
-                    if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    bool picked;
+                    if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                        picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
+                    } else {
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                    }
+                    if (picked) {
                         spell_ui_apply(&td);
                     } else if (target_last_rejection_get() == 0x100000) {
                         spell_ui_error_target_not_damaged();
@@ -2921,11 +2940,18 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    if (target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen)) {
+                        skill_ui_apply(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     skill_ui_apply(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 skill_ui_cancel();
                 break;
@@ -2977,24 +3003,33 @@ void intgame_process_event(TigMessage* msg)
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_DOWN:
-                if (sub_5517A0(msg)
-                    && target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)
-                    && td.is_loc
-                    && !inven_ui_drag_item_obj_get()
-                    && !critter_is_dead(pc_obj)
-                    && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
-                    if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
-                            || tig_kb_get_modifier(SDL_KMOD_NUM))
-                        && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                        anim_goal_run_to_tile(pc_obj, td.loc);
+                if (sub_5517A0(msg)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    bool picked;
+                    if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                        picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
                     } else {
-                        anim_goal_move_to_tile(pc_obj, td.loc);
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
                     }
+                    if (picked
+                        && td.is_loc
+                        && !inven_ui_drag_item_obj_get()
+                        && !critter_is_dead(pc_obj)
+                        && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
+                        if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
+                                || tig_kb_get_modifier(SDL_KMOD_NUM))
+                            && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
+                            anim_goal_run_to_tile(pc_obj, td.loc);
+                        } else {
+                            anim_goal_move_to_tile(pc_obj, td.loc);
+                        }
 
-                    if (dword_64C6D8) {
-                        sub_436CF0();
+                        if (dword_64C6D8) {
+                            sub_436CF0();
+                        }
+                        dword_64C6D8 = true;
                     }
-                    dword_64C6D8 = true;
                 }
                 break;
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
@@ -3026,13 +3061,22 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                bool picked;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
+                } else {
+                    picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                }
+                if (picked) {
                     item_ui_apply(&td);
                 } else if (target_last_rejection_get() == 0x100000) {
                     spell_ui_error_target_not_damaged();
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 item_ui_deactivate();
                 break;
@@ -3061,11 +3105,18 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    if (target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen)) {
+                        follower_ui_execute_order(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     follower_ui_execute_order(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 follower_ui_end_order_mode();
                 break;
@@ -4423,7 +4474,14 @@ void intgame_pc_lens_do(PcLensMode mode, PcLens* pc_lens)
         }
         break;
     case PC_LENS_MODE_PASSTHROUGH:
-        sub_551A10(player_get_local_pc_obj());
+        // CE: sub_551A10() snaps the iso viewport back to the PC so the
+        // lens always shows the player's surroundings. Gated on
+        // RECENTER_CAMERA_ON_OVERLAY_KEY — default off, the lens just
+        // shows whatever's currently centered on screen so the player
+        // can pan and still open overlays without losing their scroll.
+        if (gamelib_recenter_camera_on_overlay()) {
+            sub_551A10(player_get_local_pc_obj());
+        }
 
         intgame_pc_lens.window_handle = pc_lens->window_handle;
         intgame_pc_lens.art_id = pc_lens->art_id;
@@ -4565,19 +4623,45 @@ void intgame_pc_lens_redraw(void)
     TigArtBlitInfo blit_info;
     TigRect src_rect;
     TigRect dst_rect;
+    TigRect lens_src_rect;
 
     if (intgame_pc_lens_video_buffer != NULL) {
+        // CE: Default is to copy whatever is at screen center — vanilla
+        // behavior, correct when the camera is centered on the PC.
+        lens_src_rect = intgame_pc_lens_dst_rect;
+
+        // CE: PC_LENS_FOLLOWS_PLAYER_KEY: when the camera has been panned
+        // away from the PC (i.e. recenter-camera-on-overlay is off and the
+        // player scrolled before opening an overlay), shift the source rect
+        // so the lens widget still shows the PC. The PC's current screen
+        // position is (center - dx, center - dy) where (dx, dy) is the
+        // scroll vector needed to re-center on the PC. The lens dst rect is
+        // pre-centered on the screen, so subtracting (dx, dy) from its
+        // origin lands the source rect on the PC.
+        if (gamelib_pc_lens_follows_player()) {
+            int64_t pc_obj = player_get_local_pc_obj();
+            if (pc_obj != OBJ_HANDLE_NULL) {
+                int64_t pc_loc;
+                int64_t dx;
+                int64_t dy;
+                pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+                location_calc_dist_from_screen_center(pc_loc, &dx, &dy);
+                lens_src_rect.x = intgame_pc_lens_dst_rect.x - (int)dx;
+                lens_src_rect.y = intgame_pc_lens_dst_rect.y - (int)dy;
+            }
+        }
+
         tig_window_copy(intgame_pc_lens.window_handle,
             intgame_pc_lens.rect,
             dword_64C52C,
-            &intgame_pc_lens_dst_rect);
+            &lens_src_rect);
 
         src_rect.x = 0;
         src_rect.y = 0;
         src_rect.width = intgame_pc_lens.rect->width;
         src_rect.height = intgame_pc_lens.rect->height;
 
-        if (tig_window_copy_to_vbuffer(dword_64C52C, &intgame_pc_lens_dst_rect, intgame_pc_lens_video_buffer, &src_rect) == TIG_OK) {
+        if (tig_window_copy_to_vbuffer(dword_64C52C, &lens_src_rect, intgame_pc_lens_video_buffer, &src_rect) == TIG_OK) {
             dst_rect = src_rect;
             dst_rect.x = intgame_pc_lens.rect->x;
             dst_rect.y = intgame_pc_lens.rect->y;
@@ -4838,13 +4922,16 @@ bool intgame_get_location_under_cursor(int64_t* loc_ptr)
 {
     TigMouseState mouse_state;
     TargetDescriptor td;
+    int x, y;
 
     if (tig_mouse_get_state(&mouse_state) == TIG_OK
-        && sub_5518C0(mouse_state.x, mouse_state.y)
-        && target_pick_at_screen_xy_ex(mouse_state.x, mouse_state.y, &td, TGT_TILE, intgame_fullscreen)
-        && td.is_loc) {
-        *loc_ptr = td.loc;
-        return true;
+        && sub_5518C0(mouse_state.x, mouse_state.y)) {
+        intgame_adjust_mouse_for_zoom(mouse_state.x, mouse_state.y, &x, &y);
+        if (target_pick_at_screen_xy_ex(x, y, &td, TGT_TILE, intgame_fullscreen)
+            && td.is_loc) {
+            *loc_ptr = td.loc;
+            return true;
+        }
     }
 
     *loc_ptr = 0;
@@ -4870,22 +4957,45 @@ bool sub_5518C0(int x, int y)
     return true;
 }
 
+static bool intgame_adjust_mouse_for_zoom(int x, int y, int* adj_x, int* adj_y)
+{
+    float z = iso_zoom_current();
+
+    if (z != 1.0f) {
+        int64_t ax;
+        int64_t ay;
+
+        location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+        *adj_x = (int)ax;
+        *adj_y = (int)ay;
+        return true;
+    }
+
+    *adj_x = x;
+    *adj_y = y;
+    return false;
+}
+
 // 0x551910
 void sub_551910(TigMessage* msg)
 {
     TargetDescriptor td;
+    int x;
+    int y;
 
     if (sub_5517A0(msg)) {
         sub_551F80();
 
+        intgame_adjust_mouse_for_zoom(msg->data.mouse.x, msg->data.mouse.y, &x, &y);
+
         if (!map_is_clearing_objects()) {
-            if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+            if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
                 if (!td.is_loc) {
                     sub_57CCF0(player_get_local_pc_obj(), td.obj);
                     object_hover_obj_set(td.obj);
                 }
             } else if (combat_turn_based_is_active()
-                && target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, TGT_TILE, intgame_fullscreen)
+                && target_pick_at_screen_xy_ex(x, y, &td, TGT_TILE, intgame_fullscreen)
                 && td.is_loc
                 && intgame_mode_get() == INTGAME_MODE_MAIN) {
                 combat_check_move_to(player_get_local_pc_obj(), td.loc);
@@ -4898,6 +5008,15 @@ void sub_551910(TigMessage* msg)
 IntgameMode intgame_mode_get(void)
 {
     return intgame_mode_stack[intgame_mode_stack_size];
+}
+
+// CE: Public wrapper around sub_551A10 for overlay screens that close on
+// a PC-lens click. The lens widget is a "back to the player" button, so
+// clicking it should always recenter the iso camera on the PC — even when
+// the recenter-camera-on-overlay opt-in is off.
+void intgame_recenter_on_pc(void)
+{
+    sub_551A10(player_get_local_pc_obj());
 }
 
 // 0x551A10
@@ -4969,7 +5088,6 @@ bool intgame_mode_set(IntgameMode mode)
             combat_check_use_skill(player_get_local_pc_obj());
             break;
         case INTGAME_MODE_DIALOG:
-            sub_551A10(pc_obj);
             v1 = 1;
             if (v2) {
                 dialog_ui_end_dialog(player_get_local_pc_obj(), 0);
@@ -5195,6 +5313,10 @@ void sub_551F80(void)
 // 0x552050
 bool sub_552050(int x, int y, TargetDescriptor* td)
 {
+    if (intgame_adjust_mouse_for_zoom(x, y, &x, &y)) {
+        sub_551F80();
+        return target_pick_at_virtual_xy(x, y, td, intgame_fullscreen);
+    }
     sub_551F80();
     return target_pick_at_screen_xy(x, y, td, intgame_fullscreen);
 }
@@ -5949,6 +6071,7 @@ void intgame_dialog_end(void)
 {
     intgame_dialog_process_event_func = NULL;
     tc_hide();
+    dialog_camera_end(player_get_local_pc_obj());
     intgame_mode_set(INTGAME_MODE_MAIN);
 }
 
@@ -6249,6 +6372,8 @@ void sub_553A70(TigMessage* msg)
 {
     int64_t obj;
     TargetDescriptor td;
+    int x;
+    int y;
 
     if (!sub_5517A0(msg)) {
         return;
@@ -6259,7 +6384,9 @@ void sub_553A70(TigMessage* msg)
         return;
     }
 
-    if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+    intgame_adjust_mouse_for_zoom(msg->data.mouse.x, msg->data.mouse.y, &x, &y);
+
+    if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
         if (obj != td.obj) {
             sub_57CCF0(player_get_local_pc_obj(), td.obj);
             object_hover_obj_set(td.obj);
@@ -8322,6 +8449,104 @@ void intgame_big_window_unlock(void)
     tig_window_hide(intgame_big_window_handle);
 }
 
+bool intgame_big_window_screen_rect(TigRect* rect)
+{
+    TigWindowData wd;
+
+    if (intgame_big_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return false;
+    }
+    if (tig_window_data(intgame_big_window_handle, &wd) != TIG_OK) {
+        return false;
+    }
+    *rect = wd.rect;
+    return true;
+}
+
+// Re-push the big overlay window to the top of its z-class so it sits above
+// any subsequently created MIDDLE-class siblings (e.g. the main-menu backdrop
+// for the charedit step of character creation).
+void intgame_big_window_promote(void)
+{
+    if (intgame_big_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    tig_window_move_on_top(intgame_big_window_handle);
+}
+
+// Re-push both iso-interface HUD strips to the top of their z-class.
+// Used after the custom-UI backdrop window is created so the strips
+// (which were created earlier and are therefore older in MIDDLE class)
+// don't get covered by the backdrop. Lets the original mainmenu art's
+// chromakey knockouts reveal the strip content (rotwin / info bar)
+// underneath, the way upstream's z-compositing intended.
+void intgame_iso_strips_promote(void)
+{
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_move_on_top(dword_64C4F8[i]);
+        }
+    }
+}
+
+// Fully hide both iso-interface HUD strips.  Unlike intgame_hide(), which
+// leaves the bottom strip visible (moved up to align with main-menu chrome
+// covers and reused as the menu's rotwin / info-bar band), this hides
+// both strips outright.  Used by chrome-less menus (Save / Load) where the
+// would-be band would otherwise float visibly below the panel as "HUD
+// showing through" the menu.
+void intgame_iso_strips_hide_full(void)
+{
+    int i;
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    for (i = 0; i < 2; i++) {
+        if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_hide(dword_64C4F8[i]);
+        }
+    }
+}
+
+// Force the iso (game-world) window visible.  intgame_hide() hides the
+// iso window — so when a pause-menu chain (ESC → Save / Load) hands off
+// into a chrome-less menu, the world would otherwise stay hidden behind
+// the panel as a black flood.  Pair with intgame_iso_strips_hide_full()
+// to get a clean "panel over live game" composite.
+void intgame_iso_world_show(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C52C != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_show(dword_64C52C);
+    }
+}
+
+// Re-apply the moved-and-shown state of intgame_hide() for the bottom iso
+// strip, so chrome-bearing menus (pause menu, etc.) get their band back
+// after a transition through a chrome-less menu hid both strips.  The top
+// strip stays hidden (matches intgame_hide()).
+void intgame_iso_strips_show_as_band(void)
+{
+    TigRect rect;
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_hide(dword_64C4F8[0]);
+    }
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        rect = intgame_interface_window_frames[1];
+        hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
+        tig_window_move(dword_64C4F8[1], rect.x, rect.y);
+        if (!intgame_is_compact_interface()) {
+            tig_window_show(dword_64C4F8[1]);
+        }
+    }
+}
+
 // 0x557370
 void sub_557370(int64_t source_obj, int64_t target_obj)
 {
@@ -8530,6 +8755,11 @@ bool intgame_create_iso_window(tig_window_handle_t* window_handle_ptr)
 bool intgame_is_compact_interface(void)
 {
     return intgame_compact_interface;
+}
+
+bool intgame_iso_interface_is_created(void)
+{
+    return intgame_iso_interface_created;
 }
 
 // 0x5578D0

@@ -29,6 +29,20 @@
 #define OBJECT_LIGHTING_KEY "object lighting"
 #define SHADOWS_KEY "shadows"
 
+// When enabled, opening an overlay screen (Logbook, Inventory, Schematic,
+// Written, Options-while-in-play, Charedit) snaps the camera back to the
+// PC's location before showing the panel. Defaulted off — many players
+// find the snap disruptive (you can't open Inventory mid-scroll without
+// losing your place). Set to "1" to restore the vanilla behavior.
+#define RECENTER_CAMERA_ON_OVERLAY_KEY "recenter camera on overlay"
+
+// When enabled (default), the PC lens widget at the top of overlay screens
+// renders the PC's surroundings even when the iso camera has been panned
+// away. The lens widget acts as a "back to the player" button, so it
+// makes sense for it to always show the player. Set to "0" to fall back
+// to vanilla behavior — lens shows whatever is at screen center.
+#define PC_LENS_FOLLOWS_PLAYER_KEY "pc lens follows player"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
@@ -126,5 +140,16 @@ void gamelib_redraw(void);
 bool gamelib_copy_version(char* long_version, char* short_version, char* locale);
 void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
+void gamelib_get_iso_content_rect(TigRect* rect);
+
+// True when the user has opted into the vanilla "snap camera to PC on
+// overlay open" behavior. See RECENTER_CAMERA_ON_OVERLAY_KEY. Defaults
+// to false.
+bool gamelib_recenter_camera_on_overlay(void);
+
+// True when the PC lens widget should track the player even when the
+// iso camera has been panned away. See PC_LENS_FOLLOWS_PLAYER_KEY.
+// Defaults to true.
+bool gamelib_pc_lens_follows_player(void);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

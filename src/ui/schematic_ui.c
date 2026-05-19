@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "game/critter.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/item.h"
 #include "game/mes.h"
@@ -12,6 +13,7 @@
 #include "game/proto.h"
 #include "game/snd.h"
 #include "game/tech.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/tb_ui.h"
 
@@ -352,6 +354,12 @@ static bool schematic_ui_initialized;
  */
 static bool schematic_ui_created;
 
+static const char* schematic_ui_bg_candidates[] = {
+    "art\\ui\\crafting_bg.bmp",
+    "art\\ui\\schematic_bg.bmp",
+    NULL,
+};
+
 /**
  * Called when the game is initialized.
  *
@@ -650,8 +658,11 @@ void schematic_ui_create(void)
     schematic_ui_redraw();
 
     // Center viewport on the player (so that the lens display proper
-    // surroundings).
-    location_origin_set(obj_field_int64_get(schematic_ui_primary_obj, OBJ_F_LOCATION));
+    // surroundings). Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default
+    // off keeps the viewport where the player had it.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(schematic_ui_primary_obj, OBJ_F_LOCATION));
+    }
 
     // Enable the PC lens.
     pc_lens.window_handle = schematic_ui_window;
@@ -708,6 +719,8 @@ bool schematic_ui_message_filter(TigMessage* msg)
         // Clicking on the PC lens closes schematic UI.
         if (msg->data.mouse.event == TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP
             && intgame_pc_lens_check_pt(msg->data.mouse.x, msg->data.mouse.y)) {
+            // CE: Recenter on the PC — see logbook_ui for rationale.
+            intgame_recenter_on_pc();
             schematic_ui_close();
             return true;
         }
@@ -1107,19 +1120,21 @@ void schematic_ui_redraw(void)
     }
 
     // Draw background.
-    blit_info.flags = 0;
-    tig_art_interface_id_create(365, 0, 0, 0, &(blit_info.art_id));
-
     src_rect.x = 0;
     src_rect.y = 0;
     src_rect.width = schematic_ui_window_rect.width;
     src_rect.height = schematic_ui_window_rect.height;
-    blit_info.src_rect = &src_rect;
-
     dst_rect = src_rect;
-    blit_info.dst_rect = &dst_rect;
-
-    tig_window_blit_art(schematic_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(schematic_ui_window,
+            &dst_rect,
+            &dst_rect,
+            schematic_ui_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(365, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(schematic_ui_window, &blit_info);
+    }
 
     // Obtain current schematic info.
     schematic = schematic_ui_current_id();

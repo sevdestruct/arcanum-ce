@@ -264,7 +264,9 @@ void options_ui_start(OptionsUiTab tab, tig_window_handle_t window_handle, bool 
 
     // Special case - when options are opened in the middle of the game, center
     // viewport on the player, so that PC lens displays correct surroundings.
-    if (options_ui_in_play) {
+    // Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — default off preserves
+    // the player's scroll position.
+    if (options_ui_in_play && gamelib_recenter_camera_on_overlay()) {
         location_origin_set(obj_field_int64_get(player_get_local_pc_obj(), OBJ_F_LOCATION));
     }
 

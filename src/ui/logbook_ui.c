@@ -8,6 +8,7 @@
 #include "game/curse.h"
 #include "game/description.h"
 #include "game/effect.h"
+#include "game/gamelib.h"
 #include "game/gsound.h"
 #include "game/item.h"
 #include "game/location.h"
@@ -20,6 +21,7 @@
 #include "game/snd.h"
 #include "game/timeevent.h"
 #include "game/ui.h"
+#include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/types.h"
 
@@ -352,6 +354,20 @@ static bool logbook_ui_initialized;
  */
 static bool logbook_ui_created;
 
+static const char* logbook_ui_bg_candidates[] = {
+    "art\\ui\\journal_bg.bmp",
+    "art\\ui\\logbook_bg.bmp",
+    NULL,
+};
+
+static const char* logbook_ui_panel_bg_candidates[] = {
+    "art\\ui\\journal_panel_bg.bmp",
+    "art\\ui\\logbook_panel_bg.bmp",
+    "art\\ui\\journal_page_bg.bmp",
+    "art\\ui\\logbook_page_bg.bmp",
+    NULL,
+};
+
 /**
  * Called when the game is initialized.
  *
@@ -603,11 +619,16 @@ void logbook_ui_create(void)
     dst_rect.width = src_rect.width;
     dst_rect.height = src_rect.height;
 
-    blit_info.flags = 0;
-    tig_art_interface_id_create(264, 0, 0, 0, &(blit_info.art_id));
-    blit_info.src_rect = &src_rect;
-    blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(logbook_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(logbook_ui_window,
+            &dst_rect,
+            &dst_rect,
+            logbook_ui_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(264, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(logbook_ui_window, &blit_info);
+    }
 
     // Create page-turn buttons. Both start hidden, and will be made visible
     // when there is a need for them.
@@ -631,8 +652,12 @@ void logbook_ui_create(void)
     tig_button_radio_group_create(LOGBOOK_UI_TAB_COUNT, button_handles, logbook_ui_tab);
 
     // Center viewport on the player (so that the lens display proper
-    // surroundings).
-    location_origin_set(obj_field_int64_get(logbook_ui_obj, OBJ_F_LOCATION));
+    // surroundings). Opt-in via RECENTER_CAMERA_ON_OVERLAY_KEY — many
+    // players prefer to keep their current scroll position when popping
+    // an overlay open.
+    if (gamelib_recenter_camera_on_overlay()) {
+        location_origin_set(obj_field_int64_get(logbook_ui_obj, OBJ_F_LOCATION));
+    }
 
     // Enable the PC lens.
     pc_lens.window_handle = logbook_ui_window;
@@ -690,6 +715,10 @@ bool logbook_ui_message_filter(TigMessage* msg)
         // Clicking on the PC lens closes logbook UI.
         if (msg->data.mouse.event == TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP
             && intgame_pc_lens_check_pt(msg->data.mouse.x, msg->data.mouse.y)) {
+            // CE: Recenter on the PC — the lens is a "back to player"
+            // button so clicking it always implies returning to the PC,
+            // even when recenter-camera-on-overlay is off.
+            intgame_recenter_on_pc();
             logbook_ui_close();
             return true;
         }
@@ -804,11 +833,17 @@ void logbook_ui_draw_panel(int border_art_num, bool preserve_page)
     dst_rect.width = src_rect.width;
     dst_rect.height = src_rect.height;
 
-    blit_info.flags = 0;
-    tig_art_interface_id_create(260, 0, 0, 0, &(blit_info.art_id));
-    blit_info.src_rect = &src_rect;
-    blit_info.dst_rect = &dst_rect;
-    tig_window_blit_art(logbook_ui_window, &blit_info);
+    if (!gameuilib_custom_ui_blit(logbook_ui_window,
+            &dst_rect,
+            &dst_rect,
+            logbook_ui_panel_bg_candidates)) {
+        blit_info.flags = 0;
+        tig_art_interface_id_create(260, 0, 0, 0, &(blit_info.art_id));
+        blit_info.src_rect = &src_rect;
+        blit_info.dst_rect = &dst_rect;
+        tig_window_blit_art(logbook_ui_window, &blit_info);
+
+    }
 
     // Redraw the specified border around two-page spread.
     tig_art_interface_id_create(logbook_ui_border_art_num, 0, 0, 0, &(blit_info.art_id));
