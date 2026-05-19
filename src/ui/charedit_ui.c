@@ -1676,6 +1676,8 @@ bool charedit_window_message_filter(TigMessage* msg)
             if (charedit_mode != CHAREDIT_MODE_CREATE
                 && charedit_mode != CHAREDIT_MODE_3
                 && intgame_pc_lens_check_pt(msg->data.mouse.x, msg->data.mouse.y)) {
+                // CE: Recenter on the PC — see logbook_ui for rationale.
+                intgame_recenter_on_pc();
                 charedit_close();
                 return true;
             }

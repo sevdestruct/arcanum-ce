@@ -1829,6 +1829,10 @@ static inline bool inven_ui_message_filter_handle_mouse_lbutton_up(int x, int y,
             }
 
             if (inven_saw_down) {
+                // CE: Recenter on the PC — the lens is a "back to player"
+                // button so a lens-click close always returns to the PC,
+                // even when recenter-camera-on-overlay is off.
+                intgame_recenter_on_pc();
                 *v45 = true;
             }
         }
