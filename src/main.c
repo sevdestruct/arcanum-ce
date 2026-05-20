@@ -582,6 +582,15 @@ void main_loop(void)
                         }
                         break;
                     }
+                    case SDL_SCANCODE_F9:
+                        // Toggle zoom-out draw perf counter. Dumps a one-line
+                        // summary to the debug log every 60 zoom-active frames.
+                        gamelib_zoom_perf_toggle();
+                        intgame_message_window_display_str(-1,
+                            gamelib_zoom_perf_is_enabled()
+                                ? "Zoom perf: ON (logs to /tmp/arcanum-zoom-perf.log)"
+                                : "Zoom perf: OFF");
+                        break;
                     case SDL_SCANCODE_F10:
                         intgame_toggle_interface();
                         tig_debug_printf("iso_redraw...");

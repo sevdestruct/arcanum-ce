@@ -157,4 +157,11 @@ bool gamelib_recenter_camera_on_overlay(void);
 // Defaults to true.
 bool gamelib_pc_lens_follows_player(void);
 
+// Debug perf counter for the zoom-out draw path. When enabled, gamelib
+// times each zoom-active frame (gamelib_draw_func + downscale blit) and
+// dumps a rolling summary every 60 frames via tig_debug_printf so we
+// can compare before/after partial-redraw work. Off by default.
+void gamelib_zoom_perf_toggle(void);
+bool gamelib_zoom_perf_is_enabled(void);
+
 #endif /* ARCANUM_GAME_GAMELIB_H_ */
