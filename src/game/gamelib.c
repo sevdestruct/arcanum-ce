@@ -1014,6 +1014,7 @@ static void gamelib_zoom_perf_log(const char* line)
 void gamelib_zoom_perf_toggle(void)
 {
     gamelib_zoom_perf_enabled = !gamelib_zoom_perf_enabled;
+    tig_video_flip_perf_set_enabled(gamelib_zoom_perf_enabled);
     gamelib_zoom_perf_frames = 0;
     gamelib_zoom_perf_full_frames = 0;
     gamelib_zoom_perf_total_render_ns = 0;
@@ -1528,10 +1529,26 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_total_other_ns = 0;
                     gamelib_zoom_perf_max_other_ns = 0;
                     // Third line: main-loop bucket breakdown (tig_ping,
-                    // iso_redraw, tig_window_display). After confirming
-                    // gamelib_ping is ~0.1ms, these are the remaining
-                    // candidates for the inter-frame gap. window_display
-                    // includes SDL_RenderPresent (vsync wait).
+                    // iso_redraw, tig_window_display) + intra-flip split
+                    // (SDL_UpdateTexture vs SDL_RenderPresent). After
+                    // confirming gamelib_ping is ~0.1ms, these are the
+                    // remaining candidates for the inter-frame gap.
+                    // window_display = composite + flip; flip splits as
+                    // update (CPU→GPU upload) + present (typically vsync).
+                    TigVideoFlipPerf flip_perf;
+                    tig_video_flip_perf_get(&flip_perf);
+                    tig_video_flip_perf_reset();
+                    float avg_flip_update_ms = flip_perf.samples > 0
+                        ? (float)((double)flip_perf.update_total_ns / (double)flip_perf.samples / 1e6)
+                        : 0.0f;
+                    float max_flip_update_ms = (float)((double)flip_perf.update_max_ns / 1e6);
+                    float avg_flip_present_ms = flip_perf.samples > 0
+                        ? (float)((double)flip_perf.present_total_ns / (double)flip_perf.samples / 1e6)
+                        : 0.0f;
+                    float max_flip_present_ms = (float)((double)flip_perf.present_max_ns / 1e6);
+                    int partial_pct = flip_perf.samples > 0
+                        ? (flip_perf.partial_samples * 100) / flip_perf.samples
+                        : 0;
                     if (gamelib_zoom_perf_tig_ping_samples > 0
                         || gamelib_zoom_perf_iso_redraw_samples > 0
                         || gamelib_zoom_perf_window_display_samples > 0) {
@@ -1550,12 +1567,15 @@ bool gamelib_draw(void)
                                 / (double)gamelib_zoom_perf_window_display_samples / 1e6)
                             : 0.0f;
                         float max_win_ms = (float)((double)gamelib_zoom_perf_window_display_max_ns / 1e6);
-                        char loop_line[256];
+                        char loop_line[384];
                         snprintf(loop_line, sizeof(loop_line),
-                            "[zoom-perf]   loop: tig_ping avg %.2fms max %.2fms | iso_redraw avg %.2fms max %.2fms | win_display avg %.2fms max %.2fms\n",
+                            "[zoom-perf]   loop: tig_ping avg %.2fms max %.2fms | iso_redraw avg %.2fms max %.2fms | win_display avg %.2fms max %.2fms | flip: update avg %.2fms max %.2fms, present avg %.2fms max %.2fms, partial %d%%\n",
                             avg_tig_ms, max_tig_ms,
                             avg_iso_ms, max_iso_ms,
-                            avg_win_ms, max_win_ms);
+                            avg_win_ms, max_win_ms,
+                            avg_flip_update_ms, max_flip_update_ms,
+                            avg_flip_present_ms, max_flip_present_ms,
+                            partial_pct);
                         tig_debug_printf("%s", loop_line);
                         gamelib_zoom_perf_log(loop_line);
                     }

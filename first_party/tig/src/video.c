@@ -104,6 +104,10 @@ static TigFadeState tig_fade_state;
 static TigRect tig_video_present_dirty_rect;
 static bool tig_video_present_dirty_rect_valid;
 
+// Intra-flip timing breakdown. Driven by gamelib's F9 perf toggle.
+static bool tig_video_flip_perf_enabled = false;
+static TigVideoFlipPerf tig_video_flip_perf;
+
 // 0x51F330
 int tig_video_init(TigInitInfo* init_info)
 {
@@ -439,6 +443,34 @@ void tig_video_set_present_dirty_rect(const TigRect* rect)
     tig_video_present_dirty_rect_valid = true;
 }
 
+void tig_video_flip_perf_set_enabled(bool enabled)
+{
+    tig_video_flip_perf_enabled = enabled;
+    if (enabled) {
+        memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
+    }
+}
+
+void tig_video_flip_perf_get(TigVideoFlipPerf* out)
+{
+    if (out != NULL) {
+        *out = tig_video_flip_perf;
+    }
+}
+
+void tig_video_flip_perf_reset(void)
+{
+    memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
+}
+
+// SDL_GetPerformanceCounter ticks → nanoseconds.
+static uint64_t tig_video_flip_ticks_to_ns(uint64_t ticks)
+{
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    if (freq == 0) return 0;
+    return (uint64_t)((double)ticks * 1e9 / (double)freq);
+}
+
 // 0x51F8F0
 int tig_video_flip(void)
 {
@@ -473,6 +505,8 @@ int tig_video_flip(void)
     }
     tig_video_present_dirty_rect_valid = false;
 
+    uint64_t flip_t0 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
+
     if (partial) {
         int bpp = tig_video_state.surface->format == SDL_PIXELFORMAT_UNKNOWN
             ? 4
@@ -485,6 +519,8 @@ int tig_video_flip(void)
     } else {
         SDL_UpdateTexture(tig_video_state.texture, NULL, tig_video_state.surface->pixels, tig_video_state.surface->pitch);
     }
+
+    uint64_t flip_t1 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
 
     SDL_RenderClear(tig_video_state.renderer);
     SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
@@ -507,7 +543,21 @@ int tig_video_flip(void)
         SDL_RenderDebugTextFormat(tig_video_state.renderer, 0, 0, "%d", tig_video_state.fps);
     }
 
+    uint64_t flip_t2 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
+
     SDL_RenderPresent(tig_video_state.renderer);
+
+    if (tig_video_flip_perf_enabled) {
+        uint64_t flip_t3 = SDL_GetPerformanceCounter();
+        uint64_t upload_ns = tig_video_flip_ticks_to_ns(flip_t1 - flip_t0);
+        uint64_t present_ns = tig_video_flip_ticks_to_ns(flip_t3 - flip_t2);
+        tig_video_flip_perf.update_total_ns += upload_ns;
+        tig_video_flip_perf.present_total_ns += present_ns;
+        if (upload_ns > tig_video_flip_perf.update_max_ns) tig_video_flip_perf.update_max_ns = upload_ns;
+        if (present_ns > tig_video_flip_perf.present_max_ns) tig_video_flip_perf.present_max_ns = present_ns;
+        tig_video_flip_perf.samples++;
+        if (partial) tig_video_flip_perf.partial_samples++;
+    }
 
     return TIG_OK;
 }

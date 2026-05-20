@@ -135,6 +135,23 @@ int tig_video_flip(void);
 // mouse cursor) should call this with the union of their writes to skip the
 // CPU→GPU bandwidth of a full-surface SDL_UpdateTexture (~8MB at 1080p32).
 void tig_video_set_present_dirty_rect(const TigRect* rect);
+
+// Internal-breakdown timing for tig_video_flip. Used by the gamelib zoom-perf
+// log to attribute the ~7ms-per-frame cost between SDL_UpdateTexture
+// (CPU→GPU upload) and SDL_RenderPresent (typically vsync wait). Counters
+// are only accumulated while collection is enabled; the gamelib F9 toggle
+// drives that flag.
+typedef struct {
+    uint64_t update_total_ns;
+    uint64_t update_max_ns;
+    uint64_t present_total_ns;
+    uint64_t present_max_ns;
+    int samples;
+    int partial_samples;
+} TigVideoFlipPerf;
+void tig_video_flip_perf_set_enabled(bool enabled);
+void tig_video_flip_perf_get(TigVideoFlipPerf* out);
+void tig_video_flip_perf_reset(void);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);
 int tig_video_screenshot_make(void);
 int tig_video_get_palette(unsigned int* colors);
