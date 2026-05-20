@@ -106,6 +106,14 @@ static int64_t* pfog_col_r = NULL;
 static int64_t* pfog_col_g = NULL;
 static int64_t* pfog_col_b = NULL;
 
+/* Per-row inner-ellipse column range.  pfog_row_inner_x2 > pfog_row_inner_x1
+ * means the row has a contiguous run of alpha==0 pixels in
+ * [x1, x2) we can skip in the H-blur output and composite.  Set during
+ * pfog_regenerate_mask; rows outside the outer bbox keep their reset value
+ * (x1 == x2 == 0 → empty interval). */
+static int* pfog_row_inner_x1 = NULL;
+static int* pfog_row_inner_x2 = NULL;
+
 /* True when the alpha mask must be rebuilt before the next draw. */
 static bool pfog_dirty = true;
 
@@ -151,27 +159,32 @@ static uint8_t pfog_last_max_alpha = 0;
 
 static void pfog_free_buffers(void)
 {
-    free(pfog_alpha_mask); pfog_alpha_mask = NULL;
-    free(pfog_blur_h);     pfog_blur_h     = NULL;
-    free(pfog_blur_v);     pfog_blur_v     = NULL;
-    free(pfog_col_r);      pfog_col_r      = NULL;
-    free(pfog_col_g);      pfog_col_g      = NULL;
-    free(pfog_col_b);      pfog_col_b      = NULL;
+    free(pfog_alpha_mask);   pfog_alpha_mask   = NULL;
+    free(pfog_blur_h);       pfog_blur_h       = NULL;
+    free(pfog_blur_v);       pfog_blur_v       = NULL;
+    free(pfog_col_r);        pfog_col_r        = NULL;
+    free(pfog_col_g);        pfog_col_g        = NULL;
+    free(pfog_col_b);        pfog_col_b        = NULL;
+    free(pfog_row_inner_x1); pfog_row_inner_x1 = NULL;
+    free(pfog_row_inner_x2); pfog_row_inner_x2 = NULL;
 }
 
 static bool pfog_alloc_buffers(int w, int h)
 {
     pfog_free_buffers();
 
-    pfog_alpha_mask = (uint8_t*)malloc((size_t)w * (size_t)h * sizeof(uint8_t));
-    pfog_blur_h     = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
-    pfog_blur_v     = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
-    pfog_col_r      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
-    pfog_col_g      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
-    pfog_col_b      = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+    pfog_alpha_mask   = (uint8_t*)malloc((size_t)w * (size_t)h * sizeof(uint8_t));
+    pfog_blur_h       = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    pfog_blur_v       = (uint32_t*)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    pfog_col_r        = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+    pfog_col_g        = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+    pfog_col_b        = (int64_t*)malloc((size_t)w * sizeof(int64_t));
+    pfog_row_inner_x1 = (int*)malloc((size_t)h * sizeof(int));
+    pfog_row_inner_x2 = (int*)malloc((size_t)h * sizeof(int));
 
     if (!pfog_alpha_mask || !pfog_blur_h || !pfog_blur_v
-        || !pfog_col_r || !pfog_col_g || !pfog_col_b) {
+        || !pfog_col_r || !pfog_col_g || !pfog_col_b
+        || !pfog_row_inner_x1 || !pfog_row_inner_x2) {
         pfog_free_buffers();
         return false;
     }
@@ -259,6 +272,8 @@ static void pfog_regenerate_mask(void)
     if (pfog_displayed_hor <= 0.0f || pfog_displayed_vert <= 0.0f) {
         /* ScrollDist=0: no leash, no fog. */
         memset(pfog_alpha_mask, 0, (size_t)pfog_width * (size_t)pfog_height);
+        memset(pfog_row_inner_x1, 0, (size_t)pfog_height * sizeof(int));
+        memset(pfog_row_inner_x2, 0, (size_t)pfog_height * sizeof(int));
         pfog_has_fog = false;
         pfog_outer_bbox_x1 = 0;
         pfog_outer_bbox_y1 = 0;
@@ -302,6 +317,11 @@ static void pfog_regenerate_mask(void)
     memset(pfog_alpha_mask, max_alpha,
         (size_t)pfog_width * (size_t)pfog_height);
 
+    /* Reset all per-row inner intervals to empty.  Rows outside the outer
+     * bbox keep their reset value; rows inside are populated below. */
+    memset(pfog_row_inner_x1, 0, (size_t)pfog_height * sizeof(int));
+    memset(pfog_row_inner_x2, 0, (size_t)pfog_height * sizeof(int));
+
     /* Outer ellipse bbox in viewport pixels, clipped to the buffer. */
     bbox_x1 = player_sx - (int)(ha * outer_r) - 1;
     bbox_y1 = player_sy - (int)(va * outer_r) - 1;
@@ -313,9 +333,11 @@ static void pfog_regenerate_mask(void)
     if (bbox_y2 > pfog_height)  bbox_y2 = pfog_height;
 
     for (y = bbox_y1; y < bbox_y2; y++) {
-        uint8_t* row = pfog_alpha_mask + y * pfog_width;
-        float dy   = (float)(y - player_sy) / va;
-        float dy2  = dy * dy;
+        uint8_t* row   = pfog_alpha_mask + y * pfog_width;
+        float    dy    = (float)(y - player_sy) / va;
+        float    dy2   = dy * dy;
+        int      in_x1 = 0;
+        int      in_x2 = 0;
 
         for (x = bbox_x1; x < bbox_x2; x++) {
             float dx = (float)(x - player_sx) / ha;
@@ -324,6 +346,13 @@ static void pfog_regenerate_mask(void)
 
             if (d2 <= inner_r2) {
                 alpha = 0;
+                /* alpha==0 is contiguous within an ellipse row, so we can
+                 * just track first/last x and the [in_x1, in_x2) interval
+                 * stays correct. */
+                if (in_x2 == 0) {
+                    in_x1 = x;
+                }
+                in_x2 = x + 1;
             } else if (d2 >= outer_r2) {
                 alpha = max_alpha;
             } else {
@@ -336,6 +365,9 @@ static void pfog_regenerate_mask(void)
 
             row[x] = alpha;
         }
+
+        pfog_row_inner_x1[y] = in_x1;
+        pfog_row_inner_x2[y] = in_x2;
     }
 
     /* If max_alpha is 0, the entire mask is zero (fog is invisible).
@@ -580,7 +612,9 @@ void perception_fog_draw(TigVideoBuffer* game_vb)
 
     if (blur_enabled) {
         /* Blur path: build the dimmed/blurred fog buffer, then alpha-composite
-         * it onto the game frame using the elliptical mask. */
+         * it onto the game frame using the elliptical mask.  Per row we run
+         * two segments — [0, in_x1) and [in_x2, pfog_width) — and skip the
+         * inner-ellipse interval where alpha is known to be 0. */
         pfog_blur_pass_h(src_pixels, pitch_words,
                          pfog_blur_h, pfog_width, pfog_height,
                          pfog_cfg_blur_radius);
@@ -590,29 +624,37 @@ void perception_fog_draw(TigVideoBuffer* game_vb)
                              pfog_cfg_dim_pct);
 
         for (y = 0; y < pfog_height; y++) {
-            uint32_t*       drow = src_pixels + (size_t)y * pitch_words;
-            const uint8_t*  mrow = pfog_alpha_mask + (size_t)y * pfog_width;
-            const uint32_t* frow = pfog_blur_v + (size_t)y * pfog_width;
+            uint32_t*       drow  = src_pixels + (size_t)y * pitch_words;
+            const uint8_t*  mrow  = pfog_alpha_mask + (size_t)y * pfog_width;
+            const uint32_t* frow  = pfog_blur_v + (size_t)y * pfog_width;
+            int             in_x1 = pfog_row_inner_x1[y];
+            int             in_x2 = pfog_row_inner_x2[y];
+            int             seg;
 
-            for (x = 0; x < pfog_width; x++) {
-                int alpha = mrow[x];
-                uint32_t game_px;
-                uint32_t fog_px;
+            for (seg = 0; seg < 2; seg++) {
+                int x_lo = (seg == 0) ? 0     : in_x2;
+                int x_hi = (seg == 0) ? in_x1 : pfog_width;
 
-                if (alpha == 0) {
-                    continue;
-                }
-                game_px = drow[x];
-                fog_px  = frow[x];
+                for (x = x_lo; x < x_hi; x++) {
+                    int alpha = mrow[x];
+                    uint32_t game_px;
+                    uint32_t fog_px;
 
-                if (alpha >= 255) {
-                    drow[x] = fog_px;
-                } else {
-                    int inv = 255 - alpha;
-                    drow[x] = PIXEL_MAKE(
-                        (uint8_t)((PIXEL_R(game_px) * inv + PIXEL_R(fog_px) * alpha) / 255),
-                        (uint8_t)((PIXEL_G(game_px) * inv + PIXEL_G(fog_px) * alpha) / 255),
-                        (uint8_t)((PIXEL_B(game_px) * inv + PIXEL_B(fog_px) * alpha) / 255));
+                    if (alpha == 0) {
+                        continue; /* rounding-adjacent stragglers */
+                    }
+                    game_px = drow[x];
+                    fog_px  = frow[x];
+
+                    if (alpha >= 255) {
+                        drow[x] = fog_px;
+                    } else {
+                        int inv = 255 - alpha;
+                        drow[x] = PIXEL_MAKE(
+                            (uint8_t)((PIXEL_R(game_px) * inv + PIXEL_R(fog_px) * alpha) / 255),
+                            (uint8_t)((PIXEL_G(game_px) * inv + PIXEL_G(fog_px) * alpha) / 255),
+                            (uint8_t)((PIXEL_B(game_px) * inv + PIXEL_B(fog_px) * alpha) / 255));
+                    }
                 }
             }
         }
@@ -623,23 +665,31 @@ void perception_fog_draw(TigVideoBuffer* game_vb)
          * per-pixel multiplier. */
         int neg_dim = 100 - pfog_cfg_dim_pct;
         for (y = 0; y < pfog_height; y++) {
-            uint32_t*      drow = src_pixels + (size_t)y * pitch_words;
-            const uint8_t* mrow = pfog_alpha_mask + (size_t)y * pfog_width;
+            uint32_t*      drow  = src_pixels + (size_t)y * pitch_words;
+            const uint8_t* mrow  = pfog_alpha_mask + (size_t)y * pfog_width;
+            int            in_x1 = pfog_row_inner_x1[y];
+            int            in_x2 = pfog_row_inner_x2[y];
+            int            seg;
 
-            for (x = 0; x < pfog_width; x++) {
-                int alpha = mrow[x];
-                int k;
-                uint32_t game_px;
+            for (seg = 0; seg < 2; seg++) {
+                int x_lo = (seg == 0) ? 0     : in_x2;
+                int x_hi = (seg == 0) ? in_x1 : pfog_width;
 
-                if (alpha == 0) {
-                    continue;
+                for (x = x_lo; x < x_hi; x++) {
+                    int alpha = mrow[x];
+                    int k;
+                    uint32_t game_px;
+
+                    if (alpha == 0) {
+                        continue;
+                    }
+                    k = 25500 - alpha * neg_dim;
+                    game_px = drow[x];
+                    drow[x] = PIXEL_MAKE(
+                        (uint8_t)(PIXEL_R(game_px) * k / 25500),
+                        (uint8_t)(PIXEL_G(game_px) * k / 25500),
+                        (uint8_t)(PIXEL_B(game_px) * k / 25500));
                 }
-                k = 25500 - alpha * neg_dim;
-                game_px = drow[x];
-                drow[x] = PIXEL_MAKE(
-                    (uint8_t)(PIXEL_R(game_px) * k / 25500),
-                    (uint8_t)(PIXEL_G(game_px) * k / 25500),
-                    (uint8_t)(PIXEL_B(game_px) * k / 25500));
             }
         }
     }
