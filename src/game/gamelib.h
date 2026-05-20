@@ -1,6 +1,8 @@
 #ifndef ARCANUM_GAME_GAMELIB_H_
 #define ARCANUM_GAME_GAMELIB_H_
 
+#include <stdint.h>
+
 #include "game/context.h"
 #include "game/settings.h"
 #include "game/timeevent.h"
@@ -163,5 +165,16 @@ bool gamelib_pc_lens_follows_player(void);
 // can compare before/after partial-redraw work. Off by default.
 void gamelib_zoom_perf_toggle(void);
 bool gamelib_zoom_perf_is_enabled(void);
+
+// Monotonic ns clock for caller-side timing. Cheap (clock_gettime).
+// Pair with gamelib_perf_record_* helpers to attribute time to a bucket.
+uint64_t gamelib_perf_now_ns(void);
+
+// Per-main-loop-step accumulators. Each one buckets time spent in a
+// specific call between consecutive gamelib_draw fires. Only meaningful
+// while gamelib_zoom_perf_is_enabled() — callers should gate sampling.
+void gamelib_perf_record_tig_ping_ns(uint64_t ns);
+void gamelib_perf_record_iso_redraw_ns(uint64_t ns);
+void gamelib_perf_record_window_display_ns(uint64_t ns);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

@@ -353,6 +353,19 @@ static uint64_t gamelib_zoom_perf_ping_module_max_ns[GAMELIB_PERF_MAX_MODULES];
 static uint64_t gamelib_zoom_perf_ping_total_ns = 0;
 static uint64_t gamelib_zoom_perf_ping_max_ns = 0;
 static int gamelib_zoom_perf_ping_samples = 0;
+// Main-loop bucket accumulators. Recorded by main.c around each call so
+// we can attribute the inter-frame gap (which gamelib_ping data showed
+// is ~0.1ms) to the actual culprits — tig_ping subsystems, render
+// dispatch, or window present / vsync.
+static uint64_t gamelib_zoom_perf_tig_ping_total_ns = 0;
+static uint64_t gamelib_zoom_perf_tig_ping_max_ns = 0;
+static int gamelib_zoom_perf_tig_ping_samples = 0;
+static uint64_t gamelib_zoom_perf_iso_redraw_total_ns = 0;
+static uint64_t gamelib_zoom_perf_iso_redraw_max_ns = 0;
+static int gamelib_zoom_perf_iso_redraw_samples = 0;
+static uint64_t gamelib_zoom_perf_window_display_total_ns = 0;
+static uint64_t gamelib_zoom_perf_window_display_max_ns = 0;
+static int gamelib_zoom_perf_window_display_samples = 0;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
 
 // 0x4020F0
@@ -952,6 +965,41 @@ static uint64_t gamelib_zoom_perf_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+uint64_t gamelib_perf_now_ns(void)
+{
+    return gamelib_zoom_perf_now_ns();
+}
+
+void gamelib_perf_record_tig_ping_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    gamelib_zoom_perf_tig_ping_total_ns += ns;
+    if (ns > gamelib_zoom_perf_tig_ping_max_ns) {
+        gamelib_zoom_perf_tig_ping_max_ns = ns;
+    }
+    gamelib_zoom_perf_tig_ping_samples++;
+}
+
+void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    gamelib_zoom_perf_iso_redraw_total_ns += ns;
+    if (ns > gamelib_zoom_perf_iso_redraw_max_ns) {
+        gamelib_zoom_perf_iso_redraw_max_ns = ns;
+    }
+    gamelib_zoom_perf_iso_redraw_samples++;
+}
+
+void gamelib_perf_record_window_display_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    gamelib_zoom_perf_window_display_total_ns += ns;
+    if (ns > gamelib_zoom_perf_window_display_max_ns) {
+        gamelib_zoom_perf_window_display_max_ns = ns;
+    }
+    gamelib_zoom_perf_window_display_samples++;
+}
+
 // Append a single line to /tmp/arcanum-zoom-perf.log so the perf summary
 // is readable without dealing with macOS unified logging filters.
 static void gamelib_zoom_perf_log(const char* line)
@@ -987,6 +1035,15 @@ void gamelib_zoom_perf_toggle(void)
         gamelib_zoom_perf_ping_module_total_ns[i] = 0;
         gamelib_zoom_perf_ping_module_max_ns[i] = 0;
     }
+    gamelib_zoom_perf_tig_ping_total_ns = 0;
+    gamelib_zoom_perf_tig_ping_max_ns = 0;
+    gamelib_zoom_perf_tig_ping_samples = 0;
+    gamelib_zoom_perf_iso_redraw_total_ns = 0;
+    gamelib_zoom_perf_iso_redraw_max_ns = 0;
+    gamelib_zoom_perf_iso_redraw_samples = 0;
+    gamelib_zoom_perf_window_display_total_ns = 0;
+    gamelib_zoom_perf_window_display_max_ns = 0;
+    gamelib_zoom_perf_window_display_samples = 0;
     char line[128];
     snprintf(line, sizeof(line), "[zoom-perf] %s\n",
         gamelib_zoom_perf_enabled ? "ON" : "OFF");
@@ -1470,6 +1527,39 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_max_zoom_ns = 0;
                     gamelib_zoom_perf_total_other_ns = 0;
                     gamelib_zoom_perf_max_other_ns = 0;
+                    // Third line: main-loop bucket breakdown (tig_ping,
+                    // iso_redraw, tig_window_display). After confirming
+                    // gamelib_ping is ~0.1ms, these are the remaining
+                    // candidates for the inter-frame gap. window_display
+                    // includes SDL_RenderPresent (vsync wait).
+                    if (gamelib_zoom_perf_tig_ping_samples > 0
+                        || gamelib_zoom_perf_iso_redraw_samples > 0
+                        || gamelib_zoom_perf_window_display_samples > 0) {
+                        float avg_tig_ms = gamelib_zoom_perf_tig_ping_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_tig_ping_total_ns
+                                / (double)gamelib_zoom_perf_tig_ping_samples / 1e6)
+                            : 0.0f;
+                        float max_tig_ms = (float)((double)gamelib_zoom_perf_tig_ping_max_ns / 1e6);
+                        float avg_iso_ms = gamelib_zoom_perf_iso_redraw_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_iso_redraw_total_ns
+                                / (double)gamelib_zoom_perf_iso_redraw_samples / 1e6)
+                            : 0.0f;
+                        float max_iso_ms = (float)((double)gamelib_zoom_perf_iso_redraw_max_ns / 1e6);
+                        float avg_win_ms = gamelib_zoom_perf_window_display_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_window_display_total_ns
+                                / (double)gamelib_zoom_perf_window_display_samples / 1e6)
+                            : 0.0f;
+                        float max_win_ms = (float)((double)gamelib_zoom_perf_window_display_max_ns / 1e6);
+                        char loop_line[256];
+                        snprintf(loop_line, sizeof(loop_line),
+                            "[zoom-perf]   loop: tig_ping avg %.2fms max %.2fms | iso_redraw avg %.2fms max %.2fms | win_display avg %.2fms max %.2fms\n",
+                            avg_tig_ms, max_tig_ms,
+                            avg_iso_ms, max_iso_ms,
+                            avg_win_ms, max_win_ms);
+                        tig_debug_printf("%s", loop_line);
+                        gamelib_zoom_perf_log(loop_line);
+                    }
+
                     gamelib_zoom_perf_ping_total_ns = 0;
                     gamelib_zoom_perf_ping_max_ns = 0;
                     gamelib_zoom_perf_ping_samples = 0;
@@ -1477,6 +1567,15 @@ bool gamelib_draw(void)
                         gamelib_zoom_perf_ping_module_total_ns[i] = 0;
                         gamelib_zoom_perf_ping_module_max_ns[i] = 0;
                     }
+                    gamelib_zoom_perf_tig_ping_total_ns = 0;
+                    gamelib_zoom_perf_tig_ping_max_ns = 0;
+                    gamelib_zoom_perf_tig_ping_samples = 0;
+                    gamelib_zoom_perf_iso_redraw_total_ns = 0;
+                    gamelib_zoom_perf_iso_redraw_max_ns = 0;
+                    gamelib_zoom_perf_iso_redraw_samples = 0;
+                    gamelib_zoom_perf_window_display_total_ns = 0;
+                    gamelib_zoom_perf_window_display_max_ns = 0;
+                    gamelib_zoom_perf_window_display_samples = 0;
                 }
             }
 

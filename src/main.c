@@ -511,16 +511,38 @@ void main_loop(void)
             output_profile_data = false;
         }
 
+        // Perf instrumentation: bracket each main-loop step so the
+        // F9 perf log can attribute the inter-frame gap. Sampling is
+        // gated by gamelib_zoom_perf_is_enabled() inside the helpers,
+        // but we still skip the clock_gettime calls when off to keep
+        // the no-perf path zero-cost.
+        bool perf_on = gamelib_zoom_perf_is_enabled();
+        uint64_t perf_t0 = perf_on ? gamelib_perf_now_ns() : 0;
+
         tig_ping();
-        gamelib_ping();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            gamelib_perf_record_tig_ping_ns(now - perf_t0);
+            perf_t0 = now;
+        }
+        gamelib_ping();  // self-instruments per-subsystem already
         // CE: keep the world repainting under any HUD strip that uses
         // per-pixel see-through, so the alpha composite has fresh
         // world pixels to blend against. Cheap no-op when no strip
         // has opted in.
         intgame_hud_tick_invalidate_alpha_strips();
         handle_zoom_key_repeat();
+        if (perf_on) perf_t0 = gamelib_perf_now_ns();
         iso_redraw();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            gamelib_perf_record_iso_redraw_ns(now - perf_t0);
+            perf_t0 = now;
+        }
         tig_window_display();
+        if (perf_on) {
+            gamelib_perf_record_window_display_ns(gamelib_perf_now_ns() - perf_t0);
+        }
 
         pc_obj = player_get_local_pc_obj();
 
