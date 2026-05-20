@@ -1062,6 +1062,15 @@ bool gamelib_draw(void)
         && (gamelib_world_video_buffer != NULL)
         && (gamelib_draw_func == gamelib_draw_game);
 
+    // Start the zoom-active-total timer BEFORE the camera-move detection
+    // block (which queues a full-invalidate on scroll). This captures the
+    // full setup/teardown cost of the zoom-active path including any
+    // sub_52D480 merges from camera-move-triggered invalidates.
+    uint64_t perf_zoom_start_ns_outer = 0;
+    if (gamelib_zoom_perf_enabled && zoom_active) {
+        perf_zoom_start_ns_outer = gamelib_zoom_perf_now_ns();
+    }
+
     // Phase A: world-VB content is built up across frames (we don't clear
     // it). If zoom_active just turned on, OR the zoom level lerped this
     // frame, OR the camera origin moved without a scroll-style invalidate,
@@ -1132,14 +1141,6 @@ bool gamelib_draw(void)
         // valid as long as the camera hasn't moved (scrolling forces a
         // full screen invalidate in scroll.c at zoom != 1.0). We overpaint
         // only the dirty world-VB rects below.
-    }
-
-    // Start the zoom-active-total timer at the earliest reasonable point
-    // BEFORE any rendering work, so we can measure setup/teardown
-    // overhead separately from render and blit.
-    uint64_t perf_zoom_start_ns = 0;
-    if (gamelib_zoom_perf_enabled && zoom_active) {
-        perf_zoom_start_ns = gamelib_zoom_perf_now_ns();
     }
 
     if (location_screen_rect_to_loc_rect(&gamelib_iso_content_rect_ex, &loc_rect)) {
@@ -1289,7 +1290,7 @@ bool gamelib_draw(void)
 
                 // Total zoom-active time (start of this if-block to end of
                 // blit) and "other" = total - render - blit.
-                uint64_t zoom_total_ns = gamelib_zoom_perf_now_ns() - perf_zoom_start_ns;
+                uint64_t zoom_total_ns = gamelib_zoom_perf_now_ns() - perf_zoom_start_ns_outer;
                 uint64_t other_ns = (zoom_total_ns > perf_frame_render_ns + perf_frame_blit_ns)
                     ? zoom_total_ns - perf_frame_render_ns - perf_frame_blit_ns
                     : 0;
