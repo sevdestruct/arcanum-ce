@@ -127,6 +127,7 @@ static int game_save_entry_compare_by_name(const void* va, const void* vb);
 static void difficulty_changed(void);
 static void gamelib_draw_game(GameDrawInfo* draw_info);
 static void gamelib_draw_editor(GameDrawInfo* draw_info);
+static uint64_t gamelib_zoom_perf_now_ns(void);
 static void gamelib_logo(void);
 static void gamelib_splash(tig_window_handle_t window_handle);
 static void gamelib_load_data(void);
@@ -342,6 +343,16 @@ static uint64_t gamelib_zoom_perf_total_zoom_ns = 0;
 static uint64_t gamelib_zoom_perf_max_zoom_ns = 0;
 static uint64_t gamelib_zoom_perf_total_other_ns = 0;
 static uint64_t gamelib_zoom_perf_max_other_ns = 0;
+// Per-subsystem ping-time bucket, accumulated in gamelib_ping. Only sums
+// while gamelib_zoom_perf_enabled is on. Lets the perf log surface which
+// subsystem is eating the gap between zoom-active render time and total
+// frame time (typically 15-30ms outside the zoom path).
+#define GAMELIB_PERF_MAX_MODULES 64
+static uint64_t gamelib_zoom_perf_ping_module_total_ns[GAMELIB_PERF_MAX_MODULES];
+static uint64_t gamelib_zoom_perf_ping_module_max_ns[GAMELIB_PERF_MAX_MODULES];
+static uint64_t gamelib_zoom_perf_ping_total_ns = 0;
+static uint64_t gamelib_zoom_perf_ping_max_ns = 0;
+static int gamelib_zoom_perf_ping_samples = 0;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
 
 // 0x4020F0
@@ -584,10 +595,30 @@ void gamelib_ping(void)
 
     tig_timer_now(&gamelib_ping_time);
 
+    bool perf_on = gamelib_zoom_perf_enabled;
+    uint64_t ping_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
+
     for (index = 0; index < MODULE_COUNT; index++) {
         if (gamelib_modules[index].ping_func != NULL) {
+            uint64_t mod_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
             gamelib_modules[index].ping_func(gamelib_ping_time);
+            if (perf_on && index < GAMELIB_PERF_MAX_MODULES) {
+                uint64_t mod_dur_ns = gamelib_zoom_perf_now_ns() - mod_start_ns;
+                gamelib_zoom_perf_ping_module_total_ns[index] += mod_dur_ns;
+                if (mod_dur_ns > gamelib_zoom_perf_ping_module_max_ns[index]) {
+                    gamelib_zoom_perf_ping_module_max_ns[index] = mod_dur_ns;
+                }
+            }
         }
+    }
+
+    if (perf_on) {
+        uint64_t ping_dur_ns = gamelib_zoom_perf_now_ns() - ping_start_ns;
+        gamelib_zoom_perf_ping_total_ns += ping_dur_ns;
+        if (ping_dur_ns > gamelib_zoom_perf_ping_max_ns) {
+            gamelib_zoom_perf_ping_max_ns = ping_dur_ns;
+        }
+        gamelib_zoom_perf_ping_samples++;
     }
 }
 
@@ -949,6 +980,13 @@ void gamelib_zoom_perf_toggle(void)
     gamelib_zoom_perf_max_zoom_ns = 0;
     gamelib_zoom_perf_total_other_ns = 0;
     gamelib_zoom_perf_max_other_ns = 0;
+    gamelib_zoom_perf_ping_total_ns = 0;
+    gamelib_zoom_perf_ping_max_ns = 0;
+    gamelib_zoom_perf_ping_samples = 0;
+    for (int i = 0; i < GAMELIB_PERF_MAX_MODULES; i++) {
+        gamelib_zoom_perf_ping_module_total_ns[i] = 0;
+        gamelib_zoom_perf_ping_module_max_ns[i] = 0;
+    }
     char line[128];
     snprintf(line, sizeof(line), "[zoom-perf] %s\n",
         gamelib_zoom_perf_enabled ? "ON" : "OFF");
@@ -1371,6 +1409,54 @@ bool gamelib_draw(void)
                         stddev_frame_ms);
                     tig_debug_printf("%s", line);
                     gamelib_zoom_perf_log(line);
+
+                    // Second line: per-subsystem ping breakdown. Total ping
+                    // avg/max for the same window, then the top 3 hottest
+                    // modules by accumulated time. Helps identify which
+                    // subsystem owns the gap between zoom-active render
+                    // time and total frame time.
+                    if (gamelib_zoom_perf_ping_samples > 0) {
+                        float avg_ping_ms = (float)((double)gamelib_zoom_perf_ping_total_ns
+                            / (double)gamelib_zoom_perf_ping_samples / 1e6);
+                        float max_ping_ms = (float)((double)gamelib_zoom_perf_ping_max_ns / 1e6);
+                        int top_idx[3] = { -1, -1, -1 };
+                        uint64_t top_ns[3] = { 0, 0, 0 };
+                        int module_count = MODULE_COUNT;
+                        if (module_count > GAMELIB_PERF_MAX_MODULES) {
+                            module_count = GAMELIB_PERF_MAX_MODULES;
+                        }
+                        for (int i = 0; i < module_count; i++) {
+                            uint64_t t = gamelib_zoom_perf_ping_module_total_ns[i];
+                            if (t > top_ns[0]) {
+                                top_ns[2] = top_ns[1]; top_idx[2] = top_idx[1];
+                                top_ns[1] = top_ns[0]; top_idx[1] = top_idx[0];
+                                top_ns[0] = t; top_idx[0] = i;
+                            } else if (t > top_ns[1]) {
+                                top_ns[2] = top_ns[1]; top_idx[2] = top_idx[1];
+                                top_ns[1] = t; top_idx[1] = i;
+                            } else if (t > top_ns[2]) {
+                                top_ns[2] = t; top_idx[2] = i;
+                            }
+                        }
+                        char hot[3][64] = { "", "", "" };
+                        for (int k = 0; k < 3; k++) {
+                            if (top_idx[k] >= 0 && top_ns[k] > 0) {
+                                double avg_ms = (double)top_ns[k]
+                                    / (double)gamelib_zoom_perf_ping_samples / 1e6;
+                                double max_ms = (double)gamelib_zoom_perf_ping_module_max_ns[top_idx[k]] / 1e6;
+                                snprintf(hot[k], sizeof(hot[k]), "%s(avg %.2f max %.2f)",
+                                    gamelib_modules[top_idx[k]].name, avg_ms, max_ms);
+                            }
+                        }
+                        char ping_line[512];
+                        snprintf(ping_line, sizeof(ping_line),
+                            "[zoom-perf]   ping avg %.2fms max %.2fms (%d samples) | hot: %s %s %s\n",
+                            avg_ping_ms, max_ping_ms, gamelib_zoom_perf_ping_samples,
+                            hot[0], hot[1], hot[2]);
+                        tig_debug_printf("%s", ping_line);
+                        gamelib_zoom_perf_log(ping_line);
+                    }
+
                     gamelib_zoom_perf_frames = 0;
                     gamelib_zoom_perf_full_frames = 0;
                     gamelib_zoom_perf_total_frame_ns = 0;
@@ -1384,6 +1470,13 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_max_zoom_ns = 0;
                     gamelib_zoom_perf_total_other_ns = 0;
                     gamelib_zoom_perf_max_other_ns = 0;
+                    gamelib_zoom_perf_ping_total_ns = 0;
+                    gamelib_zoom_perf_ping_max_ns = 0;
+                    gamelib_zoom_perf_ping_samples = 0;
+                    for (int i = 0; i < GAMELIB_PERF_MAX_MODULES; i++) {
+                        gamelib_zoom_perf_ping_module_total_ns[i] = 0;
+                        gamelib_zoom_perf_ping_module_max_ns[i] = 0;
+                    }
                 }
             }
 
