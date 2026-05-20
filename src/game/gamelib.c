@@ -1048,6 +1048,18 @@ bool gamelib_draw(void)
 
     in_draw = true;
 
+    // Phase C: world-VB-space active render area. The world VB is
+    // allocated at 2*ww x 2*wh (sized for z=0.5, the deepest zoom-out).
+    // For z > 0.5 the final blit only samples a centered crop of size
+    // (ww/z, wh/z), so anything we render outside that crop is wasted.
+    // Setting the content rect to just the active area below restricts
+    // sector iteration and dirty-rect translation to the area that
+    // actually shows on screen.
+    int active_w = 0;
+    int active_h = 0;
+    int active_x = 0;
+    int active_y = 0;
+
     if (zoom_active) {
         orig_content_rect = gamelib_iso_content_rect;
         orig_content_rect_ex = gamelib_iso_content_rect_ex;
@@ -1055,15 +1067,22 @@ bool gamelib_draw(void)
         ww = orig_content_rect.width;
         wh = orig_content_rect.height;
 
-        gamelib_iso_content_rect.x = 0;
-        gamelib_iso_content_rect.y = 0;
-        gamelib_iso_content_rect.width = ww * 2;
-        gamelib_iso_content_rect.height = wh * 2;
+        active_w = (int)ceilf((float)ww / z);
+        active_h = (int)ceilf((float)wh / z);
+        if (active_w > ww * 2) active_w = ww * 2;
+        if (active_h > wh * 2) active_h = wh * 2;
+        active_x = ww - active_w / 2;
+        active_y = wh - active_h / 2;
 
-        gamelib_iso_content_rect_ex.x = -256;
-        gamelib_iso_content_rect_ex.y = -256;
-        gamelib_iso_content_rect_ex.width = ww * 2 + 512;
-        gamelib_iso_content_rect_ex.height = wh * 2 + 512;
+        gamelib_iso_content_rect.x = active_x;
+        gamelib_iso_content_rect.y = active_y;
+        gamelib_iso_content_rect.width = active_w;
+        gamelib_iso_content_rect.height = active_h;
+
+        gamelib_iso_content_rect_ex.x = active_x - 256;
+        gamelib_iso_content_rect_ex.y = active_y - 256;
+        gamelib_iso_content_rect_ex.width = active_w + 512;
+        gamelib_iso_content_rect_ex.height = active_h + 512;
 
         location_origin_pixel_set(orig_ox + ww / 2, orig_oy + wh / 2);
 
@@ -1093,15 +1112,14 @@ bool gamelib_draw(void)
         draw_info.sectors = sectors;
         draw_info.rects = &gamelib_dirty_rects_head;
         if (zoom_active) {
-            // Phase A: translate each queued dirty rect from screen-space
-            // (0..ww, 0..wh) to world-VB-space (0..2*ww, 0..2*wh). A rect
-            // that covers the full screen rect maps to the full world VB
-            // (because at zoom < 1 the visible area is bigger than the
-            // original screen rect); smaller object rects just get
-            // camera-shifted by (ww/2, wh/2) and clipped to world-VB
-            // bounds. tile/object/roof draws then redraw only those
-            // regions instead of the entire 2x buffer.
-            TigRect world_vb_bounds = { 0, 0, ww * 2, wh * 2 };
+            // Phase A + C: translate each queued dirty rect from
+            // screen-space (0..ww, 0..wh) to world-VB-space, clipped to
+            // the active render area (centered, sized active_w x
+            // active_h - just the area the final blit will sample). A
+            // rect covering the full screen maps to the full active
+            // area; smaller object rects get camera-shifted by (ww/2,
+            // wh/2) and clipped to active bounds.
+            TigRect active_bounds = { active_x, active_y, active_w, active_h };
             node = gamelib_dirty_rects_head;
             gamelib_dirty_rects_head = NULL;
             while (node != NULL) {
@@ -1112,13 +1130,13 @@ bool gamelib_draw(void)
                     && node->rect.x + node->rect.width >= ww
                     && node->rect.y + node->rect.height >= wh;
                 if (covers_full_screen) {
-                    translated = world_vb_bounds;
+                    translated = active_bounds;
                 } else {
                     translated.x = node->rect.x + ww / 2;
                     translated.y = node->rect.y + wh / 2;
                     translated.width = node->rect.width;
                     translated.height = node->rect.height;
-                    if (tig_rect_intersection(&translated, &world_vb_bounds, &translated) != TIG_OK) {
+                    if (tig_rect_intersection(&translated, &active_bounds, &translated) != TIG_OK) {
                         tig_rect_node_destroy(node);
                         node = next;
                         continue;
@@ -1136,13 +1154,15 @@ bool gamelib_draw(void)
             }
             tig_window_set_invalidate_suppressed(true);
             gamelib_zoom_world_pass_active = true;
-            TigRect zoom_content_rect = { 0, 0, ww * 2, wh * 2 };
+            TigRect zoom_content_rect = { active_x, active_y, active_w, active_h };
             object_set_iso_content_rect(&zoom_content_rect);
             light_set_iso_content_rect(&zoom_content_rect);
         }
         if (gamelib_zoom_perf_enabled && zoom_active) {
-            // Snapshot the area the renderer is about to touch.
-            int64_t full_px = (int64_t)(ww * 2) * (int64_t)(wh * 2);
+            // Snapshot the area the renderer is about to touch. After
+            // Phase C, the "full" reference is the active render area,
+            // not the whole 2x world VB.
+            int64_t full_px = (int64_t)active_w * (int64_t)active_h;
             for (node = gamelib_dirty_rects_head; node != NULL; node = node->next) {
                 perf_frame_dirty_px += (int64_t)node->rect.width * (int64_t)node->rect.height;
             }
@@ -1216,7 +1236,10 @@ bool gamelib_draw(void)
                 }
                 gamelib_zoom_perf_last_z = z;
                 if (++gamelib_zoom_perf_frames >= GAMELIB_ZOOM_PERF_INTERVAL) {
-                    int64_t full_px = (int64_t)(ww * 2) * (int64_t)(wh * 2);
+                    // "Full" denominator is the active render area (Phase C),
+                    // not the whole 2x world VB - that's what dirty rects are
+                    // now scaled to and what the renderer actually iterates.
+                    int64_t full_px = (int64_t)active_w * (int64_t)active_h;
                     float avg_render_ms = (float)gamelib_zoom_perf_total_render_ms / (float)gamelib_zoom_perf_frames;
                     float avg_blit_ms = (float)gamelib_zoom_perf_total_blit_ms / (float)gamelib_zoom_perf_frames;
                     float avg_dirty_pct = full_px > 0
@@ -1226,7 +1249,7 @@ bool gamelib_draw(void)
                     int full_pct = (gamelib_zoom_perf_full_frames * 100) / gamelib_zoom_perf_frames;
                     char line[256];
                     snprintf(line, sizeof(line),
-                        "[zoom-perf] z=%.2f over %d frames: render %.2fms, blit %.2fms, dirty %.0f%% of world-VB, full-redraws %d%%\n",
+                        "[zoom-perf] z=%.2f over %d frames: render %.2fms, blit %.2fms, dirty %.0f%% of active area, full-redraws %d%%\n",
                         gamelib_zoom_perf_last_z,
                         gamelib_zoom_perf_frames,
                         avg_render_ms,
