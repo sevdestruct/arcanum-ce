@@ -343,7 +343,15 @@ void light_draw(GameDrawInfo* draw_info)
         return;
     }
 
-    location_at(light_iso_content_rect.width / 2, light_iso_content_rect.height / 2, &center_loc);
+    // Use the rect's absolute center, not (width/2, height/2). The
+    // existing Phase A+C zoom-active path always passes a rect with
+    // x=0, so the two forms are equivalent here, but the (width/2,
+    // height/2) form silently breaks if any caller passes a non-
+    // origin rect (e.g. when the active render area is offset within
+    // a larger world VB).
+    location_at(light_iso_content_rect.x + light_iso_content_rect.width / 2,
+        light_iso_content_rect.y + light_iso_content_rect.height / 2,
+        &center_loc);
     location_xy(center_loc, &cx, &cy);
     cx += 40;
     cy += 20;
