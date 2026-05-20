@@ -1055,6 +1055,16 @@ bool gamelib_draw(void)
             blit.src_rect = &src;
             blit.dst_video_buffer = gamelib_iso_window_vb;
             blit.dst_rect = &dst;
+            // Use bilinear filtering when downscaling. Walls and roofs that
+            // fade for player occlusion are drawn with a 50/50 checkerboard
+            // stipple; NEAREST downscaling lands the sample grid on the
+            // "not drawn" cells (perfectly so at z=0.5), erasing them. LINEAR
+            // averages 2x2 neighborhoods so the stipple becomes a smooth
+            // half-alpha — the intended see-through effect — and survives any
+            // scale ratio. Keep NEAREST for upscale so zoom-in stays crisp.
+            if (z < 1.0f) {
+                blit.flags = TIG_VIDEO_BUFFER_BLIT_SCALE_LINEAR;
+            }
             tig_video_buffer_blit(&blit);
 
             // Re-run fixed-screen HUD draws (tc/tf/tb) directly onto
