@@ -417,6 +417,8 @@ int tig_window_display(void)
     int rc;
     TigRectListNode* node;
     TigMouseState mouse_state;
+    TigRect dirty_union;
+    bool dirty_union_set = false;
 
     if (!tig_window_initialized) {
         return TIG_ERR_NOT_INITIALIZED;
@@ -432,6 +434,32 @@ int tig_window_display(void)
         while (node != NULL) {
             tig_window_dirty_rects = node->next;
 
+            // Accumulate the bounding rect of every area we composite. Used
+            // below to hint tig_video_flip to do a partial-rect upload to the
+            // GPU texture instead of re-uploading the whole surface every
+            // frame (~8MB at 1080p, ~7ms CPU-side cost from earlier perf
+            // logs). The hint is just an optimization — if we miss a rect
+            // here we'd skip uploading bytes that did change and display
+            // stale pixels, so the union must cover every write to the
+            // surface during this present cycle.
+            if (!dirty_union_set) {
+                dirty_union = node->rect;
+                dirty_union_set = true;
+            } else {
+                int x1 = dirty_union.x < node->rect.x ? dirty_union.x : node->rect.x;
+                int y1 = dirty_union.y < node->rect.y ? dirty_union.y : node->rect.y;
+                int dx2 = dirty_union.x + dirty_union.width;
+                int dy2 = dirty_union.y + dirty_union.height;
+                int nx2 = node->rect.x + node->rect.width;
+                int ny2 = node->rect.y + node->rect.height;
+                int x2 = dx2 > nx2 ? dx2 : nx2;
+                int y2 = dy2 > ny2 ? dy2 : ny2;
+                dirty_union.x = x1;
+                dirty_union.y = y1;
+                dirty_union.width = x2 - x1;
+                dirty_union.height = y2 - y1;
+            }
+
             sub_51D050(&(node->rect), NULL, 0, 0, TIG_WINDOW_TOP);
             tig_rect_node_destroy(node);
 
@@ -439,8 +467,33 @@ int tig_window_display(void)
         }
 
         if ((mouse_state.flags & TIG_MOUSE_STATE_HIDDEN) == 0) {
+            // tig_mouse_display blits the cursor sprite onto the surface at
+            // mouse_state.frame, so we must union it into the dirty region.
             tig_mouse_display();
+            if (mouse_state.frame.width > 0 && mouse_state.frame.height > 0) {
+                if (!dirty_union_set) {
+                    dirty_union = mouse_state.frame;
+                    dirty_union_set = true;
+                } else {
+                    int x1 = dirty_union.x < mouse_state.frame.x ? dirty_union.x : mouse_state.frame.x;
+                    int y1 = dirty_union.y < mouse_state.frame.y ? dirty_union.y : mouse_state.frame.y;
+                    int dx2 = dirty_union.x + dirty_union.width;
+                    int dy2 = dirty_union.y + dirty_union.height;
+                    int mx2 = mouse_state.frame.x + mouse_state.frame.width;
+                    int my2 = mouse_state.frame.y + mouse_state.frame.height;
+                    int x2 = dx2 > mx2 ? dx2 : mx2;
+                    int y2 = dy2 > my2 ? dy2 : my2;
+                    dirty_union.x = x1;
+                    dirty_union.y = y1;
+                    dirty_union.width = x2 - x1;
+                    dirty_union.height = y2 - y1;
+                }
+            }
         }
+    }
+
+    if (dirty_union_set) {
+        tig_video_set_present_dirty_rect(&dirty_union);
     }
 
     tig_video_display_fps();

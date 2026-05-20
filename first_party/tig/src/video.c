@@ -95,6 +95,15 @@ static int dword_6103A4;
 
 static TigFadeState tig_fade_state;
 
+// Optional dirty rect for the next tig_video_flip. When set (width > 0), the
+// flip uploads only that rect from the surface to the GPU texture instead of
+// the whole surface, saving the per-frame CPU→GPU bandwidth (~8MB at 1080p32)
+// for the unchanged pixels. Cleared automatically after each flip — every
+// caller has to opt back in per frame, which keeps the safe default
+// (full-surface upload) in any code path that doesn't know to set it.
+static TigRect tig_video_present_dirty_rect;
+static bool tig_video_present_dirty_rect_valid;
+
 // 0x51F330
 int tig_video_init(TigInitInfo* init_info)
 {
@@ -420,10 +429,62 @@ int tig_video_fill(const TigRect* rect, tig_color_t color)
     return TIG_OK;
 }
 
+void tig_video_set_present_dirty_rect(const TigRect* rect)
+{
+    if (rect == NULL || rect->width <= 0 || rect->height <= 0) {
+        tig_video_present_dirty_rect_valid = false;
+        return;
+    }
+    tig_video_present_dirty_rect = *rect;
+    tig_video_present_dirty_rect_valid = true;
+}
+
 // 0x51F8F0
 int tig_video_flip(void)
 {
-    SDL_UpdateTexture(tig_video_state.texture, NULL, tig_video_state.surface->pixels, tig_video_state.surface->pitch);
+    // Partial-upload fast path: only re-upload the rect the compositor
+    // touched this present cycle. Falls back to full-surface upload when
+    // no hint is set or the rect is bigger than ~3/4 of the surface
+    // (point at which partial-upload overhead exceeds savings).
+    bool partial = false;
+    TigRect upload_rect;
+    if (tig_video_present_dirty_rect_valid && tig_video_state.surface != NULL) {
+        upload_rect = tig_video_present_dirty_rect;
+        TigRect surface_rect = { 0, 0, tig_video_state.surface->w, tig_video_state.surface->h };
+        if (upload_rect.x < surface_rect.x) {
+            upload_rect.width -= (surface_rect.x - upload_rect.x);
+            upload_rect.x = surface_rect.x;
+        }
+        if (upload_rect.y < surface_rect.y) {
+            upload_rect.height -= (surface_rect.y - upload_rect.y);
+            upload_rect.y = surface_rect.y;
+        }
+        if (upload_rect.x + upload_rect.width > surface_rect.x + surface_rect.width) {
+            upload_rect.width = surface_rect.x + surface_rect.width - upload_rect.x;
+        }
+        if (upload_rect.y + upload_rect.height > surface_rect.y + surface_rect.height) {
+            upload_rect.height = surface_rect.y + surface_rect.height - upload_rect.y;
+        }
+        int64_t upload_px = (int64_t)upload_rect.width * (int64_t)upload_rect.height;
+        int64_t surface_px = (int64_t)surface_rect.width * (int64_t)surface_rect.height;
+        partial = upload_rect.width > 0
+            && upload_rect.height > 0
+            && upload_px * 4 < surface_px * 3;
+    }
+    tig_video_present_dirty_rect_valid = false;
+
+    if (partial) {
+        int bpp = tig_video_state.surface->format == SDL_PIXELFORMAT_UNKNOWN
+            ? 4
+            : (int)SDL_BYTESPERPIXEL(tig_video_state.surface->format);
+        SDL_Rect sdl_rect = { upload_rect.x, upload_rect.y, upload_rect.width, upload_rect.height };
+        const uint8_t* src = (const uint8_t*)tig_video_state.surface->pixels
+            + (size_t)upload_rect.y * (size_t)tig_video_state.surface->pitch
+            + (size_t)upload_rect.x * (size_t)bpp;
+        SDL_UpdateTexture(tig_video_state.texture, &sdl_rect, src, tig_video_state.surface->pitch);
+    } else {
+        SDL_UpdateTexture(tig_video_state.texture, NULL, tig_video_state.surface->pixels, tig_video_state.surface->pitch);
+    }
 
     SDL_RenderClear(tig_video_state.renderer);
     SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);

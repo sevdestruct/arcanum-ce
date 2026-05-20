@@ -128,6 +128,13 @@ int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
     uint8_t opacity);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
+// Hint the next tig_video_flip to upload only `rect` of the surface to the GPU
+// texture instead of the whole surface. Cleared after the next flip. NULL or
+// an empty rect means "upload everything" (the default). Callers that touch
+// only a portion of the surface during a present cycle (window compositor +
+// mouse cursor) should call this with the union of their writes to skip the
+// CPU→GPU bandwidth of a full-surface SDL_UpdateTexture (~8MB at 1080p32).
+void tig_video_set_present_dirty_rect(const TigRect* rect);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);
 int tig_video_screenshot_make(void);
 int tig_video_get_palette(unsigned int* colors);
