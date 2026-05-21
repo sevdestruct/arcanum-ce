@@ -176,5 +176,7 @@ uint64_t gamelib_perf_now_ns(void);
 void gamelib_perf_record_tig_ping_ns(uint64_t ns);
 void gamelib_perf_record_iso_redraw_ns(uint64_t ns);
 void gamelib_perf_record_window_display_ns(uint64_t ns);
+void gamelib_perf_record_key_repeat_ns(uint64_t ns);
+void gamelib_perf_record_event_dispatch_ns(uint64_t ns);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

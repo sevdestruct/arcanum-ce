@@ -366,6 +366,12 @@ static int gamelib_zoom_perf_iso_redraw_samples = 0;
 static uint64_t gamelib_zoom_perf_window_display_total_ns = 0;
 static uint64_t gamelib_zoom_perf_window_display_max_ns = 0;
 static int gamelib_zoom_perf_window_display_samples = 0;
+static uint64_t gamelib_zoom_perf_key_repeat_total_ns = 0;
+static uint64_t gamelib_zoom_perf_key_repeat_max_ns = 0;
+static int gamelib_zoom_perf_key_repeat_samples = 0;
+static uint64_t gamelib_zoom_perf_event_dispatch_total_ns = 0;
+static uint64_t gamelib_zoom_perf_event_dispatch_max_ns = 0;
+static int gamelib_zoom_perf_event_dispatch_samples = 0;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
 
 // 0x4020F0
@@ -1000,6 +1006,26 @@ void gamelib_perf_record_window_display_ns(uint64_t ns)
     gamelib_zoom_perf_window_display_samples++;
 }
 
+void gamelib_perf_record_key_repeat_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    gamelib_zoom_perf_key_repeat_total_ns += ns;
+    if (ns > gamelib_zoom_perf_key_repeat_max_ns) {
+        gamelib_zoom_perf_key_repeat_max_ns = ns;
+    }
+    gamelib_zoom_perf_key_repeat_samples++;
+}
+
+void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    gamelib_zoom_perf_event_dispatch_total_ns += ns;
+    if (ns > gamelib_zoom_perf_event_dispatch_max_ns) {
+        gamelib_zoom_perf_event_dispatch_max_ns = ns;
+    }
+    gamelib_zoom_perf_event_dispatch_samples++;
+}
+
 // Append a single line to /tmp/arcanum-zoom-perf.log so the perf summary
 // is readable without dealing with macOS unified logging filters.
 static void gamelib_zoom_perf_log(const char* line)
@@ -1045,6 +1071,12 @@ void gamelib_zoom_perf_toggle(void)
     gamelib_zoom_perf_window_display_total_ns = 0;
     gamelib_zoom_perf_window_display_max_ns = 0;
     gamelib_zoom_perf_window_display_samples = 0;
+    gamelib_zoom_perf_key_repeat_total_ns = 0;
+    gamelib_zoom_perf_key_repeat_max_ns = 0;
+    gamelib_zoom_perf_key_repeat_samples = 0;
+    gamelib_zoom_perf_event_dispatch_total_ns = 0;
+    gamelib_zoom_perf_event_dispatch_max_ns = 0;
+    gamelib_zoom_perf_event_dispatch_samples = 0;
     char line[128];
     snprintf(line, sizeof(line), "[zoom-perf] %s\n",
         gamelib_zoom_perf_enabled ? "ON" : "OFF");
@@ -1578,6 +1610,33 @@ bool gamelib_draw(void)
                             partial_pct);
                         tig_debug_printf("%s", loop_line);
                         gamelib_zoom_perf_log(loop_line);
+
+                        // Fourth line: remaining main-loop buckets that
+                        // sit between the measured slots above —
+                        // handle_zoom_key_repeat and the inner message
+                        // dequeue/dispatch loop. Frame-max spikes of
+                        // 25-70ms aren't visible in any of the buckets
+                        // above; one of these should reveal where they
+                        // come from.
+                        if (gamelib_zoom_perf_key_repeat_samples > 0
+                            || gamelib_zoom_perf_event_dispatch_samples > 0) {
+                            float avg_key_ms = gamelib_zoom_perf_key_repeat_samples > 0
+                                ? (float)((double)gamelib_zoom_perf_key_repeat_total_ns
+                                    / (double)gamelib_zoom_perf_key_repeat_samples / 1e6)
+                                : 0.0f;
+                            float max_key_ms = (float)((double)gamelib_zoom_perf_key_repeat_max_ns / 1e6);
+                            float avg_evt_ms = gamelib_zoom_perf_event_dispatch_samples > 0
+                                ? (float)((double)gamelib_zoom_perf_event_dispatch_total_ns
+                                    / (double)gamelib_zoom_perf_event_dispatch_samples / 1e6)
+                                : 0.0f;
+                            float max_evt_ms = (float)((double)gamelib_zoom_perf_event_dispatch_max_ns / 1e6);
+                            char extra[256];
+                            snprintf(extra, sizeof(extra),
+                                "[zoom-perf]   loop2: key_repeat avg %.2fms max %.2fms | event_dispatch avg %.2fms max %.2fms\n",
+                                avg_key_ms, max_key_ms, avg_evt_ms, max_evt_ms);
+                            tig_debug_printf("%s", extra);
+                            gamelib_zoom_perf_log(extra);
+                        }
                     }
 
                     gamelib_zoom_perf_ping_total_ns = 0;
@@ -1596,6 +1655,12 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_window_display_total_ns = 0;
                     gamelib_zoom_perf_window_display_max_ns = 0;
                     gamelib_zoom_perf_window_display_samples = 0;
+                    gamelib_zoom_perf_key_repeat_total_ns = 0;
+                    gamelib_zoom_perf_key_repeat_max_ns = 0;
+                    gamelib_zoom_perf_key_repeat_samples = 0;
+                    gamelib_zoom_perf_event_dispatch_total_ns = 0;
+                    gamelib_zoom_perf_event_dispatch_max_ns = 0;
+                    gamelib_zoom_perf_event_dispatch_samples = 0;
                 }
             }
 

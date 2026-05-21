@@ -531,8 +531,13 @@ void main_loop(void)
         // world pixels to blend against. Cheap no-op when no strip
         // has opted in.
         intgame_hud_tick_invalidate_alpha_strips();
-        handle_zoom_key_repeat();
         if (perf_on) perf_t0 = gamelib_perf_now_ns();
+        handle_zoom_key_repeat();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            gamelib_perf_record_key_repeat_ns(now - perf_t0);
+            perf_t0 = now;
+        }
         iso_redraw();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
@@ -541,7 +546,9 @@ void main_loop(void)
         }
         tig_window_display();
         if (perf_on) {
-            gamelib_perf_record_window_display_ns(gamelib_perf_now_ns() - perf_t0);
+            uint64_t now = gamelib_perf_now_ns();
+            gamelib_perf_record_window_display_ns(now - perf_t0);
+            perf_t0 = now;
         }
 
         pc_obj = player_get_local_pc_obj();
@@ -930,6 +937,9 @@ void main_loop(void)
 
         if (intgame_mode_supports_scrolling(intgame_mode_get())) {
             handle_mouse_scroll();
+        }
+        if (perf_on) {
+            gamelib_perf_record_event_dispatch_ns(gamelib_perf_now_ns() - perf_t0);
         }
     }
 }
