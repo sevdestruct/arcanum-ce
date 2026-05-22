@@ -417,6 +417,20 @@ bool gamelib_init(GameInitInfo* init_info)
     // (lens copies whatever is at screen center).
     settings_register(&settings, PC_LENS_FOLLOWS_PLAYER_KEY, "1", NULL);
 
+    // CE: Renderer vsync mode. Default 1 (on, no tearing). 2 = adaptive
+    // (no wait when refresh rate is missed → cuts worst-frame penalty
+    // ~in half but tears during slow frames). 0 = off. The setting is
+    // surface-level: ANY value translates to SDL_SetRenderVSync. 2 maps
+    // to SDL_RENDERER_VSYNC_ADAPTIVE which is -1 in SDL.
+    settings_register(&settings, VSYNC_MODE_KEY, "1", NULL);
+    {
+        int vsync_setting = settings_get_value(&settings, VSYNC_MODE_KEY);
+        int sdl_mode = vsync_setting == 2 ? SDL_RENDERER_VSYNC_ADAPTIVE
+            : vsync_setting == 0 ? 0
+            : 1;
+        tig_video_set_vsync_mode(sdl_mode);
+    }
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 

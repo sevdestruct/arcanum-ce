@@ -463,6 +463,24 @@ void tig_video_flip_perf_reset(void)
     memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
 }
 
+int tig_video_set_vsync_mode(int mode)
+{
+    if (tig_video_state.renderer == NULL) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    if (!SDL_SetRenderVSync(tig_video_state.renderer, mode)) {
+        tig_debug_printf("tig_video_set_vsync_mode: SDL_SetRenderVSync(%d) failed: %s\n",
+            mode, SDL_GetError());
+        return TIG_ERR_GENERIC;
+    }
+    tig_debug_printf("tig_video_set_vsync_mode: applied mode=%d (%s)\n",
+        mode,
+        mode == 0 ? "off" :
+        mode == 1 ? "on" :
+        mode == -1 ? "adaptive" : "custom");
+    return TIG_OK;
+}
+
 // SDL_GetPerformanceCounter ticks → nanoseconds.
 static uint64_t tig_video_flip_ticks_to_ns(uint64_t ticks)
 {

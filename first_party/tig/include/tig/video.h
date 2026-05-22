@@ -152,6 +152,11 @@ typedef struct {
 void tig_video_flip_perf_set_enabled(bool enabled);
 void tig_video_flip_perf_get(TigVideoFlipPerf* out);
 void tig_video_flip_perf_reset(void);
+
+// Reapply the renderer's vsync mode. Values match SDL_SetRenderVSync:
+//   1 = vsync on (default at init), 0 = vsync off, -1 = adaptive vsync
+//   (SDL_RENDERER_VSYNC_ADAPTIVE). Returns TIG_OK on success.
+int tig_video_set_vsync_mode(int mode);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);
 int tig_video_screenshot_make(void);
 int tig_video_get_palette(unsigned int* colors);
