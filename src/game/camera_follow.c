@@ -106,37 +106,47 @@ void camera_follow_note_user_camera_move(void)
 // Compute the PC's CURRENT on-screen pixel coords (accounting for sub-
 // tile OFFSET_X/Y during movement animation) and the zoom-scaled
 // position the user perceives.
+//
+// Coordinate convention (verified against location.c:140-141):
+// `location_xy(loc, &sx, &sy)` returns SCREEN pixel coords — it already
+// includes `location_origin_x/y` in the result. So `pc_sx` here IS the
+// PC's current on-screen unzoomed position; we must NOT add cam_ox a
+// second time (early version of this code did, and the resulting
+// alternating-target loop caused the camera to spiral infinitely).
 static bool compute_pc_screen_pos(int64_t pc_obj, int* out_sx, int* out_sy)
 {
     int64_t pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
-    int64_t unzoomed_sx, unzoomed_sy;
-    location_xy(pc_loc, &unzoomed_sx, &unzoomed_sy);
-    unzoomed_sx += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X) + 40;  // tile center
-    unzoomed_sy += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y) + 20;
+    int64_t pc_sx, pc_sy;
+    location_xy(pc_loc, &pc_sx, &pc_sy);
+    pc_sx += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X) + 40;  // tile center
+    pc_sy += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y) + 20;
 
-    // Translate to current screen coords via camera origin.
-    int64_t cam_ox, cam_oy;
-    location_origin_get(&cam_ox, &cam_oy);
-    int64_t screen_x = unzoomed_sx + cam_ox;
-    int64_t screen_y = unzoomed_sy + cam_oy;
-
-    // Apply zoom (same math as dialog_camera).
+    // Apply zoom to get what the user actually perceives. Zoom pivots
+    // around the screen center; pre-zoom screen position is just pc_sx.
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
     float z = iso_zoom_current();
     float cx = (float)cr.width  * 0.5f;
     float cy = (float)cr.height * 0.5f;
-    float zsx = cx + ((float)screen_x - cx) * z;
-    float zsy = cy + ((float)screen_y - cy) * z;
+    float zsx = cx + ((float)pc_sx - cx) * z;
+    float zsy = cy + ((float)pc_sy - cy) * z;
 
     *out_sx = (int)zsx;
     *out_sy = (int)zsy;
     return true;
 }
 
-// Compute the desired camera ORIGIN (world-pixel coords) that would put
-// the PC at the screen center, accounting for zoom. Mirrors the math
-// used by dialog_camera_end's "tween back to PC" path.
+// Compute the desired camera ORIGIN that would put the PC at the
+// screen target position. Mirrors dialog_camera_end's recenter math
+// but expressed as an absolute origin rather than a delta.
+//
+// Math: location_xy returns SCREEN pixel position (it includes
+// cam_origin_x), so pc_sx == pc_world_pixel + cam_ox. Rearranging:
+//     pc_world_pixel = pc_sx - cam_ox
+// And the new origin we want satisfies:
+//     target_screen == pc_world_pixel + new_cam_ox
+//     new_cam_ox    == target_screen - pc_world_pixel
+//                   == target_screen - pc_sx + cam_ox
 static void compute_recenter_origin(int64_t pc_obj, int64_t* out_ox, int64_t* out_oy)
 {
     int64_t pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
@@ -144,6 +154,9 @@ static void compute_recenter_origin(int64_t pc_obj, int64_t* out_ox, int64_t* ou
     location_xy(pc_loc, &pc_sx, &pc_sy);
     pc_sx += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X) + 40;
     pc_sy += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y) + 20;
+
+    int64_t cam_ox, cam_oy;
+    location_origin_get(&cam_ox, &cam_oy);
 
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
@@ -155,9 +168,8 @@ static void compute_recenter_origin(int64_t pc_obj, int64_t* out_ox, int64_t* ou
     int target_screen_y = GAME_UI_BAR_TOP + usable_h / 2;
     int target_screen_x = cr.width / 2;
 
-    // Inverse of (pc_sx + cam_ox) = target_screen_x  →  cam_ox = target_screen_x - pc_sx.
-    *out_ox = (int64_t)target_screen_x - pc_sx;
-    *out_oy = (int64_t)target_screen_y - pc_sy;
+    *out_ox = (int64_t)target_screen_x - pc_sx + cam_ox;
+    *out_oy = (int64_t)target_screen_y - pc_sy + cam_oy;
 }
 
 // Compute safe-zone bounds for the PC's tile-center on-screen position.
