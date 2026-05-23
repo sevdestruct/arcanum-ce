@@ -20,6 +20,15 @@ typedef unsigned int TigVideoBufferCreateFlags;
 #define TIG_VIDEO_BUFFER_CREATE_VIDEO_MEMORY 0x0002
 #define TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY 0x0004
 #define TIG_VIDEO_BUFFER_CREATE_RENDER_TARGET 0x0008
+// CE: Create a GPU-backed buffer (SDL_Texture with TEXTUREACCESS_TARGET)
+// instead of an SDL_Surface. Mutually exclusive with the surface ops:
+// lock/unlock, fill, line, blit, get_pixel_color, tint, set_color_key,
+// save_to_bmp, load_from_bmp all return an error and log a warning when
+// called on a GPU buffer. The flag is the entry point for the GPU render
+// path (feature/perf-gpu-accel) -- intended for the world render target
+// in tile_draw_iso etc., where pixels never need to round-trip through
+// the CPU. COLOR_KEY is silently ignored on GPU buffers (SDL_Texture has
+// no color-key equivalent; callers use SDL_BLENDMODE_BLEND instead).
 #define TIG_VIDEO_BUFFER_CREATE_TEXTURE 0x0010
 
 typedef unsigned int TigVideoBufferFlags;

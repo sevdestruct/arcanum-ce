@@ -140,6 +140,14 @@
 // sector-load mask work).
 #define VOID_EDGE_FADE_KEY "void edge fade"
 
+// CE (feature/perf-gpu-accel Phase 1): when "1", gamelib_init creates a
+// throwaway GPU-backed TigVideoBuffer (256x256 SDL_Texture) and logs the
+// outcome. No effect at "0" (default). This is a temporary scaffold to
+// verify the new GPU buffer path links and runs end-to-end before any
+// real callers exist; remove once Phase 3 ships and the GPU path is
+// driven from gamelib_draw_game.
+#define GPU_BUFFER_SANITY_CHECK_KEY "gpu buffer sanity check"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 

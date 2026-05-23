@@ -594,6 +594,33 @@ bool gamelib_init(GameInitInfo* init_info)
 
     iso_zoom_set_available(init_info->editor || gamelib_world_video_buffer != NULL);
 
+    // CE (feature/perf-gpu-accel Phase 1): smoke-test the new GPU-backed
+    // TigVideoBuffer path. Opt-in via arcanum.cfg `gpu buffer sanity check=1`.
+    // Creates a 256x256 SDL_Texture-backed buffer, immediately destroys it,
+    // and logs the outcome -- so the user can confirm SDL_Texture creation
+    // works on their machine before any real renderer code depends on it.
+    // Remove once Phase 3 lands.
+    settings_register(&settings, GPU_BUFFER_SANITY_CHECK_KEY, "0", NULL);
+    if (settings_get_value(&settings, GPU_BUFFER_SANITY_CHECK_KEY) != 0) {
+        TigVideoBufferCreateInfo gpu_check_info;
+        TigVideoBuffer* gpu_check_buf = NULL;
+        int gpu_check_rc;
+        gpu_check_info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
+        gpu_check_info.width = 256;
+        gpu_check_info.height = 256;
+        gpu_check_info.color_key = 0;
+        gpu_check_info.background_color = tig_color_make(0x40, 0x80, 0xC0);
+        gpu_check_rc = tig_video_buffer_create(&gpu_check_info, &gpu_check_buf);
+        if (gpu_check_rc == TIG_OK && gpu_check_buf != NULL) {
+            tig_debug_printf("gamelib_init: GPU buffer sanity check OK -- created and destroyed a 256x256 SDL_Texture buffer.\n");
+        } else {
+            tig_debug_printf("gamelib_init: GPU buffer sanity check FAILED (rc=%d).\n", gpu_check_rc);
+        }
+        if (gpu_check_buf != NULL) {
+            tig_video_buffer_destroy(gpu_check_buf);
+        }
+    }
+
     if (init_info->editor) {
         gamelib_draw_func = gamelib_draw_editor;
     } else {

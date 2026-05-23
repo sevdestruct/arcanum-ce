@@ -35,9 +35,20 @@ typedef struct TigVideoBuffer {
     int texture_height;
     unsigned int background_color;
     unsigned int color_key;
+    // CE: Exactly one of `surface` and `texture` is non-NULL. The kind is
+    // chosen at create time via TIG_VIDEO_BUFFER_CREATE_TEXTURE (GPU) vs.
+    // its absence (CPU surface, the legacy default).
     SDL_Surface* surface;
+    SDL_Texture* texture;
     int lock_count;
 } TigVideoBuffer;
+
+// CE: Phase 1 GPU buffer helper. The TIG_VIDEO_BUFFER_TEXTURE runtime flag
+// mirrors `texture != NULL` after a successful create.
+static inline bool tig_video_buffer_is_gpu(const TigVideoBuffer* video_buffer)
+{
+    return (video_buffer->flags & TIG_VIDEO_BUFFER_TEXTURE) != 0;
+}
 
 typedef struct TigVideoState {
     SDL_Window* window;
@@ -1300,16 +1311,73 @@ int tig_video_buffer_create(TigVideoBufferCreateInfo* vb_create_info, TigVideoBu
     texture_width = vb_create_info->width;
     texture_height = vb_create_info->height;
 
-    video_buffer->surface = SDL_CreateSurface(texture_width, texture_height, SDL_PIXELFORMAT_XRGB8888);
-    if (video_buffer->surface == NULL) {
-        return TIG_ERR_OUT_OF_MEMORY;
-    }
+    if ((vb_create_info->flags & TIG_VIDEO_BUFFER_CREATE_TEXTURE) != 0) {
+        // CE: GPU-backed buffer. The SDL_Renderer must already be initialized
+        // (true after tig_video_init -> sub_524830). Color keying is silently
+        // ignored: SDL_Texture has no colorkey equivalent and the GPU blit
+        // primitives (Phase 2) will use SDL_BLENDMODE_BLEND for transparency
+        // sourced from per-vertex alpha or from the source texture's alpha
+        // channel.
+        if (tig_video_state.renderer == NULL) {
+            tig_debug_printf("tig_video_buffer_create: renderer is NULL, cannot create GPU buffer.\n");
+            return TIG_ERR_GENERIC;
+        }
 
-    video_buffer->flags |= TIG_VIDEO_BUFFER_SYSTEM_MEMORY;
+        if ((vb_create_info->flags & TIG_VIDEO_BUFFER_CREATE_COLOR_KEY) != 0) {
+            tig_debug_printf("tig_video_buffer_create: COLOR_KEY ignored on GPU buffer (use blend modes instead).\n");
+        }
 
-    if ((vb_create_info->flags & TIG_VIDEO_BUFFER_CREATE_COLOR_KEY) != 0) {
-        video_buffer->flags |= TIG_VIDEO_BUFFER_COLOR_KEY;
-        tig_video_buffer_set_color_key(*video_buffer_ptr, vb_create_info->color_key);
+        video_buffer->texture = SDL_CreateTexture(tig_video_state.renderer,
+            SDL_PIXELFORMAT_XRGB8888,
+            SDL_TEXTUREACCESS_TARGET,
+            texture_width,
+            texture_height);
+        if (video_buffer->texture == NULL) {
+            tig_debug_printf("tig_video_buffer_create: SDL_CreateTexture(%dx%d) failed: %s\n",
+                texture_width, texture_height, SDL_GetError());
+            return TIG_ERR_OUT_OF_MEMORY;
+        }
+
+        // Match the present-path sampling (tig_video_flip uses nearest). The
+        // game's art is pixel-perfect, so linear sampling would blur it.
+        // Per-blit overrides can be added later if any caller needs them.
+        SDL_SetTextureScaleMode(video_buffer->texture, SDL_SCALEMODE_NEAREST);
+
+        video_buffer->flags |= TIG_VIDEO_BUFFER_TEXTURE;
+
+        // Clear the new render-target to the requested background color via
+        // a brief target switch. Restoring the previous target is important
+        // because gamelib may already have one bound (e.g., the world
+        // render target during Phase 3).
+        {
+            SDL_Texture* prev_target = SDL_GetRenderTarget(tig_video_state.renderer);
+            uint32_t bg = vb_create_info->background_color;
+            if (SDL_SetRenderTarget(tig_video_state.renderer, video_buffer->texture)) {
+                SDL_SetRenderDrawColor(tig_video_state.renderer,
+                    (uint8_t)((bg >> 16) & 0xFF),
+                    (uint8_t)((bg >> 8) & 0xFF),
+                    (uint8_t)(bg & 0xFF),
+                    0xFF);
+                SDL_RenderClear(tig_video_state.renderer);
+                SDL_SetRenderTarget(tig_video_state.renderer, prev_target);
+            } else {
+                tig_debug_printf("tig_video_buffer_create: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
+            }
+        }
+    } else {
+        video_buffer->surface = SDL_CreateSurface(texture_width, texture_height, SDL_PIXELFORMAT_XRGB8888);
+        if (video_buffer->surface == NULL) {
+            return TIG_ERR_OUT_OF_MEMORY;
+        }
+
+        video_buffer->flags |= TIG_VIDEO_BUFFER_SYSTEM_MEMORY;
+
+        if ((vb_create_info->flags & TIG_VIDEO_BUFFER_CREATE_COLOR_KEY) != 0) {
+            video_buffer->flags |= TIG_VIDEO_BUFFER_COLOR_KEY;
+            tig_video_buffer_set_color_key(*video_buffer_ptr, vb_create_info->color_key);
+        }
+
+        SDL_FillSurfaceRect(video_buffer->surface, NULL, vb_create_info->background_color);
     }
 
     video_buffer->frame.x = 0;
@@ -1319,10 +1387,6 @@ int tig_video_buffer_create(TigVideoBufferCreateInfo* vb_create_info, TigVideoBu
     video_buffer->texture_width = texture_width;
     video_buffer->texture_height = texture_height;
     video_buffer->background_color = vb_create_info->background_color;
-
-    if ((video_buffer->flags & TIG_VIDEO_BUFFER_TEXTURE) == 0) {
-        SDL_FillSurfaceRect(video_buffer->surface, NULL, vb_create_info->background_color);
-    }
 
     video_buffer->lock_count = 0;
 
@@ -1336,7 +1400,14 @@ int tig_video_buffer_destroy(TigVideoBuffer* video_buffer)
         return TIG_ERR_GENERIC;
     }
 
-    SDL_DestroySurface(video_buffer->surface);
+    // CE: GPU and CPU buffers are mutually exclusive at create time, but
+    // tolerate both being set (a failed-create may leave a partial state).
+    if (video_buffer->texture != NULL) {
+        SDL_DestroyTexture(video_buffer->texture);
+    }
+    if (video_buffer->surface != NULL) {
+        SDL_DestroySurface(video_buffer->surface);
+    }
     FREE(video_buffer);
 
     return TIG_OK;
@@ -1375,6 +1446,11 @@ int tig_video_buffer_data(TigVideoBuffer* video_buffer, TigVideoBufferData* vide
 // 0x520450
 int tig_video_buffer_set_color_key(TigVideoBuffer* video_buffer, int color_key)
 {
+    if (tig_video_buffer_is_gpu(video_buffer)) {
+        tig_debug_printf("tig_video_buffer_set_color_key: unsupported on GPU buffer.\n");
+        return TIG_ERR_GENERIC;
+    }
+
     // CE: enable color-key matching on the surface unconditionally
     // (was guarded on TIG_VIDEO_BUFFER_COLOR_KEY, which is only auto-
     // set at create time for windows created with TIG_WINDOW_TRANSPARENT
@@ -1396,6 +1472,15 @@ int tig_video_buffer_set_color_key(TigVideoBuffer* video_buffer, int color_key)
 // 0x5204B0
 int tig_video_buffer_lock(TigVideoBuffer* video_buffer)
 {
+    // CE: GPU buffers can't be CPU-mapped -- that defeats the whole point of
+    // the GPU path. Bail with an error so any caller that needs pixel access
+    // (line, tint, get_pixel_color, etc.) fails loudly instead of crashing
+    // on a NULL surface deref.
+    if (tig_video_buffer_is_gpu(video_buffer)) {
+        tig_debug_printf("tig_video_buffer_lock: refused on GPU buffer (no CPU-mappable pixels).\n");
+        return TIG_ERR_GENERIC;
+    }
+
     if (video_buffer->lock_count == 0) {
         if (!SDL_LockSurface(video_buffer->surface)) {
             return TIG_ERR_DIRECTX;
@@ -1412,6 +1497,11 @@ int tig_video_buffer_lock(TigVideoBuffer* video_buffer)
 // 0x520500
 int tig_video_buffer_unlock(TigVideoBuffer* video_buffer)
 {
+    if (tig_video_buffer_is_gpu(video_buffer)) {
+        tig_debug_printf("tig_video_buffer_unlock: called on GPU buffer (no-op).\n");
+        return TIG_ERR_GENERIC;
+    }
+
     if (video_buffer->lock_count == 1) {
         SDL_UnlockSurface(video_buffer->surface);
         video_buffer->flags &= ~TIG_VIDEO_BUFFER_LOCKED;
@@ -1471,6 +1561,13 @@ int tig_video_buffer_outline(TigVideoBuffer* video_buffer, TigRect* rect, tig_co
 int tig_video_buffer_fill(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t color)
 {
     SDL_Rect native_rect;
+
+    if (tig_video_buffer_is_gpu(video_buffer)) {
+        // Phase 2 will add a GPU fill primitive via SDL_RenderFillRect once
+        // any caller actually needs it. No callers in Phase 1.
+        tig_debug_printf("tig_video_buffer_fill: unsupported on GPU buffer (Phase 1).\n");
+        return TIG_ERR_GENERIC;
+    }
 
     if (rect != NULL) {
         native_rect.x = rect->x;
@@ -1705,6 +1802,15 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
     SDL_Rect native_src_rect;
     SDL_Rect native_dst_rect;
     int rc;
+
+    // CE: Software blit doesn't know about SDL_Textures. The GPU blit
+    // primitive lands in Phase 2 (tig_video_buffer_blit_gpu). Until then
+    // any GPU buffer used as src or dst is a programmer error.
+    if (tig_video_buffer_is_gpu(blit_info->src_video_buffer)
+        || tig_video_buffer_is_gpu(blit_info->dst_video_buffer)) {
+        tig_debug_printf("tig_video_buffer_blit: unsupported on GPU buffer (use Phase 2 GPU blit).\n");
+        return TIG_ERR_GENERIC;
+    }
 
     if (blit_info->src_rect->width == blit_info->dst_rect->width
         && blit_info->src_rect->height == blit_info->dst_rect->height) {
@@ -2147,6 +2253,12 @@ int tig_video_buffer_save_to_bmp(TigVideoBufferSaveToBmpInfo* save_info)
     int rc;
     TigRect rect;
 
+    if (tig_video_buffer_is_gpu(save_info->video_buffer)) {
+        // Would need an SDL_RenderReadPixels round-trip; unused so far.
+        tig_debug_printf("tig_video_buffer_save_to_bmp: unsupported on GPU buffer.\n");
+        return TIG_ERR_GENERIC;
+    }
+
     if (save_info->rect != NULL) {
         rect = *save_info->rect;
     } else {
@@ -2250,6 +2362,18 @@ int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_
 
             return rc;
         }
+    }
+
+    if (tig_video_buffer_is_gpu(*video_buffer_ptr)) {
+        // load_from_bmp blits via SDL_BlitSurface into the destination's
+        // SDL_Surface; no Phase 1 caller passes a GPU buffer here. Phase 2
+        // can grow an explicit upload path if a caller actually needs it.
+        tig_debug_printf("tig_video_buffer_load_from_bmp: destination is a GPU buffer (unsupported).\n");
+        if ((flags & 0x1) != 0) {
+            tig_video_buffer_destroy(*video_buffer_ptr);
+        }
+        SDL_DestroySurface(surface);
+        return TIG_ERR_GENERIC;
     }
 
     if ((*video_buffer_ptr)->surface->w < surface->w || (*video_buffer_ptr)->surface->h < surface->h) {
