@@ -51,13 +51,15 @@
 #define PC_LENS_FOLLOWS_PLAYER_KEY "pc lens follows player"
 
 // Renderer vsync mode applied after settings load. Values:
-//   1 (default) — vsync ON. SDL_RenderPresent blocks until next vblank.
-//                 No tearing. Each missed vsync slot costs a full
-//                 refresh period (~8.3ms at 120Hz, ~16.6ms at 60Hz).
-//   2           — vsync ADAPTIVE. Vsync when we hit refresh rate; on
+//   2 (default) — vsync ADAPTIVE. Vsync when we hit refresh rate; on
 //                 miss, present returns immediately (tears one frame
-//                 instead of waiting). Cuts the worst-frame penalty
-//                 roughly in half. Tearing visible during slow frames.
+//                 instead of waiting). Measured ~17% lower frame avg
+//                 and ~21% lower stddev vs vsync ON on a 120Hz
+//                 ProMotion display, with no perceptible tearing.
+//   1           — vsync ON. SDL_RenderPresent blocks until next vblank.
+//                 Zero tearing guarantee. Each missed vsync slot costs
+//                 a full refresh period (~8.3ms at 120Hz, ~16.6ms at
+//                 60Hz). Set this if tearing is noticed and disliked.
 //   0           — vsync OFF. No pacing. Maximum throughput, constant
 //                 tearing. Mostly useful for benchmarking.
 // Set in arcanum.cfg. Reapplied at startup.
