@@ -170,10 +170,17 @@ static void tig_sound_async_drain(void)
             if (entry != NULL && entry->data != NULL
                 && sound_handle_is_valid(head->handle)) {
                 TigSound* snd = &(tig_sounds[head->handle]);
-                // Guard: if the handle was reassigned to a different sound
-                // since dispatch (id mismatch), drop this load — the new
-                // owner gets its own dispatch.
-                if (snd->id == head->id) {
+                // Two guards:
+                // 1. id mismatch — handle reassigned since dispatch; the
+                //    new owner gets its own dispatch (or sync load), this
+                //    one is stale.
+                // 2. slot busy — another sound is already active on this
+                //    handle. Don't stomp it. The first-play cache miss
+                //    that the user wanted to hear is gone (this drain
+                //    fires up to ~100ms after dispatch); silently dropping
+                //    is better than killing a sound that's currently
+                //    playing.
+                if (snd->id == head->id && snd->active == 0) {
                     snd->file_cache_entry = entry;
                     snd->audio_handle = AIL_quick_load_mem(entry->data, entry->size);
                     AIL_quick_set_volume(snd->audio_handle, head->volume, head->extra_volume);
@@ -587,10 +594,14 @@ int tig_sound_play(tig_sound_handle_t sound_handle, const char* path, int id)
             SDL_Thread* thread = SDL_CreateThread(tig_sound_async_worker, "tig_snd_async", req);
             if (thread != NULL) {
                 SDL_DetachThread(thread);
-                // Sound is now "pending" — it'll start playing when
-                // tig_sound_async_drain runs in tig_sound_update.
-                snd->active = 1;
-                snd->flags |= TIG_SOUND_MEMORY;
+                // Sound is pending — DON'T touch active/flags/audio_handle/
+                // file_cache_entry here. Those stay zeroed until the drain
+                // on the main thread inserts the loaded buffer into the
+                // cache and starts playback. Any other code that checks
+                // `snd->active != 0` will correctly treat the slot as
+                // not-yet-playing (tig_sound_stop is a no-op, fade logic
+                // skips it, etc.) — no NULL deref window.
+                snd->active = 0;
                 return TIG_OK;
             }
             FREE(req);
