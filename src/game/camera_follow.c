@@ -11,14 +11,21 @@
 #include "game/obj.h"
 #include "game/player.h"
 #include "game/settings.h"
+#include "game/tc.h"
 #include "tig/timer.h"
 
 // === Tunables ===
 //
-// Tween durations: active follow needs to feel responsive (PC walks
-// off the safe-zone edge, camera catches up quickly); the drift settle
-// after PC stops should feel calm.
-#define FOLLOW_TWEEN_ACTIVE_MS    220u
+// Active follow is now real-time edge-tracking: when the PC moves past
+// the safe-zone edge we move the camera by the same delta per tick to
+// keep PC pinned at the edge. No tween — matches the PC's sprite
+// motion exactly. The previous tween-based active path felt like a
+// "catch-up lurch" because the camera was always a half-tween-duration
+// behind the PC.
+//
+// The settle tween still fires when PC has been stopped for a moment,
+// to recenter on PC at rest. Keep this calm; the player has already
+// settled, so the camera should too.
 #define FOLLOW_TWEEN_SETTLE_MS    600u
 
 // Safe-zone fractions of the usable viewport. The "no-camera-move" zone
@@ -53,10 +60,10 @@
 // path; the player should settle, then the camera should settle.
 #define FOLLOW_SETTLE_DELAY_MS    250u
 
-// Re-target threshold (screen px). If the new desired camera origin is
-// within this distance of the active tween's target, don't restart the
-// tween — let the existing one finish. Avoids micro-jitter when the PC
-// moves a few pixels and the math would re-fire every frame.
+// Re-target threshold (screen px) for the settle tween. If a new
+// desired settle origin is within this distance of the active tween's
+// target, let the existing one finish. Avoids micro-jitter from tiny
+// drifts in OFFSET_X/Y between ticks.
 #define FOLLOW_RETARGET_THRESHOLD 6
 
 // === State ===
@@ -267,38 +274,90 @@ void camera_follow_ping(void)
     bool pc_in_safe_zone = pc_screen_x >= sz_x1 && pc_screen_x <= sz_x2
                         && pc_screen_y >= sz_y1 && pc_screen_y <= sz_y2;
 
-    if (pc_in_safe_zone && !pc_idle) {
-        // Moving but still within the deadband — let it ride.
+    // --- ACTIVE FOLLOW: real-time edge tracking ------------------------
+    // While PC is moving AND past the safe-zone edge, move the camera
+    // by the exact amount needed to pin PC at the edge this frame. No
+    // tween — matches PC sprite motion 1:1, no lurch.
+    //
+    // While PC is moving INSIDE the safe zone, the camera stays put
+    // (the safe zone is the deadband the user asked for).
+    if (!pc_idle) {
+        if (pc_in_safe_zone) {
+            return;
+        }
+
+        // Cancel any in-flight settle tween — we're back in motion.
+        if (camera_tween_is_active()) {
+            camera_tween_cancel();
+        }
+
+        // Smallest screen-px delta needed to push PC back to the edge.
+        // Negative on the right/bottom side, positive on the left/top.
+        int dx_screen = 0;
+        int dy_screen = 0;
+        if (pc_screen_x > sz_x2) {
+            dx_screen = sz_x2 - pc_screen_x;
+        } else if (pc_screen_x < sz_x1) {
+            dx_screen = sz_x1 - pc_screen_x;
+        }
+        if (pc_screen_y > sz_y2) {
+            dy_screen = sz_y2 - pc_screen_y;
+        } else if (pc_screen_y < sz_y1) {
+            dy_screen = sz_y1 - pc_screen_y;
+        }
+        if (dx_screen == 0 && dy_screen == 0) {
+            return;
+        }
+
+        // Screen-pixel delta is in ZOOMED space (after the *z transform
+        // in compute_pc_screen_pos). Camera origin is in unzoomed-
+        // screen-pixel space (since location_xy adds it pre-zoom). The
+        // zoom transform pivots at screen center, so an unzoomed delta
+        // of D produces a zoomed delta of D*z. Invert: unzoomed delta
+        // = zoomed delta / z.
+        float z = iso_zoom_current();
+        if (z <= 0.0f) z = 1.0f;
+        int dx_origin = (int)((float)dx_screen / z);
+        int dy_origin = (int)((float)dy_screen / z);
+        if (dx_origin == 0 && dy_origin == 0) {
+            return;
+        }
+
+        int64_t cam_ox, cam_oy;
+        location_origin_get(&cam_ox, &cam_oy);
+        location_origin_pixel_set(cam_ox + dx_origin, cam_oy + dy_origin);
+        // Keep floating text in conversation overlays synced, same as
+        // camera_tween_ping does. No-op when no conversation active.
+        tc_scroll(dx_origin, dy_origin);
+        gamelib_invalidate_rect(NULL);
         return;
     }
 
-    // Active follow OR drift settle on stop.
-    bool want_settle = false;
-    if (pc_idle) {
-        if (pc_in_safe_zone) {
-            // Idle inside safe zone: nothing to do until the player moves.
-            return;
-        }
-        // Idle outside safe zone — wait for the settle delay before
-        // tweening (avoids tweening for tiny pauses mid-path).
+    // --- IDLE: drift settle on stop ------------------------------------
+    if (pc_in_safe_zone) {
+        // Idle inside safe zone: nothing to do until the player moves.
+        return;
+    }
+    // Idle outside safe zone — wait for the settle delay before tweening
+    // (avoids tweening for tiny pauses mid-path).
+    {
         tig_timestamp_t now;
         tig_timer_now(&now);
         if (s_pc_stopped_ts == 0
             || (unsigned int)now - s_pc_stopped_ts < FOLLOW_SETTLE_DELAY_MS) {
             return;
         }
-        want_settle = true;
     }
 
-    // Target: recenter the PC. Same math as dialog_camera_end's tween-
-    // back path so the feel is consistent.
+    // Target: recenter PC. Same math as dialog_camera_end's tween-back
+    // path so the feel is consistent.
     int64_t target_ox, target_oy;
     compute_recenter_origin(pc_obj, &target_ox, &target_oy);
 
-    // Re-target damping: if a tween is already aimed within
+    // Re-target damping: if a settle tween is already aimed within
     // FOLLOW_RETARGET_THRESHOLD of the new target, let it finish. Without
-    // this, micro-movements would restart the tween every frame and the
-    // camera would "stick" to PC instead of smoothly catching up.
+    // this, micro-movements in OFFSET_X/Y between ticks would restart
+    // the tween every frame.
     if (camera_tween_is_active()) {
         int64_t cur_target_ox, cur_target_oy;
         camera_tween_get_target(&cur_target_ox, &cur_target_oy);
@@ -312,8 +371,5 @@ void camera_follow_ping(void)
         }
     }
 
-    unsigned int duration = want_settle
-        ? FOLLOW_TWEEN_SETTLE_MS
-        : FOLLOW_TWEEN_ACTIVE_MS;
-    camera_tween_to(target_ox, target_oy, duration);
+    camera_tween_to(target_ox, target_oy, FOLLOW_TWEEN_SETTLE_MS);
 }
