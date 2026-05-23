@@ -99,8 +99,16 @@ int tig_sound_init(TigInitInfo* init_info)
 
     tig_sound_set_file_path_resolver(init_info->sound_file_path_resolver);
 
-    // Create a file cache for 20 files, approx. 1 MB total.
-    tig_sound_cache = tig_file_cache_create(20, 1000000);
+    // CE: Bumped from the original 20 files / 1MB sizing — that thrashes
+    // constantly on modern hardware where every new combat / dialog /
+    // terrain footstep evicts another sound, and the next time any of them
+    // plays we pay ~400ms for re-load + re-decode on the main thread (see
+    // megahitch log entries). 256 files / 64MB easily fits in RAM on any
+    // machine that can run a 2026 build, gives effectively-infinite
+    // caching for the unique-sound set of a typical play session, and
+    // eliminates the first-play stutter for any sound played more than
+    // once per game launch.
+    tig_sound_cache = tig_file_cache_create(256, 64 * 1024 * 1024);
 
     return TIG_OK;
 }
