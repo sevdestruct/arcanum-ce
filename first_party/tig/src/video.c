@@ -2349,6 +2349,16 @@ restore:
     return rc;
 }
 
+// CE (feature/perf-gpu-accel Phase 3): see header doc. Returns the
+// underlying SDL_Texture for a GPU-backed buffer (NULL for CPU buffers).
+SDL_Texture* tig_video_buffer_get_sdl_texture(TigVideoBuffer* video_buffer)
+{
+    if (video_buffer == NULL) {
+        return NULL;
+    }
+    return video_buffer->texture;
+}
+
 // CE (feature/perf-gpu-accel Phase 2): see header doc. Used by the art
 // GPU cache to upload a CPU-backed art surface to a GPU texture for use
 // as a `tig_video_buffer_blit_gpu` source.

@@ -512,6 +512,11 @@ bool gamelib_init(GameInitInfo* init_info)
     settings_register(&settings, SOUND_ASYNC_LOAD_KEY, "1", NULL);
     tig_sound_async_set_enabled(settings_get_value(&settings, SOUND_ASYNC_LOAD_KEY) != 0);
 
+    // CE (feature/perf-gpu-accel Phase 3): tile-pass render path selector.
+    // Read by tile_draw_iso each frame; cache is initialized lazily in
+    // tile_init based on the same setting.
+    settings_register(&settings, TILE_RENDER_PATH_KEY, TILE_RENDER_PATH_SOFTWARE, NULL);
+
     settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
 
     // CE: surface the highres "aspect snap" toggle (default on) as a real

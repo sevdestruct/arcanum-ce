@@ -2,6 +2,9 @@
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <string.h>
+
+#include "tig/art_gpu_cache.h"
 
 #include "game/a_name.h"
 #include "game/gamelib.h"
@@ -66,6 +69,220 @@ static tig_window_handle_t tile_iso_window_handle;
 // 0x602E08
 static bool dword_602E08;
 
+// CE (feature/perf-gpu-accel Phase 3): GPU tile-pass state. Allocated
+// lazily the first time tile_draw_iso runs in GPU mode and resized when
+// the destination buffer changes (window resize / zoom toggle). The
+// buffer is a TigVideoBuffer wrapping an SDL_Texture with TARGET access,
+// reused frame to frame.
+static TigVideoBuffer* tile_gpu_world_buffer;
+static int tile_gpu_world_buffer_w;
+static int tile_gpu_world_buffer_h;
+
+// Sticky failure flag: once any part of the GPU init path fails (cache
+// init, buffer create, etc.), stop attempting it for the rest of the
+// session and fall back to software. Avoids per-frame retries.
+static bool tile_gpu_path_disabled;
+
+// Per-frame state for tile_blit_dispatch: true while the GPU render
+// target is bound and tile blits should route through blit_gpu instead
+// of tig_art_blit.
+static bool tile_gpu_active;
+
+// CE (feature/perf-gpu-accel Phase 3): return true if arcanum.cfg
+// requests the GPU tile path AND the GPU init didn't previously fail.
+// Re-read each frame so the user can toggle between runs.
+static bool tile_should_use_gpu_path(void)
+{
+    if (tile_gpu_path_disabled) {
+        return false;
+    }
+    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
+    if (mode == NULL) {
+        return false;
+    }
+    return strcmp(mode, TILE_RENDER_PATH_GPU) == 0;
+}
+
+// Allocate or resize the GPU world target to match `dst`. Returns false
+// on hard failure (and trips tile_gpu_path_disabled so we don't retry).
+static bool tile_gpu_ensure_world_buffer(TigVideoBuffer* dst)
+{
+    TigVideoBufferData dst_data;
+    if (dst == NULL || tig_video_buffer_data(dst, &dst_data) != TIG_OK) {
+        tile_gpu_path_disabled = true;
+        return false;
+    }
+
+    int desired_w = dst_data.width;
+    int desired_h = dst_data.height;
+
+    if (tile_gpu_world_buffer != NULL
+        && tile_gpu_world_buffer_w == desired_w
+        && tile_gpu_world_buffer_h == desired_h) {
+        return true;
+    }
+
+    if (tile_gpu_world_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_world_buffer);
+        tile_gpu_world_buffer = NULL;
+    }
+
+    TigVideoBufferCreateInfo info;
+    info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
+    info.width = desired_w;
+    info.height = desired_h;
+    info.color_key = 0;
+    info.background_color = 0;
+    if (tig_video_buffer_create(&info, &tile_gpu_world_buffer) != TIG_OK
+        || tile_gpu_world_buffer == NULL) {
+        tig_debug_printf("tile: GPU world buffer create (%dx%d) failed -- falling back to software.\n",
+            desired_w, desired_h);
+        tile_gpu_world_buffer = NULL;
+        tile_gpu_path_disabled = true;
+        return false;
+    }
+    tile_gpu_world_buffer_w = desired_w;
+    tile_gpu_world_buffer_h = desired_h;
+    return true;
+}
+
+// Upload the current CPU dst surface into the GPU world target and bind
+// the target as the render target. Returns true on success; on failure
+// the caller falls back to the software path for this frame.
+//
+// The upload is the Phase 3 "bridge": tiles with colorkeyed edges leave
+// dst pixels visible, so we need the GPU target to start with the dst's
+// current contents (light pass output, prior frame's tile output, etc.)
+// instead of stale/uninitialized pixels.
+static bool tile_gpu_begin_pass(TigVideoBuffer* dst)
+{
+    if (!tile_gpu_ensure_world_buffer(dst)) {
+        return false;
+    }
+
+    SDL_Texture* gpu_tex = tig_video_buffer_get_sdl_texture(tile_gpu_world_buffer);
+    if (gpu_tex == NULL) {
+        return false;
+    }
+
+    // Pull CPU pixels from dst. tig_video_buffer_data with no lock returns
+    // pixels=NULL, so we lock here to grab a pointer + pitch, then unlock.
+    if (tig_video_buffer_lock(dst) != TIG_OK) {
+        return false;
+    }
+    TigVideoBufferData dst_data;
+    if (tig_video_buffer_data(dst, &dst_data) != TIG_OK || dst_data.pixels == NULL) {
+        tig_video_buffer_unlock(dst);
+        return false;
+    }
+
+    SDL_Rect upload_rect = { 0, 0, dst_data.width, dst_data.height };
+    bool upload_ok = SDL_UpdateTexture(gpu_tex, &upload_rect, dst_data.pixels, dst_data.pitch);
+    tig_video_buffer_unlock(dst);
+    if (!upload_ok) {
+        tig_debug_printf("tile_gpu_begin_pass: SDL_UpdateTexture failed: %s\n", SDL_GetError());
+        return false;
+    }
+
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return false;
+    }
+    if (!SDL_SetRenderTarget(renderer, gpu_tex)) {
+        tig_debug_printf("tile_gpu_begin_pass: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+// Read the GPU world target back into the CPU dst surface and unbind the
+// target. Logs but does not raise on individual failures -- the next
+// frame will retry from begin_pass.
+static void tile_gpu_end_pass(TigVideoBuffer* dst)
+{
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return;
+    }
+
+    // ReadPixels reads from the *current* render target; the begin_pass
+    // bound the GPU world target so we can read directly.
+    SDL_Rect read_rect = { 0, 0, tile_gpu_world_buffer_w, tile_gpu_world_buffer_h };
+    SDL_Surface* read_surface = SDL_RenderReadPixels(renderer, &read_rect);
+    if (read_surface == NULL) {
+        tig_debug_printf("tile_gpu_end_pass: SDL_RenderReadPixels failed: %s\n", SDL_GetError());
+        SDL_SetRenderTarget(renderer, NULL);
+        return;
+    }
+
+    // Blit-with-conversion into the CPU dst surface. SDL handles any
+    // format mismatch (RenderReadPixels may return ARGB8888 instead of
+    // XRGB8888 depending on the driver).
+    if (tig_video_buffer_lock(dst) == TIG_OK) {
+        TigVideoBufferData dst_data;
+        if (tig_video_buffer_data(dst, &dst_data) == TIG_OK && dst_data.pixels != NULL) {
+            SDL_Surface* dst_surface = SDL_CreateSurfaceFrom(dst_data.width, dst_data.height,
+                SDL_PIXELFORMAT_XRGB8888, dst_data.pixels, dst_data.pitch);
+            if (dst_surface != NULL) {
+                SDL_BlitSurface(read_surface, NULL, dst_surface, NULL);
+                SDL_DestroySurface(dst_surface);
+            }
+        }
+        tig_video_buffer_unlock(dst);
+    }
+    SDL_DestroySurface(read_surface);
+    SDL_SetRenderTarget(renderer, NULL);
+}
+
+// CE (feature/perf-gpu-accel Phase 3): dispatch a tile blit through the
+// CPU or GPU path based on `tile_gpu_active`. Called from tile_draw_iso
+// at every site that used to call tig_art_blit directly. Software path
+// is bit-identical to the original.
+static int tile_blit_dispatch(TigArtBlitInfo* art_info)
+{
+    if (!tile_gpu_active) {
+        return tig_art_blit(art_info);
+    }
+
+    SDL_Texture* src_tex = tig_art_gpu_cache_get(art_info->art_id);
+    if (src_tex == NULL) {
+        // Cache miss + upload failure. Fall back to CPU for this one
+        // tile rather than aborting the frame.
+        return tig_art_blit(art_info);
+    }
+
+    TigVideoBufferBlitGpuInfo gpu_info;
+    memset(&gpu_info, 0, sizeof(gpu_info));
+    gpu_info.src_texture = src_tex;
+    gpu_info.src_rect = art_info->src_rect;
+    gpu_info.dst_video_buffer = tile_gpu_world_buffer;
+    gpu_info.dst_rect = art_info->dst_rect;
+
+    TigVideoBufferBlitFlags vb_flags = 0;
+    if ((art_info->flags & TIG_ART_BLT_FLIP_X) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_X;
+    }
+    if ((art_info->flags & TIG_ART_BLT_FLIP_Y) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_Y;
+    }
+    if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
+        if (art_info->field_18 != NULL && art_info->field_14 != NULL) {
+            gpu_info.lerp_rect = art_info->field_18;
+            gpu_info.lerp_colors[0] = art_info->field_14[0];
+            gpu_info.lerp_colors[1] = art_info->field_14[1];
+            gpu_info.lerp_colors[2] = art_info->field_14[2];
+            gpu_info.lerp_colors[3] = art_info->field_14[3];
+        }
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_CONST) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
+        gpu_info.lerp_colors[0] = art_info->color;
+    }
+    gpu_info.flags = vb_flags;
+
+    return tig_video_buffer_blit_gpu(&gpu_info);
+}
+
 // 0x4D6840
 bool tile_init(GameInitInfo* init_info)
 {
@@ -79,6 +296,19 @@ bool tile_init(GameInitInfo* init_info)
     tile_view_options.type = VIEW_TYPE_ISOMETRIC;
     tile_visible = true;
 
+    // CE (feature/perf-gpu-accel Phase 3): if arcanum.cfg requests the GPU
+    // tile path, initialize the art-texture cache now. Cheap if "software"
+    // (init is a no-op until first get) but cleaner to gate up-front so
+    // the cache doesn't allocate buckets in the software-only case.
+    if (tile_should_use_gpu_path()) {
+        if (!tig_art_gpu_cache_init(0)) {
+            tig_debug_printf("tile_init: art GPU cache init failed -- falling back to software.\n");
+            tile_gpu_path_disabled = true;
+        } else {
+            tig_debug_printf("tile_init: tile render path = gpu (art GPU cache initialized).\n");
+        }
+    }
+
     return true;
 }
 
@@ -88,6 +318,15 @@ void tile_exit(void)
     sub_4D7980();
     tile_iso_window_handle = TIG_WINDOW_HANDLE_INVALID;
     tile_invalidate_rect = NULL;
+
+    if (tile_gpu_world_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_world_buffer);
+        tile_gpu_world_buffer = NULL;
+        tile_gpu_world_buffer_w = 0;
+        tile_gpu_world_buffer_h = 0;
+    }
+    tig_art_gpu_cache_exit();
+    tile_gpu_path_disabled = false;
 }
 
 // 0x4D68C0
@@ -701,6 +940,17 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     light_buffers_lock();
 
+    // CE (feature/perf-gpu-accel Phase 3): if arcanum.cfg requests the GPU
+    // path AND begin_pass succeeds (renderer ready, GPU buffer allocated,
+    // CPU surface uploaded), route tile blits through blit_gpu for this
+    // frame. tile_blit_dispatch reads `tile_gpu_active` to pick the path.
+    tile_gpu_active = tile_should_use_gpu_path();
+    if (tile_gpu_active) {
+        if (!tile_gpu_begin_pass(dword_602DF0)) {
+            tile_gpu_active = false;
+        }
+    }
+
     // Pre-compute the bounding rect of all dirty rects so we can fast-
     // reject tiles whose tile_rect can't possibly overlap any of them.
     // tile_draw iterates the whole sector_rect (visible area + 256px
@@ -869,7 +1119,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             v36[2] = v51[4];
                                             v36[3] = v51[3];
 
-                                            tig_art_blit(&art_blit_info);
+                                            tile_blit_dispatch(&art_blit_info);
                                         }
 
                                         tile_subrect.x = tile_rect.x + 39;
@@ -888,7 +1138,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             v36[2] = v51[5];
                                             v36[3] = v51[4];
 
-                                            tig_art_blit(&art_blit_info);
+                                            tile_blit_dispatch(&art_blit_info);
                                         }
 
                                         tile_subrect.x = tile_rect.x;
@@ -907,7 +1157,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             v36[2] = v51[7];
                                             v36[3] = v51[6];
 
-                                            tig_art_blit(&art_blit_info);
+                                            tile_blit_dispatch(&art_blit_info);
                                         }
 
                                         tile_subrect.x = tile_rect.x + 39;
@@ -926,10 +1176,10 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             v36[2] = v51[8];
                                             v36[3] = v51[7];
 
-                                            tig_art_blit(&art_blit_info);
+                                            tile_blit_dispatch(&art_blit_info);
                                         }
                                     } else {
-                                        tig_art_blit(&art_blit_info);
+                                        tile_blit_dispatch(&art_blit_info);
                                     }
                                 }
                                 rect_node = rect_node->next;
@@ -981,6 +1231,16 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                 sector_unlock(v3->sector_ids[v4]);
             }
         }
+    }
+
+    // CE (feature/perf-gpu-accel Phase 3): close the GPU pass -- readback
+    // to the CPU dst surface and unbind the render target -- so the rest
+    // of the pipeline (object/roof/UI) keeps reading the expected pixels.
+    // Runs before the void-edge fade scan below so its lock+read sees the
+    // GPU-rendered tile pixels rather than stale pre-pass content.
+    if (tile_gpu_active) {
+        tile_gpu_end_pass(dword_602DF0);
+        tile_gpu_active = false;
     }
 
     // CE: read back the queued facade tiles' rendered pixels in one pass (single VB

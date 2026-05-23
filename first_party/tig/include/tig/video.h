@@ -345,6 +345,16 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info);
 // and sets SDL_BLENDMODE_BLEND on the resulting texture). Sampling defaults
 // to nearest to match the rest of the pixel-art pipeline.
 SDL_Texture* tig_video_buffer_upload_to_texture(TigVideoBuffer* video_buffer);
+
+// CE (feature/perf-gpu-accel Phase 3): expose the SDL_Texture underlying a
+// GPU-backed TigVideoBuffer. Returns NULL for CPU buffers. The texture is
+// owned by the TigVideoBuffer; callers must not destroy it.
+//
+// Used by the tile-pass GPU path to call SDL_UpdateTexture / SDL_RenderRead
+// Pixels directly against the world render target -- routing those through
+// a wrapper would just add an indirection without buying anything since
+// they're SDL-specific by nature.
+SDL_Texture* tig_video_buffer_get_sdl_texture(TigVideoBuffer* video_buffer);
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color);
 int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t tint_color, TigVideoBufferTintMode mode);
 

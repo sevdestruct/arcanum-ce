@@ -148,6 +148,26 @@
 // driven from gamelib_draw_game.
 #define GPU_BUFFER_SANITY_CHECK_KEY "gpu buffer sanity check"
 
+// CE (feature/perf-gpu-accel Phase 3): selects the tile-pass renderer.
+//   "software" (default) - existing CPU LERP/CONST blits via tig_art_blit
+//                          and tig_video_buffer_blit. Bit-identical to
+//                          pre-GPU behavior.
+//   "gpu"                - tile_draw_iso uploads the current dst surface
+//                          to a GPU render target, draws every tile via
+//                          tig_video_buffer_blit_gpu sourced from
+//                          tig_art_gpu_cache_get(art_id), then reads
+//                          pixels back to the dst CPU surface. The
+//                          upload/readback is the Phase 3 "bridge" so the
+//                          rest of the pipeline (object/roof/light/UI)
+//                          keeps seeing expected pixels; Phase 4 will
+//                          remove it by moving those passes to the GPU
+//                          target too.
+// Re-read at the top of each tile_draw_iso call so the user can flip the
+// flag in arcanum.cfg between runs without restarting.
+#define TILE_RENDER_PATH_KEY "tile render path"
+#define TILE_RENDER_PATH_SOFTWARE "software"
+#define TILE_RENDER_PATH_GPU "gpu"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
