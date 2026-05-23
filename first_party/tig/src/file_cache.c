@@ -30,7 +30,8 @@
 #define FOURCC_FILC SDL_FOURCC('C', 'L', 'I', 'F')
 
 static void tig_file_cache_entry_remove(TigFileCache* cache, TigFileCacheItem* entry);
-static bool tig_file_cache_read_contents_into(const char* path, void** data, int* size);
+// tig_file_cache_read_contents_into is declared in tig/file_cache.h —
+// exposed for async loaders that read off the main thread.
 static bool tig_file_cache_prepare_item(TigFileCache* cache, TigFileCacheItem* item, const char* path);
 static TigFileCacheItem* sub_538D80(TigFileCache* cache);
 static TigFileCacheItem* sub_538D90(TigFileCache* cache);
@@ -281,6 +282,89 @@ TigFileCacheEntry* tig_file_cache_acquire_internal(TigFileCache* cache, TigFileC
 
     item->refcount++;
     return &(item->entry);
+}
+
+// Lookup-only — returns the entry if `path` is already cached, or NULL on
+// miss. Never reads from disk.
+TigFileCacheEntry* tig_file_cache_lookup(TigFileCache* cache, const char* path)
+{
+    int index;
+    TigFileCacheItem* item;
+
+    if (cache == NULL || path == NULL) return NULL;
+
+    for (index = 0; index < cache->capacity; index++) {
+        item = &(cache->items[index]);
+        if (item->entry.data != NULL
+            && SDL_strcasecmp(item->entry.path, path) == 0) {
+            tig_file_cache_hit_count++;
+            tig_file_cache_hit_bytes += item->entry.size;
+            return tig_file_cache_acquire_internal(cache, item);
+        }
+    }
+    return NULL;
+}
+
+// Insert pre-loaded file data into the cache. Mirrors tig_file_cache_acquire
+// but the file content is supplied by the caller instead of read from disk —
+// used by async loaders (e.g. tig_sound async path) that read off the main
+// thread and want to hand the result over.
+//
+// Takes ownership of `data` on success; FREEs `data` on cache hit (so the
+// caller can always assume the buffer is consumed). Returns an acquired
+// entry on success, NULL on allocation/slot failure (in which case `data`
+// is also FREEd).
+TigFileCacheEntry* tig_file_cache_insert_data(TigFileCache* cache,
+    const char* path, void* data, int size)
+{
+    int index;
+    TigFileCacheItem* item;
+    TigFileCacheItem* new_item = NULL;
+
+    if (cache == NULL || path == NULL || data == NULL) {
+        if (data != NULL) FREE(data);
+        return NULL;
+    }
+
+    // First pass: look for existing entry — if same path is already cached,
+    // discard our copy and use the existing one. Mirrors the acquire path.
+    for (index = 0; index < cache->capacity; index++) {
+        item = &(cache->items[index]);
+        if (item->entry.data != NULL) {
+            if (SDL_strcasecmp(item->entry.path, path) == 0) {
+                FREE(data);
+                return tig_file_cache_acquire_internal(cache, item);
+            }
+        } else {
+            if (new_item == NULL) {
+                new_item = item;
+            }
+        }
+    }
+
+    if (new_item == NULL) {
+        new_item = sub_538D80(cache);
+        if (new_item == NULL) {
+            FREE(data);
+            return NULL;
+        }
+    }
+
+    new_item->entry.data = data;
+    new_item->entry.size = size;
+    new_item->entry.path = STRDUP(path);
+    new_item->entry.index = (int)(new_item - cache->items);
+
+    cache->items_count++;
+    cache->bytes += size;
+
+    TigFileCacheEntry* entry = tig_file_cache_acquire_internal(cache, new_item);
+
+    if (cache->bytes > cache->max_size) {
+        tig_file_cache_shrink(cache, cache->bytes - cache->max_size);
+    }
+
+    return entry;
 }
 
 // 0x538EA0

@@ -437,6 +437,9 @@ bool gamelib_init(GameInitInfo* init_info)
     // gameplay. 1 = vsync on (zero tearing guarantee, the safer choice
     // if tearing bothers you). 0 = off (uncapped, mostly benchmarking).
     // 2 maps to SDL_RENDERER_VSYNC_ADAPTIVE (which is -1 in SDL).
+    settings_register(&settings, SOUND_ASYNC_LOAD_KEY, "1", NULL);
+    tig_sound_async_set_enabled(settings_get_value(&settings, SOUND_ASYNC_LOAD_KEY) != 0);
+
     settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
     {
         int vsync_setting = settings_get_value(&settings, VSYNC_MODE_KEY);

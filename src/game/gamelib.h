@@ -50,6 +50,15 @@
 // to vanilla behavior — lens shows whatever is at screen center.
 #define PC_LENS_FOLLOWS_PLAYER_KEY "pc lens follows player"
 
+// First-play sound loading mode. Default 1 (async — sound file read
+// happens on a detached worker thread, sound starts playing when the
+// read completes; eliminates the ~100-150ms first-play hitch every time
+// a never-before-heard sound triggers, at the cost of starting playback
+// up to one tig_sound_update tick (~100ms) late). Set to 0 to force
+// synchronous loads (vanilla behavior; pick this if a thread-safety
+// issue surfaces).
+#define SOUND_ASYNC_LOAD_KEY "sound async load"
+
 // Renderer vsync mode applied after settings load. Values:
 //   2 (default) — vsync ADAPTIVE. Vsync when we hit refresh rate; on
 //                 miss, present returns immediately (tears one frame
