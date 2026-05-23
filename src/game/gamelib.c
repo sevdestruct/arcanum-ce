@@ -1088,6 +1088,44 @@ void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
     }
 }
 
+// 50ms is about 3 missed vsync slots on a 120Hz display. Below the
+// per-bucket megahitch threshold (100ms) so we catch cumulative
+// slowness that no single call would trip on its own.
+#define GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS 50000000ull
+
+void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
+    uint64_t tig_ping_ns, uint64_t key_repeat_ns,
+    uint64_t iso_redraw_ns, uint64_t win_display_ns,
+    uint64_t event_dispatch_ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    if (total_ns <= GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS) return;
+
+    // Suppress if any single bucket already tripped the per-bucket
+    // megahitch logger (>=100ms) — avoid duplicate noise for the
+    // same slow iteration. (The per-bucket logger already named
+    // the culprit; the loop-total line would add nothing.)
+    if (tig_ping_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || key_repeat_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || iso_redraw_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || win_display_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || event_dispatch_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        return;
+    }
+
+    char line[384];
+    snprintf(line, sizeof(line),
+        "[slow-loop] total %.1fms — tig_ping %.2f, key_repeat %.2f, iso_redraw %.2f, win_display %.2f, event_dispatch %.2f (ms)\n",
+        (double)total_ns / 1e6,
+        (double)tig_ping_ns / 1e6,
+        (double)key_repeat_ns / 1e6,
+        (double)iso_redraw_ns / 1e6,
+        (double)win_display_ns / 1e6,
+        (double)event_dispatch_ns / 1e6);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
 // Append a single line to /tmp/arcanum-zoom-perf.log so the perf summary
 // is readable without dealing with macOS unified logging filters.
 static void gamelib_zoom_perf_log(const char* line)

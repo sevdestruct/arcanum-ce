@@ -194,4 +194,16 @@ void gamelib_perf_record_window_display_ns(uint64_t ns);
 void gamelib_perf_record_key_repeat_ns(uint64_t ns);
 void gamelib_perf_record_event_dispatch_ns(uint64_t ns);
 
+// Complement to the per-bucket megahitch logger. Called from main.c
+// after each loop iteration with the iteration-total time and the
+// per-bucket breakdown (in ns). If the total exceeds the slow-loop
+// threshold (~50ms — a cumulative miss of 3+ vsync slots on 120Hz)
+// AND no single bucket already tripped the existing megahitch logger,
+// emits one log line attributing the cost. Useful for the case where
+// no individual call is slow but the iteration adds up.
+void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
+    uint64_t tig_ping_ns, uint64_t key_repeat_ns,
+    uint64_t iso_redraw_ns, uint64_t win_display_ns,
+    uint64_t event_dispatch_ns);
+
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

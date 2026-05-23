@@ -516,13 +516,24 @@ void main_loop(void)
         // gated by gamelib_zoom_perf_is_enabled() inside the helpers,
         // but we still skip the clock_gettime calls when off to keep
         // the no-perf path zero-cost.
+        //
+        // Per-bucket ns is also kept in locals so the slow-loop
+        // detector at the bottom can attribute cumulative-slow
+        // iterations that no single bucket would trip on its own.
         bool perf_on = gamelib_zoom_perf_is_enabled();
-        uint64_t perf_t0 = perf_on ? gamelib_perf_now_ns() : 0;
+        uint64_t loop_start_ns = perf_on ? gamelib_perf_now_ns() : 0;
+        uint64_t perf_t0 = loop_start_ns;
+        uint64_t bucket_tig_ping_ns = 0;
+        uint64_t bucket_key_repeat_ns = 0;
+        uint64_t bucket_iso_redraw_ns = 0;
+        uint64_t bucket_win_display_ns = 0;
+        uint64_t bucket_event_dispatch_ns = 0;
 
         tig_ping();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
-            gamelib_perf_record_tig_ping_ns(now - perf_t0);
+            bucket_tig_ping_ns = now - perf_t0;
+            gamelib_perf_record_tig_ping_ns(bucket_tig_ping_ns);
             perf_t0 = now;
         }
         gamelib_ping();  // self-instruments per-subsystem already
@@ -535,19 +546,22 @@ void main_loop(void)
         handle_zoom_key_repeat();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
-            gamelib_perf_record_key_repeat_ns(now - perf_t0);
+            bucket_key_repeat_ns = now - perf_t0;
+            gamelib_perf_record_key_repeat_ns(bucket_key_repeat_ns);
             perf_t0 = now;
         }
         iso_redraw();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
-            gamelib_perf_record_iso_redraw_ns(now - perf_t0);
+            bucket_iso_redraw_ns = now - perf_t0;
+            gamelib_perf_record_iso_redraw_ns(bucket_iso_redraw_ns);
             perf_t0 = now;
         }
         tig_window_display();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
-            gamelib_perf_record_window_display_ns(now - perf_t0);
+            bucket_win_display_ns = now - perf_t0;
+            gamelib_perf_record_window_display_ns(bucket_win_display_ns);
             perf_t0 = now;
         }
 
