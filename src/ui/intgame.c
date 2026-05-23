@@ -4070,6 +4070,14 @@ void iso_interface_window_set(RotatingWindowType window_type)
         dword_64C6AC = window_type;
         iso_interface_window_swap(window_type);
     }
+
+    // CE: If the user invoked a real rotwin (skills/spells/etc.,
+    // not the auto-revert to MSG) while the HUD is cropped down to
+    // MINI or fully HIDDEN, pop the stage up to MEDIUM so the
+    // rotwin is actually visible. No effect for FULL/MEDIUM.
+    if (window_type != ROTWIN_TYPE_MSG && window_type != ROTWIN_TYPE_INVALID) {
+        intgame_hud_auto_pop_for_rotwin();
+    }
 }
 
 // 0x550720
@@ -8847,15 +8855,61 @@ void intgame_hide(void)
     }
 }
 
-// CE: TAB-hide state (function definitions further below near
-// intgame_hud_user_toggle). Declared up here so intgame_show can
-// re-apply the off-screen move at the end of its restore path —
-// keeps the user's TAB-hide intact across modal menu cycles.
-static bool intgame_hud_user_hidden;
-static TigRect intgame_hud_saved_pos[2];
+// CE: TAB-cycle HUD-crop state. Bound to the TAB key in main.c.
+//
+// Four stages cycle FULL → MEDIUM → MINI → HIDDEN → FULL. Instead
+// of hiding/moving the strip windows, we use tig's per-window clip
+// rect (tig_window_clip_rect_set) to composite only a chosen band
+// of the bottom strip — the rest of the bar's VB stays intact, so
+// when the user cycles back to FULL the original bar reappears with
+// zero rebuilding. Buttons, rotwin chrome, text writes etc. all
+// continue working in their natural positions; the only thing that
+// changes is which pixels make it to screen.
+//
+// The top strip is always either fully visible (FULL) or fully
+// clipped (everything else).
+//
+// Stage-relative bands within the BOTTOM strip's VB (strip-relative
+// design coords; the strip is 800x159 anchored at y=441 in 800x600
+// reference space):
+//   FULL    → no clip; whole strip composites
+//   MEDIUM  → rotwin region: (196, 51, 410, 107) — the full
+//             skill_rot / dialoguewindow frame area
+//   MINI    → slim row: (205, 122, 394, 25) — the cropped 18px
+//             rollover row (skill_rot region at art-local (9,71))
+//   HIDDEN  → clip to a 0-sized rect; nothing composites
+//
+// When the user presses K/M (skills/spells) and the current stage
+// is HIDDEN or MINI, the cycle auto-pops to MEDIUM so the rotwin
+// becomes interactable. Cycling TAB or pressing K again reverts.
 
-#define INTGAME_HUD_OFFSCREEN_X (-10000)
-#define INTGAME_HUD_OFFSCREEN_Y (-10000)
+typedef enum IntgameHudStage {
+    INTGAME_HUD_STAGE_FULL = 0,
+    INTGAME_HUD_STAGE_MEDIUM = 1,
+    INTGAME_HUD_STAGE_MINI = 2,
+    INTGAME_HUD_STAGE_HIDDEN = 3,
+    INTGAME_HUD_STAGE_COUNT,
+} IntgameHudStage;
+
+static IntgameHudStage intgame_hud_stage = INTGAME_HUD_STAGE_FULL;
+// Mirror bool kept for the existing intgame_hud_is_user_hidden()
+// consumers (camera-follow margin math, fate/sleep top-bar dock).
+static bool intgame_hud_user_hidden;
+
+// Stage-band design coords inside the bottom strip's 800x159 VB.
+#define INTGAME_HUD_BOTTOM_W 800
+#define INTGAME_HUD_BOTTOM_H 159
+#define INTGAME_HUD_MEDIUM_BAND_X 196
+#define INTGAME_HUD_MEDIUM_BAND_Y 51
+#define INTGAME_HUD_MEDIUM_BAND_W 410
+#define INTGAME_HUD_MEDIUM_BAND_H 107
+#define INTGAME_HUD_MINI_BAND_X 205
+#define INTGAME_HUD_MINI_BAND_Y 122
+#define INTGAME_HUD_MINI_BAND_W 394
+#define INTGAME_HUD_MINI_BAND_H 25
+
+// Forward decl — definition further below near intgame_hud_user_toggle.
+static void intgame_hud_apply_clips(void);
 
 void intgame_show(void)
 {
@@ -8891,87 +8945,112 @@ void intgame_show(void)
 
     follower_ui_show();
 
-    // CE: Re-apply the user's TAB-hide on top of all the above. Modal
-    // menus (Esc main menu, plain O Options, Cmd+Shift+S Save, Cmd+O
-    // Load, etc.) call intgame_show on close, which restores strips
-    // to in-game positions and would otherwise undo the TAB toggle.
-    // By re-moving the strips off-screen here, the TAB-hide persists
-    // through any modal menu cycle.
-    if (intgame_hud_user_hidden) {
-        int i;
-        for (i = 0; i < 2; i++) {
-            if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
-                tig_window_move(dword_64C4F8[i],
-                    INTGAME_HUD_OFFSCREEN_X, INTGAME_HUD_OFFSCREEN_Y);
-            }
-        }
-    }
+    // CE: Re-apply the current TAB stage's clip after a modal menu
+    // cycle (Esc main menu, Options, Save/Load) — intgame_show is
+    // called on close and would otherwise leave the strips fully
+    // visible regardless of the user's TAB stage.
+    intgame_hud_apply_clips();
 }
 
-// CE: User-toggleable HUD strip visibility. Bound to TAB in the main
-// keyboard handler.
-//
-// Key design choice: we MOVE the strip windows off-screen rather than
-// tig_window_hide() them. The reason: tig's keyboard message dispatch
-// (window.c:1455-1456) skips windows with TIG_WINDOW_HIDDEN set.
-// iso_interface_message_filter — which owns the I/K/M/C/F/R/S/T/W
-// inventory/skills/spells/etc. shortcuts — is registered to the strip
-// windows. tig_window_hide()ing the strips would kill those shortcuts
-// while the HUD was hidden, and the user explicitly wants to keep
-// being able to open inventory etc. while the HUD is hidden.
-//
-// Moving off-screen keeps the windows flag-visible (so dispatch fires
-// the filter, keyboard shortcuts continue to work) while making them
-// visually invisible (off-screen pixels clip during composite).
-//
-// Mouse events at the now-empty HUD area fall through to the iso
-// world window, which is the desired behavior (clicks on the world
-// in the freshly-revealed space act on the world).
-//
-// State (intgame_hud_user_hidden / intgame_hud_saved_pos) and the
-// OFFSCREEN macros are declared up near intgame_hide above so
-// intgame_show can re-apply this state at the end of its restore
-// path.
-
-void intgame_hud_user_toggle(void)
+// Compute and install the per-strip clip rects for the current
+// stage. Idempotent — safe to call from any path that may have
+// reset the strips (intgame_show, mode exits, etc.).
+static void intgame_hud_apply_clips(void)
 {
-    int i;
-    TigWindowData wd;
     if (!intgame_iso_interface_created) {
         return;
     }
-    intgame_hud_user_hidden = !intgame_hud_user_hidden;
-    if (intgame_hud_user_hidden) {
-        // Snapshot current position so we can restore on un-toggle,
-        // then move off-screen. Keep tig_window flag-visible so the
-        // message_filter on these windows keeps receiving keyboard
-        // events.
-        for (i = 0; i < 2; i++) {
-            if (dword_64C4F8[i] == TIG_WINDOW_HANDLE_INVALID) {
-                continue;
-            }
-            if (tig_window_data(dword_64C4F8[i], &wd) == TIG_OK) {
-                intgame_hud_saved_pos[i].x = wd.rect.x;
-                intgame_hud_saved_pos[i].y = wd.rect.y;
-                intgame_hud_saved_pos[i].width = wd.rect.width;
-                intgame_hud_saved_pos[i].height = wd.rect.height;
-            }
-            tig_window_move(dword_64C4F8[i],
-                INTGAME_HUD_OFFSCREEN_X, INTGAME_HUD_OFFSCREEN_Y);
+    intgame_hud_user_hidden = (intgame_hud_stage != INTGAME_HUD_STAGE_FULL);
+
+    // Top strip: only visible in FULL stage.
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        if (intgame_hud_stage == INTGAME_HUD_STAGE_FULL) {
+            tig_window_clip_rect_set(dword_64C4F8[0], NULL);
+        } else {
+            // Zero-size clip → window composites nothing.
+            TigRect empty = { 0, 0, 0, 0 };
+            tig_window_clip_rect_set(dword_64C4F8[0], &empty);
         }
-    } else {
-        // Restore to saved position.
-        for (i = 0; i < 2; i++) {
-            if (dword_64C4F8[i] == TIG_WINDOW_HANDLE_INVALID) {
-                continue;
-            }
-            tig_window_move(dword_64C4F8[i],
-                intgame_hud_saved_pos[i].x, intgame_hud_saved_pos[i].y);
+    }
+
+    // Bottom strip: stage-specific band.
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[1], &wd) != TIG_OK) {
+            return;
         }
+        // wd.rect is the strip's screen-coord frame after hrp_apply.
+        // Bands below are strip-local (design coords); add the
+        // frame origin to get screen coords for the clip rect.
+        int sx = wd.rect.x;
+        int sy = wd.rect.y;
+        TigRect band;
+        switch (intgame_hud_stage) {
+        case INTGAME_HUD_STAGE_FULL:
+            tig_window_clip_rect_set(dword_64C4F8[1], NULL);
+            break;
+        case INTGAME_HUD_STAGE_MEDIUM:
+            band.x = sx + INTGAME_HUD_MEDIUM_BAND_X;
+            band.y = sy + INTGAME_HUD_MEDIUM_BAND_Y;
+            band.width = INTGAME_HUD_MEDIUM_BAND_W;
+            band.height = INTGAME_HUD_MEDIUM_BAND_H;
+            tig_window_clip_rect_set(dword_64C4F8[1], &band);
+            break;
+        case INTGAME_HUD_STAGE_MINI:
+            band.x = sx + INTGAME_HUD_MINI_BAND_X;
+            band.y = sy + INTGAME_HUD_MINI_BAND_Y;
+            band.width = INTGAME_HUD_MINI_BAND_W;
+            band.height = INTGAME_HUD_MINI_BAND_H;
+            tig_window_clip_rect_set(dword_64C4F8[1], &band);
+            break;
+        case INTGAME_HUD_STAGE_HIDDEN:
+        default: {
+            TigRect empty = { 0, 0, 0, 0 };
+            tig_window_clip_rect_set(dword_64C4F8[1], &empty);
+            break;
+        }
+        }
+    }
+
+    // (fate_ui / sleep_ui reposition helpers — when the top bar
+    // is cropped — live on a separate branch. Skipping here keeps
+    // the crop-MVP focused; the panels just stay at their normal
+    // y=41 dock position even when the top bar is invisible. Minor
+    // visual gap; can be wired in later.)
+}
+
+void intgame_hud_user_toggle(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    intgame_hud_stage = (intgame_hud_stage + 1) % INTGAME_HUD_STAGE_COUNT;
+    intgame_hud_apply_clips();
+}
+
+// Auto-pop to MEDIUM when the user invokes a rotwin (K/M/etc.)
+// while the HUD is in MINI or HIDDEN. Called from the existing
+// iso_interface_window_set hook.
+void intgame_hud_auto_pop_for_rotwin(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (intgame_hud_stage == INTGAME_HUD_STAGE_MINI
+        || intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN) {
+        intgame_hud_stage = INTGAME_HUD_STAGE_MEDIUM;
+        intgame_hud_apply_clips();
     }
 }
 
 bool intgame_hud_is_user_hidden(void)
 {
     return intgame_hud_user_hidden;
+}
+
+int intgame_hud_top_offset(void)
+{
+    // 41 = top HUD strip design height. Fate/sleep panels dock at
+    // y=41 when the top bar is visible (FULL), y=0 otherwise.
+    return intgame_hud_user_hidden ? 0 : 41;
 }

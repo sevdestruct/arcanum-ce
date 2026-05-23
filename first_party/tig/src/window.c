@@ -61,6 +61,11 @@ typedef struct TigWindow {
     /* 0038 */ int num_buttons;
     /* 003C */ tig_button_handle_t buttons[TIG_WINDOW_BUTTON_MAX];
     /* 035C */ TigWindowMessageFilterFunc message_filter;
+    // CE: optional screen-coords composite clip. When has_clip,
+    // the compositor uses (frame ∩ clip_rect) to decide what to
+    // paint; otherwise frame alone defines visibility.
+    bool has_clip;
+    TigRect clip_rect;
 } TigWindow;
 
 static int tig_window_free_index(void);
@@ -194,6 +199,7 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->background_color = window_data->background_color;
     win->color_key = window_data->color_key;
     win->num_buttons = 0;
+    win->has_clip = false;
 
     vb_create_info.flags = 0;
 
@@ -466,8 +472,25 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             TigRectListNode* curr = head;
             TigRectListNode* prev = NULL;
 
+            // CE: clip-rect support. Use frame ∩ clip_rect as the
+            // effective visible region when a clip is set. VB-source
+            // math below still uses win->frame as the anchor, so
+            // VB pixels stay at their natural positions — we just
+            // composite a sub-band of them.
+            TigRect effective_frame = win->frame;
+            bool clip_removes_window = false;
+            if (win->has_clip) {
+                if (tig_rect_intersection(&(win->frame), &(win->clip_rect), &effective_frame) != TIG_OK) {
+                    clip_removes_window = true;
+                }
+            }
+            if (clip_removes_window) {
+                top_window_index--;
+                continue;
+            }
+
             while (curr != NULL) {
-                rc = tig_rect_intersection(&(curr->rect), &(win->frame), &dirty_rect);
+                rc = tig_rect_intersection(&(curr->rect), &effective_frame, &dirty_rect);
                 if (rc == TIG_OK) {
                     // TODO: Not sure how to represent it one to one.
                     bool cont;
@@ -523,7 +546,14 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
 
-                        num_clips = tig_rect_clip(&(curr->rect), &(win->frame), clips);
+                        // CE: clip against the EFFECTIVE frame (frame ∩ clip_rect)
+                        // so the un-clipped portions of the dirty rect remain in
+                        // the list and propagate down the stack to the window
+                        // beneath. Using win->frame here would mark all of the
+                        // bar's frame as "covered" even though the clip exposes
+                        // most of it — leaving stale pixels (smearing) in the
+                        // uncovered area.
+                        num_clips = tig_rect_clip(&(curr->rect), &effective_frame, clips);
                         for (index = 0; index < num_clips; index++) {
                             node = tig_rect_node_create();
                             if (node == NULL) {
@@ -1486,6 +1516,73 @@ bool tig_window_is_hidden(tig_window_handle_t window_handle)
 {
     int window_index = tig_window_handle_to_index(window_handle);
     return (windows[window_index].flags & TIG_WINDOW_HIDDEN) != 0;
+}
+
+// CE: Set/clear an optional composite clip rect on a window.
+// Passing NULL clears any existing clip. Invalidates the union of
+// the old and new visible regions so the screen recomposites cleanly
+// (the now-uncovered area falls through to the window beneath).
+int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* clip_rect)
+{
+    int window_index;
+    TigWindow* win;
+    TigRect old_effective;
+    TigRect new_effective;
+    bool had_clip;
+
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    if (!tig_window_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+
+    window_index = tig_window_handle_to_index(window_handle);
+    win = &(windows[window_index]);
+
+    // Compute the old effective rect (what currently composites).
+    had_clip = win->has_clip;
+    if (had_clip) {
+        if (tig_rect_intersection(&(win->frame), &(win->clip_rect), &old_effective) != TIG_OK) {
+            old_effective.x = 0;
+            old_effective.y = 0;
+            old_effective.width = 0;
+            old_effective.height = 0;
+        }
+    } else {
+        old_effective = win->frame;
+    }
+
+    if (clip_rect == NULL) {
+        win->has_clip = false;
+        new_effective = win->frame;
+    } else {
+        win->has_clip = true;
+        win->clip_rect = *clip_rect;
+        if (tig_rect_intersection(&(win->frame), &(win->clip_rect), &new_effective) != TIG_OK) {
+            new_effective.x = 0;
+            new_effective.y = 0;
+            new_effective.width = 0;
+            new_effective.height = 0;
+        }
+    }
+
+    // Invalidate union of old + new visible regions so both the
+    // newly-revealed area (which needs the lower window to draw)
+    // and the newly-hidden area (which needs our window to redraw
+    // its now-cropped portion) get re-composited.
+    if (old_effective.width > 0 && old_effective.height > 0) {
+        tig_window_invalidate_rect(&old_effective);
+    }
+    if (new_effective.width > 0 && new_effective.height > 0
+        && !(new_effective.x == old_effective.x
+            && new_effective.y == old_effective.y
+            && new_effective.width == old_effective.width
+            && new_effective.height == old_effective.height)) {
+        tig_window_invalidate_rect(&new_effective);
+    }
+
+    return TIG_OK;
 }
 
 // 0x51EA10

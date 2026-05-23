@@ -173,5 +173,13 @@ void intgame_show(void);
 // on/off at will, and intgame_show re-applies it on modal close.
 void intgame_hud_user_toggle(void);
 bool intgame_hud_is_user_hidden(void);
+// CE: Auto-pop the TAB stage to MEDIUM when a rotwin is invoked
+// (K/M/skill/spell shortcut) while the HUD is in MINI or HIDDEN.
+// No-op for FULL and MEDIUM stages.
+void intgame_hud_auto_pop_for_rotwin(void);
+// CE: Y-offset of the top HUD strip in design coords (41 when the
+// top bar is visible, 0 otherwise). Used by fate_ui / sleep_ui to
+// dock their panels flush at screen-top when the bar is cropped.
+int intgame_hud_top_offset(void);
 
 #endif /* ARCANUM_UI_INTGAME_H_ */

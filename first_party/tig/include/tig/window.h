@@ -123,6 +123,23 @@ int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** vide
 int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModalDialogChoice* choice_ptr);
 int tig_window_move(tig_window_handle_t window_handle, int x, int y);
 
+// CE: Optional per-window screen-coords clip rectangle. When set
+// (non-NULL), the compositor only paints pixels inside both the
+// window's frame AND the clip rect — the rest falls through to
+// whichever window is beneath in the stack. The VB itself stays
+// untouched, and frame-relative coordinates (button positions, text
+// rects, etc.) keep working unchanged: clipping affects ONLY which
+// pixels reach the screen.
+//
+// Passing NULL clears any existing clip — the window reverts to
+// "frame defines everything visible," its normal behavior.
+//
+// Use case: showing only a band of a tall window's VB without
+// destroying the VB content (e.g. cropping the HUD bar to show
+// just the rotwin row while leaving the rest of the bar's VB —
+// buttons, art — intact for instant restore).
+int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* clip_rect);
+
 #ifdef __cplusplus
 }
 #endif
