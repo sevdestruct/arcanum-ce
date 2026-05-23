@@ -111,6 +111,21 @@ int tig_video_window_get(SDL_Window** window_ptr);
 int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
+// CE: per-pixel see-through composite for near-black source pixels.
+// Near-black pixels blend with the underlay VB; non-near-black pixels
+// copy through opaque. underlay_origin_x/y locate the screen's (0,0)
+// inside the underlay VB — for a fullscreen underlay window (e.g. iso)
+// these are the negation of the underlay window's frame.x/y. If
+// underlay_video_buffer is NULL, fall back to reading the screen
+// itself for the blend (stale pixels).
+int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    uint8_t threshold,
+    uint8_t opacity);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);

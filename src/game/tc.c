@@ -136,6 +136,14 @@ static const char* tc_options[TEXT_CONVERSATION_LINES];
  * 0x5FF568
  */
 static bool tc_active;
+// CE: vertical offset (design-coord pixels) applied to the dialog
+// options backdrop so it sits lower when the HUD bar is cropped.
+// Driven by intgame via tc_set_bottom_gap_offset().
+static int tc_bottom_gap_offset = 0;
+// Remember the last compact value seen by tc_clear so we can re-lay
+// out at any time (e.g. on a gap-offset change) without needing the
+// caller to re-pass it.
+static bool tc_last_compact = false;
 
 /**
  * Called when the game is initialized.
@@ -409,16 +417,50 @@ void tc_clear(bool compact)
     tc_highlighted_idx = -1;
     dword_5FF544 = false;
 
+    tc_last_compact = compact;
+
     // Set default content size and center it horizontally.
     tc_content_rect.width = 400;
     tc_content_rect.height = 100;
     tc_content_rect.x = (tc_iso_window_rect.width - tc_content_rect.width) / 2;
 
-    // Adjust vertical position depending on normal vs. compact mode.
-    if (compact) {
-        tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - 37;
-    } else {
-        tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - 159;
+    // Vertical position: normally sits just above the HUD bar (or the
+    // compact-bar stub). When the bar is cropped, tc_bottom_gap_offset
+    // shifts us down to claim half of the freed space.
+    int bottom_margin = (compact ? 37 : 159) - tc_bottom_gap_offset;
+    if (bottom_margin < 0) {
+        bottom_margin = 0;
+    }
+    tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - bottom_margin;
+}
+
+void tc_set_bottom_gap_offset(int offset)
+{
+    if (tc_editor) {
+        return;
+    }
+    if (offset == tc_bottom_gap_offset) {
+        return;
+    }
+
+    // Invalidate the old position so the world repaints under it.
+    if (tc_active && tc_iso_window_invalidate_rect != NULL) {
+        tc_iso_window_invalidate_rect(&tc_content_rect);
+    }
+
+    tc_bottom_gap_offset = offset;
+
+    // Recompute y using the last-known compact value. Width/x stay
+    // the same so we only need to adjust y.
+    int bottom_margin = (tc_last_compact ? 37 : 159) - tc_bottom_gap_offset;
+    if (bottom_margin < 0) {
+        bottom_margin = 0;
+    }
+    tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - bottom_margin;
+
+    // Invalidate the new position so it paints in.
+    if (tc_active && tc_iso_window_invalidate_rect != NULL) {
+        tc_iso_window_invalidate_rect(&tc_content_rect);
     }
 }
 
@@ -658,6 +700,48 @@ void tc_render_internal(TigRectListNode* node)
                 &dst_rect,
                 tig_color_make(18, 18, 18),
                 TIG_VIDEO_BUFFER_TINT_MODE_SUB);
+
+            // CE: round the corners visually by un-tinting a tiny stair-
+            // step at each corner. After tinting backdrop, re-copy iso
+            // pixels (still original — we haven't blit-back yet) into
+            // backdrop for the corner cells; the blit-back below then
+            // overwrites iso with backdrop, which now has tinted center
+            // and original corners.
+            {
+                static const int corner_chamfer[] = { 3, 2, 1 };
+                int n_chamfer = (int)(sizeof(corner_chamfer) / sizeof(corner_chamfer[0]));
+                TigWindowBlitInfo corner_blt;
+                TigRect cs;
+                TigRect cd;
+                corner_blt.type = TIG_WINDOW_BLT_WINDOW_TO_VIDEO_BUFFER;
+                corner_blt.vb_blit_flags = 0;
+                corner_blt.src_window_handle = tc_iso_window_handle;
+                corner_blt.dst_video_buffer = tc_backdrop_video_buffer;
+                corner_blt.src_rect = &cs;
+                corner_blt.dst_rect = &cd;
+                for (int j = 0; j < n_chamfer; j++) {
+                    int inset = corner_chamfer[j];
+                    int corners[4][2] = {
+                        { tc_content_rect.x,                                          tc_content_rect.y + j },
+                        { tc_content_rect.x + tc_content_rect.width  - inset,         tc_content_rect.y + j },
+                        { tc_content_rect.x,                                          tc_content_rect.y + tc_content_rect.height - 1 - j },
+                        { tc_content_rect.x + tc_content_rect.width  - inset,         tc_content_rect.y + tc_content_rect.height - 1 - j },
+                    };
+                    for (int k = 0; k < 4; k++) {
+                        TigRect strip = { corners[k][0], corners[k][1], inset, 1 };
+                        TigRect clipped;
+                        if (tig_rect_intersection(&strip, &src_rect, &clipped) == TIG_OK) {
+                            cs = clipped;
+                            cd.x = clipped.x - tc_content_rect.x;
+                            cd.y = clipped.y - tc_content_rect.y;
+                            cd.width = clipped.width;
+                            cd.height = clipped.height;
+                            tig_window_blit(&corner_blt);
+                        }
+                    }
+                }
+            }
+
             tig_window_blit(&vb_to_win_blt);
 
             // Store the affected rect in a new list for optimized text

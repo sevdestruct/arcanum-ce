@@ -731,6 +731,13 @@ bool inven_ui_create(int64_t pc_obj, int64_t target_obj, int mode)
         return false;
     }
 
+    // CE: opt the inventory family (inventory / paperdoll / loot /
+    // barter — all use the shared big window) into the optional
+    // near-black see-through alpha. Disabled on destroy so other big-
+    // window users (worldmap, logbook, charedit, schematic) don't
+    // inherit it.
+    intgame_apply_translucent_black(inven_ui_window_handle, true);
+
     button_data.flags = TIG_BUTTON_MOMENTARY;
     button_data.window_handle = inven_ui_window_handle;
     tig_art_interface_id_create(340, 0, 0, 0, &(button_data.art_id));
@@ -1135,6 +1142,9 @@ void inven_ui_destroy(void)
 
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
     inven_ui_target_inventory_scrollbar_destroy();
+    // CE: drop the near-black alpha before unlocking so the next
+    // big-window user (e.g. worldmap) starts opaque.
+    intgame_apply_translucent_black(inven_ui_window_handle, false);
     intgame_big_window_unlock();
     iso_interface_refresh();
     mode = intgame_mode_get();

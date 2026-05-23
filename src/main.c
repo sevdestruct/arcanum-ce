@@ -495,6 +495,11 @@ void main_loop(void)
 
         tig_ping();
         gamelib_ping();
+        // CE: keep the world repainting under any HUD strip that uses
+        // per-pixel see-through, so the alpha composite has fresh
+        // world pixels to blend against. Cheap no-op when no strip
+        // has opted in.
+        intgame_hud_tick_invalidate_alpha_strips();
         iso_redraw();
         tig_window_display();
 

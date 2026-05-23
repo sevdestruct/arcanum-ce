@@ -1425,6 +1425,7 @@ void wmap_ui_close(void)
         intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
         ambient_lighting_enable();
         intgame_button_destroy(&wmap_ui_navigate_button_info);
+        intgame_apply_translucent_black(wmap_ui_window, false);
         intgame_big_window_unlock();
 
         wmap_ui_window = TIG_WINDOW_HANDLE_INVALID;
@@ -1553,6 +1554,11 @@ bool wmap_ui_create(void)
     }
 
     tig_window_blit_art(wmap_ui_window, &art_blit_info);
+
+    // CE: opt the world-map UI into the optional near-black see-through
+    // alpha so the dark panel regions blend with the iso world below.
+    // Disabled on close so the next big-window user starts opaque.
+    intgame_apply_translucent_black(wmap_ui_window, true);
 
     font_desc.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_SHADOW;
     tig_art_interface_id_create(840, 0, 0, 0, &(font_desc.art_id));

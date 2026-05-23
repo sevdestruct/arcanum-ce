@@ -1609,6 +1609,7 @@ void mainmenu_ui_start(MainMenuType type)
             object_hover_obj_set(OBJ_HANDLE_NULL);
             break;
         }
+
     }
 }
 
@@ -4890,6 +4891,17 @@ void mainmenu_ui_create_window_func(bool should_display)
 
     window->refresh_text_flags |= 0x20;
     mainmenu_ui_active = true;
+
+    // CE: when the menu is being shown over a running game (in-play /
+    // in-play-locked / options), enable near-black see-through alpha
+    // on this menu sub-window so iso world peeks through dark panel
+    // regions. Covers Save / Load / Options / etc. since they all
+    // create their tig window through this same function. Out-of-game
+    // menus skip — no world to show.
+    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
+        && stru_5C36B0[mainmenu_ui_type][0]) {
+        intgame_apply_translucent_black(mainmenu_ui_window_handle, true);
+    }
 
     if (window->refresh_func != NULL) {
         window->refresh_func(NULL);

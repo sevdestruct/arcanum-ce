@@ -954,6 +954,11 @@ bool charedit_open(int64_t obj, ChareditMode mode)
         return false;
     }
 
+    // CE: opt the character screen into the optional near-black see-
+    // through alpha so the world peeks through dark panel regions.
+    // Disabled on close so other big-window users start opaque.
+    intgame_apply_translucent_black(charedit_window_handle, true);
+
     button_data.flags = TIG_BUTTON_MOMENTARY;
     button_data.window_handle = charedit_window_handle;
     button_data.mouse_down_snd_id = SND_INTERFACE_BUTTON_MEDIUM;
@@ -1207,6 +1212,7 @@ void charedit_close(void)
             object_hp_damage_set(charedit_obj, 0);
             critter_fatigue_damage_set(charedit_obj, 0);
         }
+        intgame_apply_translucent_black(charedit_window_handle, false);
         intgame_big_window_unlock();
         tig_window_hide(charedit_skills_win);
         tig_window_hide(charedit_spells_win);

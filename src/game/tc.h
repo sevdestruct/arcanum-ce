@@ -15,4 +15,10 @@ void tc_set_option(int index, const char* str);
 int tc_handle_message(TigMessage* msg);
 int tc_check_size(const char* str);
 
+// CE: shift the dialog options backdrop down by `offset` design-coord
+// pixels — used to reclaim half the visual real-estate that the cropped
+// HUD bar leaves behind. Pushed from intgame's HUD-stage transitions.
+// 0 = original position (just above the full bar). Higher = lower.
+void tc_set_bottom_gap_offset(int offset);
+
 #endif /* ARCANUM_GAME_TC_H_ */

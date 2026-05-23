@@ -167,6 +167,17 @@ static void sub_551F80(void);
 static bool sub_552050(int x, int y, TargetDescriptor* td);
 static void sub_5520D0(RotatingWindowType window_type, int step);
 static void iso_interface_window_swap(RotatingWindowType window_type);
+static void intgame_hud_apply_clips(void);
+// CE: MINI-peek press handler. Returns true if the press should be
+// swallowed (peek-expand to MEDIUM, or return-from-peek to MINI),
+// false if it should fall through to normal rotwin toggle-off.
+static bool intgame_hud_handle_mini_peek_press(void);
+// CE: re-establish MINI invariants (stage=MINI, type=SKILLS, button
+// state synced) regardless of how we got here.
+static void intgame_hud_enter_mini_with_skills(void);
+// CE: true when the HUD is in the MINI crop stage. Used by code that
+// runs ahead of where intgame_hud_stage is declared.
+static bool intgame_hud_in_mini_stage(void);
 static void intgame_clock_refresh(void);
 static void sub_552740(int64_t obj, ChareditMode mode);
 static void sub_552770(UiMessage* ui_message);
@@ -282,20 +293,23 @@ static int intgame_ui_primary_button_normal_icons[UI_PRIMARY_BUTTON_COUNT] = {
 // 0x5C6538
 static UiButtonInfo intgame_sleep_button_info = { 605, 9, 137, TIG_BUTTON_HANDLE_INVALID };
 
-// 0x5C6548 — CE: y anchor 492→491 to align rotwin chrome with the
-// bar art's well; text frames + HUD crop bands shifted in lockstep.
+// 0x5C6548
 static UiButtonInfo intgame_rotwin_button_info[ROTWIN_TYPE_COUNT] = {
-    /*        ROTWIN_TYPE_MSG */ { 196, 491, 354, TIG_BUTTON_HANDLE_INVALID },
+    /*        ROTWIN_TYPE_MSG */ { 196, 492, 354, TIG_BUTTON_HANDLE_INVALID },
+    // CE: SKILLS / SPELLS chrome sits 1px higher than the other rotwin
+    // arts to align with the inner UI elements (college buttons / spell
+    // slots / skill widgets) that were placed relative to the visual
+    // indent inside the art frame.
     /*     ROTWIN_TYPE_SPELLS */ { 196, 491, 8, TIG_BUTTON_HANDLE_INVALID },
     /*     ROTWIN_TYPE_SKILLS */ { 196, 491, 274, TIG_BUTTON_HANDLE_INVALID },
-    /*       ROTWIN_TYPE_CHAT */ { 196, 491, 642, TIG_BUTTON_HANDLE_INVALID },
-    /*      ROTWIN_TYPE_TRAPS */ { 196, 491, 290, TIG_BUTTON_HANDLE_INVALID },
-    /*   ROTWIN_TYPE_DIALOGUE */ { 196, 491, 354, TIG_BUTTON_HANDLE_INVALID },
-    /*   ROTWIN_TYPE_MAP_NOTE */ { 196, 491, 200, TIG_BUTTON_HANDLE_INVALID },
-    /*  ROTWIN_TYPE_BROADCAST */ { 196, 491, 291, TIG_BUTTON_HANDLE_INVALID },
-    /*  ROTWIN_TYPE_MAGICTECH */ { 196, 491, 564, TIG_BUTTON_HANDLE_INVALID },
-    /*   ROTWIN_TYPE_QUANTITY */ { 196, 491, 298, TIG_BUTTON_HANDLE_INVALID },
-    /* ROTWIN_TYPE_MP_KICKBAN */ { 196, 491, 842, TIG_BUTTON_HANDLE_INVALID },
+    /*       ROTWIN_TYPE_CHAT */ { 196, 492, 642, TIG_BUTTON_HANDLE_INVALID },
+    /*      ROTWIN_TYPE_TRAPS */ { 196, 492, 290, TIG_BUTTON_HANDLE_INVALID },
+    /*   ROTWIN_TYPE_DIALOGUE */ { 196, 492, 354, TIG_BUTTON_HANDLE_INVALID },
+    /*   ROTWIN_TYPE_MAP_NOTE */ { 196, 492, 200, TIG_BUTTON_HANDLE_INVALID },
+    /*  ROTWIN_TYPE_BROADCAST */ { 196, 492, 291, TIG_BUTTON_HANDLE_INVALID },
+    /*  ROTWIN_TYPE_MAGICTECH */ { 196, 492, 564, TIG_BUTTON_HANDLE_INVALID },
+    /*   ROTWIN_TYPE_QUANTITY */ { 196, 492, 298, TIG_BUTTON_HANDLE_INVALID },
+    /* ROTWIN_TYPE_MP_KICKBAN */ { 196, 492, 842, TIG_BUTTON_HANDLE_INVALID },
 };
 
 // 0x5C65F8
@@ -447,18 +461,20 @@ static UiButtonInfo intgame_quantity_buttons[INTGAME_QUANTITY_BUTTON_COUNT] = {
 // 0x5C6D58
 static RotatingWindowType dword_5C6D58 = ROTWIN_TYPE_INVALID;
 
-// 0x5C6D60 — CE: y values shifted up 1px in lockstep with the
-// rotwin chrome anchor; see intgame_rotwin_button_info above.
+// 0x5C6D60
 struct IntgameIsoWindowTypeInfo intgame_rotwin_text_frame[ROTWIN_TYPE_COUNT] = {
-    /*        ROTWIN_TYPE_MSG */ { { 211, 502, 383, 82 }, TIG_WINDOW_HANDLE_INVALID },
+    /*        ROTWIN_TYPE_MSG */ { { 211, 503, 383, 82 }, TIG_WINDOW_HANDLE_INVALID },
+    // CE: SPELLS/SKILLS chrome shifted up 1px (see intgame_rotwin_button_info);
+    // their inner text rows shift in lockstep so the rolling text stays
+    // aligned with the chrome's visible text well.
     /*     ROTWIN_TYPE_SPELLS */ { { 208, 573, 387, 18 }, TIG_WINDOW_HANDLE_INVALID },
     /*     ROTWIN_TYPE_SKILLS */ { { 208, 566, 387, 18 }, TIG_WINDOW_HANDLE_INVALID },
-    /*       ROTWIN_TYPE_CHAT */ { { 291, 565, 268, 19 }, TIG_WINDOW_HANDLE_INVALID },
-    /*      ROTWIN_TYPE_TRAPS */ { { 208, 573, 387, 18 }, TIG_WINDOW_HANDLE_INVALID },
-    /*   ROTWIN_TYPE_DIALOGUE */ { { 211, 506, 383, 84 }, TIG_WINDOW_HANDLE_INVALID },
-    /*   ROTWIN_TYPE_MAP_NOTE */ { { 262, 507, 303, 24 }, TIG_WINDOW_HANDLE_INVALID },
-    /*  ROTWIN_TYPE_BROADCAST */ { { 220, 502, 350, 82 }, TIG_WINDOW_HANDLE_INVALID },
-    /*  ROTWIN_TYPE_MAGICTECH */ { { 355, 505, 227, 18 }, TIG_WINDOW_HANDLE_INVALID },
+    /*       ROTWIN_TYPE_CHAT */ { { 291, 566, 268, 19 }, TIG_WINDOW_HANDLE_INVALID },
+    /*      ROTWIN_TYPE_TRAPS */ { { 208, 574, 387, 18 }, TIG_WINDOW_HANDLE_INVALID },
+    /*   ROTWIN_TYPE_DIALOGUE */ { { 211, 507, 383, 84 }, TIG_WINDOW_HANDLE_INVALID },
+    /*   ROTWIN_TYPE_MAP_NOTE */ { { 262, 508, 303, 24 }, TIG_WINDOW_HANDLE_INVALID },
+    /*  ROTWIN_TYPE_BROADCAST */ { { 220, 503, 350, 82 }, TIG_WINDOW_HANDLE_INVALID },
+    /*  ROTWIN_TYPE_MAGICTECH */ { { 355, 506, 227, 18 }, TIG_WINDOW_HANDLE_INVALID },
     /*   ROTWIN_TYPE_QUANTITY */ { { 0, 0, 0, 0 }, TIG_WINDOW_HANDLE_INVALID },
     /* ROTWIN_TYPE_MP_KICKBAN */ { { 0, 0, 0, 0 }, TIG_WINDOW_HANDLE_INVALID },
 };
@@ -1251,6 +1267,19 @@ void iso_interface_create(tig_window_handle_t window_handle)
         window_data.rect.x = 0;
         window_data.rect.y = 0;
         tig_window_blit_art(dword_64C4F8[index], &art_blit_info);
+
+        // CE: bottom strip opts into per-pixel see-through for the
+        // panel art's near-black background. Threshold 8 catches the
+        // mixed near-black shades (010008, 000808, 000000) exactly
+        // without snagging dark chrome detail; opacity 128 = 50%
+        // src / 50% dst. The iso window is the underlay — the
+        // blend samples its VB directly (which always has the current
+        // world content) instead of reading the stale screen surface.
+        // Gated by the TranslucentBlackUI cfg flag.
+        if (index == 1 && settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+            tig_window_near_black_alpha_set(dword_64C4F8[index],
+                true, intgame_iso_window, 8, 128);
+        }
     }
 
     for (index = 0; index < 5; index++) {
@@ -2602,6 +2631,16 @@ void intgame_secondary_button_toggle(IntgameSecondaryButton btn, RotatingWindowT
         tig_button_state_change(intgame_secondary_buttons[btn].button_handle, TIG_BUTTON_STATE_PRESSED);
         iso_interface_window_set(window_type);
     } else {
+        // CE: when the user is in MINI-peek for this same rotwin (TAB
+        // expanded MINI to MEDIUM via re-press), a second re-press
+        // should NOT dismiss the rotwin — it should collapse the crop
+        // back to MINI while leaving SKILLS/SPELLS active. Otherwise
+        // MINI's slim text row would lose its content. Button stays
+        // PRESSED, fullscreen stays forced.
+        if (intgame_iso_window_type == window_type
+            && intgame_hud_handle_mini_peek_press()) {
+            return;
+        }
         iso_interface_window_set(ROTWIN_TYPE_MSG);
         tig_button_state_change(intgame_secondary_buttons[btn].button_handle, TIG_BUTTON_STATE_RELEASED);
         intgame_unforce_fullscreen();
@@ -4064,8 +4103,21 @@ void iso_interface_window_set(RotatingWindowType window_type)
         intgame_mode_set(INTGAME_MODE_MAIN);
     }
 
+    // CE: capture the effective result before the swap, since the swap
+    // updates intgame_iso_window_type. Same-type re-press is the user's
+    // dismiss gesture (e.g. K → SKILLS → K → MSG).
+    bool toggled_off = (intgame_iso_window_type == window_type);
+    RotatingWindowType effective = toggled_off ? ROTWIN_TYPE_MSG : window_type;
+
+    // CE: MINI-peek special case. See intgame_hud_handle_mini_peek_press
+    // for the full state machine. If it handles the press, we return —
+    // the rotwin type stays as-is, only the crop stage flips.
+    if (toggled_off && intgame_hud_handle_mini_peek_press()) {
+        return;
+    }
+
     intgame_rotwin_step = MAX_INTERFACE_WINDOW_ROTATION_STEPS;
-    if (intgame_iso_window_type == window_type) {
+    if (toggled_off) {
         dword_64C6AC = ROTWIN_TYPE_MSG;
         iso_interface_window_swap(ROTWIN_TYPE_MSG);
     } else {
@@ -4073,11 +4125,16 @@ void iso_interface_window_set(RotatingWindowType window_type)
         iso_interface_window_swap(window_type);
     }
 
-    // CE: If the user invoked a real rotwin (skills/spells/etc.,
-    // not the auto-revert to MSG) while the HUD is cropped down to
-    // MINI or fully HIDDEN, pop the stage up to MEDIUM so the
-    // rotwin is actually visible. No effect for FULL/MEDIUM.
-    if (window_type != ROTWIN_TYPE_MSG && window_type != ROTWIN_TYPE_INVALID) {
+    // CE: HUD-crop coupling.
+    // - Real rotwin (skills/spells/magictech-weapon/etc.) invoked from
+    //   MINI/HIDDEN: pop to MEDIUM and stash the prior stage.
+    // - Result is MSG (toggle-off or explicit dismiss): restore the
+    //   stashed stage so the user returns to where they were.
+    // Auto-reverts that route through iso_interface_window_swap directly
+    // (cursor leaving the bar, mode exits) bypass this entirely.
+    if (effective == ROTWIN_TYPE_MSG) {
+        intgame_hud_restore_after_rotwin();
+    } else if (effective != ROTWIN_TYPE_INVALID) {
         intgame_hud_auto_pop_for_rotwin();
     }
 }
@@ -5247,10 +5304,28 @@ void sub_5520D0(RotatingWindowType window_type, int step)
 // 0x552130
 void iso_interface_window_swap(RotatingWindowType window_type)
 {
+    // CE: MINI's slim-row hack assumes SKILLS rotwin is the active
+    // chrome (skill_rot art has a text well at art-local +71 that
+    // exactly matches the MINI band). The engine internally swaps
+    // the rotwin on world-hover (MSG / examine / etc.) — when stage
+    // is MINI, ignore those swaps so the slim row keeps showing
+    // SKILLS content instead of jittering between chrome layouts.
+    // Allow re-swaps to SKILLS itself (used by the MINI-restore path).
+    if (intgame_hud_in_mini_stage()
+        && intgame_iso_window_type == ROTWIN_TYPE_SKILLS
+        && window_type != ROTWIN_TYPE_SKILLS) {
+        return;
+    }
     iso_interface_window_disable(intgame_iso_window_type);
     intgame_rotwin_step = MAX_INTERFACE_WINDOW_ROTATION_STEPS;
     iso_interface_window_enable(window_type);
     dword_5C6D58 = intgame_iso_window_type;
+    // CE: the bottom-strip clip band is anchored to the active chrome's
+    // strip-local y. SKILLS/SPELLS chrome lives 1px higher than other
+    // rotwin arts, so a type swap (e.g. MSG -> SKILLS) shifts the band
+    // by that delta. Re-apply so the crop stays flush with the new
+    // chrome. No-op in FULL stage (clears to NULL clip both times).
+    intgame_hud_apply_clips();
 }
 
 // 0x552160
@@ -8894,6 +8969,20 @@ typedef enum IntgameHudStage {
 } IntgameHudStage;
 
 static IntgameHudStage intgame_hud_stage = INTGAME_HUD_STAGE_FULL;
+// CE: pre-rotwin stage snapshot. When the user is in MINI/HIDDEN and
+// invokes a rotwin (K/M, magictech weapon, etc.), we auto-pop to MEDIUM
+// and remember where to return when the rotwin is dismissed. Cleared
+// by user-driven TAB cycling (manual override).
+static IntgameHudStage intgame_hud_saved_stage = INTGAME_HUD_STAGE_FULL;
+static bool intgame_hud_has_saved_stage = false;
+// CE: MINI is a "hack" stage — it silently keeps SKILLS active so the
+// slim text row shows real hover content. Pressing K (or whichever key
+// matches the active rotwin) while MINI is up should NOT dismiss the
+// rotwin (that would swap to MSG and visually break the row); instead
+// it peek-expands to MEDIUM. A second press returns to MINI without
+// dismissing. This flag tracks "we're MEDIUM but only because MINI
+// peeked," so we know to return-to-MINI instead of toggling-off.
+static bool intgame_hud_peek_from_mini = false;
 // Mirror bool kept for the existing intgame_hud_is_user_hidden()
 // consumers (camera-follow margin math, fate/sleep top-bar dock).
 static bool intgame_hud_user_hidden;
@@ -8902,16 +8991,13 @@ static bool intgame_hud_user_hidden;
 #define INTGAME_HUD_BOTTOM_W 800
 #define INTGAME_HUD_BOTTOM_H 159
 #define INTGAME_HUD_MEDIUM_BAND_X 196
-#define INTGAME_HUD_MEDIUM_BAND_Y 50
+#define INTGAME_HUD_MEDIUM_BAND_Y 51
 #define INTGAME_HUD_MEDIUM_BAND_W 410
 #define INTGAME_HUD_MEDIUM_BAND_H 107
 #define INTGAME_HUD_MINI_BAND_X 205
-#define INTGAME_HUD_MINI_BAND_Y 121
+#define INTGAME_HUD_MINI_BAND_Y 122
 #define INTGAME_HUD_MINI_BAND_W 394
 #define INTGAME_HUD_MINI_BAND_H 25
-
-// Forward decl — definition further below near intgame_hud_user_toggle.
-static void intgame_hud_apply_clips(void);
 
 void intgame_show(void)
 {
@@ -8964,6 +9050,24 @@ static void intgame_hud_apply_clips(void)
     }
     intgame_hud_user_hidden = (intgame_hud_stage != INTGAME_HUD_STAGE_FULL);
 
+    // CE: invalidate the world (iso VB) under both bar strips on every
+    // stage change. The iso layer only paints into its VB for regions
+    // gamelib has been asked to redraw; while a strip is opaque on top,
+    // iso leaves that band stale. When the clip uncovers part of the
+    // strip, the compositor blits iso's stale pixels through the hole
+    // and the user sees an edge smear. Invalidating here forces the
+    // world to repaint into iso's VB so the newly-exposed band has
+    // fresh content by the next composite.
+    for (int strip_idx = 0; strip_idx < 2; strip_idx++) {
+        if (dword_64C4F8[strip_idx] == TIG_WINDOW_HANDLE_INVALID) {
+            continue;
+        }
+        TigWindowData strip_wd;
+        if (tig_window_data(dword_64C4F8[strip_idx], &strip_wd) == TIG_OK) {
+            iso_invalidate_rect(&strip_wd.rect);
+        }
+    }
+
     // Top strip: only visible in FULL stage.
     if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
         if (intgame_hud_stage == INTGAME_HUD_STAGE_FULL) {
@@ -8987,20 +9091,36 @@ static void intgame_hud_apply_clips(void)
         int sx = wd.rect.x;
         int sy = wd.rect.y;
         TigRect band;
+        // CE: anchor the band's Y to the active rotwin's chrome top so
+        // a per-type anchor offset (e.g. SKILLS/SPELLS shifted 1px up
+        // vs MSG/dialogue) doesn't leave a sliver of bar background
+        // above/below the chrome. Width and X stay constant — the band
+        // is always 410px wide centered on the chrome anchor.
+        int chrome_strip_y = INTGAME_HUD_MEDIUM_BAND_Y;
+        if (intgame_iso_window_type >= 0
+            && intgame_iso_window_type < ROTWIN_TYPE_COUNT) {
+            int btn_y = intgame_rotwin_button_info[intgame_iso_window_type].y;
+            // Skip the zero-sized stub entries (QUANTITY / MP_KICKBAN).
+            if (btn_y > intgame_interface_window_frames[1].y) {
+                chrome_strip_y = btn_y - intgame_interface_window_frames[1].y;
+            }
+        }
         switch (intgame_hud_stage) {
         case INTGAME_HUD_STAGE_FULL:
             tig_window_clip_rect_set(dword_64C4F8[1], NULL);
             break;
         case INTGAME_HUD_STAGE_MEDIUM:
             band.x = sx + INTGAME_HUD_MEDIUM_BAND_X;
-            band.y = sy + INTGAME_HUD_MEDIUM_BAND_Y;
+            band.y = sy + chrome_strip_y;
             band.width = INTGAME_HUD_MEDIUM_BAND_W;
             band.height = INTGAME_HUD_MEDIUM_BAND_H;
             tig_window_clip_rect_set(dword_64C4F8[1], &band);
             break;
         case INTGAME_HUD_STAGE_MINI:
+            // MINI shows just the inner text-row band of the chrome art
+            // (art-local row at +71). Slides with the chrome anchor.
             band.x = sx + INTGAME_HUD_MINI_BAND_X;
-            band.y = sy + INTGAME_HUD_MINI_BAND_Y;
+            band.y = sy + chrome_strip_y + (INTGAME_HUD_MINI_BAND_Y - INTGAME_HUD_MEDIUM_BAND_Y);
             band.width = INTGAME_HUD_MINI_BAND_W;
             band.height = INTGAME_HUD_MINI_BAND_H;
             tig_window_clip_rect_set(dword_64C4F8[1], &band);
@@ -9014,11 +9134,15 @@ static void intgame_hud_apply_clips(void)
         }
     }
 
-    // (fate_ui / sleep_ui reposition helpers — when the top bar
-    // is cropped — live on a separate branch. Skipping here keeps
-    // the crop-MVP focused; the panels just stay at their normal
-    // y=41 dock position even when the top bar is invisible. Minor
-    // visual gap; can be wired in later.)
+    // Reposition top-bar-docked panels so they sit flush against the
+    // screen top when the bar is hidden, or below the bar when it's
+    // shown. No-op if the respective panel isn't currently open.
+    fate_ui_reposition();
+    sleep_ui_reposition();
+
+    // Notify the dialog options backdrop of the new bar-gap so it can
+    // drop down into the freed space. No-op when no dialog is active.
+    tc_set_bottom_gap_offset(intgame_hud_bottom_gap_offset());
 }
 
 void intgame_hud_user_toggle(void)
@@ -9026,7 +9150,47 @@ void intgame_hud_user_toggle(void)
     if (!intgame_iso_interface_created) {
         return;
     }
+    // Manual TAB cycle = user override; drop any auto-pop snapshot so
+    // a later rotwin dismiss won't snap them back to a stage they've
+    // since moved past.
+    intgame_hud_has_saved_stage = false;
+    intgame_hud_peek_from_mini = false;
+    IntgameHudStage prev_stage = intgame_hud_stage;
     intgame_hud_stage = (intgame_hud_stage + 1) % INTGAME_HUD_STAGE_COUNT;
+
+    // CE: MINI's only purpose is the slim rollover row — and that row
+    // is driven by whichever rotwin is currently active. On the way
+    // INTO MINI, silently force the SKILLS rotwin so the row shows
+    // skill names / hover text. On the way OUT of MINI (cycling to
+    // HIDDEN or wrapping back to FULL), drop the rotwin back to MSG
+    // so we don't leave SKILLS arbitrarily active afterwards. Use
+    // iso_interface_window_swap directly (not _set) to skip the
+    // K/M-style auto-pop-to-MEDIUM hook — we want the type change
+    // without the stage override. The swap itself re-applies clips,
+    // so we skip the manual apply below in those branches.
+    bool entering_mini = (intgame_hud_stage == INTGAME_HUD_STAGE_MINI
+        && prev_stage != INTGAME_HUD_STAGE_MINI);
+    bool leaving_mini = (prev_stage == INTGAME_HUD_STAGE_MINI
+        && intgame_hud_stage != INTGAME_HUD_STAGE_MINI);
+
+    if (entering_mini) {
+        intgame_hud_enter_mini_with_skills();
+        return;
+    }
+    if (leaving_mini) {
+        // Sync the secondary buttons back to RELEASED so the next K
+        // / M press behaves as an activation, not a dismiss-of-stale.
+        tig_button_state_change(
+            intgame_secondary_buttons[INTGAME_SECONDARY_BUTTON_SKILLS].button_handle,
+            TIG_BUTTON_STATE_RELEASED);
+        tig_button_state_change(
+            intgame_secondary_buttons[INTGAME_SECONDARY_BUTTON_SPELLS].button_handle,
+            TIG_BUTTON_STATE_RELEASED);
+        if (intgame_iso_window_type != ROTWIN_TYPE_MSG) {
+            iso_interface_window_swap(ROTWIN_TYPE_MSG);
+            return;
+        }
+    }
     intgame_hud_apply_clips();
 }
 
@@ -9040,9 +9204,96 @@ void intgame_hud_auto_pop_for_rotwin(void)
     }
     if (intgame_hud_stage == INTGAME_HUD_STAGE_MINI
         || intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN) {
+        // Stash the user's pre-rotwin stage so dismissing the rotwin
+        // can return to it. Don't overwrite an existing snapshot — a
+        // rotwin-to-rotwin switch (SKILLS->SPELLS) is still part of
+        // the same pop, and we want to restore the *original* state.
+        if (!intgame_hud_has_saved_stage) {
+            intgame_hud_saved_stage = intgame_hud_stage;
+            intgame_hud_has_saved_stage = true;
+        }
         intgame_hud_stage = INTGAME_HUD_STAGE_MEDIUM;
         intgame_hud_apply_clips();
     }
+}
+
+// Restore the pre-rotwin stage stashed by intgame_hud_auto_pop_for_rotwin.
+// Called when the rotwin returns to MSG (user re-pressed the dismiss key,
+// hovered off, magictech weapon cleared, etc.). No-op if nothing was
+// stashed or the interface isn't up.
+void intgame_hud_restore_after_rotwin(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (!intgame_hud_has_saved_stage) {
+        return;
+    }
+    IntgameHudStage restored = intgame_hud_saved_stage;
+    intgame_hud_has_saved_stage = false;
+    if (restored == INTGAME_HUD_STAGE_MINI) {
+        // Use the centralized MINI-invariant helper so type, stage,
+        // and button state all line up.
+        intgame_hud_enter_mini_with_skills();
+    } else {
+        intgame_hud_stage = restored;
+        intgame_hud_apply_clips();
+    }
+}
+
+// CE: enforce MINI invariants. MINI's whole point is "SKILLS rotwin
+// silently active so the slim row shows skill hover content". Any
+// path that lands us in MINI must call this so the rotwin and the
+// secondary button state stay in sync — TAB-into-MINI, MEDIUM-peek
+// return, dismiss-while-peeked, etc.
+static bool intgame_hud_in_mini_stage(void)
+{
+    return intgame_iso_interface_created
+        && intgame_hud_stage == INTGAME_HUD_STAGE_MINI;
+}
+
+static void intgame_hud_enter_mini_with_skills(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    intgame_hud_stage = INTGAME_HUD_STAGE_MINI;
+    if (intgame_iso_window_type != ROTWIN_TYPE_SKILLS) {
+        tig_button_state_change(
+            intgame_secondary_buttons[INTGAME_SECONDARY_BUTTON_SPELLS].button_handle,
+            TIG_BUTTON_STATE_RELEASED);
+        tig_button_state_change(
+            intgame_secondary_buttons[INTGAME_SECONDARY_BUTTON_SKILLS].button_handle,
+            TIG_BUTTON_STATE_PRESSED);
+        // swap re-applies clips for us.
+        iso_interface_window_swap(ROTWIN_TYPE_SKILLS);
+    } else {
+        intgame_hud_apply_clips();
+    }
+}
+
+static bool intgame_hud_handle_mini_peek_press(void)
+{
+    if (!intgame_iso_interface_created) {
+        return false;
+    }
+    // MINI -> MEDIUM peek: rotwin stays active, only the crop expands.
+    if (intgame_hud_stage == INTGAME_HUD_STAGE_MINI) {
+        intgame_hud_peek_from_mini = true;
+        intgame_hud_stage = INTGAME_HUD_STAGE_MEDIUM;
+        intgame_hud_apply_clips();
+        return true;
+    }
+    // MEDIUM (peeked) -> MINI return: same condition, opposite direction.
+    // Re-enter MINI invariants so SKILLS is active even if the user
+    // switched the rotwin to SPELLS while peeking.
+    if (intgame_hud_peek_from_mini
+        && intgame_hud_stage == INTGAME_HUD_STAGE_MEDIUM) {
+        intgame_hud_peek_from_mini = false;
+        intgame_hud_enter_mini_with_skills();
+        return true;
+    }
+    return false;
 }
 
 bool intgame_hud_is_user_hidden(void)
@@ -9055,4 +9306,73 @@ int intgame_hud_top_offset(void)
     // 41 = top HUD strip design height. Fate/sleep panels dock at
     // y=41 when the top bar is visible (FULL), y=0 otherwise.
     return intgame_hud_user_hidden ? 0 : 41;
+}
+
+// Half of the bottom strip's currently hidden height (in design coords).
+// The bottom strip is 159px tall; in MEDIUM/MINI/HIDDEN stages portions
+// of it are clipped out. tc.c (dialog options backdrop) shifts down by
+// this amount when shown so it takes half of the visual gap that the
+// cropped bar leaves behind.
+int intgame_hud_bottom_gap_offset(void)
+{
+    switch (intgame_hud_stage) {
+    case INTGAME_HUD_STAGE_FULL:
+        return 0;
+    case INTGAME_HUD_STAGE_MEDIUM:
+        // Chrome 107px visible; ~52 hidden. Half = 26.
+        return 26;
+    case INTGAME_HUD_STAGE_MINI:
+        // Only the 25px slim row visible; 134 hidden. Half = 67.
+        return 67;
+    case INTGAME_HUD_STAGE_HIDDEN:
+        // Entire 159 hidden. Half = 79.
+        return 79;
+    default:
+        return 0;
+    }
+}
+
+void intgame_hud_tick_invalidate_alpha_strips(void)
+{
+    // Currently only the bottom strip + (optionally) the big window opt
+    // in to per-pixel see-through. Tell gamelib to repaint the world
+    // under each every tick so the alpha-blend composite has fresh
+    // world pixels to blend against.
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
+            iso_invalidate_rect(&wd.rect);
+        }
+    }
+    if (intgame_big_window_locked
+        && intgame_big_window_handle != TIG_WINDOW_HANDLE_INVALID) {
+        TigWindowData bwd;
+        if (tig_window_data(intgame_big_window_handle, &bwd) == TIG_OK) {
+            iso_invalidate_rect(&bwd.rect);
+        }
+    }
+}
+
+// CE: Apply the optional TranslucentBlackUI effect to a window. Used
+// by inventory / paperdoll / loot / barter screens (and anything else
+// sharing the intgame_big_window_handle) to opt in/out at lock/unlock
+// time, since the big window is shared across UIs that may or may not
+// want the effect. enable=false disables it.
+void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    if (enable && !settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        // Cfg disables the feature globally — ensure the window has
+        // alpha cleared in case it was set by a prior owner.
+        tig_window_near_black_alpha_set(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0);
+        return;
+    }
+    tig_window_near_black_alpha_set(window_handle, enable,
+        intgame_iso_window, 8, 128);
 }

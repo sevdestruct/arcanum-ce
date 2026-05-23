@@ -29,6 +29,11 @@
 #define OBJECT_LIGHTING_KEY "object lighting"
 #define SHADOWS_KEY "shadows"
 
+// CE: blend near-black pixels in the HUD bar / inventory family of
+// windows with the game world underneath. Visually opens up dark
+// panel regions so the world peeks through. Defaults to 1 (enabled).
+#define TRANSLUCENT_BLACK_UI_KEY "translucent black ui"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 

@@ -326,6 +326,16 @@ bool gamelib_init(GameInitInfo* init_info)
     settings_register(&settings, DIFFICULTY_KEY, "1", difficulty_changed);
     difficulty_changed();
 
+    // CE: optional near-black see-through alpha on the HUD bar +
+    // inventory family of windows + modal dialogs. The tig-side
+    // modal hook applies the effect at modal-create time so quit /
+    // confirm dialogs blend with whatever's beneath them.
+    settings_register(&settings, TRANSLUCENT_BLACK_UI_KEY, "1", NULL);
+    tig_window_modal_translucent_black_set(
+        settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY) != 0,
+        8,
+        128);
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 

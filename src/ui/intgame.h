@@ -177,9 +177,29 @@ bool intgame_hud_is_user_hidden(void);
 // (K/M/skill/spell shortcut) while the HUD is in MINI or HIDDEN.
 // No-op for FULL and MEDIUM stages.
 void intgame_hud_auto_pop_for_rotwin(void);
+// CE: Restore the stage that was active before intgame_hud_auto_pop_for_rotwin
+// last fired (called from iso_interface_window_set when the rotwin
+// returns to MSG). No-op when no snapshot is stashed.
+void intgame_hud_restore_after_rotwin(void);
 // CE: Y-offset of the top HUD strip in design coords (41 when the
 // top bar is visible, 0 otherwise). Used by fate_ui / sleep_ui to
 // dock their panels flush at screen-top when the bar is cropped.
 int intgame_hud_top_offset(void);
+// CE: invalidate the world (iso VB) behind any HUD strip that opts in
+// to per-pixel see-through. Called every game tick so the world keeps
+// repainting under the bar's transparent regions and the alpha-blend
+// composite has fresh world pixels to blend against. No-op when no
+// strip has near-black-alpha enabled.
+void intgame_hud_tick_invalidate_alpha_strips(void);
+// CE: half of the bottom-strip's currently cropped-out height (in design
+// coords). 0 when stage is FULL. Used by the dialog options backdrop
+// (tc.c) to drop its position down into the freed space when the bar
+// is cropped, taking half the visual real-estate that the cropped
+// portion of the bar would have occupied.
+int intgame_hud_bottom_gap_offset(void);
+// CE: enable/disable the optional near-black see-through alpha on the
+// given window. Gated by the TranslucentBlackUI cfg flag — when off
+// (or enable=false), this clears any prior alpha state on the window.
+void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable);
 
 #endif /* ARCANUM_UI_INTGAME_H_ */
