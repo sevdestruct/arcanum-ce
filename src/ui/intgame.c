@@ -8847,6 +8847,16 @@ void intgame_hide(void)
     }
 }
 
+// CE: TAB-hide state (function definitions further below near
+// intgame_hud_user_toggle). Declared up here so intgame_show can
+// re-apply the off-screen move at the end of its restore path —
+// keeps the user's TAB-hide intact across modal menu cycles.
+static bool intgame_hud_user_hidden;
+static TigRect intgame_hud_saved_pos[2];
+
+#define INTGAME_HUD_OFFSCREEN_X (-10000)
+#define INTGAME_HUD_OFFSCREEN_Y (-10000)
+
 void intgame_show(void)
 {
     int index;
@@ -8880,4 +8890,88 @@ void intgame_show(void)
     tig_window_move(dword_64C4F8[1], rect.x, rect.y);
 
     follower_ui_show();
+
+    // CE: Re-apply the user's TAB-hide on top of all the above. Modal
+    // menus (Esc main menu, plain O Options, Cmd+Shift+S Save, Cmd+O
+    // Load, etc.) call intgame_show on close, which restores strips
+    // to in-game positions and would otherwise undo the TAB toggle.
+    // By re-moving the strips off-screen here, the TAB-hide persists
+    // through any modal menu cycle.
+    if (intgame_hud_user_hidden) {
+        int i;
+        for (i = 0; i < 2; i++) {
+            if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
+                tig_window_move(dword_64C4F8[i],
+                    INTGAME_HUD_OFFSCREEN_X, INTGAME_HUD_OFFSCREEN_Y);
+            }
+        }
+    }
+}
+
+// CE: User-toggleable HUD strip visibility. Bound to TAB in the main
+// keyboard handler.
+//
+// Key design choice: we MOVE the strip windows off-screen rather than
+// tig_window_hide() them. The reason: tig's keyboard message dispatch
+// (window.c:1455-1456) skips windows with TIG_WINDOW_HIDDEN set.
+// iso_interface_message_filter — which owns the I/K/M/C/F/R/S/T/W
+// inventory/skills/spells/etc. shortcuts — is registered to the strip
+// windows. tig_window_hide()ing the strips would kill those shortcuts
+// while the HUD was hidden, and the user explicitly wants to keep
+// being able to open inventory etc. while the HUD is hidden.
+//
+// Moving off-screen keeps the windows flag-visible (so dispatch fires
+// the filter, keyboard shortcuts continue to work) while making them
+// visually invisible (off-screen pixels clip during composite).
+//
+// Mouse events at the now-empty HUD area fall through to the iso
+// world window, which is the desired behavior (clicks on the world
+// in the freshly-revealed space act on the world).
+//
+// State (intgame_hud_user_hidden / intgame_hud_saved_pos) and the
+// OFFSCREEN macros are declared up near intgame_hide above so
+// intgame_show can re-apply this state at the end of its restore
+// path.
+
+void intgame_hud_user_toggle(void)
+{
+    int i;
+    TigWindowData wd;
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    intgame_hud_user_hidden = !intgame_hud_user_hidden;
+    if (intgame_hud_user_hidden) {
+        // Snapshot current position so we can restore on un-toggle,
+        // then move off-screen. Keep tig_window flag-visible so the
+        // message_filter on these windows keeps receiving keyboard
+        // events.
+        for (i = 0; i < 2; i++) {
+            if (dword_64C4F8[i] == TIG_WINDOW_HANDLE_INVALID) {
+                continue;
+            }
+            if (tig_window_data(dword_64C4F8[i], &wd) == TIG_OK) {
+                intgame_hud_saved_pos[i].x = wd.rect.x;
+                intgame_hud_saved_pos[i].y = wd.rect.y;
+                intgame_hud_saved_pos[i].width = wd.rect.width;
+                intgame_hud_saved_pos[i].height = wd.rect.height;
+            }
+            tig_window_move(dword_64C4F8[i],
+                INTGAME_HUD_OFFSCREEN_X, INTGAME_HUD_OFFSCREEN_Y);
+        }
+    } else {
+        // Restore to saved position.
+        for (i = 0; i < 2; i++) {
+            if (dword_64C4F8[i] == TIG_WINDOW_HANDLE_INVALID) {
+                continue;
+            }
+            tig_window_move(dword_64C4F8[i],
+                intgame_hud_saved_pos[i].x, intgame_hud_saved_pos[i].y);
+        }
+    }
+}
+
+bool intgame_hud_is_user_hidden(void)
+{
+    return intgame_hud_user_hidden;
 }

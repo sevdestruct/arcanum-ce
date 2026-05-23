@@ -165,4 +165,13 @@ int sub_557CF0(void);
 void intgame_hide(void);
 void intgame_show(void);
 
+// CE: User-toggleable HUD visibility (TAB key). Hides both iso HUD
+// strips (top and bottom bars) by moving them off-screen so their
+// message filters keep receiving keyboard / dialog input even while
+// the HUD is visually hidden. Distinct from intgame_hide (modal
+// hiding); this one tracks its own state so the user can toggle
+// on/off at will, and intgame_show re-applies it on modal close.
+void intgame_hud_user_toggle(void);
+bool intgame_hud_is_user_hidden(void);
+
 #endif /* ARCANUM_UI_INTGAME_H_ */

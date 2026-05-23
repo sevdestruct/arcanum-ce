@@ -560,6 +560,19 @@ void main_loop(void)
                         tig_window_display();
                         tig_debug_printf("completed.\n");
                         break;
+                    case SDL_SCANCODE_TAB:
+                        // CE: Toggle HUD strip visibility (both top and
+                        // bottom iso bars) for an unobstructed view of
+                        // the game world. Distinct from F10's compact-
+                        // interface toggle (which has no visible effect
+                        // in the current layout); this fully hides the
+                        // bars.
+                        if (!textedit_ui_is_focused()) {
+                            intgame_hud_user_toggle();
+                            iso_redraw();
+                            tig_window_display();
+                        }
+                        break;
                     case SDL_SCANCODE_O:
                         // Plain O → Options menu (existing in-game shortcut).
                         // Cmd/Ctrl+O → Load Game menu (mnemonic: "Open").
