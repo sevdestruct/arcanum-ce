@@ -291,6 +291,60 @@ int tig_video_buffer_fill(TigVideoBuffer* video_buffer, TigRect* rect, tig_color
 int tig_video_buffer_line(TigVideoBuffer* video_buffer, TigLine* line, TigRect* a3, tig_color_t color);
 int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
+
+// CE (feature/perf-gpu-accel Phase 2): GPU blit primitive.
+//
+// The source is a raw SDL_Texture (typically from the art GPU cache); the
+// destination must be a GPU-backed TigVideoBuffer (TIG_VIDEO_BUFFER_TEXTURE
+// flag set, i.e. TEXTUREACCESS_TARGET). The function temporarily binds the
+// destination as the render target and restores the previous target before
+// returning.
+//
+// Supported blend modes (subset of TigVideoBufferBlitFlags used by
+// tile_draw_iso):
+//   - TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP: per-corner color modulation.
+//     `lerp_rect` (in source-texture coordinates) defines the gradient field
+//     where lerp_colors[0..3] = TL, TR, BR, BL. `src_rect` is the visible
+//     sub-region of that field; the function bilinearly interpolates
+//     lerp_colors at src_rect's corners and emits 4 vertices with those
+//     colors via SDL_RenderGeometry. Matches the CPU
+//     TIG_ART_BLT_BLEND_COLOR_LERP semantics.
+//
+//   - TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST: SDL_SetTextureColorMod with
+//     lerp_colors[0], then SDL_RenderTexture. The color is reset before
+//     returning so subsequent blits aren't affected.
+//
+//   - No blend / FLIP_X / FLIP_Y: plain SDL_RenderTexture (with flip if
+//     either flag is set).
+//
+// Source-texture alpha is honored via SDL_BLENDMODE_BLEND so art uploaded
+// with a colorkey -> alpha=0 conversion renders transparent over the dst.
+//
+// Other TigVideoBufferBlitFlags (ALPHA_*, BLEND_ADD/MUL/AVG/etc) are not
+// supported in Phase 2; the function logs and returns TIG_ERR_GENERIC.
+typedef struct TigVideoBufferBlitGpuInfo {
+    TigVideoBufferBlitFlags flags;
+    SDL_Texture* src_texture;
+    TigRect* src_rect;
+    TigRect* lerp_rect;
+    tig_color_t lerp_colors[4];
+    TigVideoBuffer* dst_video_buffer;
+    TigRect* dst_rect;
+} TigVideoBufferBlitGpuInfo;
+
+int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info);
+
+// CE (feature/perf-gpu-accel Phase 2): one-shot upload of a CPU-backed
+// TigVideoBuffer (SDL_Surface) into a freshly created SDL_Texture suitable
+// for use as a `tig_video_buffer_blit_gpu` source. Returns NULL if the
+// input buffer is GPU-backed or the renderer isn't ready. The caller owns
+// the returned texture and must SDL_DestroyTexture it when done.
+//
+// Honors any color key set on the source surface (via
+// SDL_CreateTextureFromSurface, which converts the keyed pixels to alpha=0
+// and sets SDL_BLENDMODE_BLEND on the resulting texture). Sampling defaults
+// to nearest to match the rest of the pixel-art pipeline.
+SDL_Texture* tig_video_buffer_upload_to_texture(TigVideoBuffer* video_buffer);
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color);
 int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t tint_color, TigVideoBufferTintMode mode);
 

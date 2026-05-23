@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include "tig/font.h"
@@ -594,30 +595,123 @@ bool gamelib_init(GameInitInfo* init_info)
 
     iso_zoom_set_available(init_info->editor || gamelib_world_video_buffer != NULL);
 
-    // CE (feature/perf-gpu-accel Phase 1): smoke-test the new GPU-backed
-    // TigVideoBuffer path. Opt-in via arcanum.cfg `gpu buffer sanity check=1`.
-    // Creates a 256x256 SDL_Texture-backed buffer, immediately destroys it,
-    // and logs the outcome -- so the user can confirm SDL_Texture creation
-    // works on their machine before any real renderer code depends on it.
-    // Remove once Phase 3 lands.
+    // CE (feature/perf-gpu-accel Phase 1+2): smoke-test the new GPU paths.
+    // Opt-in via arcanum.cfg `gpu buffer sanity check=1`. Exercises:
+    //   1. GPU-backed TigVideoBuffer create/destroy (Phase 1).
+    //   2. CPU surface -> SDL_Texture upload helper (Phase 2).
+    //   3. tig_video_buffer_blit_gpu in plain / COLOR_CONST / COLOR_LERP
+    //      modes (Phase 2).
+    //   4. tig_art_gpu_cache_init / stats / exit lifecycle (Phase 2).
+    // Real callers come in Phase 3; this just confirms the path links and
+    // runs end-to-end on the user's hardware before then.
     settings_register(&settings, GPU_BUFFER_SANITY_CHECK_KEY, "0", NULL);
     if (settings_get_value(&settings, GPU_BUFFER_SANITY_CHECK_KEY) != 0) {
         TigVideoBufferCreateInfo gpu_check_info;
-        TigVideoBuffer* gpu_check_buf = NULL;
+        TigVideoBuffer* gpu_dst = NULL;
+        TigVideoBuffer* cpu_src = NULL;
+        SDL_Texture* gpu_src = NULL;
         int gpu_check_rc;
+        bool gpu_check_ok = true;
+
+        // (1) Create a GPU-backed destination buffer.
         gpu_check_info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
         gpu_check_info.width = 256;
         gpu_check_info.height = 256;
         gpu_check_info.color_key = 0;
         gpu_check_info.background_color = tig_color_make(0x40, 0x80, 0xC0);
-        gpu_check_rc = tig_video_buffer_create(&gpu_check_info, &gpu_check_buf);
-        if (gpu_check_rc == TIG_OK && gpu_check_buf != NULL) {
-            tig_debug_printf("gamelib_init: GPU buffer sanity check OK -- created and destroyed a 256x256 SDL_Texture buffer.\n");
-        } else {
-            tig_debug_printf("gamelib_init: GPU buffer sanity check FAILED (rc=%d).\n", gpu_check_rc);
+        gpu_check_rc = tig_video_buffer_create(&gpu_check_info, &gpu_dst);
+        if (gpu_check_rc != TIG_OK || gpu_dst == NULL) {
+            tig_debug_printf("gamelib_init: GPU sanity (1) buffer create FAILED rc=%d.\n", gpu_check_rc);
+            gpu_check_ok = false;
         }
-        if (gpu_check_buf != NULL) {
-            tig_video_buffer_destroy(gpu_check_buf);
+
+        // (2) Create a CPU source buffer and upload it as an SDL_Texture.
+        if (gpu_check_ok) {
+            TigVideoBufferCreateInfo cpu_info;
+            cpu_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+            cpu_info.width = 64;
+            cpu_info.height = 64;
+            cpu_info.color_key = 0;
+            cpu_info.background_color = tig_color_make(0xFF, 0xFF, 0xFF);
+            gpu_check_rc = tig_video_buffer_create(&cpu_info, &cpu_src);
+            if (gpu_check_rc != TIG_OK || cpu_src == NULL) {
+                tig_debug_printf("gamelib_init: GPU sanity (2) CPU buffer create FAILED rc=%d.\n", gpu_check_rc);
+                gpu_check_ok = false;
+            }
+        }
+        if (gpu_check_ok) {
+            gpu_src = tig_video_buffer_upload_to_texture(cpu_src);
+            if (gpu_src == NULL) {
+                tig_debug_printf("gamelib_init: GPU sanity (2) upload FAILED.\n");
+                gpu_check_ok = false;
+            }
+        }
+
+        // (3) Run all three blit_gpu paths.
+        if (gpu_check_ok) {
+            TigRect src_rect = { 0, 0, 64, 64 };
+            TigRect dst_rect = { 0, 0, 64, 64 };
+            TigVideoBufferBlitGpuInfo blit;
+            memset(&blit, 0, sizeof(blit));
+            blit.src_texture = gpu_src;
+            blit.src_rect = &src_rect;
+            blit.dst_video_buffer = gpu_dst;
+            blit.dst_rect = &dst_rect;
+
+            // 3a: plain.
+            blit.flags = 0;
+            if (tig_video_buffer_blit_gpu(&blit) != TIG_OK) {
+                tig_debug_printf("gamelib_init: GPU sanity (3a) plain blit FAILED.\n");
+                gpu_check_ok = false;
+            }
+
+            // 3b: COLOR_CONST.
+            blit.flags = TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
+            blit.lerp_colors[0] = tig_color_make(0x80, 0xC0, 0xFF);
+            if (tig_video_buffer_blit_gpu(&blit) != TIG_OK) {
+                tig_debug_printf("gamelib_init: GPU sanity (3b) COLOR_CONST blit FAILED.\n");
+                gpu_check_ok = false;
+            }
+
+            // 3c: COLOR_LERP.
+            TigRect lerp_rect = { 0, 0, 64, 64 };
+            blit.flags = TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
+            blit.lerp_rect = &lerp_rect;
+            blit.lerp_colors[0] = tig_color_make(0xFF, 0x00, 0x00);
+            blit.lerp_colors[1] = tig_color_make(0x00, 0xFF, 0x00);
+            blit.lerp_colors[2] = tig_color_make(0x00, 0x00, 0xFF);
+            blit.lerp_colors[3] = tig_color_make(0xFF, 0xFF, 0x00);
+            if (tig_video_buffer_blit_gpu(&blit) != TIG_OK) {
+                tig_debug_printf("gamelib_init: GPU sanity (3c) COLOR_LERP blit FAILED.\n");
+                gpu_check_ok = false;
+            }
+        }
+
+        // (4) Cache lifecycle.
+        if (gpu_check_ok) {
+            if (!tig_art_gpu_cache_init(0)) {
+                tig_debug_printf("gamelib_init: GPU sanity (4) cache init FAILED.\n");
+                gpu_check_ok = false;
+            } else {
+                TigArtGpuCacheStats stats;
+                tig_art_gpu_cache_stats(&stats);
+                tig_debug_printf("gamelib_init: GPU sanity (4) cache init OK -- budget=%zu bytes.\n", stats.budget_bytes);
+                tig_art_gpu_cache_exit();
+            }
+        }
+
+        if (gpu_check_ok) {
+            tig_debug_printf("gamelib_init: GPU sanity check OK (Phase 1+2 paths verified).\n");
+        }
+
+        if (gpu_src != NULL) {
+            SDL_DestroyTexture(gpu_src);
+        }
+        if (cpu_src != NULL) {
+            tig_video_buffer_destroy(cpu_src);
+        }
+        if (gpu_dst != NULL) {
+            tig_video_buffer_destroy(gpu_dst);
         }
     }
 

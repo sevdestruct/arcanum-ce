@@ -4,6 +4,7 @@
 #include <zlib.h>
 
 #include "tig/art.h"
+#include "tig/art_gpu_cache.h"
 #include "tig/bmp.h"
 #include "tig/bsearch.h"
 #include "tig/button.h"

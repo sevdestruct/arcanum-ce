@@ -557,6 +557,27 @@ static TigVideoBuffer* tig_art_composite_vb(tig_art_id_t art_id)
     return NULL;
 }
 
+// CE (feature/perf-gpu-accel Phase 2): public wrapper around the internal
+// cache_entry lookup + art_get_video_buffer flow. The returned pointer is
+// owned by the art cache and remains valid until the next cache flush /
+// eviction; callers must not destroy it.
+int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr)
+{
+    int cache_entry_index;
+
+    if (video_buffer_ptr == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    *video_buffer_ptr = NULL;
+
+    cache_entry_index = sub_51AA90(art_id);
+    if (cache_entry_index == -1) {
+        return TIG_ERR_IO;
+    }
+
+    return art_get_video_buffer(cache_entry_index, art_id, video_buffer_ptr);
+}
+
 // 0x502360
 int tig_art_blit(TigArtBlitInfo* blit_info)
 {

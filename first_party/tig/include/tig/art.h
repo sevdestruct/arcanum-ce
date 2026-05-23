@@ -442,6 +442,13 @@ void tig_art_set_composite_resolver(TigArtCompositeResolver func);
 // composite resolver; either or both may be registered independently.
 void tig_art_set_override_resolver(TigArtCompositeResolver func);
 
+// CE (feature/perf-gpu-accel Phase 2): look up the CPU-backed
+// TigVideoBuffer for an art_id, materializing it through the art cache the
+// same way `tig_art_blit` does. Returns TIG_OK on success and writes the
+// internal video buffer pointer to *video_buffer_ptr; callers must not
+// destroy it (the art cache owns it). Used by `tig_art_gpu_cache_get` to
+// source pixels for GPU texture upload.
+int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr);
 int tig_art_type(tig_art_id_t art_id);
 unsigned int tig_art_num_get(tig_art_id_t art_id);
 tig_art_id_t tig_art_num_set(tig_art_id_t art_id, unsigned int value);

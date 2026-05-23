@@ -2086,6 +2086,294 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
     return TIG_OK;
 }
 
+// CE (feature/perf-gpu-accel Phase 2): bilinear-interpolate the 4 lerp
+// colors at one corner of the visible sub-rect. lerp_rect is in source-
+// texture coordinates; (x, y) is one of src_rect's corners in the same
+// coords; lerp_colors are TL, TR, BR, BL of lerp_rect.
+static tig_color_t tig_video_buffer_blit_gpu_lerp_corner(
+    const tig_color_t* lerp_colors,
+    const TigRect* lerp_rect,
+    int x,
+    int y)
+{
+    // u, v are 0..1 within the lerp_rect.
+    float u = lerp_rect->width > 0
+        ? (float)(x - lerp_rect->x) / (float)lerp_rect->width
+        : 0.0f;
+    float v = lerp_rect->height > 0
+        ? (float)(y - lerp_rect->y) / (float)lerp_rect->height
+        : 0.0f;
+
+    // Bilinear: c = TL*(1-u)(1-v) + TR*u*(1-v) + BR*u*v + BL*(1-u)*v.
+    float w_tl = (1.0f - u) * (1.0f - v);
+    float w_tr = u * (1.0f - v);
+    float w_br = u * v;
+    float w_bl = (1.0f - u) * v;
+
+    float r = w_tl * (float)tig_color_get_red(lerp_colors[0])
+        + w_tr * (float)tig_color_get_red(lerp_colors[1])
+        + w_br * (float)tig_color_get_red(lerp_colors[2])
+        + w_bl * (float)tig_color_get_red(lerp_colors[3]);
+    float g = w_tl * (float)tig_color_get_green(lerp_colors[0])
+        + w_tr * (float)tig_color_get_green(lerp_colors[1])
+        + w_br * (float)tig_color_get_green(lerp_colors[2])
+        + w_bl * (float)tig_color_get_green(lerp_colors[3]);
+    float b = w_tl * (float)tig_color_get_blue(lerp_colors[0])
+        + w_tr * (float)tig_color_get_blue(lerp_colors[1])
+        + w_br * (float)tig_color_get_blue(lerp_colors[2])
+        + w_bl * (float)tig_color_get_blue(lerp_colors[3]);
+
+    if (r < 0.0f) r = 0.0f; else if (r > 255.0f) r = 255.0f;
+    if (g < 0.0f) g = 0.0f; else if (g > 255.0f) g = 255.0f;
+    if (b < 0.0f) b = 0.0f; else if (b > 255.0f) b = 255.0f;
+
+    return tig_color_make((uint8_t)r, (uint8_t)g, (uint8_t)b);
+}
+
+static void tig_video_buffer_blit_gpu_color_to_fcolor(tig_color_t c, SDL_FColor* out)
+{
+    out->r = (float)tig_color_get_red(c) / 255.0f;
+    out->g = (float)tig_color_get_green(c) / 255.0f;
+    out->b = (float)tig_color_get_blue(c) / 255.0f;
+    out->a = 1.0f;
+}
+
+// CE (feature/perf-gpu-accel Phase 2): GPU blit primitive. See header doc
+// for blend mode coverage. The dst must be a GPU-backed TigVideoBuffer
+// (TEXTUREACCESS_TARGET). Renderer state (target, color mod, blend mode)
+// is restored before returning so callers can stay agnostic to internal
+// state changes.
+int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
+{
+    SDL_Renderer* renderer;
+    SDL_Texture* prev_target;
+    SDL_FRect sdl_src;
+    SDL_FRect sdl_dst;
+    SDL_FlipMode flip_mode;
+    int rc = TIG_OK;
+
+    if (blit_info == NULL
+        || blit_info->src_texture == NULL
+        || blit_info->dst_video_buffer == NULL
+        || blit_info->src_rect == NULL
+        || blit_info->dst_rect == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    if (!tig_video_buffer_is_gpu(blit_info->dst_video_buffer)
+        || blit_info->dst_video_buffer->texture == NULL) {
+        tig_debug_printf("tig_video_buffer_blit_gpu: destination is not a GPU buffer.\n");
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    // Reject unsupported flag combinations early. Alpha-blend variants and
+    // arithmetic blends (ADD/MUL/AVG) aren't used by tile_draw_iso; we'll
+    // grow them when callers actually need them.
+    {
+        TigVideoBufferBlitFlags unsupported_blend =
+            TIG_VIDEO_BUFFER_BLIT_BLEND_ADD
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_MUL
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_AVG
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_SRC
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
+        if ((blit_info->flags & unsupported_blend) != 0) {
+            tig_debug_printf("tig_video_buffer_blit_gpu: unsupported blend flags 0x%x in Phase 2.\n",
+                blit_info->flags & unsupported_blend);
+            return TIG_ERR_GENERIC;
+        }
+    }
+
+    renderer = tig_video_state.renderer;
+    if (renderer == NULL) {
+        return TIG_ERR_GENERIC;
+    }
+
+    prev_target = SDL_GetRenderTarget(renderer);
+
+    if (!SDL_SetRenderTarget(renderer, blit_info->dst_video_buffer->texture)) {
+        tig_debug_printf("tig_video_buffer_blit_gpu: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
+        return TIG_ERR_GENERIC;
+    }
+
+    // Source-side alpha (e.g., from colorkey-converted art) needs blending
+    // to skip transparent pixels. SDL_BLENDMODE_BLEND is the standard
+    // src_alpha/(1-src_alpha) over-blend.
+    SDL_SetTextureBlendMode(blit_info->src_texture, SDL_BLENDMODE_BLEND);
+
+    sdl_src.x = (float)blit_info->src_rect->x;
+    sdl_src.y = (float)blit_info->src_rect->y;
+    sdl_src.w = (float)blit_info->src_rect->width;
+    sdl_src.h = (float)blit_info->src_rect->height;
+
+    sdl_dst.x = (float)blit_info->dst_rect->x;
+    sdl_dst.y = (float)blit_info->dst_rect->y;
+    sdl_dst.w = (float)blit_info->dst_rect->width;
+    sdl_dst.h = (float)blit_info->dst_rect->height;
+
+    flip_mode = SDL_FLIP_NONE;
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0) {
+        flip_mode |= SDL_FLIP_HORIZONTAL;
+    }
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0) {
+        flip_mode |= SDL_FLIP_VERTICAL;
+    }
+
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP) != 0) {
+        // 4-vertex quad with per-vertex colors computed from the 4 corners
+        // of src_rect within lerp_rect. SDL_RenderGeometry modulates the
+        // texture sample by the vertex color.
+        if (blit_info->lerp_rect == NULL) {
+            tig_debug_printf("tig_video_buffer_blit_gpu: BLEND_COLOR_LERP requires lerp_rect.\n");
+            rc = TIG_ERR_INVALID_PARAM;
+            goto restore;
+        }
+
+        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+
+        // Corner colors interpolated from lerp_colors at the 4 corners of
+        // src_rect (in source-texture coordinates) within lerp_rect.
+        tig_color_t c_tl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
+            blit_info->src_rect->x,
+            blit_info->src_rect->y);
+        tig_color_t c_tr = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
+            blit_info->src_rect->x + blit_info->src_rect->width,
+            blit_info->src_rect->y);
+        tig_color_t c_br = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
+            blit_info->src_rect->x + blit_info->src_rect->width,
+            blit_info->src_rect->y + blit_info->src_rect->height);
+        tig_color_t c_bl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
+            blit_info->src_rect->x,
+            blit_info->src_rect->y + blit_info->src_rect->height);
+
+        // SDL_RenderGeometry samples src at tex_coord (0..1 in texture
+        // space). Convert pixel-space src_rect to normalized coords via
+        // SDL_GetTextureSize so we don't have to hand the texture's pixel
+        // dimensions through the API.
+        float tex_w = 0.0f;
+        float tex_h = 0.0f;
+        if (!SDL_GetTextureSize(blit_info->src_texture, &tex_w, &tex_h) || tex_w <= 0.0f || tex_h <= 0.0f) {
+            tig_debug_printf("tig_video_buffer_blit_gpu: SDL_GetTextureSize failed: %s\n", SDL_GetError());
+            rc = TIG_ERR_GENERIC;
+            goto restore;
+        }
+
+        float u0 = sdl_src.x / tex_w;
+        float v0 = sdl_src.y / tex_h;
+        float u1 = (sdl_src.x + sdl_src.w) / tex_w;
+        float v1 = (sdl_src.y + sdl_src.h) / tex_h;
+
+        // Honor FLIP_X / FLIP_Y by swapping the UV mapping; SDL_RenderGeometry
+        // has no flip parameter.
+        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0) {
+            float t = u0; u0 = u1; u1 = t;
+        }
+        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0) {
+            float t = v0; v0 = v1; v1 = t;
+        }
+
+        SDL_Vertex verts[4];
+        verts[0].position.x = sdl_dst.x;
+        verts[0].position.y = sdl_dst.y;
+        verts[0].tex_coord.x = u0;
+        verts[0].tex_coord.y = v0;
+        tig_video_buffer_blit_gpu_color_to_fcolor(c_tl, &verts[0].color);
+
+        verts[1].position.x = sdl_dst.x + sdl_dst.w;
+        verts[1].position.y = sdl_dst.y;
+        verts[1].tex_coord.x = u1;
+        verts[1].tex_coord.y = v0;
+        tig_video_buffer_blit_gpu_color_to_fcolor(c_tr, &verts[1].color);
+
+        verts[2].position.x = sdl_dst.x + sdl_dst.w;
+        verts[2].position.y = sdl_dst.y + sdl_dst.h;
+        verts[2].tex_coord.x = u1;
+        verts[2].tex_coord.y = v1;
+        tig_video_buffer_blit_gpu_color_to_fcolor(c_br, &verts[2].color);
+
+        verts[3].position.x = sdl_dst.x;
+        verts[3].position.y = sdl_dst.y + sdl_dst.h;
+        verts[3].tex_coord.x = u0;
+        verts[3].tex_coord.y = v1;
+        tig_video_buffer_blit_gpu_color_to_fcolor(c_bl, &verts[3].color);
+
+        // Two triangles: (0,1,2) and (0,2,3).
+        static const int indices[6] = { 0, 1, 2, 0, 2, 3 };
+
+        if (!SDL_RenderGeometry(renderer, blit_info->src_texture, verts, 4, indices, 6)) {
+            tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderGeometry failed: %s\n", SDL_GetError());
+            rc = TIG_ERR_GENERIC;
+        }
+    } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST) != 0) {
+        // Single-color modulation via SDL_SetTextureColorMod, then a normal
+        // textured draw. Reset the mod after the draw so the texture is
+        // safe to reuse from another caller.
+        tig_color_t c = blit_info->lerp_colors[0];
+        SDL_SetTextureColorMod(blit_info->src_texture,
+            (uint8_t)tig_color_get_red(c),
+            (uint8_t)tig_color_get_green(c),
+            (uint8_t)tig_color_get_blue(c));
+
+        if (flip_mode != SDL_FLIP_NONE) {
+            if (!SDL_RenderTextureRotated(renderer, blit_info->src_texture, &sdl_src, &sdl_dst, 0.0, NULL, flip_mode)) {
+                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTextureRotated failed: %s\n", SDL_GetError());
+                rc = TIG_ERR_GENERIC;
+            }
+        } else {
+            if (!SDL_RenderTexture(renderer, blit_info->src_texture, &sdl_src, &sdl_dst)) {
+                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTexture failed: %s\n", SDL_GetError());
+                rc = TIG_ERR_GENERIC;
+            }
+        }
+
+        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+    } else {
+        // Plain copy with optional flip.
+        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+
+        if (flip_mode != SDL_FLIP_NONE) {
+            if (!SDL_RenderTextureRotated(renderer, blit_info->src_texture, &sdl_src, &sdl_dst, 0.0, NULL, flip_mode)) {
+                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTextureRotated failed: %s\n", SDL_GetError());
+                rc = TIG_ERR_GENERIC;
+            }
+        } else {
+            if (!SDL_RenderTexture(renderer, blit_info->src_texture, &sdl_src, &sdl_dst)) {
+                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTexture failed: %s\n", SDL_GetError());
+                rc = TIG_ERR_GENERIC;
+            }
+        }
+    }
+
+restore:
+    SDL_SetRenderTarget(renderer, prev_target);
+    return rc;
+}
+
+// CE (feature/perf-gpu-accel Phase 2): see header doc. Used by the art
+// GPU cache to upload a CPU-backed art surface to a GPU texture for use
+// as a `tig_video_buffer_blit_gpu` source.
+SDL_Texture* tig_video_buffer_upload_to_texture(TigVideoBuffer* video_buffer)
+{
+    SDL_Texture* tex;
+
+    if (video_buffer == NULL || tig_video_state.renderer == NULL) {
+        return NULL;
+    }
+    if (tig_video_buffer_is_gpu(video_buffer) || video_buffer->surface == NULL) {
+        tig_debug_printf("tig_video_buffer_upload_to_texture: source must be a CPU buffer.\n");
+        return NULL;
+    }
+
+    tex = SDL_CreateTextureFromSurface(tig_video_state.renderer, video_buffer->surface);
+    if (tex == NULL) {
+        tig_debug_printf("tig_video_buffer_upload_to_texture: SDL_CreateTextureFromSurface failed: %s\n",
+            SDL_GetError());
+        return NULL;
+    }
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+    return tex;
+}
+
 // 0x522F30
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color)
 {

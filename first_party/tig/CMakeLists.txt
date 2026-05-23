@@ -1,6 +1,7 @@
 # Keep alphabetically sorted.
 set(HDRS
     "include/tig/art.h"
+    "include/tig/art_gpu_cache.h"
     "include/tig/bmp.h"
     "include/tig/bsearch.h"
     "include/tig/button.h"
@@ -34,6 +35,7 @@ set(HDRS
 # Keep alphabetically sorted.
 set(SRCS
     "src/art.c"
+    "src/art_gpu_cache.c"
     "src/bmp.c"
     "src/bsearch.c"
     "src/button.c"
