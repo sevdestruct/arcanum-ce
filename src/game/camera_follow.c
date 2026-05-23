@@ -13,7 +13,6 @@
 #include "game/settings.h"
 #include "game/tc.h"
 #include "tig/timer.h"
-#include "ui/intgame.h"
 
 // === Tunables ===========================================================
 //
@@ -396,14 +395,13 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
 
-    // When the user has TAB-hidden the HUD strips, the top and bottom
-    // bar areas are part of the visible game world — don't subtract
-    // them from the usable area. Otherwise the safe zone would
-    // unnecessarily push PC toward screen center and waste the freshly
-    // visible space.
-    bool hud_hidden = intgame_hud_is_user_hidden();
-    int usable_top = hud_hidden ? 0 : GAME_UI_BAR_TOP;
-    int usable_bot = cr.height - (hud_hidden ? 0 : GAME_UI_BAR_BOTTOM);
+    // HUD strips are always present in this branch's safe-zone
+    // accounting. The HUD-aware path that consulted
+    // intgame_hud_is_user_hidden() returns when the TAB-hide
+    // feature rejoins this branch via the rebase chain through the
+    // PR branch / custom-ui — see HANDOFF_TAB_HUD_CROP.md.
+    int usable_top = GAME_UI_BAR_TOP;
+    int usable_bot = cr.height - GAME_UI_BAR_BOTTOM;
     int usable_w   = cr.width;
     int usable_h   = usable_bot - usable_top;
 
