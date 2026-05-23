@@ -128,6 +128,7 @@ static void difficulty_changed(void);
 static void gamelib_draw_game(GameDrawInfo* draw_info);
 static void gamelib_draw_editor(GameDrawInfo* draw_info);
 static uint64_t gamelib_zoom_perf_now_ns(void);
+static void gamelib_zoom_perf_log(const char* line);
 static void gamelib_logo(void);
 static void gamelib_splash(tig_window_handle_t window_handle);
 static void gamelib_load_data(void);
@@ -1004,6 +1005,24 @@ uint64_t gamelib_perf_now_ns(void)
     return gamelib_zoom_perf_now_ns();
 }
 
+// Threshold above which a single loop-step measurement is treated as a
+// megahitch and logged inline (rather than being averaged into the
+// 60-frame aggregate). 100ms is ~12x the typical loop budget on a
+// 120Hz display — catches real perceptible pauses (e.g. save flush,
+// sector load, art cache eviction) without spamming on routine vsync
+// misses.
+#define GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS 100000000ull
+
+static void gamelib_perf_log_megahitch(const char* bucket, uint64_t ns)
+{
+    char line[256];
+    snprintf(line, sizeof(line),
+        "[megahitch] %s took %.1fms (%.2fs) — single iteration\n",
+        bucket, (double)ns / 1e6, (double)ns / 1e9);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
 void gamelib_perf_record_tig_ping_ns(uint64_t ns)
 {
     if (!gamelib_zoom_perf_enabled) return;
@@ -1012,6 +1031,9 @@ void gamelib_perf_record_tig_ping_ns(uint64_t ns)
         gamelib_zoom_perf_tig_ping_max_ns = ns;
     }
     gamelib_zoom_perf_tig_ping_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("tig_ping", ns);
+    }
 }
 
 void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
@@ -1022,6 +1044,9 @@ void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
         gamelib_zoom_perf_iso_redraw_max_ns = ns;
     }
     gamelib_zoom_perf_iso_redraw_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("iso_redraw", ns);
+    }
 }
 
 void gamelib_perf_record_window_display_ns(uint64_t ns)
@@ -1032,6 +1057,9 @@ void gamelib_perf_record_window_display_ns(uint64_t ns)
         gamelib_zoom_perf_window_display_max_ns = ns;
     }
     gamelib_zoom_perf_window_display_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("win_display", ns);
+    }
 }
 
 void gamelib_perf_record_key_repeat_ns(uint64_t ns)
@@ -1042,6 +1070,9 @@ void gamelib_perf_record_key_repeat_ns(uint64_t ns)
         gamelib_zoom_perf_key_repeat_max_ns = ns;
     }
     gamelib_zoom_perf_key_repeat_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("key_repeat", ns);
+    }
 }
 
 void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
@@ -1052,6 +1083,9 @@ void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
         gamelib_zoom_perf_event_dispatch_max_ns = ns;
     }
     gamelib_zoom_perf_event_dispatch_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("event_dispatch", ns);
+    }
 }
 
 // Append a single line to /tmp/arcanum-zoom-perf.log so the perf summary

@@ -736,18 +736,21 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                 if (sector_lock_results[v15]) {
                     for (v42 = 0; v42 < v3->num_hor_tiles[v15]; v42++) {
                         blit_info_initialized = false;
-                        art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
-                        tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
                         // Fast-reject tiles outside the dirty-rect union
                         // before paying for roof_is_covered_xy (which does
                         // sector lookups). Tile rect math matches what
-                        // the slow path computes below.
+                        // the slow path computes below. Also defer
+                        // sectors[].tiles.art_ids[] dereference and
+                        // tig_art_tile_id_type_get() into the slow path —
+                        // both are needed only when we actually draw.
                         bool tile_in_dirty = tile_draw_dirty_union_set
                             && (center_x + 1) < tile_draw_dirty_union.x + tile_draw_dirty_union.width
                             && (center_x + 1 + tile_rect.width) > tile_draw_dirty_union.x
                             && center_y < tile_draw_dirty_union.y + tile_draw_dirty_union.height
                             && (center_y + tile_rect.height) > tile_draw_dirty_union.y;
                         if (tile_in_dirty && !roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
+                            art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
+                            tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
                             tile_rect.x = center_x + 1;
                             tile_rect.y = center_y;
 
