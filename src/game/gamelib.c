@@ -1,6 +1,16 @@
 #include "game/gamelib.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <time.h>
+
+#include "game/camera_follow.h"
+#include "game/camera_tween.h"
+#include "game/dialog_camera.h"
+#include "game/iso_zoom.h"
+#include "game/location.h"
+#include "game/tile.h"
 
 #include "game/ai.h"
 #include "game/anim.h"
@@ -119,6 +129,8 @@ static int game_save_entry_compare_by_name(const void* va, const void* vb);
 static void difficulty_changed(void);
 static void gamelib_draw_game(GameDrawInfo* draw_info);
 static void gamelib_draw_editor(GameDrawInfo* draw_info);
+static uint64_t gamelib_zoom_perf_now_ns(void);
+static void gamelib_zoom_perf_log(const char* line);
 static void gamelib_logo(void);
 static void gamelib_splash(tig_window_handle_t window_handle);
 static void gamelib_load_data(void);
@@ -304,6 +316,88 @@ Settings settings;
 // 0x739E7C
 TigVideoBuffer* gamelib_scratch_video_buffer;
 
+static TigVideoBuffer* gamelib_world_video_buffer = NULL;
+static TigVideoBuffer* gamelib_iso_window_vb = NULL;
+static bool gamelib_zoom_world_pass_active = false;
+
+// Zoom-out draw perf counter. See gamelib_zoom_perf_toggle().
+static bool gamelib_zoom_perf_enabled = false;
+static int gamelib_zoom_perf_frames = 0;
+static int gamelib_zoom_perf_full_frames = 0;
+// Switched to ns precision so we can compute zoom_total - render - blit
+// = other-work (setup/teardown) without losing precision.
+static uint64_t gamelib_zoom_perf_total_render_ns = 0;
+static uint64_t gamelib_zoom_perf_total_blit_ns = 0;
+static int64_t gamelib_zoom_perf_total_dirty_px = 0;
+static float gamelib_zoom_perf_last_z = 1.0f;
+// High-precision wall-clock frame-interval tracker. Captures TOTAL
+// frame cost (render + AI + script + present + everything else
+// between draws), not just our render bucket. Reports avg, max, and
+// stddev so we can see jitter/spikes that aren't visible in averages.
+static uint64_t gamelib_zoom_perf_last_ns = 0;
+static uint64_t gamelib_zoom_perf_total_frame_ns = 0;
+static uint64_t gamelib_zoom_perf_max_frame_ns = 0;
+static double gamelib_zoom_perf_sum_sq_frame_ms = 0.0;
+static int gamelib_zoom_perf_frame_ns_samples = 0;
+// Per-frame breakdown of the zoom-active path. zoom_total = start of
+// zoom-active processing through end of blit; other = total - render
+// - blit (setup/teardown bucket).
+static uint64_t gamelib_zoom_perf_total_zoom_ns = 0;
+static uint64_t gamelib_zoom_perf_max_zoom_ns = 0;
+static uint64_t gamelib_zoom_perf_total_other_ns = 0;
+static uint64_t gamelib_zoom_perf_max_other_ns = 0;
+// Per-subsystem ping-time bucket, accumulated in gamelib_ping. Only sums
+// while gamelib_zoom_perf_enabled is on. Lets the perf log surface which
+// subsystem is eating the gap between zoom-active render time and total
+// frame time (typically 15-30ms outside the zoom path).
+#define GAMELIB_PERF_MAX_MODULES 64
+static uint64_t gamelib_zoom_perf_ping_module_total_ns[GAMELIB_PERF_MAX_MODULES];
+static uint64_t gamelib_zoom_perf_ping_module_max_ns[GAMELIB_PERF_MAX_MODULES];
+static uint64_t gamelib_zoom_perf_ping_total_ns = 0;
+static uint64_t gamelib_zoom_perf_ping_max_ns = 0;
+static int gamelib_zoom_perf_ping_samples = 0;
+// Main-loop bucket accumulators. Recorded by main.c around each call so
+// we can attribute the inter-frame gap (which gamelib_ping data showed
+// is ~0.1ms) to the actual culprits — tig_ping subsystems, render
+// dispatch, or window present / vsync.
+static uint64_t gamelib_zoom_perf_tig_ping_total_ns = 0;
+static uint64_t gamelib_zoom_perf_tig_ping_max_ns = 0;
+static int gamelib_zoom_perf_tig_ping_samples = 0;
+static uint64_t gamelib_zoom_perf_iso_redraw_total_ns = 0;
+static uint64_t gamelib_zoom_perf_iso_redraw_max_ns = 0;
+static int gamelib_zoom_perf_iso_redraw_samples = 0;
+static uint64_t gamelib_zoom_perf_window_display_total_ns = 0;
+static uint64_t gamelib_zoom_perf_window_display_max_ns = 0;
+static int gamelib_zoom_perf_window_display_samples = 0;
+static uint64_t gamelib_zoom_perf_key_repeat_total_ns = 0;
+static uint64_t gamelib_zoom_perf_key_repeat_max_ns = 0;
+static int gamelib_zoom_perf_key_repeat_samples = 0;
+static uint64_t gamelib_zoom_perf_event_dispatch_total_ns = 0;
+static uint64_t gamelib_zoom_perf_event_dispatch_max_ns = 0;
+static int gamelib_zoom_perf_event_dispatch_samples = 0;
+// First few main-loop iterations after F9-toggle-on always show cold-cache
+// outliers: 108ms tig_ping, 47ms object_max, etc. — perf counters warming
+// up, CPU caches cold, accumulators allocating. Skip those samples so they
+// don't pollute worst-case numbers. Driven by the first record-function
+// called per loop iteration (tig_ping).
+#define GAMELIB_PERF_WARMUP_ITERATIONS 2
+static int gamelib_zoom_perf_warmup_count = 0;
+static bool gamelib_zoom_perf_warmed_up = false;
+// Per-render-pass accumulators. iso_redraw is dominated by gamelib_draw_game
+// which calls light/tile/object/roof in sequence. Breaking out each pass
+// lets us identify which one drives the heavy-frame (10-20ms iso_redraw)
+// spikes during scroll-at-zoom-out.
+static uint64_t gamelib_zoom_perf_pass_light_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_light_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_tile_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_tile_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_object_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_object_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_roof_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_roof_max_ns = 0;
+static int gamelib_zoom_perf_pass_samples = 0;
+#define GAMELIB_ZOOM_PERF_INTERVAL 60
+
 // 0x4020F0
 bool gamelib_init(GameInitInfo* init_info)
 {
@@ -326,15 +420,12 @@ bool gamelib_init(GameInitInfo* init_info)
     settings_register(&settings, DIFFICULTY_KEY, "1", difficulty_changed);
     difficulty_changed();
 
-    // CE: optional near-black see-through alpha on the HUD bar +
-    // inventory family of windows + modal dialogs. The tig-side
-    // modal hook applies the effect at modal-create time so quit /
-    // confirm dialogs blend with whatever's beneath them.
+    // CE: optional translucent-black effect on the HUD bar (and any
+    // other window that opts in via intgame_apply_translucent_black).
+    // Dialog-backdrop-style tint: pre-bake the bar's near-black pixels
+    // to color-key transparency, per-tick subtract-tint the iso pixels
+    // under the bar, plain hardware color-key blit in compositor.
     settings_register(&settings, TRANSLUCENT_BLACK_UI_KEY, "1", NULL);
-    tig_window_modal_translucent_black_set(
-        settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY) != 0,
-        8,
-        128);
 
     // CE: Opt-in for vanilla "snap camera to PC on overlay open". Default
     // off — opening Inventory / Logbook / Schematic / Written / Options
@@ -346,6 +437,24 @@ bool gamelib_init(GameInitInfo* init_info)
     // it should always show the player. Set to "0" for vanilla behavior
     // (lens copies whatever is at screen center).
     settings_register(&settings, PC_LENS_FOLLOWS_PLAYER_KEY, "1", NULL);
+
+    // CE: Renderer vsync mode. Default 2 (adaptive) — measured ~17%
+    // lower frame avg and ~21% lower stddev vs vanilla vsync on a 120Hz
+    // ProMotion display, with no perceptible tearing during normal
+    // gameplay. 1 = vsync on (zero tearing guarantee, the safer choice
+    // if tearing bothers you). 0 = off (uncapped, mostly benchmarking).
+    // 2 maps to SDL_RENDERER_VSYNC_ADAPTIVE (which is -1 in SDL).
+    settings_register(&settings, SOUND_ASYNC_LOAD_KEY, "1", NULL);
+    tig_sound_async_set_enabled(settings_get_value(&settings, SOUND_ASYNC_LOAD_KEY) != 0);
+
+    settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
+    {
+        int vsync_setting = settings_get_value(&settings, VSYNC_MODE_KEY);
+        int sdl_mode = vsync_setting == 2 ? SDL_RENDERER_VSYNC_ADAPTIVE
+            : vsync_setting == 0 ? 0
+            : 1;
+        tig_video_set_vsync_mode(sdl_mode);
+    }
 
     gamelib_mod_loaded = false;
     gamelib_load_data();
@@ -389,6 +498,23 @@ bool gamelib_init(GameInitInfo* init_info)
         return false;
     }
 
+    tig_window_vbid_get(init_info->iso_window_handle, &gamelib_iso_window_vb);
+
+    if (!init_info->editor) {
+        TigVideoBufferCreateInfo world_vb_info;
+        world_vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        world_vb_info.width = window_data.rect.width * 2;
+        world_vb_info.height = window_data.rect.height * 2;
+        world_vb_info.color_key = 0;
+        world_vb_info.background_color = 0;
+        if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
+            gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_init: zoom disabled because world video buffer allocation failed.\n");
+        }
+    }
+
+    iso_zoom_set_available(init_info->editor || gamelib_world_video_buffer != NULL);
+
     if (init_info->editor) {
         gamelib_draw_func = gamelib_draw_editor;
     } else {
@@ -413,6 +539,11 @@ bool gamelib_init(GameInitInfo* init_info)
                 return false;
             }
         }
+    }
+
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
     }
 
     return true;
@@ -499,6 +630,11 @@ void gamelib_exit(void)
         gamelib_scratch_video_buffer = NULL;
     }
 
+    if (gamelib_world_video_buffer != NULL) {
+        tig_video_buffer_destroy(gamelib_world_video_buffer);
+        gamelib_world_video_buffer = NULL;
+    }
+
     if (tig_file_is_directory("Save\\Current")) {
         if (!tig_file_empty_directory("Save\\Current")) {
             // FIXME: Typo in function name, this is definitely not
@@ -517,10 +653,30 @@ void gamelib_ping(void)
 
     tig_timer_now(&gamelib_ping_time);
 
+    bool perf_on = gamelib_zoom_perf_enabled;
+    uint64_t ping_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
+
     for (index = 0; index < MODULE_COUNT; index++) {
         if (gamelib_modules[index].ping_func != NULL) {
+            uint64_t mod_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
             gamelib_modules[index].ping_func(gamelib_ping_time);
+            if (perf_on && index < GAMELIB_PERF_MAX_MODULES) {
+                uint64_t mod_dur_ns = gamelib_zoom_perf_now_ns() - mod_start_ns;
+                gamelib_zoom_perf_ping_module_total_ns[index] += mod_dur_ns;
+                if (mod_dur_ns > gamelib_zoom_perf_ping_module_max_ns[index]) {
+                    gamelib_zoom_perf_ping_module_max_ns[index] = mod_dur_ns;
+                }
+            }
         }
+    }
+
+    if (perf_on) {
+        uint64_t ping_dur_ns = gamelib_zoom_perf_now_ns() - ping_start_ns;
+        gamelib_zoom_perf_ping_total_ns += ping_dur_ns;
+        if (ping_dur_ns > gamelib_zoom_perf_ping_max_ns) {
+            gamelib_zoom_perf_ping_max_ns = ping_dur_ns;
+        }
+        gamelib_zoom_perf_ping_samples++;
     }
 }
 
@@ -558,10 +714,37 @@ void gamelib_resize(GameResizeInfo* resize_info)
         return;
     }
 
+    tig_window_vbid_get(resize_info->window_handle, &gamelib_iso_window_vb);
+
+    if (gamelib_world_video_buffer != NULL) {
+        tig_video_buffer_destroy(gamelib_world_video_buffer);
+        gamelib_world_video_buffer = NULL;
+    }
+
+    if (gamelib_draw_func == gamelib_draw_game) {
+        TigVideoBufferCreateInfo world_vb_info;
+        world_vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        world_vb_info.width = gamelib_iso_content_rect.width * 2;
+        world_vb_info.height = gamelib_iso_content_rect.height * 2;
+        world_vb_info.color_key = 0;
+        world_vb_info.background_color = 0;
+        if (tig_video_buffer_create(&world_vb_info, &gamelib_world_video_buffer) != TIG_OK) {
+            gamelib_world_video_buffer = NULL;
+            tig_debug_printf("gamelib_resize: zoom disabled because world video buffer allocation failed.\n");
+        }
+    }
+
+    iso_zoom_set_available(gamelib_draw_func != gamelib_draw_game || gamelib_world_video_buffer != NULL);
+
     for (index = 0; index < MODULE_COUNT; index++) {
         if (gamelib_modules[index].resize_func != NULL) {
             gamelib_modules[index].resize_func(resize_info);
         }
+    }
+
+    if (gamelib_world_video_buffer != NULL) {
+        TigRect zoom_content_rect = { 0, 0, gamelib_iso_content_rect.width * 2, gamelib_iso_content_rect.height * 2 };
+        light_preallocate_for_zoom(&zoom_content_rect);
     }
 
     if (gamelib_dirty_rects_head != NULL) {
@@ -817,19 +1000,283 @@ void gamelib_get_view_options(ViewOptions* view_options)
     *view_options = gamelib_view_options;
 }
 
+// Monotonic nanoseconds. CLOCK_MONOTONIC is portable to macOS/Linux.
+static uint64_t gamelib_zoom_perf_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t gamelib_perf_now_ns(void)
+{
+    return gamelib_zoom_perf_now_ns();
+}
+
+// Threshold above which a single loop-step measurement is treated as a
+// megahitch and logged inline (rather than being averaged into the
+// 60-frame aggregate). 100ms is ~12x the typical loop budget on a
+// 120Hz display — catches real perceptible pauses (e.g. save flush,
+// sector load, art cache eviction) without spamming on routine vsync
+// misses.
+#define GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS 100000000ull
+
+static void gamelib_perf_log_megahitch(const char* bucket, uint64_t ns)
+{
+    char line[256];
+    snprintf(line, sizeof(line),
+        "[megahitch] %s took %.1fms (%.2fs) — single iteration\n",
+        bucket, (double)ns / 1e6, (double)ns / 1e9);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
+void gamelib_perf_record_tig_ping_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    // First main-loop step recorded per iteration — also drives the
+    // warmup counter. Skip until we're past the first few cold-cache
+    // iterations after F9-on.
+    if (!gamelib_zoom_perf_warmed_up) {
+        gamelib_zoom_perf_warmup_count++;
+        if (gamelib_zoom_perf_warmup_count >= GAMELIB_PERF_WARMUP_ITERATIONS) {
+            gamelib_zoom_perf_warmed_up = true;
+        }
+        return;
+    }
+    gamelib_zoom_perf_tig_ping_total_ns += ns;
+    if (ns > gamelib_zoom_perf_tig_ping_max_ns) {
+        gamelib_zoom_perf_tig_ping_max_ns = ns;
+    }
+    gamelib_zoom_perf_tig_ping_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("tig_ping", ns);
+    }
+}
+
+void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    gamelib_zoom_perf_iso_redraw_total_ns += ns;
+    if (ns > gamelib_zoom_perf_iso_redraw_max_ns) {
+        gamelib_zoom_perf_iso_redraw_max_ns = ns;
+    }
+    gamelib_zoom_perf_iso_redraw_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("iso_redraw", ns);
+    }
+}
+
+void gamelib_perf_record_window_display_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    gamelib_zoom_perf_window_display_total_ns += ns;
+    if (ns > gamelib_zoom_perf_window_display_max_ns) {
+        gamelib_zoom_perf_window_display_max_ns = ns;
+    }
+    gamelib_zoom_perf_window_display_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("win_display", ns);
+    }
+}
+
+void gamelib_perf_record_key_repeat_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    gamelib_zoom_perf_key_repeat_total_ns += ns;
+    if (ns > gamelib_zoom_perf_key_repeat_max_ns) {
+        gamelib_zoom_perf_key_repeat_max_ns = ns;
+    }
+    gamelib_zoom_perf_key_repeat_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("key_repeat", ns);
+    }
+}
+
+void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    gamelib_zoom_perf_event_dispatch_total_ns += ns;
+    if (ns > gamelib_zoom_perf_event_dispatch_max_ns) {
+        gamelib_zoom_perf_event_dispatch_max_ns = ns;
+    }
+    gamelib_zoom_perf_event_dispatch_samples++;
+    if (ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        gamelib_perf_log_megahitch("event_dispatch", ns);
+    }
+}
+
+void gamelib_perf_log_event(const char* context, uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    if (ns <= GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) return;
+    char line[384];
+    snprintf(line, sizeof(line),
+        "[megahitch] event: %s took %.1fms (%.2fs)\n",
+        context, (double)ns / 1e6, (double)ns / 1e9);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
+// 50ms is about 3 missed vsync slots on a 120Hz display. Below the
+// per-bucket megahitch threshold (100ms) so we catch cumulative
+// slowness that no single call would trip on its own.
+#define GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS 50000000ull
+
+void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
+    uint64_t tig_ping_ns, uint64_t key_repeat_ns,
+    uint64_t iso_redraw_ns, uint64_t win_display_ns,
+    uint64_t event_dispatch_ns)
+{
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
+    if (total_ns <= GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS) return;
+
+    // Suppress if any single bucket already tripped the per-bucket
+    // megahitch logger (>=100ms) — avoid duplicate noise for the
+    // same slow iteration. (The per-bucket logger already named
+    // the culprit; the loop-total line would add nothing.)
+    if (tig_ping_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || key_repeat_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || iso_redraw_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || win_display_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
+        || event_dispatch_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) {
+        return;
+    }
+
+    char line[384];
+    snprintf(line, sizeof(line),
+        "[slow-loop] total %.1fms — tig_ping %.2f, key_repeat %.2f, iso_redraw %.2f, win_display %.2f, event_dispatch %.2f (ms)\n",
+        (double)total_ns / 1e6,
+        (double)tig_ping_ns / 1e6,
+        (double)key_repeat_ns / 1e6,
+        (double)iso_redraw_ns / 1e6,
+        (double)win_display_ns / 1e6,
+        (double)event_dispatch_ns / 1e6);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
+// Append a single line to /tmp/arcanum-zoom-perf.log so the perf summary
+// is readable without dealing with macOS unified logging filters.
+static void gamelib_zoom_perf_log(const char* line)
+{
+    FILE* fp = fopen("/tmp/arcanum-zoom-perf.log", "a");
+    if (fp != NULL) {
+        fputs(line, fp);
+        fclose(fp);
+    }
+}
+
+void gamelib_zoom_perf_toggle(void)
+{
+    gamelib_zoom_perf_enabled = !gamelib_zoom_perf_enabled;
+    tig_video_flip_perf_set_enabled(gamelib_zoom_perf_enabled);
+    gamelib_zoom_perf_frames = 0;
+    gamelib_zoom_perf_full_frames = 0;
+    gamelib_zoom_perf_total_render_ns = 0;
+    gamelib_zoom_perf_total_blit_ns = 0;
+    gamelib_zoom_perf_total_dirty_px = 0;
+    gamelib_zoom_perf_last_ns = 0;
+    gamelib_zoom_perf_total_frame_ns = 0;
+    gamelib_zoom_perf_max_frame_ns = 0;
+    gamelib_zoom_perf_sum_sq_frame_ms = 0.0;
+    gamelib_zoom_perf_frame_ns_samples = 0;
+    gamelib_zoom_perf_total_zoom_ns = 0;
+    gamelib_zoom_perf_max_zoom_ns = 0;
+    gamelib_zoom_perf_total_other_ns = 0;
+    gamelib_zoom_perf_max_other_ns = 0;
+    gamelib_zoom_perf_ping_total_ns = 0;
+    gamelib_zoom_perf_ping_max_ns = 0;
+    gamelib_zoom_perf_ping_samples = 0;
+    for (int i = 0; i < GAMELIB_PERF_MAX_MODULES; i++) {
+        gamelib_zoom_perf_ping_module_total_ns[i] = 0;
+        gamelib_zoom_perf_ping_module_max_ns[i] = 0;
+    }
+    gamelib_zoom_perf_tig_ping_total_ns = 0;
+    gamelib_zoom_perf_tig_ping_max_ns = 0;
+    gamelib_zoom_perf_tig_ping_samples = 0;
+    gamelib_zoom_perf_iso_redraw_total_ns = 0;
+    gamelib_zoom_perf_iso_redraw_max_ns = 0;
+    gamelib_zoom_perf_iso_redraw_samples = 0;
+    gamelib_zoom_perf_window_display_total_ns = 0;
+    gamelib_zoom_perf_window_display_max_ns = 0;
+    gamelib_zoom_perf_window_display_samples = 0;
+    gamelib_zoom_perf_key_repeat_total_ns = 0;
+    gamelib_zoom_perf_key_repeat_max_ns = 0;
+    gamelib_zoom_perf_key_repeat_samples = 0;
+    gamelib_zoom_perf_event_dispatch_total_ns = 0;
+    gamelib_zoom_perf_event_dispatch_max_ns = 0;
+    gamelib_zoom_perf_event_dispatch_samples = 0;
+    gamelib_zoom_perf_warmup_count = 0;
+    gamelib_zoom_perf_warmed_up = false;
+    gamelib_zoom_perf_pass_light_total_ns = 0;
+    gamelib_zoom_perf_pass_light_max_ns = 0;
+    gamelib_zoom_perf_pass_tile_total_ns = 0;
+    gamelib_zoom_perf_pass_tile_max_ns = 0;
+    gamelib_zoom_perf_pass_object_total_ns = 0;
+    gamelib_zoom_perf_pass_object_max_ns = 0;
+    gamelib_zoom_perf_pass_roof_total_ns = 0;
+    gamelib_zoom_perf_pass_roof_max_ns = 0;
+    gamelib_zoom_perf_pass_samples = 0;
+    char line[128];
+    snprintf(line, sizeof(line), "[zoom-perf] %s\n",
+        gamelib_zoom_perf_enabled ? "ON" : "OFF");
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
+bool gamelib_zoom_perf_is_enabled(void)
+{
+    return gamelib_zoom_perf_enabled;
+}
+
 // 0x402D30
 void gamelib_invalidate_rect(TigRect* rect)
 {
     TigRect dirty_rect;
+    TigRect clip_rect;
+
+    // Always queue dirty rects in screen-space (the original ww x wh
+    // viewport). gamelib_draw translates them to world-VB space at draw
+    // time if zoom is active, so the coordinate system stays consistent
+    // even if the zoom level changes between invalidate and draw.
+    //
+    // Clip-to-viewport logic: at zoom = 1.0 we just clip to the original
+    // content rect. At zoom < 1.0 the visible area is wider than the
+    // original viewport (we render a centered crop of size ww/z), so we
+    // must expand the clip rect accordingly. Otherwise an NPC outside
+    // the original [0, ww] viewport — but inside the zoomed-out visible
+    // area — has its invalidation discarded here and the world VB stays
+    // stale at its old position. Matches the expansion math in
+    // object_get_effective_iso_content_rect_ex.
+    clip_rect = gamelib_iso_content_rect;
+    {
+        float z = iso_zoom_current();
+        bool zoom_active = (z != 1.0f)
+            && (gamelib_world_video_buffer != NULL)
+            && (gamelib_draw_func == gamelib_draw_game);
+        if (zoom_active && z < 1.0f) {
+            int exp_w = (int)ceilf((float)gamelib_iso_content_rect.width / z);
+            int exp_h = (int)ceilf((float)gamelib_iso_content_rect.height / z);
+            clip_rect.x = gamelib_iso_content_rect.x
+                + (gamelib_iso_content_rect.width - exp_w) / 2 - 256;
+            clip_rect.y = gamelib_iso_content_rect.y
+                + (gamelib_iso_content_rect.height - exp_h) / 2 - 256;
+            clip_rect.width = exp_w + 512;
+            clip_rect.height = exp_h + 512;
+        }
+    }
 
     if (rect != NULL) {
         dirty_rect = *rect;
 
-        if (tig_rect_intersection(&dirty_rect, &gamelib_iso_content_rect, &dirty_rect) != TIG_OK) {
+        if (tig_rect_intersection(&dirty_rect, &clip_rect, &dirty_rect) != TIG_OK) {
             return;
         }
     } else {
-        dirty_rect = gamelib_iso_content_rect;
+        dirty_rect = clip_rect;
     }
 
     if (in_draw) {
@@ -862,6 +1309,14 @@ bool gamelib_draw(void)
     SectorRect sector_rect;
     SectorListNode* sectors;
     GameDrawInfo draw_info;
+    float z;
+    bool zoom_active;
+    TigRect orig_content_rect;
+    TigRect orig_content_rect_ex;
+    int64_t orig_ox;
+    int64_t orig_oy;
+    int ww;
+    int wh;
 
     if (gamelib_renderlock_cnt <= 0) {
         return false;
@@ -871,9 +1326,107 @@ bool gamelib_draw(void)
         return false;
     }
 
+    iso_zoom_ping();
+    // Order matters: tween_ping advances any in-flight tween; the
+    // policy modules below (dialog_camera_ping, camera_follow_ping)
+    // react to "just finished" or decide whether to start a new tween.
+    camera_tween_ping();
+    dialog_camera_ping();
+    camera_follow_ping();
+    z = iso_zoom_current();
+    zoom_active = (z != 1.0f)
+        && (gamelib_world_video_buffer != NULL)
+        && (gamelib_draw_func == gamelib_draw_game);
+
+    // Start the zoom-active-total timer BEFORE the camera-move detection
+    // block (which queues a full-invalidate on scroll). This captures the
+    // full setup/teardown cost of the zoom-active path including any
+    // sub_52D480 merges from camera-move-triggered invalidates.
+    uint64_t perf_zoom_start_ns_outer = 0;
+    if (gamelib_zoom_perf_enabled && zoom_active) {
+        perf_zoom_start_ns_outer = gamelib_zoom_perf_now_ns();
+    }
+
+    // Phase A: world-VB content is built up across frames (we don't clear
+    // it). If zoom_active just turned on, OR the zoom level lerped this
+    // frame, OR the camera origin moved without a scroll-style invalidate,
+    // the world VB has stale or empty regions that partial-render alone
+    // won't refresh. Force a full screen invalidate in those cases so the
+    // dirty rect translation downstream produces a full world-VB rect.
+    {
+        static float gamelib_prev_zoom = 1.0f;
+        static int64_t gamelib_prev_ox = 0;
+        static int64_t gamelib_prev_oy = 0;
+        int64_t cur_ox;
+        int64_t cur_oy;
+        location_origin_get(&cur_ox, &cur_oy);
+        bool zoom_step = (z != gamelib_prev_zoom);
+        bool camera_moved = (cur_ox != gamelib_prev_ox || cur_oy != gamelib_prev_oy);
+        if (zoom_active && (zoom_step || camera_moved)) {
+            gamelib_invalidate_rect(NULL);
+        }
+        gamelib_prev_zoom = z;
+        gamelib_prev_ox = cur_ox;
+        gamelib_prev_oy = cur_oy;
+    }
+
     in_draw = true;
 
+    // Phase C: world-VB-space active render area. The world VB is
+    // allocated at 2*ww x 2*wh (sized for z=0.5, the deepest zoom-out).
+    // For z > 0.5 the final blit only samples a centered crop of size
+    // (ww/z, wh/z), so anything we render outside that crop is wasted.
+    // Setting the content rect to just the active area below restricts
+    // sector iteration and dirty-rect translation to the area that
+    // actually shows on screen.
+    int active_w = 0;
+    int active_h = 0;
+    int active_x = 0;
+    int active_y = 0;
+
+    if (zoom_active) {
+        orig_content_rect = gamelib_iso_content_rect;
+        orig_content_rect_ex = gamelib_iso_content_rect_ex;
+        location_origin_get(&orig_ox, &orig_oy);
+        ww = orig_content_rect.width;
+        wh = orig_content_rect.height;
+
+        active_w = (int)ceilf((float)ww / z);
+        active_h = (int)ceilf((float)wh / z);
+        if (active_w > ww * 2) active_w = ww * 2;
+        if (active_h > wh * 2) active_h = wh * 2;
+        active_x = ww - active_w / 2;
+        active_y = wh - active_h / 2;
+
+        gamelib_iso_content_rect.x = active_x;
+        gamelib_iso_content_rect.y = active_y;
+        gamelib_iso_content_rect.width = active_w;
+        gamelib_iso_content_rect.height = active_h;
+
+        gamelib_iso_content_rect_ex.x = active_x - 256;
+        gamelib_iso_content_rect_ex.y = active_y - 256;
+        gamelib_iso_content_rect_ex.width = active_w + 512;
+        gamelib_iso_content_rect_ex.height = active_h + 512;
+
+        location_origin_pixel_set(orig_ox + ww / 2, orig_oy + wh / 2);
+
+        tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_world_video_buffer);
+        tile_set_render_target(gamelib_world_video_buffer);
+
+        // Phase A: do NOT clear the world VB. Previous-frame pixels stay
+        // valid as long as the camera hasn't moved (scrolling forces a
+        // full screen invalidate in scroll.c at zoom != 1.0). We overpaint
+        // only the dirty world-VB rects below.
+    }
+
     if (location_screen_rect_to_loc_rect(&gamelib_iso_content_rect_ex, &loc_rect)) {
+        uint64_t perf_render_start_ns = 0;
+        uint64_t perf_blit_start_ns = 0;
+        uint64_t perf_frame_render_ns = 0;
+        uint64_t perf_frame_blit_ns = 0;
+        int64_t perf_frame_dirty_px = 0;
+        bool perf_frame_full = false;
+
         if (gamelib_view_options.type == VIEW_TYPE_ISOMETRIC) {
             sector_rect_from_loc_rect(&loc_rect, &sector_rect);
         }
@@ -884,20 +1437,469 @@ bool gamelib_draw(void)
         draw_info.sector_rect = &sector_rect;
         draw_info.sectors = sectors;
         draw_info.rects = &gamelib_dirty_rects_head;
+        if (zoom_active) {
+            // Phase A + C: translate each queued dirty rect from
+            // screen-space (0..ww, 0..wh) to world-VB-space, clipped to
+            // the active render area (centered, sized active_w x
+            // active_h - just the area the final blit will sample). A
+            // rect covering the full screen maps to the full active
+            // area; smaller object rects get camera-shifted by (ww/2,
+            // wh/2) and clipped to active bounds.
+            TigRect active_bounds = { active_x, active_y, active_w, active_h };
+            node = gamelib_dirty_rects_head;
+            gamelib_dirty_rects_head = NULL;
+            while (node != NULL) {
+                next = node->next;
+                TigRect translated;
+                bool covers_full_screen = node->rect.x <= 0
+                    && node->rect.y <= 0
+                    && node->rect.x + node->rect.width >= ww
+                    && node->rect.y + node->rect.height >= wh;
+                if (covers_full_screen) {
+                    translated = active_bounds;
+                } else {
+                    translated.x = node->rect.x + ww / 2;
+                    translated.y = node->rect.y + wh / 2;
+                    translated.width = node->rect.width;
+                    translated.height = node->rect.height;
+                    if (tig_rect_intersection(&translated, &active_bounds, &translated) != TIG_OK) {
+                        tig_rect_node_destroy(node);
+                        node = next;
+                        continue;
+                    }
+                }
+                tig_rect_node_destroy(node);
+                if (gamelib_dirty_rects_head == NULL) {
+                    gamelib_dirty_rects_head = tig_rect_node_create();
+                    gamelib_dirty_rects_head->rect = translated;
+                    gamelib_dirty_rects_head->next = NULL;
+                } else {
+                    sub_52D480(&gamelib_dirty_rects_head, &translated);
+                }
+                node = next;
+            }
+            tig_window_set_invalidate_suppressed(true);
+            gamelib_zoom_world_pass_active = true;
+            TigRect zoom_content_rect = { active_x, active_y, active_w, active_h };
+            object_set_iso_content_rect(&zoom_content_rect);
+            light_set_iso_content_rect(&zoom_content_rect);
+        }
+        if (gamelib_zoom_perf_enabled && zoom_active) {
+            // Snapshot the area the renderer is about to touch. After
+            // Phase C, the "full" reference is the active render area,
+            // not the whole 2x world VB.
+            int64_t full_px = (int64_t)active_w * (int64_t)active_h;
+            for (node = gamelib_dirty_rects_head; node != NULL; node = node->next) {
+                perf_frame_dirty_px += (int64_t)node->rect.width * (int64_t)node->rect.height;
+            }
+            perf_frame_full = (perf_frame_dirty_px >= full_px);
+            perf_render_start_ns = gamelib_zoom_perf_now_ns();
+        }
         gamelib_draw_func(&draw_info);
+        if (gamelib_zoom_perf_enabled && zoom_active) {
+            perf_frame_render_ns = gamelib_zoom_perf_now_ns() - perf_render_start_ns;
+            gamelib_zoom_perf_total_render_ns += perf_frame_render_ns;
+        }
+        if (zoom_active) {
+            gamelib_zoom_world_pass_active = false;
+            tig_window_set_invalidate_suppressed(false);
+            object_set_iso_content_rect(&orig_content_rect);
+            light_set_iso_content_rect(&orig_content_rect);
+        }
         sector_list_destroy(sectors);
 
-        node = gamelib_dirty_rects_head;
-        while (node != NULL) {
-            next = node->next;
-            rect = node->rect;
-            rect.x += gamelib_window_rect_x;
-            rect.y += gamelib_window_rect_y;
-            tig_window_invalidate_rect(&rect);
-            tig_rect_node_destroy(node);
-            node = next;
+        if (zoom_active) {
+            int src_w;
+            int src_h;
+            TigRect src;
+            TigRect dst;
+            TigVideoBufferBlitInfo blit = { 0 };
+
+            tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+            tile_set_render_target(gamelib_iso_window_vb);
+            gamelib_iso_content_rect = orig_content_rect;
+            gamelib_iso_content_rect_ex = orig_content_rect_ex;
+            location_origin_pixel_set(orig_ox, orig_oy);
+            zoom_active = false;
+
+            // Phase A: render is partial (driven by dirty rects above),
+            // but blit is ALWAYS full. Reason: world-VB content is
+            // zoom-independent (rendered at world-VB coords) but the
+            // downscale-to-window mapping is zoom-dependent. If we
+            // partial-blit and the zoom changed since the previous frame,
+            // un-blitted window regions keep the old downscale and look
+            // out of sync with the freshly-blitted partials. Full blit at
+            // 0.5-1ms is small change vs. the ~8ms render savings.
+            src_w = (int)roundf((float)ww / z);
+            src_h = (int)roundf((float)wh / z);
+            src.x = ww - src_w / 2;
+            src.y = wh - src_h / 2;
+            src.width = src_w;
+            src.height = src_h;
+            dst.x = 0;
+            dst.y = 0;
+            dst.width = ww;
+            dst.height = wh;
+            blit.src_video_buffer = gamelib_world_video_buffer;
+            blit.src_rect = &src;
+            blit.dst_video_buffer = gamelib_iso_window_vb;
+            blit.dst_rect = &dst;
+            if (z < 1.0f) {
+                // Bilinear when downscaling so the stipple dither used for
+                // fade-for-occlusion walls/roofs averages to ~50% alpha
+                // instead of being erased by NEAREST sampling.
+                blit.flags = TIG_VIDEO_BUFFER_BLIT_SCALE_LINEAR;
+            }
+            if (gamelib_zoom_perf_enabled) {
+                perf_blit_start_ns = gamelib_zoom_perf_now_ns();
+            }
+            tig_video_buffer_blit(&blit);
+
+            if (gamelib_zoom_perf_enabled) {
+                perf_frame_blit_ns = gamelib_zoom_perf_now_ns() - perf_blit_start_ns;
+                gamelib_zoom_perf_total_blit_ns += perf_frame_blit_ns;
+                gamelib_zoom_perf_total_dirty_px += perf_frame_dirty_px;
+                if (perf_frame_full) {
+                    gamelib_zoom_perf_full_frames++;
+                }
+                gamelib_zoom_perf_last_z = z;
+
+                // Total zoom-active time (start of this if-block to end of
+                // blit) and "other" = total - render - blit.
+                uint64_t zoom_total_ns = gamelib_zoom_perf_now_ns() - perf_zoom_start_ns_outer;
+                uint64_t other_ns = (zoom_total_ns > perf_frame_render_ns + perf_frame_blit_ns)
+                    ? zoom_total_ns - perf_frame_render_ns - perf_frame_blit_ns
+                    : 0;
+                gamelib_zoom_perf_total_zoom_ns += zoom_total_ns;
+                gamelib_zoom_perf_total_other_ns += other_ns;
+                if (zoom_total_ns > gamelib_zoom_perf_max_zoom_ns) {
+                    gamelib_zoom_perf_max_zoom_ns = zoom_total_ns;
+                }
+                if (other_ns > gamelib_zoom_perf_max_other_ns) {
+                    gamelib_zoom_perf_max_other_ns = other_ns;
+                }
+
+                // Wall-clock frame interval: time from previous zoom-active
+                // draw to this one. Captures the TOTAL frame cost (render +
+                // AI + scripts + present), not just our render bucket. The
+                // first sample after toggle-ON has no prior reference; skip.
+                uint64_t now_ns = gamelib_zoom_perf_now_ns();
+                if (gamelib_zoom_perf_last_ns != 0 && now_ns >= gamelib_zoom_perf_last_ns) {
+                    uint64_t delta_ns = now_ns - gamelib_zoom_perf_last_ns;
+                    gamelib_zoom_perf_total_frame_ns += delta_ns;
+                    if (delta_ns > gamelib_zoom_perf_max_frame_ns) {
+                        gamelib_zoom_perf_max_frame_ns = delta_ns;
+                    }
+                    double delta_ms = (double)delta_ns / 1e6;
+                    gamelib_zoom_perf_sum_sq_frame_ms += delta_ms * delta_ms;
+                    gamelib_zoom_perf_frame_ns_samples++;
+                }
+                gamelib_zoom_perf_last_ns = now_ns;
+
+                if (++gamelib_zoom_perf_frames >= GAMELIB_ZOOM_PERF_INTERVAL) {
+                    int64_t full_px = (int64_t)active_w * (int64_t)active_h;
+                    float avg_render_ms = (float)((double)gamelib_zoom_perf_total_render_ns
+                        / (double)gamelib_zoom_perf_frames / 1e6);
+                    float avg_blit_ms = (float)((double)gamelib_zoom_perf_total_blit_ns
+                        / (double)gamelib_zoom_perf_frames / 1e6);
+                    float avg_zoom_ms = (float)((double)gamelib_zoom_perf_total_zoom_ns
+                        / (double)gamelib_zoom_perf_frames / 1e6);
+                    float avg_other_ms = (float)((double)gamelib_zoom_perf_total_other_ns
+                        / (double)gamelib_zoom_perf_frames / 1e6);
+                    float max_zoom_ms = (float)((double)gamelib_zoom_perf_max_zoom_ns / 1e6);
+                    float max_other_ms = (float)((double)gamelib_zoom_perf_max_other_ns / 1e6);
+                    float avg_dirty_pct = full_px > 0
+                        ? (float)gamelib_zoom_perf_total_dirty_px * 100.0f
+                            / ((float)full_px * (float)gamelib_zoom_perf_frames)
+                        : 0.0f;
+                    int full_pct = (gamelib_zoom_perf_full_frames * 100) / gamelib_zoom_perf_frames;
+
+                    // Frame-interval stats (wall clock, captures EVERYTHING).
+                    float avg_frame_ms = 0.0f;
+                    float max_frame_ms = 0.0f;
+                    float stddev_frame_ms = 0.0f;
+                    if (gamelib_zoom_perf_frame_ns_samples > 0) {
+                        avg_frame_ms = (float)((double)gamelib_zoom_perf_total_frame_ns
+                            / (double)gamelib_zoom_perf_frame_ns_samples / 1e6);
+                        max_frame_ms = (float)((double)gamelib_zoom_perf_max_frame_ns / 1e6);
+                        double mean = avg_frame_ms;
+                        double var = (gamelib_zoom_perf_sum_sq_frame_ms
+                            / (double)gamelib_zoom_perf_frame_ns_samples) - mean * mean;
+                        if (var < 0.0) var = 0.0;
+                        stddev_frame_ms = (float)sqrt(var);
+                    }
+
+                    char line[512];
+                    snprintf(line, sizeof(line),
+                        "[zoom-perf] z=%.2f over %d frames: render %.2fms, blit %.2fms, OTHER %.2fms (max %.2fms), zoom-total %.2fms (max %.2fms), dirty %.0f%%, full-redraws %d%% | frame avg %.2fms max %.2fms stddev %.2fms\n",
+                        gamelib_zoom_perf_last_z,
+                        gamelib_zoom_perf_frames,
+                        avg_render_ms,
+                        avg_blit_ms,
+                        avg_other_ms,
+                        max_other_ms,
+                        avg_zoom_ms,
+                        max_zoom_ms,
+                        avg_dirty_pct,
+                        full_pct,
+                        avg_frame_ms,
+                        max_frame_ms,
+                        stddev_frame_ms);
+                    tig_debug_printf("%s", line);
+                    gamelib_zoom_perf_log(line);
+
+                    // Second line: per-subsystem ping breakdown. Total ping
+                    // avg/max for the same window, then the top 3 hottest
+                    // modules by accumulated time. Helps identify which
+                    // subsystem owns the gap between zoom-active render
+                    // time and total frame time.
+                    if (gamelib_zoom_perf_ping_samples > 0) {
+                        float avg_ping_ms = (float)((double)gamelib_zoom_perf_ping_total_ns
+                            / (double)gamelib_zoom_perf_ping_samples / 1e6);
+                        float max_ping_ms = (float)((double)gamelib_zoom_perf_ping_max_ns / 1e6);
+                        int top_idx[3] = { -1, -1, -1 };
+                        uint64_t top_ns[3] = { 0, 0, 0 };
+                        int module_count = MODULE_COUNT;
+                        if (module_count > GAMELIB_PERF_MAX_MODULES) {
+                            module_count = GAMELIB_PERF_MAX_MODULES;
+                        }
+                        for (int i = 0; i < module_count; i++) {
+                            uint64_t t = gamelib_zoom_perf_ping_module_total_ns[i];
+                            if (t > top_ns[0]) {
+                                top_ns[2] = top_ns[1]; top_idx[2] = top_idx[1];
+                                top_ns[1] = top_ns[0]; top_idx[1] = top_idx[0];
+                                top_ns[0] = t; top_idx[0] = i;
+                            } else if (t > top_ns[1]) {
+                                top_ns[2] = top_ns[1]; top_idx[2] = top_idx[1];
+                                top_ns[1] = t; top_idx[1] = i;
+                            } else if (t > top_ns[2]) {
+                                top_ns[2] = t; top_idx[2] = i;
+                            }
+                        }
+                        char hot[3][64] = { "", "", "" };
+                        for (int k = 0; k < 3; k++) {
+                            if (top_idx[k] >= 0 && top_ns[k] > 0) {
+                                double avg_ms = (double)top_ns[k]
+                                    / (double)gamelib_zoom_perf_ping_samples / 1e6;
+                                double max_ms = (double)gamelib_zoom_perf_ping_module_max_ns[top_idx[k]] / 1e6;
+                                snprintf(hot[k], sizeof(hot[k]), "%s(avg %.2f max %.2f)",
+                                    gamelib_modules[top_idx[k]].name, avg_ms, max_ms);
+                            }
+                        }
+                        char ping_line[512];
+                        snprintf(ping_line, sizeof(ping_line),
+                            "[zoom-perf]   ping avg %.2fms max %.2fms (%d samples) | hot: %s %s %s\n",
+                            avg_ping_ms, max_ping_ms, gamelib_zoom_perf_ping_samples,
+                            hot[0], hot[1], hot[2]);
+                        tig_debug_printf("%s", ping_line);
+                        gamelib_zoom_perf_log(ping_line);
+                    }
+
+                    gamelib_zoom_perf_frames = 0;
+                    gamelib_zoom_perf_full_frames = 0;
+                    gamelib_zoom_perf_total_frame_ns = 0;
+                    gamelib_zoom_perf_max_frame_ns = 0;
+                    gamelib_zoom_perf_sum_sq_frame_ms = 0.0;
+                    gamelib_zoom_perf_frame_ns_samples = 0;
+                    gamelib_zoom_perf_total_render_ns = 0;
+                    gamelib_zoom_perf_total_blit_ns = 0;
+                    gamelib_zoom_perf_total_dirty_px = 0;
+                    gamelib_zoom_perf_total_zoom_ns = 0;
+                    gamelib_zoom_perf_max_zoom_ns = 0;
+                    gamelib_zoom_perf_total_other_ns = 0;
+                    gamelib_zoom_perf_max_other_ns = 0;
+                    // Third line: main-loop bucket breakdown (tig_ping,
+                    // iso_redraw, tig_window_display) + intra-flip split
+                    // (SDL_UpdateTexture vs SDL_RenderPresent). After
+                    // confirming gamelib_ping is ~0.1ms, these are the
+                    // remaining candidates for the inter-frame gap.
+                    // window_display = composite + flip; flip splits as
+                    // update (CPU→GPU upload) + present (typically vsync).
+                    TigVideoFlipPerf flip_perf;
+                    tig_video_flip_perf_get(&flip_perf);
+                    tig_video_flip_perf_reset();
+                    float avg_flip_update_ms = flip_perf.samples > 0
+                        ? (float)((double)flip_perf.update_total_ns / (double)flip_perf.samples / 1e6)
+                        : 0.0f;
+                    float max_flip_update_ms = (float)((double)flip_perf.update_max_ns / 1e6);
+                    float avg_flip_present_ms = flip_perf.samples > 0
+                        ? (float)((double)flip_perf.present_total_ns / (double)flip_perf.samples / 1e6)
+                        : 0.0f;
+                    float max_flip_present_ms = (float)((double)flip_perf.present_max_ns / 1e6);
+                    int partial_pct = flip_perf.samples > 0
+                        ? (flip_perf.partial_samples * 100) / flip_perf.samples
+                        : 0;
+                    if (gamelib_zoom_perf_tig_ping_samples > 0
+                        || gamelib_zoom_perf_iso_redraw_samples > 0
+                        || gamelib_zoom_perf_window_display_samples > 0) {
+                        float avg_tig_ms = gamelib_zoom_perf_tig_ping_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_tig_ping_total_ns
+                                / (double)gamelib_zoom_perf_tig_ping_samples / 1e6)
+                            : 0.0f;
+                        float max_tig_ms = (float)((double)gamelib_zoom_perf_tig_ping_max_ns / 1e6);
+                        float avg_iso_ms = gamelib_zoom_perf_iso_redraw_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_iso_redraw_total_ns
+                                / (double)gamelib_zoom_perf_iso_redraw_samples / 1e6)
+                            : 0.0f;
+                        float max_iso_ms = (float)((double)gamelib_zoom_perf_iso_redraw_max_ns / 1e6);
+                        float avg_win_ms = gamelib_zoom_perf_window_display_samples > 0
+                            ? (float)((double)gamelib_zoom_perf_window_display_total_ns
+                                / (double)gamelib_zoom_perf_window_display_samples / 1e6)
+                            : 0.0f;
+                        float max_win_ms = (float)((double)gamelib_zoom_perf_window_display_max_ns / 1e6);
+                        char loop_line[384];
+                        snprintf(loop_line, sizeof(loop_line),
+                            "[zoom-perf]   loop: tig_ping avg %.2fms max %.2fms | iso_redraw avg %.2fms max %.2fms | win_display avg %.2fms max %.2fms | flip: update avg %.2fms max %.2fms, present avg %.2fms max %.2fms, partial %d%%\n",
+                            avg_tig_ms, max_tig_ms,
+                            avg_iso_ms, max_iso_ms,
+                            avg_win_ms, max_win_ms,
+                            avg_flip_update_ms, max_flip_update_ms,
+                            avg_flip_present_ms, max_flip_present_ms,
+                            partial_pct);
+                        tig_debug_printf("%s", loop_line);
+                        gamelib_zoom_perf_log(loop_line);
+
+                        // Fourth line: remaining main-loop buckets that
+                        // sit between the measured slots above —
+                        // handle_zoom_key_repeat and the inner message
+                        // dequeue/dispatch loop. Frame-max spikes of
+                        // 25-70ms aren't visible in any of the buckets
+                        // above; one of these should reveal where they
+                        // come from.
+                        if (gamelib_zoom_perf_key_repeat_samples > 0
+                            || gamelib_zoom_perf_event_dispatch_samples > 0) {
+                            float avg_key_ms = gamelib_zoom_perf_key_repeat_samples > 0
+                                ? (float)((double)gamelib_zoom_perf_key_repeat_total_ns
+                                    / (double)gamelib_zoom_perf_key_repeat_samples / 1e6)
+                                : 0.0f;
+                            float max_key_ms = (float)((double)gamelib_zoom_perf_key_repeat_max_ns / 1e6);
+                            float avg_evt_ms = gamelib_zoom_perf_event_dispatch_samples > 0
+                                ? (float)((double)gamelib_zoom_perf_event_dispatch_total_ns
+                                    / (double)gamelib_zoom_perf_event_dispatch_samples / 1e6)
+                                : 0.0f;
+                            float max_evt_ms = (float)((double)gamelib_zoom_perf_event_dispatch_max_ns / 1e6);
+                            char extra[256];
+                            snprintf(extra, sizeof(extra),
+                                "[zoom-perf]   loop2: key_repeat avg %.2fms max %.2fms | event_dispatch avg %.2fms max %.2fms\n",
+                                avg_key_ms, max_key_ms, avg_evt_ms, max_evt_ms);
+                            tig_debug_printf("%s", extra);
+                            gamelib_zoom_perf_log(extra);
+                        }
+
+                        // Fifth line: render-pass breakdown. Identifies
+                        // which pass dominates the heavy iso_redraw
+                        // frames (the ones that overrun the 8.3ms
+                        // ProMotion budget and cause remaining stutter).
+                        if (gamelib_zoom_perf_pass_samples > 0) {
+                            double n = (double)gamelib_zoom_perf_pass_samples;
+                            float al = (float)((double)gamelib_zoom_perf_pass_light_total_ns / n / 1e6);
+                            float at = (float)((double)gamelib_zoom_perf_pass_tile_total_ns / n / 1e6);
+                            float ao = (float)((double)gamelib_zoom_perf_pass_object_total_ns / n / 1e6);
+                            float ar = (float)((double)gamelib_zoom_perf_pass_roof_total_ns / n / 1e6);
+                            float ml = (float)((double)gamelib_zoom_perf_pass_light_max_ns / 1e6);
+                            float mt = (float)((double)gamelib_zoom_perf_pass_tile_max_ns / 1e6);
+                            float mo = (float)((double)gamelib_zoom_perf_pass_object_max_ns / 1e6);
+                            float mr = (float)((double)gamelib_zoom_perf_pass_roof_max_ns / 1e6);
+                            char passes[384];
+                            snprintf(passes, sizeof(passes),
+                                "[zoom-perf]   passes: light avg %.2fms max %.2fms | tile avg %.2fms max %.2fms | object avg %.2fms max %.2fms | roof avg %.2fms max %.2fms\n",
+                                al, ml, at, mt, ao, mo, ar, mr);
+                            tig_debug_printf("%s", passes);
+                            gamelib_zoom_perf_log(passes);
+                        }
+                    }
+
+                    gamelib_zoom_perf_ping_total_ns = 0;
+                    gamelib_zoom_perf_ping_max_ns = 0;
+                    gamelib_zoom_perf_ping_samples = 0;
+                    for (int i = 0; i < GAMELIB_PERF_MAX_MODULES; i++) {
+                        gamelib_zoom_perf_ping_module_total_ns[i] = 0;
+                        gamelib_zoom_perf_ping_module_max_ns[i] = 0;
+                    }
+                    gamelib_zoom_perf_tig_ping_total_ns = 0;
+                    gamelib_zoom_perf_tig_ping_max_ns = 0;
+                    gamelib_zoom_perf_tig_ping_samples = 0;
+                    gamelib_zoom_perf_iso_redraw_total_ns = 0;
+                    gamelib_zoom_perf_iso_redraw_max_ns = 0;
+                    gamelib_zoom_perf_iso_redraw_samples = 0;
+                    gamelib_zoom_perf_window_display_total_ns = 0;
+                    gamelib_zoom_perf_window_display_max_ns = 0;
+                    gamelib_zoom_perf_window_display_samples = 0;
+                    gamelib_zoom_perf_key_repeat_total_ns = 0;
+                    gamelib_zoom_perf_key_repeat_max_ns = 0;
+                    gamelib_zoom_perf_key_repeat_samples = 0;
+                    gamelib_zoom_perf_event_dispatch_total_ns = 0;
+                    gamelib_zoom_perf_event_dispatch_max_ns = 0;
+                    gamelib_zoom_perf_event_dispatch_samples = 0;
+                    gamelib_zoom_perf_pass_light_total_ns = 0;
+                    gamelib_zoom_perf_pass_light_max_ns = 0;
+                    gamelib_zoom_perf_pass_tile_total_ns = 0;
+                    gamelib_zoom_perf_pass_tile_max_ns = 0;
+                    gamelib_zoom_perf_pass_object_total_ns = 0;
+                    gamelib_zoom_perf_pass_object_max_ns = 0;
+                    gamelib_zoom_perf_pass_roof_total_ns = 0;
+                    gamelib_zoom_perf_pass_roof_max_ns = 0;
+                    gamelib_zoom_perf_pass_samples = 0;
+                }
+            }
+
+            // Re-run fixed-screen HUD draws (tc/tf/tb) directly onto
+            // iso_window_vb at normal viewport coordinates. They rendered into
+            // world_vb at fixed coords outside the scale-blit src rect, so
+            // they would have been clipped away. We stamp them on top here.
+            {
+                TigRectListNode hud_node;
+                TigRectListNode* hud_head;
+                GameDrawInfo hud_info;
+
+                hud_node.rect = orig_content_rect;
+                hud_node.next = NULL;
+                hud_head = &hud_node;
+
+                memset(&hud_info, 0, sizeof(hud_info));
+                hud_info.rects = &hud_head;
+
+                if (tig_video_3d_begin_scene() == TIG_OK) {
+                    tb_draw(&hud_info);
+                    tf_draw(&hud_info);
+                    tc_draw(&hud_info);
+                    tig_video_3d_end_scene();
+                }
+            }
+
+            // Phase A: drop dirty world-VB rects (consumed) and do a full
+            // window invalidate. Matches the full blit above.
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                tig_rect_node_destroy(node);
+                node = next;
+            }
+            gamelib_dirty_rects_head = NULL;
+            tig_window_invalidate_rect(NULL);
+        } else {
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                rect = node->rect;
+                rect.x += gamelib_window_rect_x;
+                rect.y += gamelib_window_rect_y;
+                tig_window_invalidate_rect(&rect);
+                tig_rect_node_destroy(node);
+                node = next;
+            }
         }
         ret = true;
+    }
+
+    if (zoom_active) {
+        tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+        tile_set_render_target(gamelib_iso_window_vb);
+        gamelib_iso_content_rect = orig_content_rect;
+        gamelib_iso_content_rect_ex = orig_content_rect_ex;
+        location_origin_pixel_set(orig_ox, orig_oy);
+        object_set_iso_content_rect(&orig_content_rect);
+        light_set_iso_content_rect(&orig_content_rect);
     }
 
     gamelib_dirty_rects_head = gamelib_pending_dirty_rects_head;
@@ -905,6 +1907,15 @@ bool gamelib_draw(void)
 
     if (gamelib_dirty_rects_head == NULL) {
         gamelib_dirty = false;
+    }
+
+    // Keep rendering each frame while zoom is still lerping.
+    if (iso_zoom_is_animating()) {
+        gamelib_dirty = true;
+    }
+
+    if (dialog_camera_is_animating()) {
+        gamelib_dirty = true;
     }
 
     in_draw = false;
@@ -1079,6 +2090,10 @@ bool gamelib_save(const char* name, const char* description)
     duration = tig_timer_elapsed(start_time);
     tig_debug_printf("gamelib_save(): Save Complete.  Total time: %d ms.\n", duration);
 
+    if (gamelib_zoom_perf_enabled && duration > 100) {
+        gamelib_perf_log_event("gamelib_save", (uint64_t)duration * 1000000ull);
+    }
+
     return true;
 }
 
@@ -1207,6 +2222,10 @@ bool gamelib_load(const char* name)
 
     duration = tig_timer_elapsed(start_time);
     tig_debug_printf("gamelib_load: Load Complete.  Total time: %d ms.\n", duration);
+
+    if (gamelib_zoom_perf_enabled && duration > 100) {
+        gamelib_perf_log_event("gamelib_load", (uint64_t)duration * 1000000ull);
+    }
 
     return true;
 }
@@ -1696,6 +2715,11 @@ void gamelib_patch_lvl_set(const char* patch_lvl)
     (void)patch_lvl;
 }
 
+void gamelib_get_iso_content_rect(TigRect* rect)
+{
+    *rect = gamelib_iso_content_rect;
+}
+
 // 0x404650
 const char* gamelib_get_locale(void)
 {
@@ -1738,14 +2762,46 @@ bool gamelib_pc_lens_follows_player(void)
 void gamelib_draw_game(GameDrawInfo* draw_info)
 {
     if (tig_video_3d_begin_scene() == TIG_OK) {
+        // Gate pass timing on warmup too — same cold-cache outlier
+        // applies to the very first render after F9 on.
+        bool perf_on = gamelib_zoom_perf_enabled && gamelib_zoom_perf_warmed_up;
+        uint64_t t0;
+
+        t0 = perf_on ? gamelib_zoom_perf_now_ns() : 0;
         light_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_light_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_light_max_ns) gamelib_zoom_perf_pass_light_max_ns = d;
+            t0 = gamelib_zoom_perf_now_ns();
+        }
         tile_draw(draw_info);
-        sub_43C690(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_tile_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_tile_max_ns) gamelib_zoom_perf_pass_tile_max_ns = d;
+        }
+        sub_43C690(draw_info);  // bucketed in 'tile' bucket above-or-below if we cared; here it falls between
+        if (perf_on) t0 = gamelib_zoom_perf_now_ns();
         object_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_object_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_object_max_ns) gamelib_zoom_perf_pass_object_max_ns = d;
+            t0 = gamelib_zoom_perf_now_ns();
+        }
         roof_draw(draw_info);
-        tb_draw(draw_info);
-        tf_draw(draw_info);
-        tc_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_roof_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_roof_max_ns) gamelib_zoom_perf_pass_roof_max_ns = d;
+            gamelib_zoom_perf_pass_samples++;
+        }
+        if (!gamelib_zoom_world_pass_active) {
+            tb_draw(draw_info);
+            tf_draw(draw_info);
+            tc_draw(draw_info);
+        }
         tig_video_3d_end_scene();
     }
 }

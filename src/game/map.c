@@ -794,6 +794,12 @@ bool map_open_in_game(int map, bool a2, bool a3)
     MapListInfo* info;
     char base_path[TIG_MAX_PATH];
     char save_path[TIG_MAX_PATH];
+    tig_timestamp_t map_open_start_ts;
+    bool perf_on = gamelib_zoom_perf_is_enabled();
+
+    if (perf_on) {
+        tig_timer_now(&map_open_start_ts);
+    }
 
     if (!dword_5D11F0) {
         return false;
@@ -842,6 +848,15 @@ bool map_open_in_game(int map, bool a2, bool a3)
     if (!obj_validate_system(1)) {
         tig_debug_println("Object system validate failed post-load in map_open_in_game.");
         tig_message_post_quit(0);
+    }
+
+    if (perf_on) {
+        tig_duration_t map_open_duration = tig_timer_elapsed(map_open_start_ts);
+        if (map_open_duration > 100) {
+            char ctx[128];
+            snprintf(ctx, sizeof(ctx), "map_open_in_game map=%d", map);
+            gamelib_perf_log_event(ctx, (uint64_t)map_open_duration * 1000000ull);
+        }
     }
 
     return true;

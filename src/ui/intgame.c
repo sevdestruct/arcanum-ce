@@ -2,6 +2,9 @@
 
 #include <stdio.h>
 
+#include "game/dialog_camera.h"
+#include "game/iso_zoom.h"
+#include "game/location.h"
 #include "game/ai.h"
 #include "game/anim.h"
 #include "game/bless.h"
@@ -159,6 +162,7 @@ static void iso_interface_window_enable(RotatingWindowType window_type);
 static void intgame_mt_spells_enable(void);
 static int find_interface_window_index(int x, int y);
 static void sub_5517F0(void);
+static bool intgame_adjust_mouse_for_zoom(int x, int y, int* adj_x, int* adj_y);
 static bool sub_5518C0(int x, int y);
 static void sub_551910(TigMessage* msg);
 static void sub_551A10(int64_t obj);
@@ -937,6 +941,14 @@ static bool dword_64C6B0;
 // 0x64C6B4
 static bool intgame_iso_interface_created;
 
+// CE: translucent-black tint pathway opt-in flag. Set true when the
+// bar is created with TRANSLUCENT_BLACK_UI_KEY on. Read by:
+//   - intgame_hud_tick_invalidate_alpha_strips (per-tick: marks iso
+//     under the bar dirty so iso_redraw refreshes it)
+//   - intgame_hud_tick_apply_tint (per-tick after iso_redraw: tints
+//     the freshly-rendered iso pixels under the bar)
+static bool intgame_hud_bar_uses_tint = false;
+
 // 0x64C6B8
 static int intgame_mode_stack_size;
 
@@ -1269,17 +1281,26 @@ void iso_interface_create(tig_window_handle_t window_handle)
         window_data.rect.y = 0;
         tig_window_blit_art(dword_64C4F8[index], &art_blit_info);
 
-        // CE: bottom strip opts into per-pixel see-through for the
-        // panel art's near-black background. Threshold 8 catches the
-        // mixed near-black shades (010008, 000808, 000000) exactly
-        // without snagging dark chrome detail; opacity 128 = 50%
-        // src / 50% dst. The iso window is the underlay — the
-        // blend samples its VB directly (which always has the current
-        // world content) instead of reading the stale screen surface.
+        // CE: bottom strip opts into the translucent-black see-through
+        // for its panel art's near-black regions. Dialog-backdrop-style
+        // tint: pre-bake the bar's near-black pixels to color-key
+        // transparency in the bar's VB (one-shot), then a per-tick
+        // hook (intgame_hud_tick_apply_tint) darkens the iso pixels
+        // under the bar so the tinted world shows through the holes.
         // Gated by the TranslucentBlackUI cfg flag.
         if (index == 1 && settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-            tig_window_near_black_alpha_set(dword_64C4F8[index],
-                true, intgame_iso_window, 8, 128);
+            TigVideoBuffer* bar_vb = NULL;
+            if (tig_window_vbid_get(dword_64C4F8[index], &bar_vb) == TIG_OK
+                && bar_vb != NULL) {
+                TigRect bake = {
+                    0, 0,
+                    intgame_interface_window_frames[index].width,
+                    intgame_interface_window_frames[index].height
+                };
+                tig_video_buffer_replace_near_black_with_color_key(bar_vb,
+                    &bake, 8);
+            }
+            intgame_hud_bar_uses_tint = true;
         }
     }
 
@@ -2820,7 +2841,7 @@ void intgame_process_event(TigMessage* msg)
                             sub_4B4320(pc_obj);
 
                             tig_mouse_get_state(&mouse_state);
-                            if (location_at(mouse_state.x, mouse_state.y, &loc)
+                            if (location_at_zoomed(mouse_state.x, mouse_state.y, iso_zoom_current(), &loc)
                                 && sub_5517A0(msg)) {
                                 int64_t pc_loc;
                                 tig_art_id_t aid;
@@ -2842,6 +2863,12 @@ void intgame_process_event(TigMessage* msg)
                         sub_575770();
                         intgame_refresh_cursor();
                     }
+                }
+                break;
+            case TIG_MESSAGE_MOUSE_WHEEL:
+                if (iso_zoom_is_available()) {
+                    iso_zoom_wheel(msg->data.mouse.dy);
+                    gamelib_invalidate_rect(NULL);
                 }
                 break;
             case TIG_MESSAGE_MOUSE_IDLE:
@@ -2891,7 +2918,15 @@ void intgame_process_event(TigMessage* msg)
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
                 if (!inven_ui_is_created()) {
-                    if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    bool picked;
+                    if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                        picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
+                    } else {
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                    }
+                    if (picked) {
                         spell_ui_apply(&td);
                     } else if (target_last_rejection_get() == 0x100000) {
                         spell_ui_error_target_not_damaged();
@@ -2963,11 +2998,18 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    if (target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen)) {
+                        skill_ui_apply(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     skill_ui_apply(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 skill_ui_cancel();
                 break;
@@ -3019,24 +3061,33 @@ void intgame_process_event(TigMessage* msg)
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_DOWN:
-                if (sub_5517A0(msg)
-                    && target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)
-                    && td.is_loc
-                    && !inven_ui_drag_item_obj_get()
-                    && !critter_is_dead(pc_obj)
-                    && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
-                    if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
-                            || tig_kb_get_modifier(SDL_KMOD_NUM))
-                        && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                        anim_goal_run_to_tile(pc_obj, td.loc);
+                if (sub_5517A0(msg)) {
+                    int mx = msg->data.mouse.x;
+                    int my = msg->data.mouse.y;
+                    bool picked;
+                    if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                        picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
                     } else {
-                        anim_goal_move_to_tile(pc_obj, td.loc);
+                        picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
                     }
+                    if (picked
+                        && td.is_loc
+                        && !inven_ui_drag_item_obj_get()
+                        && !critter_is_dead(pc_obj)
+                        && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
+                        if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
+                                || tig_kb_get_modifier(SDL_KMOD_NUM))
+                            && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
+                            anim_goal_run_to_tile(pc_obj, td.loc);
+                        } else {
+                            anim_goal_move_to_tile(pc_obj, td.loc);
+                        }
 
-                    if (dword_64C6D8) {
-                        sub_436CF0();
+                        if (dword_64C6D8) {
+                            sub_436CF0();
+                        }
+                        dword_64C6D8 = true;
                     }
-                    dword_64C6D8 = true;
                 }
                 break;
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
@@ -3068,13 +3119,22 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                bool picked;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    picked = target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen);
+                } else {
+                    picked = target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen);
+                }
+                if (picked) {
                     item_ui_apply(&td);
                 } else if (target_last_rejection_get() == 0x100000) {
                     spell_ui_error_target_not_damaged();
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 item_ui_deactivate();
                 break;
@@ -3103,11 +3163,18 @@ void intgame_process_event(TigMessage* msg)
         switch (msg->type) {
         case TIG_MESSAGE_MOUSE:
             switch (msg->data.mouse.event) {
-            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
-                if (target_pick_at_screen_xy(msg->data.mouse.x, msg->data.mouse.y, &td, intgame_fullscreen)) {
+            case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP: {
+                int mx = msg->data.mouse.x;
+                int my = msg->data.mouse.y;
+                if (intgame_adjust_mouse_for_zoom(mx, my, &mx, &my)) {
+                    if (target_pick_at_virtual_xy(mx, my, &td, intgame_fullscreen)) {
+                        follower_ui_execute_order(&td);
+                    }
+                } else if (target_pick_at_screen_xy(mx, my, &td, intgame_fullscreen)) {
                     follower_ui_execute_order(&td);
                 }
                 break;
+            }
             case TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP:
                 follower_ui_end_order_mode();
                 break;
@@ -4939,13 +5006,16 @@ bool intgame_get_location_under_cursor(int64_t* loc_ptr)
 {
     TigMouseState mouse_state;
     TargetDescriptor td;
+    int x, y;
 
     if (tig_mouse_get_state(&mouse_state) == TIG_OK
-        && sub_5518C0(mouse_state.x, mouse_state.y)
-        && target_pick_at_screen_xy_ex(mouse_state.x, mouse_state.y, &td, TGT_TILE, intgame_fullscreen)
-        && td.is_loc) {
-        *loc_ptr = td.loc;
-        return true;
+        && sub_5518C0(mouse_state.x, mouse_state.y)) {
+        intgame_adjust_mouse_for_zoom(mouse_state.x, mouse_state.y, &x, &y);
+        if (target_pick_at_screen_xy_ex(x, y, &td, TGT_TILE, intgame_fullscreen)
+            && td.is_loc) {
+            *loc_ptr = td.loc;
+            return true;
+        }
     }
 
     *loc_ptr = 0;
@@ -4971,22 +5041,45 @@ bool sub_5518C0(int x, int y)
     return true;
 }
 
+static bool intgame_adjust_mouse_for_zoom(int x, int y, int* adj_x, int* adj_y)
+{
+    float z = iso_zoom_current();
+
+    if (z != 1.0f) {
+        int64_t ax;
+        int64_t ay;
+
+        location_zoom_adjust_screen_xy(x, y, z, &ax, &ay);
+        *adj_x = (int)ax;
+        *adj_y = (int)ay;
+        return true;
+    }
+
+    *adj_x = x;
+    *adj_y = y;
+    return false;
+}
+
 // 0x551910
 void sub_551910(TigMessage* msg)
 {
     TargetDescriptor td;
+    int x;
+    int y;
 
     if (sub_5517A0(msg)) {
         sub_551F80();
 
+        intgame_adjust_mouse_for_zoom(msg->data.mouse.x, msg->data.mouse.y, &x, &y);
+
         if (!map_is_clearing_objects()) {
-            if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+            if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
                 if (!td.is_loc) {
                     sub_57CCF0(player_get_local_pc_obj(), td.obj);
                     object_hover_obj_set(td.obj);
                 }
             } else if (combat_turn_based_is_active()
-                && target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, TGT_TILE, intgame_fullscreen)
+                && target_pick_at_screen_xy_ex(x, y, &td, TGT_TILE, intgame_fullscreen)
                 && td.is_loc
                 && intgame_mode_get() == INTGAME_MODE_MAIN) {
                 combat_check_move_to(player_get_local_pc_obj(), td.loc);
@@ -5079,7 +5172,6 @@ bool intgame_mode_set(IntgameMode mode)
             combat_check_use_skill(player_get_local_pc_obj());
             break;
         case INTGAME_MODE_DIALOG:
-            sub_551A10(pc_obj);
             v1 = 1;
             if (v2) {
                 dialog_ui_end_dialog(player_get_local_pc_obj(), 0);
@@ -5305,6 +5397,10 @@ void sub_551F80(void)
 // 0x552050
 bool sub_552050(int x, int y, TargetDescriptor* td)
 {
+    if (intgame_adjust_mouse_for_zoom(x, y, &x, &y)) {
+        sub_551F80();
+        return target_pick_at_virtual_xy(x, y, td, intgame_fullscreen);
+    }
     sub_551F80();
     return target_pick_at_screen_xy(x, y, td, intgame_fullscreen);
 }
@@ -6077,6 +6173,7 @@ void intgame_dialog_end(void)
 {
     intgame_dialog_process_event_func = NULL;
     tc_hide();
+    dialog_camera_end(player_get_local_pc_obj());
     intgame_mode_set(INTGAME_MODE_MAIN);
 }
 
@@ -6377,6 +6474,8 @@ void sub_553A70(TigMessage* msg)
 {
     int64_t obj;
     TargetDescriptor td;
+    int x;
+    int y;
 
     if (!sub_5517A0(msg)) {
         return;
@@ -6387,7 +6486,9 @@ void sub_553A70(TigMessage* msg)
         return;
     }
 
-    if (target_pick_at_screen_xy_ex(msg->data.mouse.x, msg->data.mouse.y, &td, qword_5C7280, intgame_fullscreen)) {
+    intgame_adjust_mouse_for_zoom(msg->data.mouse.x, msg->data.mouse.y, &x, &y);
+
+    if (target_pick_at_screen_xy_ex(x, y, &td, qword_5C7280, intgame_fullscreen)) {
         if (obj != td.obj) {
             sub_57CCF0(player_get_local_pc_obj(), td.obj);
             object_hover_obj_set(td.obj);
@@ -9478,47 +9579,105 @@ int intgame_hud_bottom_gap_offset(void)
     }
 }
 
+// CE: per-tick hook called from main.c BEFORE iso_redraw. Marks the
+// iso world under any window using the translucent-black tint
+// pathway as dirty, so iso_redraw repaints fresh world pixels into
+// the iso VB. The post-iso_redraw tint pass then darkens those
+// pixels in place. Throttled at non-1.0 zoom because the world→iso
+// scaled blit is the expensive step and a 20Hz refresh of the
+// see-through underlay is visually indistinguishable from 60Hz.
 void intgame_hud_tick_invalidate_alpha_strips(void)
 {
-    // Currently only the bottom strip + (optionally) the big window opt
-    // in to per-pixel see-through. Tell gamelib to repaint the world
-    // under each every tick so the alpha-blend composite has fresh
-    // world pixels to blend against.
     if (!intgame_iso_interface_created) {
         return;
     }
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        return;
+    }
+    if (!intgame_hud_bar_uses_tint) {
+        return;
+    }
+
+    static unsigned int tick_counter = 0;
+    tick_counter++;
+    unsigned int throttle = 1;
+    {
+        float z = iso_zoom_current();
+        if (z != 1.0f) {
+            throttle = 3;
+        }
+    }
+    if ((tick_counter % throttle) != 0) {
+        return;
+    }
+
     if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
         TigWindowData wd;
         if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
             iso_invalidate_rect(&wd.rect);
         }
     }
-    if (intgame_big_window_locked
-        && intgame_big_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-        TigWindowData bwd;
-        if (tig_window_data(intgame_big_window_handle, &bwd) == TIG_OK) {
-            iso_invalidate_rect(&bwd.rect);
-        }
-    }
 }
 
-// CE: Apply the optional TranslucentBlackUI effect to a window. Used
-// by inventory / paperdoll / loot / barter screens (and anything else
-// sharing the intgame_big_window_handle) to opt in/out at lock/unlock
-// time, since the big window is shared across UIs that may or may not
-// want the effect. enable=false disables it.
+// CE: per-tick hook called from main.c AFTER iso_redraw. For each
+// window opted into the translucent-black tint pathway, darken the
+// iso VB pixels under that window's rect so the pre-baked color-key
+// holes in the chrome show "tinted iso world" through them. The
+// compositor then does a plain hardware color-key blit — no per-
+// pixel CPU work in its inner loop. Same architectural pattern as
+// the dialog options backdrop tint in tc.c.
+void intgame_hud_tick_apply_tint(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        return;
+    }
+    if (!intgame_hud_bar_uses_tint) {
+        return;
+    }
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
+    TigVideoBuffer* iso_vb = NULL;
+    if (tig_window_vbid_get(intgame_iso_window, &iso_vb) != TIG_OK
+        || iso_vb == NULL) {
+        return;
+    }
+
+    TigWindowData iso_wd;
+    TigWindowData bar_wd;
+    if (tig_window_data(intgame_iso_window, &iso_wd) != TIG_OK) {
+        return;
+    }
+    if (tig_window_data(dword_64C4F8[1], &bar_wd) != TIG_OK) {
+        return;
+    }
+
+    // Bar rect in iso-VB-local coords.
+    TigRect local;
+    local.x = bar_wd.rect.x - iso_wd.rect.x;
+    local.y = bar_wd.rect.y - iso_wd.rect.y;
+    local.width = bar_wd.rect.width;
+    local.height = bar_wd.rect.height;
+
+    // Subtractive tint — darken the iso pixels under the bar's
+    // color-key holes by a constant per channel.
+    tig_video_buffer_tint(iso_vb,
+        &local,
+        tig_color_make(30, 30, 30),
+        TIG_VIDEO_BUFFER_TINT_MODE_SUB);
+}
+
+// CE: Apply the translucent-black effect to a window. Currently a
+// no-op stub kept for ABI compatibility while we decide whether to
+// generalize the bar's tint pathway to other UIs (charedit / inven
+// / wmap / mainmenu Options). For now those windows show opaque
+// chrome — the see-through effect only applies to the HUD bar.
 void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable)
 {
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
-        return;
-    }
-    if (enable && !settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-        // Cfg disables the feature globally — ensure the window has
-        // alpha cleared in case it was set by a prior owner.
-        tig_window_near_black_alpha_set(window_handle, false,
-            TIG_WINDOW_HANDLE_INVALID, 0, 0);
-        return;
-    }
-    tig_window_near_black_alpha_set(window_handle, enable,
-        intgame_iso_window, 8, 128);
+    (void)window_handle;
+    (void)enable;
 }

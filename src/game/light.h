@@ -46,6 +46,8 @@ typedef struct Shadow {
 bool light_init(GameInitInfo* init_info);
 void light_exit(void);
 void light_resize(GameResizeInfo* resize_info);
+void light_set_iso_content_rect(const TigRect* rect);
+void light_preallocate_for_zoom(const TigRect* zoom_rect);
 void light_update_view(ViewOptions* view_options);
 void light_toggle(void);
 void light_buffers_lock(void);

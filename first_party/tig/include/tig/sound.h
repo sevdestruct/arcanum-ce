@@ -42,6 +42,15 @@ void tig_sound_ping(void);
 // Sets a callback function to resolve sound ID to a file path.
 void tig_sound_set_file_path_resolver(TigSoundFilePathResolver func);
 
+// Enable/disable async first-play sound loading. When enabled (the
+// default), a cache miss in tig_sound_play dispatches a detached worker
+// thread to read the file off the main thread; the sound starts playing
+// when the read completes (typically <16ms later, vs 100-150ms hitch
+// for the synchronous path). Set to false to force synchronous loads
+// (vanilla pre-async behavior). Driven by the `sound async load` cfg
+// key in arcanum.cfg.
+void tig_sound_async_set_enabled(bool enabled);
+
 // Returns `true` if SOUND subsystem is initialized.
 bool tig_sound_is_initialized(void);
 

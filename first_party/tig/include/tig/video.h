@@ -111,24 +111,41 @@ int tig_video_window_get(SDL_Window** window_ptr);
 int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
-// CE: per-pixel see-through composite for near-black source pixels.
-// Near-black pixels blend with the underlay VB; non-near-black pixels
-// copy through opaque. underlay_origin_x/y locate the screen's (0,0)
-// inside the underlay VB — for a fullscreen underlay window (e.g. iso)
-// these are the negation of the underlay window's frame.x/y. If
-// underlay_video_buffer is NULL, fall back to reading the screen
-// itself for the blend (stale pixels).
-int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
-    TigRect* src_rect,
-    TigRect* dst_rect,
-    TigVideoBuffer* underlay_video_buffer,
-    int underlay_offset_x,
-    int underlay_offset_y,
-    uint8_t threshold,
-    uint8_t opacity);
+// Video-replacement system: hardware-accelerated scaled blit used by
+// the cutscene/intro player. Kept from the pre-merge state; not part of
+// the translucent-black-UI rework on ui-improvements.
 int tig_video_blit_scaled(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
+// Hint the next tig_video_flip to upload only `rect` of the surface to the GPU
+// texture instead of the whole surface. Cleared after the next flip. NULL or
+// an empty rect means "upload everything" (the default). Callers that touch
+// only a portion of the surface during a present cycle (window compositor +
+// mouse cursor) should call this with the union of their writes to skip the
+// CPU→GPU bandwidth of a full-surface SDL_UpdateTexture (~8MB at 1080p32).
+void tig_video_set_present_dirty_rect(const TigRect* rect);
+
+// Internal-breakdown timing for tig_video_flip. Used by the gamelib zoom-perf
+// log to attribute the ~7ms-per-frame cost between SDL_UpdateTexture
+// (CPU→GPU upload) and SDL_RenderPresent (typically vsync wait). Counters
+// are only accumulated while collection is enabled; the gamelib F9 toggle
+// drives that flag.
+typedef struct {
+    uint64_t update_total_ns;
+    uint64_t update_max_ns;
+    uint64_t present_total_ns;
+    uint64_t present_max_ns;
+    int samples;
+    int partial_samples;
+} TigVideoFlipPerf;
+void tig_video_flip_perf_set_enabled(bool enabled);
+void tig_video_flip_perf_get(TigVideoFlipPerf* out);
+void tig_video_flip_perf_reset(void);
+
+// Reapply the renderer's vsync mode. Values match SDL_SetRenderVSync:
+//   1 = vsync on (default at init), 0 = vsync off, -1 = adaptive vsync
+//   (SDL_RENDERER_VSYNC_ADAPTIVE). Returns TIG_OK on success.
+int tig_video_set_vsync_mode(int mode);
 int tig_video_screenshot_set_settings(TigVideoScreenshotSettings* settings);
 int tig_video_screenshot_make(void);
 int tig_video_get_palette(unsigned int* colors);
@@ -152,6 +169,17 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color);
 int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t tint_color, TigVideoBufferTintMode mode);
+
+// CE: scan the rect for pixels whose R, G, B are all ≤ threshold
+// ("near-black") and overwrite them with the VB's color_key so the
+// next SDL blit treats those pixels as transparent. Used by the
+// translucent-black-UI tint pathway to bake panel art's dark
+// regions to color-key transparency at window creation, after which
+// the standard color-key blit shows whatever's beneath through the
+// holes. NEON-vectorized fast path on Apple Silicon.
+int tig_video_buffer_replace_near_black_with_color_key(TigVideoBuffer* video_buffer,
+    TigRect* rect,
+    uint8_t threshold);
 int tig_video_buffer_save_to_bmp(TigVideoBufferSaveToBmpInfo* save_info);
 int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_buffer_ptr, unsigned int flags);
 

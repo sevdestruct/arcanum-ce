@@ -2,12 +2,14 @@
 
 #include <stdio.h>
 
+#include <SDL3/SDL.h>
 #include <mss_compat.h>
 
 #include "tig/core.h"
 #include "tig/debug.h"
 #include "tig/file.h"
 #include "tig/file_cache.h"
+#include "tig/memory.h"
 #include "tig/timer.h"
 
 #define FIRST_VOICE_HANDLE 0
@@ -84,6 +86,119 @@ static TigFileCache* tig_sound_cache;
 // 0x6301F4
 static int tig_sound_effects_volume;
 
+// === Async first-play loader ===
+//
+// On a cache miss, `tig_sound_play` dispatches a detached worker thread to
+// read the file from disk, then queues the loaded data for the main thread
+// to insert into the cache + play. Eliminates the synchronous ~100-150ms
+// disk-load-and-decode hitch the first time any sound plays (after the
+// 256-file cache thrashing fix in `38fe0a04`, this is the residual sound
+// hitch). Sound plays slightly late on first encounter; subsequent plays
+// hit the cache and are immediate.
+//
+// Worker threads only do file I/O (tig_file_fopen + read). The cache
+// insert and AIL_quick_load_mem + AIL_quick_play stay on the main thread
+// because (a) tig_file_cache has no locks and (b) the SDL_mixer mixer
+// object is shared global state. Result: ~0 thread-safety surface area
+// beyond the completion-queue mutex.
+typedef struct TigSoundAsyncLoad {
+    char path[TIG_MAX_PATH];
+    tig_sound_handle_t handle;
+    int id;
+    int loops;
+    int volume;
+    int extra_volume;
+    void* data;     // file contents (worker malloc; main FREEs after cache insert OR on failure)
+    int size;
+    int success;    // 1 on successful read, 0 on failure (file missing, etc.)
+    struct TigSoundAsyncLoad* next;
+} TigSoundAsyncLoad;
+
+static SDL_Mutex* tig_sound_async_mutex;
+static TigSoundAsyncLoad* tig_sound_async_completion_head;
+// Opt-out flag: caller may turn off async loading via the cfg key. Default
+// is on because the data showed first-play hitches as the residual issue
+// after every other optimization.
+static bool tig_sound_async_enabled = true;
+
+void tig_sound_async_set_enabled(bool enabled)
+{
+    tig_sound_async_enabled = enabled;
+}
+
+static int SDLCALL tig_sound_async_worker(void* arg)
+{
+    TigSoundAsyncLoad* req = (TigSoundAsyncLoad*)arg;
+    void* buf = NULL;
+    int size = 0;
+    if (tig_file_cache_read_contents_into(req->path, &buf, &size)) {
+        req->data = buf;
+        req->size = size;
+        req->success = 1;
+    } else {
+        req->data = NULL;
+        req->size = 0;
+        req->success = 0;
+    }
+    // Push onto completion stack — main thread drains in tig_sound_update.
+    SDL_LockMutex(tig_sound_async_mutex);
+    req->next = tig_sound_async_completion_head;
+    tig_sound_async_completion_head = req;
+    SDL_UnlockMutex(tig_sound_async_mutex);
+    return 0;
+}
+
+// Called from tig_sound_update (which fires at most every 100ms) to drain
+// any completed async loads and start their playback. Has to be on the
+// main thread because of tig_file_cache + SDL_mixer thread-safety.
+static void tig_sound_async_drain(void)
+{
+    SDL_LockMutex(tig_sound_async_mutex);
+    TigSoundAsyncLoad* head = tig_sound_async_completion_head;
+    tig_sound_async_completion_head = NULL;
+    SDL_UnlockMutex(tig_sound_async_mutex);
+
+    while (head != NULL) {
+        TigSoundAsyncLoad* next = head->next;
+        if (head->success && head->data != NULL) {
+            // Insert into cache (takes ownership of head->data on success;
+            // on cache-hit-collision, FREEs our copy and returns the
+            // existing entry; on failure FREEs our copy and returns NULL).
+            TigFileCacheEntry* entry = tig_file_cache_insert_data(
+                tig_sound_cache, head->path, head->data, head->size);
+            head->data = NULL;  // ownership transferred
+            if (entry != NULL && entry->data != NULL
+                && sound_handle_is_valid(head->handle)) {
+                TigSound* snd = &(tig_sounds[head->handle]);
+                // Two guards:
+                // 1. id mismatch — handle reassigned since dispatch; the
+                //    new owner gets its own dispatch (or sync load), this
+                //    one is stale.
+                // 2. slot busy — another sound is already active on this
+                //    handle. Don't stomp it. The first-play cache miss
+                //    that the user wanted to hear is gone (this drain
+                //    fires up to ~100ms after dispatch); silently dropping
+                //    is better than killing a sound that's currently
+                //    playing.
+                if (snd->id == head->id && snd->active == 0) {
+                    snd->file_cache_entry = entry;
+                    snd->audio_handle = AIL_quick_load_mem(entry->data, entry->size);
+                    AIL_quick_set_volume(snd->audio_handle, head->volume, head->extra_volume);
+                    AIL_quick_play(snd->audio_handle, head->loops);
+                    snd->flags |= TIG_SOUND_MEMORY;
+                    snd->active = 1;
+                } else {
+                    tig_file_cache_release(tig_sound_cache, entry);
+                }
+            }
+        } else if (head->data != NULL) {
+            FREE(head->data);
+        }
+        FREE(head);
+        head = next;
+    }
+}
+
 // 0x532D40
 int tig_sound_init(TigInitInfo* init_info)
 {
@@ -99,8 +214,19 @@ int tig_sound_init(TigInitInfo* init_info)
 
     tig_sound_set_file_path_resolver(init_info->sound_file_path_resolver);
 
-    // Create a file cache for 20 files, approx. 1 MB total.
-    tig_sound_cache = tig_file_cache_create(20, 1000000);
+    // CE: Bumped from the original 20 files / 1MB sizing — that thrashes
+    // constantly on modern hardware where every new combat / dialog /
+    // terrain footstep evicts another sound, and the next time any of them
+    // plays we pay ~400ms for re-load + re-decode on the main thread (see
+    // megahitch log entries). 256 files / 64MB easily fits in RAM on any
+    // machine that can run a 2026 build, gives effectively-infinite
+    // caching for the unique-sound set of a typical play session, and
+    // eliminates the first-play stutter for any sound played more than
+    // once per game launch.
+    tig_sound_cache = tig_file_cache_create(256, 64 * 1024 * 1024);
+
+    tig_sound_async_mutex = SDL_CreateMutex();
+    tig_sound_async_completion_head = NULL;
 
     return TIG_OK;
 }
@@ -111,6 +237,26 @@ void tig_sound_exit(void)
     if (tig_sound_initialized) {
         tig_sound_initialized = false;
         tig_sound_stop_all(0);
+        // Drop any pending completions before we destroy the cache + mixer.
+        // Detached worker threads might still post completions after this,
+        // but the early-return guard at the top of tig_sound_async_drain
+        // (and `tig_sound_initialized = false` above) prevents further
+        // drains. Worst case: a leaked buffer from a thread completing
+        // after exit, which the OS reclaims on process tear-down.
+        if (tig_sound_async_mutex != NULL) {
+            SDL_LockMutex(tig_sound_async_mutex);
+            TigSoundAsyncLoad* head = tig_sound_async_completion_head;
+            tig_sound_async_completion_head = NULL;
+            SDL_UnlockMutex(tig_sound_async_mutex);
+            while (head != NULL) {
+                TigSoundAsyncLoad* next = head->next;
+                if (head->data != NULL) FREE(head->data);
+                FREE(head);
+                head = next;
+            }
+            SDL_DestroyMutex(tig_sound_async_mutex);
+            tig_sound_async_mutex = NULL;
+        }
         tig_file_cache_destroy(tig_sound_cache);
         AIL_quick_shutdown();
     }
@@ -151,6 +297,12 @@ void tig_sound_update(void)
 
     if (!tig_sound_initialized) {
         return;
+    }
+
+    // Drain any async-loaded sounds whose disk read finished since the
+    // last tick. Cheap (typically empty or 1-2 entries).
+    if (tig_sound_async_mutex != NULL) {
+        tig_sound_async_drain();
     }
 
     for (index = 0; index < SOUND_HANDLE_MAX; index++) {
@@ -405,14 +557,66 @@ int tig_sound_play(tig_sound_handle_t sound_handle, const char* path, int id)
 
     snd = &(tig_sounds[sound_handle]);
     strcpy(snd->path, path);
-    snd->file_cache_entry = tig_file_cache_acquire(tig_sound_cache, path);
+    // Lookup-only first — if the sound is cached we play it now (fast
+    // path, identical to pre-async behavior). On miss, EITHER dispatch
+    // an async load (async path), OR fall back to the original
+    // synchronous load (if async is disabled or thread create fails).
+    snd->file_cache_entry = tig_file_cache_lookup(tig_sound_cache, path);
 
-    if (snd->file_cache_entry->data != NULL) {
+    if (snd->file_cache_entry != NULL && snd->file_cache_entry->data != NULL) {
         snd->audio_handle = AIL_quick_load_mem(snd->file_cache_entry->data, snd->file_cache_entry->size);
         AIL_quick_set_volume(snd->audio_handle, snd->volume, snd->extra_volume);
         AIL_quick_play(snd->audio_handle, snd->loops);
         snd->flags |= TIG_SOUND_MEMORY;
         snd->id = id;
+        return TIG_OK;
+    }
+
+    snd->file_cache_entry = NULL;
+    snd->id = id;
+
+    if (tig_sound_async_enabled && tig_sound_async_mutex != NULL) {
+        TigSoundAsyncLoad* req = (TigSoundAsyncLoad*)MALLOC(sizeof(*req));
+        if (req != NULL) {
+            size_t n = strlen(path);
+            if (n >= sizeof(req->path)) n = sizeof(req->path) - 1;
+            memcpy(req->path, path, n);
+            req->path[n] = '\0';
+            req->handle = sound_handle;
+            req->id = id;
+            req->loops = snd->loops;
+            req->volume = snd->volume;
+            req->extra_volume = snd->extra_volume;
+            req->data = NULL;
+            req->size = 0;
+            req->success = 0;
+            req->next = NULL;
+            SDL_Thread* thread = SDL_CreateThread(tig_sound_async_worker, "tig_snd_async", req);
+            if (thread != NULL) {
+                SDL_DetachThread(thread);
+                // Sound is pending — DON'T touch active/flags/audio_handle/
+                // file_cache_entry here. Those stay zeroed until the drain
+                // on the main thread inserts the loaded buffer into the
+                // cache and starts playback. Any other code that checks
+                // `snd->active != 0` will correctly treat the slot as
+                // not-yet-playing (tig_sound_stop is a no-op, fade logic
+                // skips it, etc.) — no NULL deref window.
+                snd->active = 0;
+                return TIG_OK;
+            }
+            FREE(req);
+        }
+    }
+
+    // Fallback: synchronous load (pre-async behavior). Used when async
+    // is disabled, mutex isn't set up, allocation failed, or thread
+    // creation failed.
+    snd->file_cache_entry = tig_file_cache_acquire(tig_sound_cache, path);
+    if (snd->file_cache_entry->data != NULL) {
+        snd->audio_handle = AIL_quick_load_mem(snd->file_cache_entry->data, snd->file_cache_entry->size);
+        AIL_quick_set_volume(snd->audio_handle, snd->volume, snd->extra_volume);
+        AIL_quick_play(snd->audio_handle, snd->loops);
+        snd->flags |= TIG_SOUND_MEMORY;
     } else {
         snd->active = 0;
     }

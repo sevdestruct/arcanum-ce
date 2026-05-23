@@ -1,6 +1,8 @@
 #ifndef ARCANUM_GAME_GAMELIB_H_
 #define ARCANUM_GAME_GAMELIB_H_
 
+#include <stdint.h>
+
 #include "game/context.h"
 #include "game/settings.h"
 #include "game/timeevent.h"
@@ -47,6 +49,30 @@
 // makes sense for it to always show the player. Set to "0" to fall back
 // to vanilla behavior — lens shows whatever is at screen center.
 #define PC_LENS_FOLLOWS_PLAYER_KEY "pc lens follows player"
+
+// First-play sound loading mode. Default 1 (async — sound file read
+// happens on a detached worker thread, sound starts playing when the
+// read completes; eliminates the ~100-150ms first-play hitch every time
+// a never-before-heard sound triggers, at the cost of starting playback
+// up to one tig_sound_update tick (~100ms) late). Set to 0 to force
+// synchronous loads (vanilla behavior; pick this if a thread-safety
+// issue surfaces).
+#define SOUND_ASYNC_LOAD_KEY "sound async load"
+
+// Renderer vsync mode applied after settings load. Values:
+//   2 (default) — vsync ADAPTIVE. Vsync when we hit refresh rate; on
+//                 miss, present returns immediately (tears one frame
+//                 instead of waiting). Measured ~17% lower frame avg
+//                 and ~21% lower stddev vs vsync ON on a 120Hz
+//                 ProMotion display, with no perceptible tearing.
+//   1           — vsync ON. SDL_RenderPresent blocks until next vblank.
+//                 Zero tearing guarantee. Each missed vsync slot costs
+//                 a full refresh period (~8.3ms at 120Hz, ~16.6ms at
+//                 60Hz). Set this if tearing is noticed and disliked.
+//   0           — vsync OFF. No pacing. Maximum throughput, constant
+//                 tearing. Mostly useful for benchmarking.
+// Set in arcanum.cfg. Reapplied at startup.
+#define VSYNC_MODE_KEY "vsync mode"
 
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
@@ -145,6 +171,7 @@ void gamelib_redraw(void);
 bool gamelib_copy_version(char* long_version, char* short_version, char* locale);
 void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
+void gamelib_get_iso_content_rect(TigRect* rect);
 
 // True when the user has opted into the vanilla "snap camera to PC on
 // overlay open" behavior. See RECENTER_CAMERA_ON_OVERLAY_KEY. Defaults
@@ -155,5 +182,45 @@ bool gamelib_recenter_camera_on_overlay(void);
 // iso camera has been panned away. See PC_LENS_FOLLOWS_PLAYER_KEY.
 // Defaults to true.
 bool gamelib_pc_lens_follows_player(void);
+
+// Debug perf counter for the zoom-out draw path. When enabled, gamelib
+// times each zoom-active frame (gamelib_draw_func + downscale blit) and
+// dumps a rolling summary every 60 frames via tig_debug_printf so we
+// can compare before/after partial-redraw work. Off by default.
+void gamelib_zoom_perf_toggle(void);
+bool gamelib_zoom_perf_is_enabled(void);
+
+// Monotonic ns clock for caller-side timing. Cheap (clock_gettime).
+// Pair with gamelib_perf_record_* helpers to attribute time to a bucket.
+uint64_t gamelib_perf_now_ns(void);
+
+// Per-main-loop-step accumulators. Each one buckets time spent in a
+// specific call between consecutive gamelib_draw fires. Only meaningful
+// while gamelib_zoom_perf_is_enabled() — callers should gate sampling.
+void gamelib_perf_record_tig_ping_ns(uint64_t ns);
+void gamelib_perf_record_iso_redraw_ns(uint64_t ns);
+void gamelib_perf_record_window_display_ns(uint64_t ns);
+void gamelib_perf_record_key_repeat_ns(uint64_t ns);
+void gamelib_perf_record_event_dispatch_ns(uint64_t ns);
+
+// Complement to the per-bucket megahitch logger. Called from main.c
+// after each loop iteration with the iteration-total time and the
+// per-bucket breakdown (in ns). If the total exceeds the slow-loop
+// threshold (~50ms — a cumulative miss of 3+ vsync slots on 120Hz)
+// AND no single bucket already tripped the existing megahitch logger,
+// emits one log line attributing the cost. Useful for the case where
+// no individual call is slow but the iteration adds up.
+void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
+    uint64_t tig_ping_ns, uint64_t key_repeat_ns,
+    uint64_t iso_redraw_ns, uint64_t win_display_ns,
+    uint64_t event_dispatch_ns);
+
+// Single message-handler-step timing inside the inner event dispatch
+// loop. Lets us attribute event_dispatch megahitches to a specific
+// message (e.g. F8 quickload, mouse click on worldmap travel arrow,
+// menu close). Threshold matches the per-bucket megahitch logger
+// (100ms). `context` is a free-form short description — typically
+// "msg=KEYBOARD scancode=N up/down" or "msg=type=N".
+void gamelib_perf_log_event(const char* context, uint64_t ns);
 
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

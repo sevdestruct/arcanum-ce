@@ -99,6 +99,11 @@ void tile_resize(GameResizeInfo* resize_info)
     tile_iso_window_handle = resize_info->window_handle;
 }
 
+void tile_set_render_target(TigVideoBuffer* vb)
+{
+    dword_602DF0 = vb;
+}
+
 // 0x4D6900
 void tile_update_view(ViewOptions* view_options)
 {
@@ -672,6 +677,43 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     light_buffers_lock();
 
+    // Pre-compute the bounding rect of all dirty rects so we can fast-
+    // reject tiles whose tile_rect can't possibly overlap any of them.
+    // tile_draw iterates the whole sector_rect (visible area + 256px
+    // border on every side); on heavy frames with full-screen dirty
+    // areas this still wastes ~25-30% of the per-tile work (roof check
+    // + rect intersect loop) on the border tiles. The earlier perf log
+    // identified this pass as the dominant cost during scroll-at-zoom-
+    // out, where tile_max hits 7-10ms — half the 8.3ms ProMotion
+    // budget on its own.
+    TigRect tile_draw_dirty_union;
+    bool tile_draw_dirty_union_set = false;
+    {
+        TigRectListNode* union_node = *draw_info->rects;
+        while (union_node != NULL) {
+            if (!tile_draw_dirty_union_set) {
+                tile_draw_dirty_union = union_node->rect;
+                tile_draw_dirty_union_set = true;
+            } else {
+                int x1 = tile_draw_dirty_union.x < union_node->rect.x
+                    ? tile_draw_dirty_union.x : union_node->rect.x;
+                int y1 = tile_draw_dirty_union.y < union_node->rect.y
+                    ? tile_draw_dirty_union.y : union_node->rect.y;
+                int x2a = tile_draw_dirty_union.x + tile_draw_dirty_union.width;
+                int y2a = tile_draw_dirty_union.y + tile_draw_dirty_union.height;
+                int x2b = union_node->rect.x + union_node->rect.width;
+                int y2b = union_node->rect.y + union_node->rect.height;
+                int x2 = x2a > x2b ? x2a : x2b;
+                int y2 = y2a > y2b ? y2a : y2b;
+                tile_draw_dirty_union.x = x1;
+                tile_draw_dirty_union.y = y1;
+                tile_draw_dirty_union.width = x2 - x1;
+                tile_draw_dirty_union.height = y2 - y1;
+            }
+            union_node = union_node->next;
+        }
+    }
+
     for (v2 = 0; v2 < v1->num_rows; v2++) {
         v3 = &(v1->rows[v2]);
 
@@ -694,9 +736,21 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                 if (sector_lock_results[v15]) {
                     for (v42 = 0; v42 < v3->num_hor_tiles[v15]; v42++) {
                         blit_info_initialized = false;
-                        art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
-                        tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
-                        if (!roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
+                        // Fast-reject tiles outside the dirty-rect union
+                        // before paying for roof_is_covered_xy (which does
+                        // sector lookups). Tile rect math matches what
+                        // the slow path computes below. Also defer
+                        // sectors[].tiles.art_ids[] dereference and
+                        // tig_art_tile_id_type_get() into the slow path —
+                        // both are needed only when we actually draw.
+                        bool tile_in_dirty = tile_draw_dirty_union_set
+                            && (center_x + 1) < tile_draw_dirty_union.x + tile_draw_dirty_union.width
+                            && (center_x + 1 + tile_rect.width) > tile_draw_dirty_union.x
+                            && center_y < tile_draw_dirty_union.y + tile_draw_dirty_union.height
+                            && (center_y + tile_rect.height) > tile_draw_dirty_union.y;
+                        if (tile_in_dirty && !roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
+                            art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
+                            tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
                             tile_rect.x = center_x + 1;
                             tile_rect.y = center_y;
 

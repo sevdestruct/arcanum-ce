@@ -1632,6 +1632,17 @@ void sub_541170(void)
 void mainmenu_ui_start(MainMenuType type)
 {
     tig_art_id_t art_id;
+    // CE: Separate setup-work from modal-think-time. The Escape-key
+    // megahitches in the F9 perf log were almost entirely the user
+    // sitting in the pause menu (mainmenu_ui_handle's modal loop blocks
+    // the event dispatcher until dismissal — see commit 269fdc4e for
+    // the original analysis). Time the setup body separately and log
+    // when it exceeds ~50ms so we can tell a real cold-load hitch from
+    // user think-time. Custom-UI BG art (inmenu_bg.bmp etc.) is loaded
+    // during mainmenu_ui_open below — if THAT path is slow, this
+    // counter will surface it.
+    tig_timestamp_t mm_start_ts;
+    tig_timer_now(&mm_start_ts);
 
     if (!mainmenu_ui_active) {
         mainmenu_ui_num_windows = 0;
@@ -1699,6 +1710,18 @@ void mainmenu_ui_start(MainMenuType type)
             break;
         }
 
+    }
+
+    // Emit a perf entry when the open path was actually slow. Threshold
+    // matches gamelib_save/load (~100ms), with a finer 50ms floor here
+    // since menu open is supposed to be effectively instant.
+    {
+        int dur_ms = tig_timer_elapsed(mm_start_ts);
+        if (dur_ms >= 50) {
+            char ctx[64];
+            snprintf(ctx, sizeof(ctx), "mainmenu_ui_start type=%d", (int)type);
+            gamelib_perf_log_event(ctx, (uint64_t)dur_ms * 1000000ull);
+        }
     }
 }
 

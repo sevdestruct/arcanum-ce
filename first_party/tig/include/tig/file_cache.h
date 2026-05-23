@@ -59,8 +59,33 @@ void tig_file_cache_destroy(TigFileCache* cache);
 // needed.
 TigFileCacheEntry* tig_file_cache_acquire(TigFileCache* cache, const char* path);
 
+// Lookup-only variant: returns an acquired entry if `path` is already in
+// the cache, or NULL if not. Never reads from disk. Used by callers that
+// want to handle the miss themselves (e.g. dispatch an async load instead
+// of blocking the main thread on file I/O).
+TigFileCacheEntry* tig_file_cache_lookup(TigFileCache* cache, const char* path);
+
+// Read the file at `path` into a freshly MALLOC'd buffer (caller takes
+// ownership). Returns true on success and writes the buffer + size out;
+// returns false (and leaves outputs untouched) on open failure. Does
+// NOT touch any cache state — safe to call from a worker thread. Used
+// by async loaders that then hand the buffer to tig_file_cache_insert_data
+// on the main thread.
+bool tig_file_cache_read_contents_into(const char* path, void** data, int* size);
+
 // Releases access to given entry.
 void tig_file_cache_release(TigFileCache* cache, TigFileCacheEntry* entry);
+
+// Inserts pre-loaded file data into the cache, returning an acquired entry
+// (refcount = 1). Used by async loaders that read the file off the main
+// thread and want to hand the result to the cache. Takes ownership of
+// `data` — caller must not free it after a successful call (cache will
+// FREE() it on eviction). On cache hit (path already present), the
+// pre-loaded `data` is FREEd by this function and the existing entry is
+// returned. On failure (no free slot, allocation error), `data` is FREEd
+// and the function returns NULL.
+TigFileCacheEntry* tig_file_cache_insert_data(TigFileCache* cache,
+    const char* path, void* data, int size);
 
 #ifdef __cplusplus
 }

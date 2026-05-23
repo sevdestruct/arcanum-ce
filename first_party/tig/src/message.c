@@ -42,6 +42,12 @@ static TigMessageListNode* tig_message_empty_node_head;
 // 0x62B294
 static TigMessageListNode* tig_message_queue_head;
 
+// O(1)-append cache: points at the tail of `tig_message_queue_head`. Without
+// it, every enqueue walked the entire list to find the end — a per-event cost
+// that grew quadratic during input/scroll bursts when many messages queued
+// between dequeues. Maintained under tig_message_mutex.
+static TigMessageListNode* tig_message_queue_tail;
+
 // 0x62B298
 static int tig_message_key_handlers_count;
 
@@ -54,6 +60,7 @@ int tig_message_init(TigInitInfo* init_info)
 
     tig_message_empty_node_head = NULL;
     tig_message_queue_head = NULL;
+    tig_message_queue_tail = NULL;
     tig_message_key_handlers_count = 0;
 
     return TIG_OK;
@@ -69,6 +76,7 @@ void tig_message_exit(void)
         FREE(tig_message_queue_head);
         tig_message_queue_head = next;
     }
+    tig_message_queue_tail = NULL;
 
     while (tig_message_empty_node_head != NULL) {
         next = tig_message_empty_node_head->next;
@@ -167,7 +175,6 @@ void tig_message_ping(void)
 int tig_message_enqueue(TigMessage* message)
 {
     TigMessageListNode* node;
-    TigMessageListNode* prev;
 
     SDL_LockMutex(tig_message_mutex);
 
@@ -179,14 +186,12 @@ int tig_message_enqueue(TigMessage* message)
         // Redraw is always placed on top of the message queue.
         node->next = tig_message_queue_head;
         tig_message_queue_head = node;
-    } else {
-        // Append new node to the end of the message queue.
-        prev = tig_message_queue_head;
-        while (prev->next != NULL) {
-            prev = prev->next;
+        if (tig_message_queue_tail == NULL) {
+            tig_message_queue_tail = node;
         }
-
-        prev->next = node;
+    } else {
+        tig_message_queue_tail->next = node;
+        tig_message_queue_tail = node;
     }
 
     SDL_UnlockMutex(tig_message_mutex);
@@ -258,6 +263,9 @@ int tig_message_dequeue(TigMessage* message)
         temp_message = tig_message_queue_head->message;
         tig_message_node_release(tig_message_queue_head);
         tig_message_queue_head = next;
+        if (tig_message_queue_head == NULL) {
+            tig_message_queue_tail = NULL;
+        }
 
         if (!tig_movie_is_playing()) {
             if (temp_message.type == TIG_MESSAGE_MOUSE

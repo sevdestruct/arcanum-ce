@@ -1,5 +1,7 @@
 #include "game/location.h"
 
+#include <math.h>
+
 #include "game/path.h"
 #include "game/target.h"
 
@@ -234,6 +236,28 @@ void location_origin_get(int64_t* sx, int64_t* sy)
 {
     *sx = location_origin_x;
     *sy = location_origin_y;
+}
+
+void location_origin_pixel_set(int64_t ox, int64_t oy)
+{
+    location_origin_x = ox;
+    location_origin_y = oy;
+}
+
+void location_zoom_adjust_screen_xy(int64_t sx, int64_t sy, float zoom, int64_t* adj_sx, int64_t* adj_sy)
+{
+    int64_t center_x = location_iso_content_rect.width / 2;
+    int64_t center_y = location_iso_content_rect.height / 2;
+    *adj_sx = center_x + (int64_t)roundf((float)(sx - center_x) / zoom);
+    *adj_sy = center_y + (int64_t)roundf((float)(sy - center_y) / zoom);
+}
+
+bool location_at_zoomed(int64_t sx, int64_t sy, float zoom, int64_t* loc_ptr)
+{
+    int64_t adj_sx;
+    int64_t adj_sy;
+    location_zoom_adjust_screen_xy(sx, sy, zoom, &adj_sx, &adj_sy);
+    return location_at(adj_sx, adj_sy, loc_ptr);
 }
 
 // 0x4B8B30

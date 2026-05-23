@@ -120,6 +120,8 @@ int tig_window_show(tig_window_handle_t window_handle);
 int tig_window_hide(tig_window_handle_t window_handle);
 bool tig_window_is_hidden(tig_window_handle_t window_handle);
 int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** video_buffer_ptr);
+int tig_window_set_video_buffer(tig_window_handle_t window_handle, TigVideoBuffer* vb);
+void tig_window_set_invalidate_suppressed(bool suppressed);
 int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModalDialogChoice* choice_ptr);
 int tig_window_move(tig_window_handle_t window_handle, int x, int y);
 
@@ -139,39 +141,6 @@ int tig_window_move(tig_window_handle_t window_handle, int x, int y);
 // just the rotwin row while leaving the rest of the bar's VB —
 // buttons, art — intact for instant restore).
 int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* clip_rect);
-
-// CE: Per-pixel see-through for "near-black" pixels during composite.
-// When enabled, the compositor blends source pixels whose R, G, B are
-// all <= `threshold` (per channel) with the configured underlay window's
-// VB pixels at the given `opacity` (0 = fully transparent, 255 = fully
-// opaque). All other source pixels copy through opaque as usual.
-//
-// `underlay_handle` is the window whose VB supplies the "destination"
-// half of the blend — typically the iso/world window. We sample its
-// VB directly rather than reading the screen surface, because the
-// top-down compositor leaves the screen stale at the bar's position
-// until lower windows blit (which never happens, since the bar
-// "covers" the region). Pass TIG_WINDOW_HANDLE_INVALID to fall back
-// to reading from the screen surface (only useful when something else
-// already painted the underlay there).
-//
-// Use case: HUD bars whose panel art has wide near-black regions that
-// the user wants to see the game world through, without affecting the
-// chrome/text overlays painted in real colors.
-int tig_window_near_black_alpha_set(tig_window_handle_t window_handle,
-    bool enabled,
-    tig_window_handle_t underlay_handle,
-    uint8_t threshold,
-    uint8_t opacity);
-
-// CE: globally opt modal dialogs (tig_window_modal_dialog) into the
-// same per-pixel see-through alpha as near_black_alpha_set. When
-// enabled, each modal-dialog window auto-wires its underlay to the
-// topmost non-modal non-hidden window in the stack at create time.
-// Pass enabled=false to disable.
-int tig_window_modal_translucent_black_set(bool enabled,
-    uint8_t threshold,
-    uint8_t opacity);
 
 #ifdef __cplusplus
 }

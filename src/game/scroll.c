@@ -1,6 +1,10 @@
 #include "game/scroll.h"
 
+#include <math.h>
+
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
+#include "game/tb.h"
 #include "game/gsound.h"
 #include "game/location.h"
 #include "game/name.h"
@@ -12,11 +16,15 @@
 
 #define SCROLL_DIAG_X 4
 #define SCROLL_DIAG_Y 2
+#define SCROLL_LEASH_SPRING_START_RATIO 0.7f
+#define SCROLL_LEASH_SPRING_MIN_SCALE 0.2f
 
 static void scroll_by(int64_t dx, int64_t dy);
 static void scroll_origin_changed(int64_t loc);
 static void scroll_speed_changed(void);
 static bool scroll_cursor_art_set(tig_art_id_t art_id);
+static void scroll_refresh_clamped_view(void);
+static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit);
 
 /**
  * The minimum time (in milliseconds) between scroll updates.
@@ -103,6 +111,58 @@ static int scroll_distance;
  * 0x5D11C8
  */
 static ScrollFunc scroll_func;
+
+/**
+ * Forces a viewport refresh when a scroll attempt is clamped by the leash or
+ * map bounds.
+ */
+static void scroll_refresh_clamped_view(void)
+{
+    if (!scroll_init_info.editor) {
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    }
+}
+
+static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit)
+{
+    int spring_start;
+    int adjusted;
+    float t;
+    float scale;
+
+    if (delta == 0 || limit <= 0 || next_dist <= current_dist) {
+        return delta;
+    }
+
+    spring_start = (int)roundf((float)limit * SCROLL_LEASH_SPRING_START_RATIO);
+    if (spring_start >= limit) {
+        spring_start = limit - 1;
+    }
+
+    if (current_dist < spring_start) {
+        return delta;
+    }
+
+    if (current_dist >= limit) {
+        return 0;
+    }
+
+    t = (float)(limit - current_dist) / (float)(limit - spring_start);
+    if (t < 0.0f) {
+        t = 0.0f;
+    } else if (t > 1.0f) {
+        t = 1.0f;
+    }
+
+    scale = SCROLL_LEASH_SPRING_MIN_SCALE
+        + (1.0f - SCROLL_LEASH_SPRING_MIN_SCALE) * t;
+    adjusted = (int)roundf((float)delta * scale);
+    if (adjusted == 0) {
+        adjusted = delta > 0 ? 1 : -1;
+    }
+
+    return adjusted;
+}
 
 /**
  * Called when the game is initialized.
@@ -214,6 +274,10 @@ void scroll_start(int direction)
     int64_t center_y;
     int viewport_center_x;
     int viewport_center_y;
+    int current_hor;
+    int current_vert;
+    int hor_limit;
+    int vert_limit;
     int hor;
     int vert;
     bool blocked;
@@ -299,6 +363,19 @@ void scroll_start(int direction)
     // Calculate viewport center.
     viewport_center_x = scroll_iso_content_rect.width / 2;
     viewport_center_y = scroll_iso_content_rect.height / 2;
+    current_hor = abs(viewport_center_x - (int)center_x);
+    current_vert = abs(viewport_center_y - (int)center_y);
+    hor_limit = 80 * distance;
+    vert_limit = 40 * distance;
+
+    dx = scroll_apply_leash_spring_component(dx,
+        current_hor,
+        abs(viewport_center_x - dx - (int)center_x),
+        hor_limit);
+    dy = scroll_apply_leash_spring_component(dy,
+        current_vert,
+        abs(viewport_center_y - dy - (int)center_y),
+        vert_limit);
 
     // Calculate horizontal and vertical distance (in pixels) from the scroll
     // center.
@@ -306,7 +383,7 @@ void scroll_start(int direction)
     vert = abs(viewport_center_y - dy - (int)center_y);
 
     // Check if scrolling is within perception-based limits.
-    if (hor < 80 * distance && vert < 40 * distance) {
+    if (hor < hor_limit && vert < vert_limit) {
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
         scroll_by(dx, dy);
@@ -328,7 +405,7 @@ void scroll_start(int direction)
     blocked = false;
 
     // Adjust direction if horizontal distance exceeds scroll distance limit.
-    if (hor >= 80 * distance) {
+    if (hor >= hor_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP_RIGHT:
             direction = SCROLL_DIRECTION_UP;
@@ -354,7 +431,7 @@ void scroll_start(int direction)
     }
 
     // Adjust direction if vertical distance exceeds scroll distance limit.
-    if (vert >= 40 * distance) {
+    if (vert >= vert_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP:
         case SCROLL_DIRECTION_DOWN:
@@ -378,6 +455,15 @@ void scroll_start(int direction)
             break;
         }
     }
+
+    dx = scroll_apply_leash_spring_component(dx,
+        current_hor,
+        abs(viewport_center_x - dx - (int)center_x),
+        hor_limit);
+    dy = scroll_apply_leash_spring_component(dy,
+        current_vert,
+        abs(viewport_center_y - dy - (int)center_y),
+        vert_limit);
 
     // Perform scroll unless blocked.
     if (!blocked) {
@@ -419,6 +505,8 @@ void scroll_start(int direction)
             break;
         }
     }
+
+    scroll_refresh_clamped_view();
 }
 
 /**
@@ -446,9 +534,13 @@ void scroll_by(int64_t dx, int64_t dy)
     int64_t new_origin_x;
     int64_t new_origin_y;
     TigRect rect;
+    float z;
 
-    // Redraw the view to prepare for scrolling.
-    scroll_init_info.draw_func();
+    z = iso_zoom_current();
+    if (z != 1.0f) {
+        dx = (int64_t)roundf((float)dx / z);
+        dy = (int64_t)roundf((float)dy / z);
+    }
 
     // Update the view origin and check for actual movement.
     location_origin_get(&old_origin_x, &old_origin_y);
@@ -457,6 +549,7 @@ void scroll_by(int64_t dx, int64_t dy)
 
     // Exit if no actual movement occurred (at map edges).
     if (old_origin_x == new_origin_x && old_origin_y == new_origin_y) {
+        scroll_refresh_clamped_view();
         return;
     }
 
@@ -464,36 +557,69 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
-    // Scroll the window content.
-    tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
-
-    // Invalidate newly revealed areas (horizontal scroll).
-    if (dx > 0) {
-        rect = scroll_iso_content_rect;
-        rect.width = (int)dx;
-        scroll_init_info.invalidate_rect_func(&rect);
-    } else if (dx < 0) {
-        rect = scroll_iso_content_rect;
-        rect.x = rect.width + (int)dx;
-        rect.width = -((int)dx);
-        scroll_init_info.invalidate_rect_func(&rect);
-    }
-
-    // Force redraw when scrolling in both directions.
-    if (dx != 0 && dy != 0) {
+    // CE: Force full-redraw on every scroll, regardless of zoom.
+    //
+    // The legacy hardware-scroll path at zoom=1.0 (the `else` branch
+    // below) uses tig_window_scroll, which does a tig_video_buffer_blit
+    // from the iso_window's video buffer to itself with overlapping
+    // src/dst rects. SDL_BlitSurface's behavior on overlapping
+    // same-surface blits is undefined — depending on copy direction,
+    // pixels can be duplicated rather than cleanly shifted, producing
+    // sprite ghosts that trail at the scroll edge until the affected
+    // tiles get re-invalidated by some other event (PC walking
+    // through, etc.).
+    //
+    // Verified on UI-improvements branch: wolf-corpse-duplicates-at-
+    // scroll-edge artifact, present only at zoom=1.0 where this
+    // branch was reached. Forcing the full-redraw path on all zoom
+    // levels eliminates the artifact at the cost of one extra
+    // redraw per scroll frame (cheaper than fighting SDL's overlap
+    // semantics, and zoom=1.0 has no Phase A/C scaling overhead).
+    //
+    // The legacy hardware-scroll branch is preserved below (dead)
+    // for reference; a future cleaner fix could route the scroll
+    // through a scratch video buffer to avoid the overlapping blit.
+    if (true) {
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    } else if (z != 1.0f || tb_any_active()) {
+        // At non-unity zoom, or when speech bubbles are visible, the hardware
+        // scroll optimization leaves stale bubble pixels. Force a full redraw.
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    } else {
+        // Redraw the view to prepare for the hardware pixel-copy scroll below.
         scroll_init_info.draw_func();
-    }
 
-    // Invalidate newly revealed areas (vertical scroll).
-    if (dy < 0) {
-        rect = scroll_iso_content_rect;
-        rect.y += rect.height + (int)dy;
-        rect.height = -(int)dy;
-        scroll_init_info.invalidate_rect_func(&rect);
-    } else if (dy > 0) {
-        rect = scroll_iso_content_rect;
-        rect.height = (int)dy;
-        scroll_init_info.invalidate_rect_func(&rect);
+        // Scroll the window content.
+        tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
+
+        // Invalidate newly revealed areas (horizontal scroll).
+        if (dx > 0) {
+            rect = scroll_iso_content_rect;
+            rect.width = (int)dx;
+            scroll_init_info.invalidate_rect_func(&rect);
+        } else if (dx < 0) {
+            rect = scroll_iso_content_rect;
+            rect.x = rect.width + (int)dx;
+            rect.width = -((int)dx);
+            scroll_init_info.invalidate_rect_func(&rect);
+        }
+
+        // Force redraw when scrolling in both directions.
+        if (dx != 0 && dy != 0) {
+            scroll_init_info.draw_func();
+        }
+
+        // Invalidate newly revealed areas (vertical scroll).
+        if (dy < 0) {
+            rect = scroll_iso_content_rect;
+            rect.y += rect.height + (int)dy;
+            rect.height = -(int)dy;
+            scroll_init_info.invalidate_rect_func(&rect);
+        } else if (dy > 0) {
+            rect = scroll_iso_content_rect;
+            rect.height = (int)dy;
+            scroll_init_info.invalidate_rect_func(&rect);
+        }
     }
 
     // Notify text conversation system of the scroll, so it can update it's

@@ -8,6 +8,14 @@
 #include <objc/runtime.h>
 #endif
 
+// CE: NEON intrinsics on ARM (Apple Silicon, mobile). Used by the
+// near-black-to-color-key one-shot bake in
+// tig_video_buffer_replace_near_black_with_color_key.
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define TIG_HAVE_NEON 1
+#endif
+
 #include "tig/art.h"
 #include "tig/color.h"
 #include "tig/core.h"
@@ -94,6 +102,19 @@ static bool tig_video_show_fps;
 static int dword_6103A4;
 
 static TigFadeState tig_fade_state;
+
+// Optional dirty rect for the next tig_video_flip. When set (width > 0), the
+// flip uploads only that rect from the surface to the GPU texture instead of
+// the whole surface, saving the per-frame CPU→GPU bandwidth (~8MB at 1080p32)
+// for the unchanged pixels. Cleared automatically after each flip — every
+// caller has to opt back in per frame, which keeps the safe default
+// (full-surface upload) in any code path that doesn't know to set it.
+static TigRect tig_video_present_dirty_rect;
+static bool tig_video_present_dirty_rect_valid;
+
+// Intra-flip timing breakdown. Driven by gamelib's F9 perf toggle.
+static bool tig_video_flip_perf_enabled = false;
+static TigVideoFlipPerf tig_video_flip_perf;
 
 // 0x51F330
 int tig_video_init(TigInitInfo* init_info)
@@ -269,127 +290,9 @@ int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect*
     return TIG_OK;
 }
 
-// CE: Per-pixel see-through blit for "near-black" source pixels.
-// For each pixel in src_rect/dst_rect, if all of R, G, B are
-// <= `threshold`, blend src with the underlay VB's pixel at the same
-// screen position at `opacity` (255 opaque, 0 fully transparent).
-// Other source pixels copy opaque to the screen. Sampling the underlay
-// directly (instead of reading from the screen) avoids the top-down
-// compositor's stale-dst problem — at the bar's frame the screen is
-// stale because the iso below never blit through. underlay_offset_x/y
-// give the (x, y) inside the underlay VB that corresponds to screen
-// (0, 0); for a fullscreen iso window at frame (0,0,...) these are 0.
-//
-// Both src VB and the underlay (and screen) are XRGB8888 — bytes in
-// memory [B, G, R, X] on little-endian; reads/writes are 32-bit.
-int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
-    TigRect* src_rect,
-    TigRect* dst_rect,
-    TigVideoBuffer* underlay_video_buffer,
-    int underlay_offset_x,
-    int underlay_offset_y,
-    uint8_t threshold,
-    uint8_t opacity)
-{
-    if (!tig_video_initialized) {
-        return TIG_ERR_NOT_INITIALIZED;
-    }
-    if (src_video_buffer == NULL || src_video_buffer->surface == NULL
-        || tig_video_state.surface == NULL) {
-        return TIG_ERR_INVALID_PARAM;
-    }
-
-    TigRect clamped_dst;
-    int rc = tig_rect_intersection(dst_rect, &stru_610388, &clamped_dst);
-    if (rc != TIG_OK) {
-        return rc;
-    }
-    int dx_off = clamped_dst.x - dst_rect->x;
-    int dy_off = clamped_dst.y - dst_rect->y;
-
-    SDL_Surface* src = src_video_buffer->surface;
-    SDL_Surface* dst = tig_video_state.surface;
-    SDL_Surface* under = (underlay_video_buffer != NULL)
-        ? underlay_video_buffer->surface
-        : NULL;
-
-    if (!SDL_LockSurface(src)) {
-        return TIG_ERR_GENERIC;
-    }
-    if (!SDL_LockSurface(dst)) {
-        SDL_UnlockSurface(src);
-        return TIG_ERR_GENERIC;
-    }
-    if (under != NULL && !SDL_LockSurface(under)) {
-        SDL_UnlockSurface(dst);
-        SDL_UnlockSurface(src);
-        return TIG_ERR_GENERIC;
-    }
-
-    int src_pitch_px = src->pitch / 4;
-    int dst_pitch_px = dst->pitch / 4;
-    int under_pitch_px = (under != NULL) ? (under->pitch / 4) : 0;
-    uint32_t* src_base = (uint32_t*)src->pixels
-        + (src_rect->y + dy_off) * src_pitch_px
-        + (src_rect->x + dx_off);
-    uint32_t* dst_base = (uint32_t*)dst->pixels
-        + clamped_dst.y * dst_pitch_px
-        + clamped_dst.x;
-    uint32_t* under_base = NULL;
-    if (under != NULL) {
-        // Underlay-VB row corresponding to clamped_dst.y on screen.
-        int uy = clamped_dst.y + underlay_offset_y;
-        int ux = clamped_dst.x + underlay_offset_x;
-        // Clamp to underlay extents — fall back to screen pixels for
-        // any row/col outside the underlay's VB.
-        if (uy < 0 || ux < 0 || uy >= under->h || ux >= under->w) {
-            under = NULL;
-        } else {
-            under_base = (uint32_t*)under->pixels + uy * under_pitch_px + ux;
-        }
-    }
-
-    int w = clamped_dst.width;
-    int h = clamped_dst.height;
-    // Scale 0..255 -> 0..256 so (s*a + d*(256-a)) >> 8 lands on the
-    // standard alpha lerp without an off-by-one at opacity=255.
-    int a = opacity + (opacity >> 7);
-
-    for (int y = 0; y < h; y++) {
-        uint32_t* sp = src_base + y * src_pitch_px;
-        uint32_t* dp = dst_base + y * dst_pitch_px;
-        uint32_t* up = (under_base != NULL) ? (under_base + y * under_pitch_px) : NULL;
-        for (int x = 0; x < w; x++) {
-            uint32_t s = sp[x];
-            uint8_t sr = (uint8_t)(s >> 16);
-            uint8_t sg = (uint8_t)(s >> 8);
-            uint8_t sb = (uint8_t)s;
-            if (sr <= threshold && sg <= threshold && sb <= threshold) {
-                // "Destination" for the blend = underlay if available,
-                // else whatever's on the screen (likely stale).
-                uint32_t d = (up != NULL) ? up[x] : dp[x];
-                uint8_t dr = (uint8_t)(d >> 16);
-                uint8_t dg = (uint8_t)(d >> 8);
-                uint8_t db = (uint8_t)d;
-                int br = (sr * a + dr * (256 - a)) >> 8;
-                int bg = (sg * a + dg * (256 - a)) >> 8;
-                int bb = (sb * a + db * (256 - a)) >> 8;
-                dp[x] = 0xFF000000u | ((uint32_t)br << 16) | ((uint32_t)bg << 8) | (uint32_t)bb;
-            } else {
-                dp[x] = s;
-            }
-        }
-    }
-
-    if (under != NULL) {
-        SDL_UnlockSurface(under);
-    }
-    SDL_UnlockSurface(dst);
-    SDL_UnlockSurface(src);
-
-    return TIG_OK;
-}
-
+// Video-replacement system: hardware-accelerated scaled blit used by
+// the cutscene/intro player. Kept from the pre-merge state; not part
+// of the translucent-black-UI rework.
 int tig_video_blit_scaled(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect)
 {
     SDL_Rect native_src_rect;
@@ -448,10 +351,112 @@ int tig_video_fill(const TigRect* rect, tig_color_t color)
     return TIG_OK;
 }
 
+void tig_video_set_present_dirty_rect(const TigRect* rect)
+{
+    if (rect == NULL || rect->width <= 0 || rect->height <= 0) {
+        tig_video_present_dirty_rect_valid = false;
+        return;
+    }
+    tig_video_present_dirty_rect = *rect;
+    tig_video_present_dirty_rect_valid = true;
+}
+
+void tig_video_flip_perf_set_enabled(bool enabled)
+{
+    tig_video_flip_perf_enabled = enabled;
+    if (enabled) {
+        memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
+    }
+}
+
+void tig_video_flip_perf_get(TigVideoFlipPerf* out)
+{
+    if (out != NULL) {
+        *out = tig_video_flip_perf;
+    }
+}
+
+void tig_video_flip_perf_reset(void)
+{
+    memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
+}
+
+int tig_video_set_vsync_mode(int mode)
+{
+    if (tig_video_state.renderer == NULL) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    if (!SDL_SetRenderVSync(tig_video_state.renderer, mode)) {
+        tig_debug_printf("tig_video_set_vsync_mode: SDL_SetRenderVSync(%d) failed: %s\n",
+            mode, SDL_GetError());
+        return TIG_ERR_GENERIC;
+    }
+    tig_debug_printf("tig_video_set_vsync_mode: applied mode=%d (%s)\n",
+        mode,
+        mode == 0 ? "off" :
+        mode == 1 ? "on" :
+        mode == -1 ? "adaptive" : "custom");
+    return TIG_OK;
+}
+
+// SDL_GetPerformanceCounter ticks → nanoseconds.
+static uint64_t tig_video_flip_ticks_to_ns(uint64_t ticks)
+{
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    if (freq == 0) return 0;
+    return (uint64_t)((double)ticks * 1e9 / (double)freq);
+}
+
 // 0x51F8F0
 int tig_video_flip(void)
 {
-    SDL_UpdateTexture(tig_video_state.texture, NULL, tig_video_state.surface->pixels, tig_video_state.surface->pitch);
+    // Partial-upload fast path: only re-upload the rect the compositor
+    // touched this present cycle. Falls back to full-surface upload when
+    // no hint is set or the rect is bigger than ~3/4 of the surface
+    // (point at which partial-upload overhead exceeds savings).
+    bool partial = false;
+    TigRect upload_rect;
+    if (tig_video_present_dirty_rect_valid && tig_video_state.surface != NULL) {
+        upload_rect = tig_video_present_dirty_rect;
+        TigRect surface_rect = { 0, 0, tig_video_state.surface->w, tig_video_state.surface->h };
+        if (upload_rect.x < surface_rect.x) {
+            upload_rect.width -= (surface_rect.x - upload_rect.x);
+            upload_rect.x = surface_rect.x;
+        }
+        if (upload_rect.y < surface_rect.y) {
+            upload_rect.height -= (surface_rect.y - upload_rect.y);
+            upload_rect.y = surface_rect.y;
+        }
+        if (upload_rect.x + upload_rect.width > surface_rect.x + surface_rect.width) {
+            upload_rect.width = surface_rect.x + surface_rect.width - upload_rect.x;
+        }
+        if (upload_rect.y + upload_rect.height > surface_rect.y + surface_rect.height) {
+            upload_rect.height = surface_rect.y + surface_rect.height - upload_rect.y;
+        }
+        int64_t upload_px = (int64_t)upload_rect.width * (int64_t)upload_rect.height;
+        int64_t surface_px = (int64_t)surface_rect.width * (int64_t)surface_rect.height;
+        partial = upload_rect.width > 0
+            && upload_rect.height > 0
+            && upload_px * 4 < surface_px * 3;
+    }
+    tig_video_present_dirty_rect_valid = false;
+
+    uint64_t flip_t0 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
+
+    if (partial) {
+        int bpp = tig_video_state.surface->format == SDL_PIXELFORMAT_UNKNOWN
+            ? 4
+            : (int)SDL_BYTESPERPIXEL(tig_video_state.surface->format);
+        SDL_Rect sdl_rect = { upload_rect.x, upload_rect.y, upload_rect.width, upload_rect.height };
+        const uint8_t* src = (const uint8_t*)tig_video_state.surface->pixels
+            + (size_t)upload_rect.y * (size_t)tig_video_state.surface->pitch
+            + (size_t)upload_rect.x * (size_t)bpp;
+        SDL_UpdateTexture(tig_video_state.texture, &sdl_rect, src, tig_video_state.surface->pitch);
+    } else {
+        SDL_UpdateTexture(tig_video_state.texture, NULL, tig_video_state.surface->pixels, tig_video_state.surface->pitch);
+    }
+
+    uint64_t flip_t1 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
 
     SDL_RenderClear(tig_video_state.renderer);
     SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
@@ -474,7 +479,21 @@ int tig_video_flip(void)
         SDL_RenderDebugTextFormat(tig_video_state.renderer, 0, 0, "%d", tig_video_state.fps);
     }
 
+    uint64_t flip_t2 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
+
     SDL_RenderPresent(tig_video_state.renderer);
+
+    if (tig_video_flip_perf_enabled) {
+        uint64_t flip_t3 = SDL_GetPerformanceCounter();
+        uint64_t upload_ns = tig_video_flip_ticks_to_ns(flip_t1 - flip_t0);
+        uint64_t present_ns = tig_video_flip_ticks_to_ns(flip_t3 - flip_t2);
+        tig_video_flip_perf.update_total_ns += upload_ns;
+        tig_video_flip_perf.present_total_ns += present_ns;
+        if (upload_ns > tig_video_flip_perf.update_max_ns) tig_video_flip_perf.update_max_ns = upload_ns;
+        if (present_ns > tig_video_flip_perf.present_max_ns) tig_video_flip_perf.present_max_ns = present_ns;
+        tig_video_flip_perf.samples++;
+        if (partial) tig_video_flip_perf.partial_samples++;
+    }
 
     return TIG_OK;
 }
@@ -1338,6 +1357,65 @@ int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color
         }
     }
 
+    tig_video_buffer_unlock(video_buffer);
+    return TIG_OK;
+}
+
+// CE: one-shot bake — replace near-black pixels in `rect` with the VB's
+// color_key so the standard SDL color-key blit treats them as
+// transparent. Threshold is per-channel: a pixel qualifies when R, G,
+// AND B are all ≤ threshold. NEON path processes 4 pixels per iter;
+// scalar fallback for non-ARM targets and the trailing < 4 pixels.
+int tig_video_buffer_replace_near_black_with_color_key(TigVideoBuffer* video_buffer,
+    TigRect* rect,
+    uint8_t threshold)
+{
+    TigRect frame;
+    int rc;
+    if (video_buffer == NULL || video_buffer->surface == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    rc = tig_rect_intersection(rect, &(video_buffer->frame), &frame);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+    rc = tig_video_buffer_lock(video_buffer);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+    uint32_t key = video_buffer->color_key;
+    int pitch_px = video_buffer->surface->pitch / 4;
+    for (int y = 0; y < frame.height; y++) {
+        uint32_t* dst = (uint32_t*)video_buffer->surface->pixels
+            + pitch_px * (y + frame.y)
+            + frame.x;
+        int x = 0;
+#if TIG_HAVE_NEON
+        if (frame.width >= 4) {
+            uint8x16_t thresh_v = vdupq_n_u8(threshold);
+            uint8x16_t alpha_clear = vreinterpretq_u8_u32(vdupq_n_u32(0x00FFFFFFu));
+            uint32x4_t allones = vdupq_n_u32(0xFFFFFFFFu);
+            uint32x4_t key_v = vdupq_n_u32(key);
+            for (; x + 4 <= frame.width; x += 4) {
+                uint32x4_t s4 = vld1q_u32(dst + x);
+                uint8x16_t s_rgb = vandq_u8(vreinterpretq_u8_u32(s4), alpha_clear);
+                uint8x16_t le = vcleq_u8(s_rgb, thresh_v);
+                uint32x4_t le_u32 = vreinterpretq_u32_u8(le);
+                uint32x4_t nb_mask = vceqq_u32(le_u32, allones);
+                uint32x4_t out = vbslq_u32(nb_mask, key_v, s4);
+                vst1q_u32(dst + x, out);
+            }
+        }
+#endif
+        for (; x < frame.width; x++) {
+            uint32_t s = dst[x];
+            if (((s >> 16) & 0xFF) <= threshold
+                && ((s >> 8) & 0xFF) <= threshold
+                && (s & 0xFF) <= threshold) {
+                dst[x] = key;
+            }
+        }
+    }
     tig_video_buffer_unlock(video_buffer);
     return TIG_OK;
 }

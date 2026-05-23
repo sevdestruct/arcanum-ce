@@ -1,6 +1,7 @@
 #include "game/object.h"
 
 #include <inttypes.h>
+#include <math.h>
 
 #include "game/ai.h"
 #include "game/anim.h"
@@ -10,6 +11,7 @@
 #include "game/effect.h"
 #include "game/gamelib.h"
 #include "game/gsound.h"
+#include "game/iso_zoom.h"
 #include "game/item.h"
 #include "game/light.h"
 #include "game/magictech.h"
@@ -96,6 +98,7 @@ static bool sub_443880(TigRect* rect, tig_art_id_t art_id);
 static bool load_reaction_colors(void);
 static void sub_444270(int64_t obj, int a2);
 static void object_lighting_changed(void);
+static void object_get_effective_iso_content_rect_ex(TigRect* rect);
 
 // 0x5A548C
 static int dword_5A548C[8] = {
@@ -293,6 +296,39 @@ void object_resize(GameResizeInfo* resize_info)
     object_iso_content_rect_ex.height = object_iso_content_rect.height + 512;
     qword_5E2F50 = object_iso_content_rect.width / 40 / 2 + 2;
     qword_5E2E60 = object_iso_content_rect.height / 20 / 2 + 2;
+}
+
+void object_set_iso_content_rect(const TigRect* rect)
+{
+    object_iso_content_rect = *rect;
+    object_iso_content_rect_ex.x = rect->x - 256;
+    object_iso_content_rect_ex.y = rect->y - 256;
+    object_iso_content_rect_ex.width = rect->width + 512;
+    object_iso_content_rect_ex.height = rect->height + 512;
+    qword_5E2F50 = rect->width / 40 / 2 + 2;
+    qword_5E2E60 = rect->height / 20 / 2 + 2;
+}
+
+static void object_get_effective_iso_content_rect_ex(TigRect* rect)
+{
+    *rect = object_iso_content_rect_ex;
+
+    float z = iso_zoom_current();
+    if (z >= 1.0f) {
+        return;
+    }
+
+    int expanded_width = (int)ceilf((float)object_iso_content_rect.width / z);
+    int expanded_height = (int)ceilf((float)object_iso_content_rect.height / z);
+    int expanded_x = object_iso_content_rect.x
+        + (object_iso_content_rect.width - expanded_width) / 2;
+    int expanded_y = object_iso_content_rect.y
+        + (object_iso_content_rect.height - expanded_height) / 2;
+
+    rect->x = expanded_x - 256;
+    rect->y = expanded_y - 256;
+    rect->width = expanded_width + 512;
+    rect->height = expanded_height + 512;
 }
 
 // 0x43A650
@@ -538,6 +574,48 @@ void object_draw(GameDrawInfo* draw_info)
     v1 = draw_info->sector_rect;
     is_detecting_invisible = magictech_check_env_sf(OSF_DETECTING_INVISIBLE);
 
+    // Pre-compute the bounding rect of all dirty rects for AABB pre-
+    // skip per tile. object_draw iterates the full sector_rect
+    // (content_rect + 256px border each side); on heavy frames like
+    // scroll-at-z=0.5 in a populated area, per-tile cost (roof check +
+    // object iteration + per-object rect intersect + art_blit) can
+    // push object_max to 20-25ms — the rare in-active-play hitch
+    // that's left after tile_draw's AABB skip handled the tile pass.
+    //
+    // Margin justification: object_iso_content_rect_ex (object.c:243-
+    // 246) uses ±256px around the content rect because that's the
+    // engine's assumed max sprite overhang. Apply the same margin
+    // here when testing tiles against dirty_union so an oversized
+    // sprite anchored at a tile near dirty_union's edge isn't
+    // erroneously skipped.
+    TigRect object_draw_dirty_union;
+    bool object_draw_dirty_union_set = false;
+    {
+        TigRectListNode* u_node = *draw_info->rects;
+        while (u_node != NULL) {
+            if (!object_draw_dirty_union_set) {
+                object_draw_dirty_union = u_node->rect;
+                object_draw_dirty_union_set = true;
+            } else {
+                int x1 = object_draw_dirty_union.x < u_node->rect.x
+                    ? object_draw_dirty_union.x : u_node->rect.x;
+                int y1 = object_draw_dirty_union.y < u_node->rect.y
+                    ? object_draw_dirty_union.y : u_node->rect.y;
+                int x2a = object_draw_dirty_union.x + object_draw_dirty_union.width;
+                int y2a = object_draw_dirty_union.y + object_draw_dirty_union.height;
+                int x2b = u_node->rect.x + u_node->rect.width;
+                int y2b = u_node->rect.y + u_node->rect.height;
+                int x2 = x2a > x2b ? x2a : x2b;
+                int y2 = y2a > y2b ? y2a : y2b;
+                object_draw_dirty_union.x = x1;
+                object_draw_dirty_union.y = y1;
+                object_draw_dirty_union.width = x2 - x1;
+                object_draw_dirty_union.height = y2 - y1;
+            }
+            u_node = u_node->next;
+        }
+    }
+
     for (col = 0; col < v1->num_rows; col++) {
         v2 = &(v1->rows[col]);
 
@@ -557,7 +635,36 @@ void object_draw(GameDrawInfo* draw_info)
                         if (obj_node != NULL) {
                             loc = locations[row];
 
-                            if (!roof_is_covered_loc(loc, true)) {
+                            // AABB pre-skip — compute the tile's pixel
+                            // coords once (loc_x, loc_y) so we can fast-
+                            // reject tiles whose expanded-by-sprite-
+                            // overhang rect can't intersect any dirty
+                            // rect, before paying for roof check + per-
+                            // object iteration. We need loc_x/loc_y
+                            // inside the object loop anyway (line 606
+                            // below), so this is a hoist, not an extra
+                            // call: when we DO enter the slow path the
+                            // location_xy is reused. When we skip, we
+                            // saved everything.
+                            location_xy(loc, &loc_x, &loc_y);
+                            bool tile_in_dirty = object_draw_dirty_union_set;
+                            if (tile_in_dirty) {
+                                // Tile pixel rect approximately
+                                // (loc_x, loc_y, 80, 40), expanded by
+                                // ±256px for sprite overhang.
+                                int tx1 = (int)loc_x - 256;
+                                int ty1 = (int)loc_y - 256;
+                                int tx2 = (int)loc_x + 80 + 256;
+                                int ty2 = (int)loc_y + 40 + 256;
+                                int dx1 = object_draw_dirty_union.x;
+                                int dy1 = object_draw_dirty_union.y;
+                                int dx2 = dx1 + object_draw_dirty_union.width;
+                                int dy2 = dy1 + object_draw_dirty_union.height;
+                                tile_in_dirty = tx1 < dx2 && tx2 > dx1
+                                    && ty1 < dy2 && ty2 > dy1;
+                            }
+
+                            if (tile_in_dirty && !roof_is_covered_loc(loc, true)) {
                                 while (obj_node != NULL) {
                                     obj_type = obj_field_int32_get(obj_node->obj, OBJ_F_TYPE);
                                     if (object_type_visibility[obj_type]) {
@@ -2003,6 +2110,7 @@ void object_get_rect(int64_t obj, unsigned int flags, TigRect* rect)
     unsigned int render_flags;
     int idx;
     TigRect extra_rect;
+    TigRect effective_content_rect_ex;
 
     obj_flags = obj_field_int32_get(obj, OBJ_F_FLAGS);
     if ((flags & 0x8) == 0 && (obj_flags & dword_5E2F88) != 0) {
@@ -2039,10 +2147,12 @@ void object_get_rect(int64_t obj, unsigned int flags, TigRect* rect)
         loc_y = 0;
     }
 
-    if ((int)loc_x < object_iso_content_rect_ex.x
-        || (int)loc_y < object_iso_content_rect_ex.y
-        || (int)loc_x >= object_iso_content_rect_ex.x + object_iso_content_rect_ex.width
-        || (int)loc_y >= object_iso_content_rect_ex.y + object_iso_content_rect_ex.height) {
+    object_get_effective_iso_content_rect_ex(&effective_content_rect_ex);
+
+    if ((int)loc_x < effective_content_rect_ex.x
+        || (int)loc_y < effective_content_rect_ex.y
+        || (int)loc_x >= effective_content_rect_ex.x + effective_content_rect_ex.width
+        || (int)loc_y >= effective_content_rect_ex.y + effective_content_rect_ex.height) {
         rect->x = 0;
         rect->y = 0;
         rect->width = 0;

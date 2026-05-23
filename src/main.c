@@ -17,7 +17,11 @@
 #include "game/critter.h"
 #include "game/descriptions.h"
 #include "game/dialog.h"
+#include "game/camera_follow.h"
+#include "game/camera_tween.h"
+#include "game/dialog_camera.h"
 #include "game/gamelib.h"
+#include "game/iso_zoom.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
 #include "game/highres_config.h"
@@ -56,6 +60,17 @@ static void main_loop(void);
 static void handle_mouse_scroll(void);
 static void handle_keyboard_scroll(void);
 static void build_cmd_line(char* dst, size_t size, int argc, char** argv);
+static void handle_zoom_key_press(SDL_Scancode scancode);
+static void handle_zoom_key_release(SDL_Scancode scancode);
+static void handle_zoom_key_repeat(void);
+
+#define ZOOM_KEY_REPEAT_INITIAL_DELAY_MS 300
+#define ZOOM_KEY_REPEAT_INTERVAL_SLOW_MS 110
+#define ZOOM_KEY_REPEAT_INTERVAL_FAST_MS 70
+
+static SDL_Scancode zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+static tig_timestamp_t zoom_repeat_next_ms;
+static int zoom_repeat_count = 0;
 
 // 0x59A040
 static float gamma = 1.0f;
@@ -344,6 +359,13 @@ int main(int argc, char** argv)
         return EXIT_SUCCESS; // FIXME: Should be `EXIT_FAILURE`.
     }
 
+    // Must init after gamelib_init so that settings are already loaded —
+    // iso_zoom_init registers a setting and applies the loaded value.
+    iso_zoom_init();
+    camera_tween_init();   // generic tween engine — must precede any consumers
+    dialog_camera_init();
+    camera_follow_init();
+
     if (strstr(lpCmdLine, "-dialogcheck") != NULL) {
         dialog_check();
     }
@@ -493,19 +515,82 @@ void main_loop(void)
             output_profile_data = false;
         }
 
+        // Perf instrumentation: bracket each main-loop step so the
+        // F9 perf log can attribute the inter-frame gap. Sampling is
+        // gated by gamelib_zoom_perf_is_enabled() inside the helpers,
+        // but we still skip the clock_gettime calls when off to keep
+        // the no-perf path zero-cost.
+        //
+        // Per-bucket ns is also kept in locals so the slow-loop
+        // detector at the bottom can attribute cumulative-slow
+        // iterations that no single bucket would trip on its own.
+        bool perf_on = gamelib_zoom_perf_is_enabled();
+        uint64_t loop_start_ns = perf_on ? gamelib_perf_now_ns() : 0;
+        uint64_t perf_t0 = loop_start_ns;
+        uint64_t bucket_tig_ping_ns = 0;
+        uint64_t bucket_key_repeat_ns = 0;
+        uint64_t bucket_iso_redraw_ns = 0;
+        uint64_t bucket_win_display_ns = 0;
+        uint64_t bucket_event_dispatch_ns = 0;
+
         tig_ping();
-        gamelib_ping();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            bucket_tig_ping_ns = now - perf_t0;
+            gamelib_perf_record_tig_ping_ns(bucket_tig_ping_ns);
+            perf_t0 = now;
+        }
+        gamelib_ping();  // self-instruments per-subsystem already
         // CE: keep the world repainting under any HUD strip that uses
         // per-pixel see-through, so the alpha composite has fresh
         // world pixels to blend against. Cheap no-op when no strip
         // has opted in.
         intgame_hud_tick_invalidate_alpha_strips();
+        if (perf_on) perf_t0 = gamelib_perf_now_ns();
+        handle_zoom_key_repeat();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            bucket_key_repeat_ns = now - perf_t0;
+            gamelib_perf_record_key_repeat_ns(bucket_key_repeat_ns);
+            perf_t0 = now;
+        }
         iso_redraw();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            bucket_iso_redraw_ns = now - perf_t0;
+            gamelib_perf_record_iso_redraw_ns(bucket_iso_redraw_ns);
+            perf_t0 = now;
+        }
+        // CE: tint the iso VB pixels under any HUD window that opts
+        // into the translucent-black tint pathway. Runs once after
+        // iso_redraw has refreshed those pixels, so the composite
+        // reads the darkened version through the bar's pre-baked
+        // color-key holes.
+        intgame_hud_tick_apply_tint();
         tig_window_display();
+        if (perf_on) {
+            uint64_t now = gamelib_perf_now_ns();
+            bucket_win_display_ns = now - perf_t0;
+            gamelib_perf_record_window_display_ns(bucket_win_display_ns);
+            perf_t0 = now;
+        }
 
         pc_obj = player_get_local_pc_obj();
 
         while (tig_message_dequeue(&message) == TIG_OK) {
+            // Per-message timing: when an individual message handler
+            // takes >100ms, log which message type (and scancode for
+            // keyboard) caused it. The event_dispatch bucket alone
+            // can't distinguish F8 quickload from worldmap travel from
+            // a heavy menu open — this attributes each spike to a
+            // specific handler path.
+            uint64_t msg_t0 = perf_on ? gamelib_perf_now_ns() : 0;
+            int saved_msg_type = (int)message.type;
+            int saved_scancode = (message.type == TIG_MESSAGE_KEYBOARD)
+                ? (int)message.data.keyboard.scancode : -1;
+            bool saved_pressed = (message.type == TIG_MESSAGE_KEYBOARD)
+                ? message.data.keyboard.pressed : false;
+
             if (message.type == TIG_MESSAGE_QUIT
                 && mainmenu_ui_confirm_quit() == TIG_WINDOW_MODAL_DIALOG_CHOICE_OK) {
                 mainmenu_ui_reset();
@@ -535,6 +620,12 @@ void main_loop(void)
                     object_highlight_mode_set(message.data.keyboard.pressed);
                 }
 
+                if (message.data.keyboard.pressed) {
+                    handle_zoom_key_press(message.data.keyboard.scancode);
+                } else {
+                    handle_zoom_key_release(message.data.keyboard.scancode);
+                }
+
                 if (!message.data.keyboard.pressed) {
                     switch (message.data.keyboard.scancode) {
                     case SDL_SCANCODE_ESCAPE: {
@@ -557,6 +648,15 @@ void main_loop(void)
                         }
                         break;
                     }
+                    case SDL_SCANCODE_F9:
+                        // Toggle zoom-out draw perf counter. Dumps a one-line
+                        // summary to the debug log every 60 zoom-active frames.
+                        gamelib_zoom_perf_toggle();
+                        intgame_message_window_display_str(-1,
+                            gamelib_zoom_perf_is_enabled()
+                                ? "Zoom perf: ON (logs to /tmp/arcanum-zoom-perf.log)"
+                                : "Zoom perf: OFF");
+                        break;
                     case SDL_SCANCODE_F10:
                         intgame_toggle_interface();
                         tig_debug_printf("iso_redraw...");
@@ -683,6 +783,12 @@ void main_loop(void)
                             intgame_draw_bar(INTGAME_BAR_FATIGUE);
                         }
                         break;
+                    case SDL_SCANCODE_0:
+                        if (!textedit_ui_is_focused() && iso_zoom_is_available()) {
+                            iso_zoom_reset();
+                            gamelib_invalidate_rect(NULL);
+                        }
+                        break;
                     default:
                         break;
                     }
@@ -774,7 +880,7 @@ void main_loop(void)
                                 break;
                             case SDL_SCANCODE_X:
                                 tig_mouse_get_state(&mouse_state);
-                                location_at(mouse_state.x, mouse_state.y, &mouse_loc);
+                                location_at_zoomed(mouse_state.x, mouse_state.y, iso_zoom_current(), &mouse_loc);
                                 snprintf(mouse_state_str, sizeof(mouse_state_str),
                                     "x: %d, y: %d",
                                     (int)LOCATION_GET_X(mouse_loc),
@@ -864,12 +970,118 @@ void main_loop(void)
                     }
                 }
             }
+
+            if (perf_on) {
+                uint64_t msg_ns = gamelib_perf_now_ns() - msg_t0;
+                if (msg_ns > 100000000ull) {
+                    char ctx[128];
+                    if (saved_msg_type == TIG_MESSAGE_KEYBOARD) {
+                        snprintf(ctx, sizeof(ctx),
+                            "KEYBOARD scancode=%d %s",
+                            saved_scancode, saved_pressed ? "down" : "up");
+                    } else if (saved_msg_type == TIG_MESSAGE_MOUSE) {
+                        snprintf(ctx, sizeof(ctx), "MOUSE");
+                    } else if (saved_msg_type == TIG_MESSAGE_REDRAW) {
+                        snprintf(ctx, sizeof(ctx), "REDRAW");
+                    } else if (saved_msg_type == TIG_MESSAGE_QUIT) {
+                        snprintf(ctx, sizeof(ctx), "QUIT");
+                    } else {
+                        snprintf(ctx, sizeof(ctx), "type=%d", saved_msg_type);
+                    }
+                    gamelib_perf_log_event(ctx, msg_ns);
+                }
+            }
         }
 
         if (intgame_mode_supports_scrolling(intgame_mode_get())) {
             handle_mouse_scroll();
         }
+        if (perf_on) {
+            gamelib_perf_record_event_dispatch_ns(gamelib_perf_now_ns() - perf_t0);
+        }
     }
+}
+
+static void handle_zoom_key_press(SDL_Scancode scancode)
+{
+    tig_timestamp_t now;
+
+    if (textedit_ui_is_focused() || !iso_zoom_is_available()) {
+        return;
+    }
+
+    switch (scancode) {
+    case SDL_SCANCODE_EQUALS:
+        iso_zoom_step_in();
+        break;
+    case SDL_SCANCODE_MINUS:
+        iso_zoom_step_out();
+        break;
+    default:
+        return;
+    }
+
+    gamelib_invalidate_rect(NULL);
+    zoom_repeat_scancode = scancode;
+    zoom_repeat_count = 0;
+    tig_timer_now(&now);
+    zoom_repeat_next_ms = now + ZOOM_KEY_REPEAT_INITIAL_DELAY_MS;
+}
+
+static void handle_zoom_key_release(SDL_Scancode scancode)
+{
+    if (zoom_repeat_scancode == scancode) {
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        zoom_repeat_count = 0;
+    }
+}
+
+static void handle_zoom_key_repeat(void)
+{
+    tig_timestamp_t now;
+
+    if (zoom_repeat_scancode == SDL_SCANCODE_UNKNOWN) {
+        return;
+    }
+
+    if (textedit_ui_is_focused() || !iso_zoom_is_available()) {
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        return;
+    }
+
+    tig_timer_now(&now);
+    if ((int)(now - zoom_repeat_next_ms) < 0) {
+        return;
+    }
+
+    switch (zoom_repeat_scancode) {
+    case SDL_SCANCODE_EQUALS:
+        iso_zoom_step_in();
+        break;
+    case SDL_SCANCODE_MINUS:
+        iso_zoom_step_out();
+        break;
+    default:
+        zoom_repeat_scancode = SDL_SCANCODE_UNKNOWN;
+        return;
+    }
+
+    gamelib_invalidate_rect(NULL);
+    zoom_repeat_count++;
+    zoom_repeat_next_ms = now
+        + (zoom_repeat_count < 2
+            ? ZOOM_KEY_REPEAT_INTERVAL_SLOW_MS
+            : ZOOM_KEY_REPEAT_INTERVAL_FAST_MS);
+}
+
+// Wrap scroll_start with the camera-follow override note so the auto-
+// follow camera knows the user is steering the view manually.
+// camera_follow_note_user_camera_move is a no-op when the feature is
+// disabled, so this is zero-cost for users who haven't opted in.
+static void user_scroll_start(int direction)
+{
+    scroll_start(direction);
+    camera_follow_note_user_camera_move();
 }
 
 // 0x401F50
@@ -916,11 +1128,11 @@ void handle_mouse_scroll(void)
                 // around 800x600 / a small absolute pixel tolerance, not a
                 // fraction of the window width.
                 if (rel_x < tolerance) {
-                    scroll_start(SCROLL_DIRECTION_UP_LEFT);
+                    user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
                 } else if (rel_x >= ww - tolerance) {
-                    scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+                    user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
                 } else {
-                    scroll_start(SCROLL_DIRECTION_UP);
+                    user_scroll_start(SCROLL_DIRECTION_UP);
                 }
                 return;
             }
@@ -936,25 +1148,25 @@ void handle_mouse_scroll(void)
     // scrolling still triggers when the cursor overshoots the bounds.
     if (mouse_state.x < tolerance) {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
         } else {
-            scroll_start(SCROLL_DIRECTION_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_LEFT);
         }
     } else if (mouse_state.x >= width - tolerance) {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_RIGHT);
         }
     } else {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP);
+            user_scroll_start(SCROLL_DIRECTION_UP);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN);
+            user_scroll_start(SCROLL_DIRECTION_DOWN);
         } else {
             scroll_stop();
         }
@@ -966,24 +1178,24 @@ void handle_keyboard_scroll(void)
 {
     if (tig_kb_is_key_pressed(SDL_SCANCODE_UP)) {
         if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-            scroll_start(SCROLL_DIRECTION_UP_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
         } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-            scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_UP);
+            user_scroll_start(SCROLL_DIRECTION_UP);
         }
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_DOWN)) {
         if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-            scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
         } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-            scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_DOWN);
+            user_scroll_start(SCROLL_DIRECTION_DOWN);
         }
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-        scroll_start(SCROLL_DIRECTION_LEFT);
+        user_scroll_start(SCROLL_DIRECTION_LEFT);
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-        scroll_start(SCROLL_DIRECTION_RIGHT);
+        user_scroll_start(SCROLL_DIRECTION_RIGHT);
     }
 }
 
