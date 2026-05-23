@@ -373,6 +373,14 @@ static int gamelib_zoom_perf_key_repeat_samples = 0;
 static uint64_t gamelib_zoom_perf_event_dispatch_total_ns = 0;
 static uint64_t gamelib_zoom_perf_event_dispatch_max_ns = 0;
 static int gamelib_zoom_perf_event_dispatch_samples = 0;
+// First few main-loop iterations after F9-toggle-on always show cold-cache
+// outliers: 108ms tig_ping, 47ms object_max, etc. — perf counters warming
+// up, CPU caches cold, accumulators allocating. Skip those samples so they
+// don't pollute worst-case numbers. Driven by the first record-function
+// called per loop iteration (tig_ping).
+#define GAMELIB_PERF_WARMUP_ITERATIONS 2
+static int gamelib_zoom_perf_warmup_count = 0;
+static bool gamelib_zoom_perf_warmed_up = false;
 // Per-render-pass accumulators. iso_redraw is dominated by gamelib_draw_game
 // which calls light/tile/object/roof in sequence. Breaking out each pass
 // lets us identify which one drives the heavy-frame (10-20ms iso_redraw)
@@ -1029,6 +1037,16 @@ static void gamelib_perf_log_megahitch(const char* bucket, uint64_t ns)
 void gamelib_perf_record_tig_ping_ns(uint64_t ns)
 {
     if (!gamelib_zoom_perf_enabled) return;
+    // First main-loop step recorded per iteration — also drives the
+    // warmup counter. Skip until we're past the first few cold-cache
+    // iterations after F9-on.
+    if (!gamelib_zoom_perf_warmed_up) {
+        gamelib_zoom_perf_warmup_count++;
+        if (gamelib_zoom_perf_warmup_count >= GAMELIB_PERF_WARMUP_ITERATIONS) {
+            gamelib_zoom_perf_warmed_up = true;
+        }
+        return;
+    }
     gamelib_zoom_perf_tig_ping_total_ns += ns;
     if (ns > gamelib_zoom_perf_tig_ping_max_ns) {
         gamelib_zoom_perf_tig_ping_max_ns = ns;
@@ -1041,7 +1059,7 @@ void gamelib_perf_record_tig_ping_ns(uint64_t ns)
 
 void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     gamelib_zoom_perf_iso_redraw_total_ns += ns;
     if (ns > gamelib_zoom_perf_iso_redraw_max_ns) {
         gamelib_zoom_perf_iso_redraw_max_ns = ns;
@@ -1054,7 +1072,7 @@ void gamelib_perf_record_iso_redraw_ns(uint64_t ns)
 
 void gamelib_perf_record_window_display_ns(uint64_t ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     gamelib_zoom_perf_window_display_total_ns += ns;
     if (ns > gamelib_zoom_perf_window_display_max_ns) {
         gamelib_zoom_perf_window_display_max_ns = ns;
@@ -1067,7 +1085,7 @@ void gamelib_perf_record_window_display_ns(uint64_t ns)
 
 void gamelib_perf_record_key_repeat_ns(uint64_t ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     gamelib_zoom_perf_key_repeat_total_ns += ns;
     if (ns > gamelib_zoom_perf_key_repeat_max_ns) {
         gamelib_zoom_perf_key_repeat_max_ns = ns;
@@ -1080,7 +1098,7 @@ void gamelib_perf_record_key_repeat_ns(uint64_t ns)
 
 void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     gamelib_zoom_perf_event_dispatch_total_ns += ns;
     if (ns > gamelib_zoom_perf_event_dispatch_max_ns) {
         gamelib_zoom_perf_event_dispatch_max_ns = ns;
@@ -1093,7 +1111,7 @@ void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
 
 void gamelib_perf_log_event(const char* context, uint64_t ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     if (ns <= GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) return;
     char line[384];
     snprintf(line, sizeof(line),
@@ -1113,7 +1131,7 @@ void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
     uint64_t iso_redraw_ns, uint64_t win_display_ns,
     uint64_t event_dispatch_ns)
 {
-    if (!gamelib_zoom_perf_enabled) return;
+    if (!gamelib_zoom_perf_enabled || !gamelib_zoom_perf_warmed_up) return;
     if (total_ns <= GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS) return;
 
     // Suppress if any single bucket already tripped the per-bucket
@@ -1192,6 +1210,8 @@ void gamelib_zoom_perf_toggle(void)
     gamelib_zoom_perf_event_dispatch_total_ns = 0;
     gamelib_zoom_perf_event_dispatch_max_ns = 0;
     gamelib_zoom_perf_event_dispatch_samples = 0;
+    gamelib_zoom_perf_warmup_count = 0;
+    gamelib_zoom_perf_warmed_up = false;
     gamelib_zoom_perf_pass_light_total_ns = 0;
     gamelib_zoom_perf_pass_light_max_ns = 0;
     gamelib_zoom_perf_pass_tile_total_ns = 0;
@@ -2738,7 +2758,9 @@ bool gamelib_pc_lens_follows_player(void)
 void gamelib_draw_game(GameDrawInfo* draw_info)
 {
     if (tig_video_3d_begin_scene() == TIG_OK) {
-        bool perf_on = gamelib_zoom_perf_enabled;
+        // Gate pass timing on warmup too — same cold-cache outlier
+        // applies to the very first render after F9 on.
+        bool perf_on = gamelib_zoom_perf_enabled && gamelib_zoom_perf_warmed_up;
         uint64_t t0;
 
         t0 = perf_on ? gamelib_zoom_perf_now_ns() : 0;
