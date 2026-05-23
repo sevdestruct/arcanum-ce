@@ -16,17 +16,14 @@
 
 // === Tunables ===
 //
-// Active follow is now real-time edge-tracking: when the PC moves past
-// the safe-zone edge we move the camera by the same delta per tick to
-// keep PC pinned at the edge. No tween — matches the PC's sprite
-// motion exactly. The previous tween-based active path felt like a
-// "catch-up lurch" because the camera was always a half-tween-duration
-// behind the PC.
-//
-// The settle tween still fires when PC has been stopped for a moment,
-// to recenter on PC at rest. Keep this calm; the player has already
-// settled, so the camera should too.
-#define FOLLOW_TWEEN_SETTLE_MS    600u
+// Real-time edge tracking only: when the PC moves past the safe-zone
+// edge we move the camera by the same delta per tick to keep the PC
+// pinned at the edge. No tween — matches the PC's sprite motion
+// exactly. When the PC stops, the camera stops with them — no extra
+// movement after they reach the destination. The previous version
+// also did a "drift settle" recenter on stop, but the user explicitly
+// wanted that gone: the camera should only ever move because the PC
+// is actively pushing on the safe-zone edge.
 
 // Safe-zone fractions of the usable viewport. The "no-camera-move" zone
 // is the centered rect of (usable_w * (1 - 2*FRAC_X)) by
@@ -55,17 +52,6 @@
 // snapping back the moment the cooldown ticks out.
 #define FOLLOW_USER_COOLDOWN_MS   3000u
 
-// Drift settle delay: when PC stops, wait this long before the recenter
-// tween fires. Avoids tweening for tiny pauses between steps in a longer
-// path; the player should settle, then the camera should settle.
-#define FOLLOW_SETTLE_DELAY_MS    250u
-
-// Re-target threshold (screen px) for the settle tween. If a new
-// desired settle origin is within this distance of the active tween's
-// target, let the existing one finish. Avoids micro-jitter from tiny
-// drifts in OFFSET_X/Y between ticks.
-#define FOLLOW_RETARGET_THRESHOLD 6
-
 // === State ===
 
 // Cached cfg flag — checked once per init (could be hot-reloaded by
@@ -78,9 +64,6 @@ static unsigned int s_user_override_until_ts;   // tig_timer ms timestamp
 static bool s_user_override_armed;              // override active AND PC hasn't moved since
 static bool s_pc_was_idle_last_tick;            // for detecting "PC just started moving"
 
-// Drift settle state
-static unsigned int s_pc_stopped_ts;            // ms timestamp PC went idle (0 = not pending)
-
 void camera_follow_init(void)
 {
     settings_register(&settings, CAMERA_FOLLOWS_PLAYER_KEY, "0", NULL);
@@ -88,7 +71,6 @@ void camera_follow_init(void)
     s_user_override_until_ts = 0;
     s_user_override_armed = false;
     s_pc_was_idle_last_tick = true;
-    s_pc_stopped_ts = 0;
 }
 
 void camera_follow_note_user_camera_move(void)
@@ -141,42 +123,6 @@ static bool compute_pc_screen_pos(int64_t pc_obj, int* out_sx, int* out_sy)
     *out_sx = (int)zsx;
     *out_sy = (int)zsy;
     return true;
-}
-
-// Compute the desired camera ORIGIN that would put the PC at the
-// screen target position. Mirrors dialog_camera_end's recenter math
-// but expressed as an absolute origin rather than a delta.
-//
-// Math: location_xy returns SCREEN pixel position (it includes
-// cam_origin_x), so pc_sx == pc_world_pixel + cam_ox. Rearranging:
-//     pc_world_pixel = pc_sx - cam_ox
-// And the new origin we want satisfies:
-//     target_screen == pc_world_pixel + new_cam_ox
-//     new_cam_ox    == target_screen - pc_world_pixel
-//                   == target_screen - pc_sx + cam_ox
-static void compute_recenter_origin(int64_t pc_obj, int64_t* out_ox, int64_t* out_oy)
-{
-    int64_t pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
-    int64_t pc_sx, pc_sy;
-    location_xy(pc_loc, &pc_sx, &pc_sy);
-    pc_sx += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X) + 40;
-    pc_sy += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y) + 20;
-
-    int64_t cam_ox, cam_oy;
-    location_origin_get(&cam_ox, &cam_oy);
-
-    TigRect cr;
-    gamelib_get_iso_content_rect(&cr);
-
-    // Bias the recenter slightly UPWARD to account for the HUD bottom
-    // bar being thicker than the top — without this the PC sits visually
-    // below center on the unobscured iso area.
-    int usable_h = cr.height - GAME_UI_BAR_TOP - GAME_UI_BAR_BOTTOM;
-    int target_screen_y = GAME_UI_BAR_TOP + usable_h / 2;
-    int target_screen_x = cr.width / 2;
-
-    *out_ox = (int64_t)target_screen_x - pc_sx + cam_ox;
-    *out_oy = (int64_t)target_screen_y - pc_sy + cam_oy;
 }
 
 // Compute safe-zone bounds for the PC's tile-center on-screen position.
@@ -253,14 +199,11 @@ void camera_follow_ping(void)
         }
     }
 
-    // Drift-settle bookkeeping: remember when PC went idle so we can
-    // start a calm recenter tween if they don't move for a moment.
-    if (!pc_idle) {
-        s_pc_stopped_ts = 0;
-    } else if (s_pc_stopped_ts == 0) {
-        tig_timestamp_t now;
-        tig_timer_now(&now);
-        s_pc_stopped_ts = (unsigned int)now;
+    // No drift-on-stop: the camera only ever moves because the PC is
+    // actively pushing on the safe-zone edge. When PC stops, camera
+    // stops too — no extra movement after they reach the destination.
+    if (pc_idle) {
+        return;
     }
 
     int pc_screen_x, pc_screen_y;
@@ -271,105 +214,53 @@ void camera_follow_ping(void)
     int sz_x1, sz_y1, sz_x2, sz_y2;
     compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
 
+    // PC is moving. Inside the safe-zone deadband → camera holds.
     bool pc_in_safe_zone = pc_screen_x >= sz_x1 && pc_screen_x <= sz_x2
                         && pc_screen_y >= sz_y1 && pc_screen_y <= sz_y2;
-
-    // --- ACTIVE FOLLOW: real-time edge tracking ------------------------
-    // While PC is moving AND past the safe-zone edge, move the camera
-    // by the exact amount needed to pin PC at the edge this frame. No
-    // tween — matches PC sprite motion 1:1, no lurch.
-    //
-    // While PC is moving INSIDE the safe zone, the camera stays put
-    // (the safe zone is the deadband the user asked for).
-    if (!pc_idle) {
-        if (pc_in_safe_zone) {
-            return;
-        }
-
-        // Cancel any in-flight settle tween — we're back in motion.
-        if (camera_tween_is_active()) {
-            camera_tween_cancel();
-        }
-
-        // Smallest screen-px delta needed to push PC back to the edge.
-        // Negative on the right/bottom side, positive on the left/top.
-        int dx_screen = 0;
-        int dy_screen = 0;
-        if (pc_screen_x > sz_x2) {
-            dx_screen = sz_x2 - pc_screen_x;
-        } else if (pc_screen_x < sz_x1) {
-            dx_screen = sz_x1 - pc_screen_x;
-        }
-        if (pc_screen_y > sz_y2) {
-            dy_screen = sz_y2 - pc_screen_y;
-        } else if (pc_screen_y < sz_y1) {
-            dy_screen = sz_y1 - pc_screen_y;
-        }
-        if (dx_screen == 0 && dy_screen == 0) {
-            return;
-        }
-
-        // Screen-pixel delta is in ZOOMED space (after the *z transform
-        // in compute_pc_screen_pos). Camera origin is in unzoomed-
-        // screen-pixel space (since location_xy adds it pre-zoom). The
-        // zoom transform pivots at screen center, so an unzoomed delta
-        // of D produces a zoomed delta of D*z. Invert: unzoomed delta
-        // = zoomed delta / z.
-        float z = iso_zoom_current();
-        if (z <= 0.0f) z = 1.0f;
-        int dx_origin = (int)((float)dx_screen / z);
-        int dy_origin = (int)((float)dy_screen / z);
-        if (dx_origin == 0 && dy_origin == 0) {
-            return;
-        }
-
-        int64_t cam_ox, cam_oy;
-        location_origin_get(&cam_ox, &cam_oy);
-        location_origin_pixel_set(cam_ox + dx_origin, cam_oy + dy_origin);
-        // Keep floating text in conversation overlays synced, same as
-        // camera_tween_ping does. No-op when no conversation active.
-        tc_scroll(dx_origin, dy_origin);
-        gamelib_invalidate_rect(NULL);
-        return;
-    }
-
-    // --- IDLE: drift settle on stop ------------------------------------
     if (pc_in_safe_zone) {
-        // Idle inside safe zone: nothing to do until the player moves.
         return;
     }
-    // Idle outside safe zone — wait for the settle delay before tweening
-    // (avoids tweening for tiny pauses mid-path).
-    {
-        tig_timestamp_t now;
-        tig_timer_now(&now);
-        if (s_pc_stopped_ts == 0
-            || (unsigned int)now - s_pc_stopped_ts < FOLLOW_SETTLE_DELAY_MS) {
-            return;
-        }
+
+    // PC is past the safe-zone edge — move the camera by the exact
+    // delta needed to pin them at the edge this frame. Matches sprite
+    // motion 1:1, no tween, no lurch.
+
+    // Smallest screen-px delta needed to push PC back to the edge.
+    // Negative on the right/bottom side, positive on the left/top.
+    int dx_screen = 0;
+    int dy_screen = 0;
+    if (pc_screen_x > sz_x2) {
+        dx_screen = sz_x2 - pc_screen_x;
+    } else if (pc_screen_x < sz_x1) {
+        dx_screen = sz_x1 - pc_screen_x;
+    }
+    if (pc_screen_y > sz_y2) {
+        dy_screen = sz_y2 - pc_screen_y;
+    } else if (pc_screen_y < sz_y1) {
+        dy_screen = sz_y1 - pc_screen_y;
+    }
+    if (dx_screen == 0 && dy_screen == 0) {
+        return;
     }
 
-    // Target: recenter PC. Same math as dialog_camera_end's tween-back
-    // path so the feel is consistent.
-    int64_t target_ox, target_oy;
-    compute_recenter_origin(pc_obj, &target_ox, &target_oy);
-
-    // Re-target damping: if a settle tween is already aimed within
-    // FOLLOW_RETARGET_THRESHOLD of the new target, let it finish. Without
-    // this, micro-movements in OFFSET_X/Y between ticks would restart
-    // the tween every frame.
-    if (camera_tween_is_active()) {
-        int64_t cur_target_ox, cur_target_oy;
-        camera_tween_get_target(&cur_target_ox, &cur_target_oy);
-        int64_t ddx = cur_target_ox - target_ox;
-        int64_t ddy = cur_target_oy - target_oy;
-        if (ddx < 0) ddx = -ddx;
-        if (ddy < 0) ddy = -ddy;
-        if (ddx <= FOLLOW_RETARGET_THRESHOLD
-            && ddy <= FOLLOW_RETARGET_THRESHOLD) {
-            return;
-        }
+    // Screen-pixel delta is in ZOOMED space (after the *z transform in
+    // compute_pc_screen_pos). Camera origin is in unzoomed-screen-pixel
+    // space (since location_xy adds it pre-zoom). The zoom transform
+    // pivots at screen center, so an unzoomed delta of D produces a
+    // zoomed delta of D*z. Invert: unzoomed delta = zoomed delta / z.
+    float z = iso_zoom_current();
+    if (z <= 0.0f) z = 1.0f;
+    int dx_origin = (int)((float)dx_screen / z);
+    int dy_origin = (int)((float)dy_screen / z);
+    if (dx_origin == 0 && dy_origin == 0) {
+        return;
     }
 
-    camera_tween_to(target_ox, target_oy, FOLLOW_TWEEN_SETTLE_MS);
+    int64_t cam_ox, cam_oy;
+    location_origin_get(&cam_ox, &cam_oy);
+    location_origin_pixel_set(cam_ox + dx_origin, cam_oy + dy_origin);
+    // Keep floating text in conversation overlays synced, same as
+    // camera_tween_ping does. No-op when no conversation active.
+    tc_scroll(dx_origin, dy_origin);
+    gamelib_invalidate_rect(NULL);
 }
