@@ -568,6 +568,19 @@ void main_loop(void)
         pc_obj = player_get_local_pc_obj();
 
         while (tig_message_dequeue(&message) == TIG_OK) {
+            // Per-message timing: when an individual message handler
+            // takes >100ms, log which message type (and scancode for
+            // keyboard) caused it. The event_dispatch bucket alone
+            // can't distinguish F8 quickload from worldmap travel from
+            // a heavy menu open — this attributes each spike to a
+            // specific handler path.
+            uint64_t msg_t0 = perf_on ? gamelib_perf_now_ns() : 0;
+            int saved_msg_type = (int)message.type;
+            int saved_scancode = (message.type == TIG_MESSAGE_KEYBOARD)
+                ? (int)message.data.keyboard.scancode : -1;
+            bool saved_pressed = (message.type == TIG_MESSAGE_KEYBOARD)
+                ? message.data.keyboard.pressed : false;
+
             if (message.type == TIG_MESSAGE_QUIT
                 && mainmenu_ui_confirm_quit() == TIG_WINDOW_MODAL_DIALOG_CHOICE_OK) {
                 mainmenu_ui_reset();
@@ -945,6 +958,27 @@ void main_loop(void)
                     if (!mainmenu_ui_handle()) {
                         return;
                     }
+                }
+            }
+
+            if (perf_on) {
+                uint64_t msg_ns = gamelib_perf_now_ns() - msg_t0;
+                if (msg_ns > 100000000ull) {
+                    char ctx[128];
+                    if (saved_msg_type == TIG_MESSAGE_KEYBOARD) {
+                        snprintf(ctx, sizeof(ctx),
+                            "KEYBOARD scancode=%d %s",
+                            saved_scancode, saved_pressed ? "down" : "up");
+                    } else if (saved_msg_type == TIG_MESSAGE_MOUSE) {
+                        snprintf(ctx, sizeof(ctx), "MOUSE");
+                    } else if (saved_msg_type == TIG_MESSAGE_REDRAW) {
+                        snprintf(ctx, sizeof(ctx), "REDRAW");
+                    } else if (saved_msg_type == TIG_MESSAGE_QUIT) {
+                        snprintf(ctx, sizeof(ctx), "QUIT");
+                    } else {
+                        snprintf(ctx, sizeof(ctx), "type=%d", saved_msg_type);
+                    }
+                    gamelib_perf_log_event(ctx, msg_ns);
                 }
             }
         }

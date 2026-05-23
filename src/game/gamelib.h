@@ -206,4 +206,12 @@ void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
     uint64_t iso_redraw_ns, uint64_t win_display_ns,
     uint64_t event_dispatch_ns);
 
+// Single message-handler-step timing inside the inner event dispatch
+// loop. Lets us attribute event_dispatch megahitches to a specific
+// message (e.g. F8 quickload, mouse click on worldmap travel arrow,
+// menu close). Threshold matches the per-bucket megahitch logger
+// (100ms). `context` is a free-form short description — typically
+// "msg=KEYBOARD scancode=N up/down" or "msg=type=N".
+void gamelib_perf_log_event(const char* context, uint64_t ns);
+
 #endif /* ARCANUM_GAME_GAMELIB_H_ */

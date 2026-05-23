@@ -1088,6 +1088,18 @@ void gamelib_perf_record_event_dispatch_ns(uint64_t ns)
     }
 }
 
+void gamelib_perf_log_event(const char* context, uint64_t ns)
+{
+    if (!gamelib_zoom_perf_enabled) return;
+    if (ns <= GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS) return;
+    char line[384];
+    snprintf(line, sizeof(line),
+        "[megahitch] event: %s took %.1fms (%.2fs)\n",
+        context, (double)ns / 1e6, (double)ns / 1e9);
+    tig_debug_printf("%s", line);
+    gamelib_zoom_perf_log(line);
+}
+
 // 50ms is about 3 missed vsync slots on a 120Hz display. Below the
 // per-bucket megahitch threshold (100ms) so we catch cumulative
 // slowness that no single call would trip on its own.
