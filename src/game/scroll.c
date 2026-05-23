@@ -557,7 +557,31 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
-    if (z != 1.0f || tb_any_active()) {
+    // CE: Force full-redraw on every scroll, regardless of zoom.
+    //
+    // The legacy hardware-scroll path at zoom=1.0 (the `else` branch
+    // below) uses tig_window_scroll, which does a tig_video_buffer_blit
+    // from the iso_window's video buffer to itself with overlapping
+    // src/dst rects. SDL_BlitSurface's behavior on overlapping
+    // same-surface blits is undefined — depending on copy direction,
+    // pixels can be duplicated rather than cleanly shifted, producing
+    // sprite ghosts that trail at the scroll edge until the affected
+    // tiles get re-invalidated by some other event (PC walking
+    // through, etc.).
+    //
+    // Verified on UI-improvements branch: wolf-corpse-duplicates-at-
+    // scroll-edge artifact, present only at zoom=1.0 where this
+    // branch was reached. Forcing the full-redraw path on all zoom
+    // levels eliminates the artifact at the cost of one extra
+    // redraw per scroll frame (cheaper than fighting SDL's overlap
+    // semantics, and zoom=1.0 has no Phase A/C scaling overhead).
+    //
+    // The legacy hardware-scroll branch is preserved below (dead)
+    // for reference; a future cleaner fix could route the scroll
+    // through a scratch video buffer to avoid the overlapping blit.
+    if (true) {
+        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
+    } else if (z != 1.0f || tb_any_active()) {
         // At non-unity zoom, or when speech bubbles are visible, the hardware
         // scroll optimization leaves stale bubble pixels. Force a full redraw.
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
