@@ -13,6 +13,7 @@
 #include "game/settings.h"
 #include "game/tc.h"
 #include "tig/timer.h"
+#include "ui/intgame.h"
 
 // === Tunables ===========================================================
 //
@@ -92,7 +93,7 @@
 //                              more PC sway during walking. 0.25 keeps
 //                              PC within ~1-2 origin-px of the edge
 //                              at steady state.
-#define FOLLOW_PC_V_SMOOTH_ALPHA 0.15f
+#define FOLLOW_PC_V_SMOOTH_ALPHA 0.10f
 #define FOLLOW_GAP_GAIN          0.25f
 
 // Quick tuning guide for taste:
@@ -103,9 +104,19 @@
 //   World scroll feels chunky?      lower PC_V_SMOOTH_ALPHA (more FF
 //                                    smoothing, longer drift)
 //   PC visibly lags behind edge?    raise GAP_GAIN (tighter pin)
-#define FOLLOW_MAX_VEL_ORIGIN  8.0f
-#define FOLLOW_MAX_ACCEL       1.0f
-#define FOLLOW_DRIFT_DAMPING   0.85f
+// Note: spring saturates at GAP_GAIN * MAX_VEL_ORIGIN. Spring max
+// MUST exceed PC's max walking/running speed for catch-up to work
+// when PC is past the edge and moving away from the camera. PC
+// walks ~1.7 origin-px/tick and runs ~5. With GAP_GAIN=0.25 and
+// MAX_VEL=10, saturation is 2.5/tick — exceeds walking. Running
+// catch-up is handled by FF (no longer capped); spring just adds
+// a small position-correction on top.
+//
+// Lowering MAX_VEL below ~7 (=walking_speed/GAP_GAIN) makes catch-up
+// fail for "PC walked off-screen, user clicked further away".
+#define FOLLOW_MAX_VEL_ORIGIN  10.0f
+#define FOLLOW_MAX_ACCEL       0.5f
+#define FOLLOW_DRIFT_DAMPING   0.92f
 #define FOLLOW_VEL_CUTOFF      0.25f
 
 // Catch-up inset: during off-camera resume (large gap), aim for PC
@@ -144,8 +155,8 @@
 // FRAC_X_BASE; wider screens get a slightly larger fraction so the
 // deadband stays visually balanced (wide screens have proportionally
 // more sideways "look-ahead" room).
-#define FOLLOW_SAFE_FRAC_X_BASE   0.22f
-#define FOLLOW_SAFE_FRAC_X_WIDE   0.30f
+#define FOLLOW_SAFE_FRAC_X_BASE   0.17f
+#define FOLLOW_SAFE_FRAC_X_WIDE   0.24f
 #define FOLLOW_REF_ASPECT         (4.0f / 3.0f)
 #define FOLLOW_WIDE_ASPECT        (16.0f / 9.0f)
 
@@ -155,6 +166,28 @@
 // during diagonal movement.
 #define FOLLOW_SAFE_FRAC_Y_TOP    0.32f
 #define FOLLOW_SAFE_FRAC_Y_BOT    0.20f
+
+// Zoom-aware shrink of the safe zone at high zoom.
+//
+// Safe-zone WIDTH = usable_w - 2 * (frac_x * usable_w) = (1 - 2*frac_x)
+// * usable_w. Look-ahead margin on each side = frac_x * usable_w.
+//
+// At higher zoom you see less of the world (each screen-px = 1/z world
+// units). With fixed frac_x, the world-space safe zone stays the same
+// FRACTION of the visible viewport, but the actual world-units it
+// represents shrinks with z. Meanwhile look-ahead (also in world-units)
+// shrinks too. PC has less room to walk to the edge before tracking
+// kicks in, AND less is visible past the edge in world terms.
+//
+// Fix: GROW the look-ahead margin (frac_x) inversely with zoom — at
+// z=2, frac_x is 1.5x default, so the look-ahead margin grows and the
+// safe-zone width shrinks (in screen-px). World-space look-ahead now
+// stays roughly constant; the camera engages tracking sooner so PC
+// approaches the visible-world edge less often.
+//
+// Clamped to a max scale so safe zone doesn't collapse entirely at
+// extreme zoom (would lose the deadband benefit).
+#define FOLLOW_ZOOM_MARGIN_SCALE_MAX 1.80f
 
 // Cooldown after a manual user camera move (mouse-edge scroll,
 // keyboard arrow, portrait click, UI recenter). Auto-follow stays off
@@ -218,6 +251,15 @@ static bool s_pc_world_prev_valid;
 static int s_scroll_note_count;
 static unsigned int s_last_scroll_note_ts;
 
+// Per-axis catch-up state. Engages when |outer_gap| > CATCHUP_THRESHOLD;
+// while engaged, the deadband uses the INNER zone (shrunk by INSET on
+// each side) so the camera tween doesn't stop at the outer edge —
+// it carries PC inside the zone. Disengages once PC is inside the
+// inner zone on that axis, at which point normal (outer-zone)
+// deadband applies for steady tracking.
+static bool s_catchup_active_x;
+static bool s_catchup_active_y;
+
 // Origin after the last tick we drove. Used to detect EXTERNAL camera
 // jumps: anything that moved the origin between ticks without going
 // through our apply path — portrait click, inventory open, dialog
@@ -242,6 +284,8 @@ void camera_follow_init(void)
     s_pc_world_prev_valid = false;
     s_scroll_note_count = 0;
     s_last_scroll_note_ts = 0;
+    s_catchup_active_x = false;
+    s_catchup_active_y = false;
     s_last_origin_valid = false;
 }
 
@@ -259,6 +303,8 @@ static void zero_motion_state(void)
     s_pc_v_smooth_x = 0.0f;
     s_pc_v_smooth_y = 0.0f;
     s_pc_world_prev_valid = false;
+    s_catchup_active_x = false;
+    s_catchup_active_y = false;
 }
 
 // Directly arm the user-override cooldown — used by handle_external_jump
@@ -350,8 +396,14 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
 
-    int usable_top = GAME_UI_BAR_TOP;
-    int usable_bot = cr.height - GAME_UI_BAR_BOTTOM;
+    // When the user has TAB-hidden the HUD strips, the top and bottom
+    // bar areas are part of the visible game world — don't subtract
+    // them from the usable area. Otherwise the safe zone would
+    // unnecessarily push PC toward screen center and waste the freshly
+    // visible space.
+    bool hud_hidden = intgame_hud_is_user_hidden();
+    int usable_top = hud_hidden ? 0 : GAME_UI_BAR_TOP;
+    int usable_bot = cr.height - (hud_hidden ? 0 : GAME_UI_BAR_BOTTOM);
     int usable_w   = cr.width;
     int usable_h   = usable_bot - usable_top;
 
@@ -364,10 +416,26 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
     if (t_aspect > 1.0f) t_aspect = 1.0f;
     float frac_x = FOLLOW_SAFE_FRAC_X_BASE
         + (FOLLOW_SAFE_FRAC_X_WIDE - FOLLOW_SAFE_FRAC_X_BASE) * t_aspect;
+
+    // Zoom-aware GROW of the look-ahead margin: at zoom > 1, scale
+    // margin fractions UP by z (clamped). Wider margins → narrower
+    // safe zone → more look-ahead. World-space deadband stays in a
+    // comfortable range regardless of zoom.
+    float z = iso_zoom_current();
+    if (z <= 0.0f) z = 1.0f;
+    float zoom_scale = 1.0f;
+    if (z > 1.0f) {
+        zoom_scale = z;
+        if (zoom_scale > FOLLOW_ZOOM_MARGIN_SCALE_MAX) {
+            zoom_scale = FOLLOW_ZOOM_MARGIN_SCALE_MAX;
+        }
+    }
+    frac_x *= zoom_scale;
+
     int margin_x = (int)((float)usable_w * frac_x);
 
-    int margin_y_top = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_TOP);
-    int margin_y_bot = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_BOT);
+    int margin_y_top = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_TOP * zoom_scale);
+    int margin_y_bot = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_BOT * zoom_scale);
 
     *x1 = margin_x;
     *x2 = usable_w - margin_x;
@@ -557,35 +625,80 @@ void camera_follow_ping(void)
             int sz_x1, sz_y1, sz_x2, sz_y2;
             compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
 
-            int gap_x_raw = 0;
-            int gap_y_raw = 0;
+            // Outer-zone gap (the raw "PC past the safe zone edge")
+            // — used to detect catch-up engagement and as the gap for
+            // steady-state tracking.
+            int outer_gap_x = 0;
+            int outer_gap_y = 0;
             if (pc_screen_x > sz_x2) {
-                gap_x_raw = sz_x2 - pc_screen_x;
+                outer_gap_x = sz_x2 - pc_screen_x;
             } else if (pc_screen_x < sz_x1) {
-                gap_x_raw = sz_x1 - pc_screen_x;
+                outer_gap_x = sz_x1 - pc_screen_x;
             }
             if (pc_screen_y > sz_y2) {
-                gap_y_raw = sz_y2 - pc_screen_y;
+                outer_gap_y = sz_y2 - pc_screen_y;
             } else if (pc_screen_y < sz_y1) {
-                gap_y_raw = sz_y1 - pc_screen_y;
+                outer_gap_y = sz_y1 - pc_screen_y;
             }
 
-            // Catch-up inset: large gaps target PC just inside zone.
-            // sign() * INSET added in the same direction as gap_raw
-            // → camera tweens slightly further to put PC inside the
-            // zone rather than exactly at the edge.
-            int gap_x_eff = gap_x_raw;
-            int gap_y_eff = gap_y_raw;
-            if (gap_x_raw > FOLLOW_CATCHUP_THRESHOLD) {
-                gap_x_eff = gap_x_raw + FOLLOW_CATCHUP_INSET;
-            } else if (gap_x_raw < -FOLLOW_CATCHUP_THRESHOLD) {
-                gap_x_eff = gap_x_raw - FOLLOW_CATCHUP_INSET;
+            // Engage catch-up on either axis when outer gap exceeds
+            // threshold — sticky state so the inset actually lands
+            // PC INSIDE the zone instead of the deadband canceling
+            // it at the outer edge.
+            if (outer_gap_x > FOLLOW_CATCHUP_THRESHOLD
+                || outer_gap_x < -FOLLOW_CATCHUP_THRESHOLD) {
+                s_catchup_active_x = true;
             }
-            if (gap_y_raw > FOLLOW_CATCHUP_THRESHOLD) {
-                gap_y_eff = gap_y_raw + FOLLOW_CATCHUP_INSET;
-            } else if (gap_y_raw < -FOLLOW_CATCHUP_THRESHOLD) {
-                gap_y_eff = gap_y_raw - FOLLOW_CATCHUP_INSET;
+            if (outer_gap_y > FOLLOW_CATCHUP_THRESHOLD
+                || outer_gap_y < -FOLLOW_CATCHUP_THRESHOLD) {
+                s_catchup_active_y = true;
             }
+
+            // Effective gap per axis. If catch-up is active on an
+            // axis, use the INNER zone (shrunk by INSET) — camera
+            // keeps tweening until PC is genuinely inside the zone,
+            // not just at the outer edge. Once PC reaches the inner
+            // zone (effective gap = 0), the state clears and
+            // steady-state tracking resumes against the outer zone.
+            //
+            // Per-axis state so a diagonal off-camera resume can
+            // disengage one axis while still pulling the other.
+            int gap_x_eff = 0;
+            int gap_y_eff = 0;
+            if (s_catchup_active_x) {
+                int inner_x1 = sz_x1 + FOLLOW_CATCHUP_INSET;
+                int inner_x2 = sz_x2 - FOLLOW_CATCHUP_INSET;
+                if (pc_screen_x > inner_x2) {
+                    gap_x_eff = inner_x2 - pc_screen_x;
+                } else if (pc_screen_x < inner_x1) {
+                    gap_x_eff = inner_x1 - pc_screen_x;
+                } else {
+                    // PC reached inner zone — catch-up done.
+                    s_catchup_active_x = false;
+                }
+            } else {
+                gap_x_eff = outer_gap_x;
+            }
+            if (s_catchup_active_y) {
+                int inner_y1 = sz_y1 + FOLLOW_CATCHUP_INSET;
+                int inner_y2 = sz_y2 - FOLLOW_CATCHUP_INSET;
+                if (pc_screen_y > inner_y2) {
+                    gap_y_eff = inner_y2 - pc_screen_y;
+                } else if (pc_screen_y < inner_y1) {
+                    gap_y_eff = inner_y1 - pc_screen_y;
+                } else {
+                    s_catchup_active_y = false;
+                }
+            } else {
+                gap_y_eff = outer_gap_y;
+            }
+
+            // Below, the per-axis deadband gate uses gap_x_eff /
+            // gap_y_eff (= 0 means deadband). That way catch-up
+            // doesn't terminate at the outer edge; it goes until
+            // PC is at the inner zone.
+            int gap_x_raw = gap_x_eff;
+            int gap_y_raw = gap_y_eff;
 
             // Convert effective gap (zoomed screen px) → origin px.
             // Zoom transform pivots at screen center; unzoomed delta D
@@ -621,19 +734,29 @@ void camera_follow_ping(void)
             // spring distance-proportional with a comfortable ceiling,
             // so off-camera resume still feels eased rather than
             // sproingy at huge gaps.
+            // FF + spring; no total cap applied here. The spring term
+            // is naturally bounded by tanh * GAP_GAIN * MAX_VEL (~1.25
+            // at current tunings — gentle catch-up). FF must be free
+            // to match PC's actual movement speed, since clamping it
+            // to MAX_VEL clipped the running case: PC running at e.g.
+            // 7 origin-px/tick would get target = -7 (FF) clamped to
+            // -MAX_VEL = -5, so the camera lagged PC by 2 px/tick
+            // continuously — visible as running stutter that walking
+            // (well below MAX_VEL) doesn't have.
+            //
+            // accel-cap still bounds the per-tick velocity change, so
+            // ramp-up to a high target stays eased even with no total
+            // cap. PC's max walking/running speed is implicitly the
+            // bound here.
             if (gap_x_raw != 0) {
                 target_vx = -s_pc_v_smooth_x
                     + FOLLOW_GAP_GAIN * FOLLOW_MAX_VEL_ORIGIN
                       * tanhf(gap_x_orig / FOLLOW_MAX_VEL_ORIGIN);
-                if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
-                if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
             }
             if (gap_y_raw != 0) {
                 target_vy = -s_pc_v_smooth_y
                     + FOLLOW_GAP_GAIN * FOLLOW_MAX_VEL_ORIGIN
                       * tanhf(gap_y_orig / FOLLOW_MAX_VEL_ORIGIN);
-                if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
-                if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
             }
         }
     }
@@ -652,19 +775,29 @@ void camera_follow_ping(void)
     // sprite oscillation. On transitions (onset, off-camera catch-up,
     // direction reversal, PC re-enters safe zone), the cap smooths
     // the velocity change over a few ticks.
+    // Drift fix: when PC is idle, override the deadband-killed target
+    // with -smoothed_pc_v. Smoothed PC velocity carries PC's actual
+    // walking/running momentum (it's updated regardless of deadband),
+    // so cam_v drifts from PC's real speed even if the deadband had
+    // just zeroed cam_v during the walking oscillation. smoothed_pc_v
+    // naturally decays each tick (raw_pc_v=0 → smoothed *= 1-alpha),
+    // so the drift fades on its own without explicit damping.
+    //
+    // Drift distance ≈ smoothed_pc_v_initial / PC_V_SMOOTH_ALPHA.
+    // For walking (1.67) at alpha 0.10: ~17 origin-px. Lower alpha
+    // for longer drift; raise for snappier stops.
     if (pc_idle) {
-        s_cam_vx_origin *= FOLLOW_DRIFT_DAMPING;
-        s_cam_vy_origin *= FOLLOW_DRIFT_DAMPING;
-    } else {
-        float diff_x = target_vx - s_cam_vx_origin;
-        float diff_y = target_vy - s_cam_vy_origin;
-        if (diff_x >  FOLLOW_MAX_ACCEL) diff_x =  FOLLOW_MAX_ACCEL;
-        if (diff_x < -FOLLOW_MAX_ACCEL) diff_x = -FOLLOW_MAX_ACCEL;
-        if (diff_y >  FOLLOW_MAX_ACCEL) diff_y =  FOLLOW_MAX_ACCEL;
-        if (diff_y < -FOLLOW_MAX_ACCEL) diff_y = -FOLLOW_MAX_ACCEL;
-        s_cam_vx_origin += diff_x;
-        s_cam_vy_origin += diff_y;
+        target_vx = -s_pc_v_smooth_x;
+        target_vy = -s_pc_v_smooth_y;
     }
+    float diff_x = target_vx - s_cam_vx_origin;
+    float diff_y = target_vy - s_cam_vy_origin;
+    if (diff_x >  FOLLOW_MAX_ACCEL) diff_x =  FOLLOW_MAX_ACCEL;
+    if (diff_x < -FOLLOW_MAX_ACCEL) diff_x = -FOLLOW_MAX_ACCEL;
+    if (diff_y >  FOLLOW_MAX_ACCEL) diff_y =  FOLLOW_MAX_ACCEL;
+    if (diff_y < -FOLLOW_MAX_ACCEL) diff_y = -FOLLOW_MAX_ACCEL;
+    s_cam_vx_origin += diff_x;
+    s_cam_vy_origin += diff_y;
 
     // === Apply via sub-pixel accumulator =================================
     // Settled? Zero everything and bail.
