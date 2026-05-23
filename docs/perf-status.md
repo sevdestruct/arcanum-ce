@@ -7,24 +7,32 @@ across the work itself.
 
 ## TL;DR
 
-After 22 commits (mix of perf wins, bug fixes, configuration, and
+After 27 commits (mix of perf wins, bug fixes, configuration, and
 instrumentation), measured on the same play scenario:
 
 | Metric                          |    Before |     After |  Δ        |
 | ------------------------------- | --------: | --------: | --------: |
-| frame avg (per zoom-active gap) |   13.73ms |   10.21ms | **−26%**  |
-| frame max mean                  |  120.03ms |   26.51ms | **−78%**  |
-| frame max worst                 |  4941ms†  |   50.38ms | **−99%**  |
-| frame stddev (smoothness proxy) |   17.62ms |    5.11ms | **−71%**  |
+| frame avg (per zoom-active gap) |   13.73ms |   10.81ms | **−21%**  |
+| frame max mean                  |  120.03ms |   31.10ms | **−74%**  |
+| frame max worst (real, excl. menu) |   74ms |   133ms   |  see note |
+| frame stddev (smoothness proxy) |   17.62ms |    6.09ms | **−65%**  |
 | `tile_draw` avg                 |    1.01ms |    0.71ms | **−30%**  |
-| `tile_draw` max (worst)         |   10.07ms |   11.14ms |   ≈ same  |
-| Megahitches per play session    |       1+  |        0  | **fixed** |
+| `tile_draw` max worst           |   10.07ms |   10.76ms |   ≈ same  |
+| `tile_max` > 8.3ms (ProMotion budget) | 49% intervals | **2%** | **−96%** |
+| `object_draw` avg               |    0.47ms |    0.33ms | **−30%**  |
+| `object_draw` max worst         |   42.14ms |   26.20ms* | targeted next |
+| Real megahitches (non-modal)    |       1+  |        0  | **fixed** |
+| Modal-menu time mislabeled as megahitch | many | (logged but understood) | see methodology |
 
-† The 4941ms baseline value was a user-paused-in-menu artifact of how
-  `frame max` was measured (gap between consecutive zoom-active draws,
-  multi-loop). The instrumentation got sharper across the push — by the
-  end we exclude these from the headline numbers and have a separate
-  `[megahitch]` logger for actual single-iteration slowness.
+*object_max worst was 26ms in a populated z=0.5 area — addressed by
+`556cb999` (object_draw AABB skip). Awaiting next-test data to confirm
+the expected drop into the 5-8ms range.
+
+The 133ms "frame max worst" is a single non-modal outlier traced to a
+first-play sound cache miss (SoundGame ping spiked 8.14ms) during
+combat. The 64MB sound cache (`38fe0a04`) eliminated re-eviction
+hitches; the residual first-play disk + decode cost is the next
+candidate for async loading if it remains visible.
 
 Subjective: user reports the game went from "scrolling stutters" to
 "smooth" with no perceptible tearing despite adaptive vsync.
@@ -134,6 +142,18 @@ Quantified before/after where instrumentation existed.
   `sectors[].tiles.art_ids[]` dereference are now only done when the
   AABB skip actually wants to enter the slow path. Micro-win.
 
+- **`556cb999` Fast-reject out-of-dirty tiles in `object_draw`** (with
+  256px sprite-overhang margin)
+  Same pattern as `tile_draw_iso`'s AABB skip but for the object pass.
+  Initially deferred because I misread the loop structure as using a
+  stale row-origin loc — re-audit confirmed `locations[row]` IS updated
+  per-tile at object.c:977 and :981, so `loc` IS the current tile and
+  the skip is safe. Margin justification: the engine itself uses ±256px
+  for `object_iso_content_rect_ex` (object.c:243-246) as the assumed
+  max sprite overhang. Targets the `object_max` 26ms spikes seen at
+  z=0.5 in populated areas (4× more screen tiles → 4× more objects to
+  consider when scrolling at max zoom-out).
+
 - **`4f5fbd74` Partial-rect `SDL_UpdateTexture` in `tig_video_flip`**
   *Did not move the needle.* Hypothesis was that the full ~8 MB
   CPU→GPU upload every frame was expensive. Instrumentation in
@@ -182,7 +202,43 @@ keep using it.
   measurement exceeds 100ms. Caught the 400ms sound-cache hitch.
 - **`c8ecab90`** Loop-total slow-iteration logger — complements the
   per-bucket megahitch logger by catching iterations where cumulative
-  time exceeds 50ms even though no single bucket spikes.
+  time exceeds 50ms even though no single bucket spikes. Confirmed
+  zero hits in latest test → cumulative-but-no-spike doesn't happen.
+- **`7ac505de`** Per-message timing inside the inner dispatch loop.
+  When a single message handler iteration exceeds 100ms, logs the
+  message type and (for KEYBOARD) scancode. Critical for the next
+  finding: the multi-second "event_dispatch" megahitches were all
+  ESC scancode=41 — i.e. modal-menu user-think-time being measured
+  as one giant handler call. Not a perf bug; an instrumentation
+  artifact.
+- **`269fdc4e`** Function-level timing for `gamelib_save`,
+  `gamelib_load`, `map_open_in_game`. Catches actual disk-I/O cost
+  separate from modal menu wrapping. Latest test: `gamelib_load`
+  measured at 123ms (fast), confirmed by data that a 4.5s "ESC
+  spike" was 123ms of real load work + ~4.4s of user-in-menu time.
+
+## Per-session findings worth keeping in the PR notes
+
+### Session A — sound cache megahitch
+The cache bump (`38fe0a04`) was triggered by a 400ms `event_dispatch`
+spike captured by the megahitch logger, correlated with a SoundGame
+ping spike. Sound cache was 1990s-sized (20 files / 1MB), evicting
+constantly. Bumped to 256 files / 64MB. Re-test showed 0 megahitches.
+
+### Session B — "31-second megahitch" was a modal artifact
+A subsequent test logged 7 megahitches in `event_dispatch`, including
+one 31.4s. New per-message timing (`7ac505de`) revealed all of them
+were KEYBOARD scancode=41 (ESC) → modal menu time. User confirmed
+they opened menus, loaded saves, etc. Not perf bugs — just the
+instrumentation conflating modal-loop user time with one big handler
+call. Function-level save/load/map_open timing (`269fdc4e`) gave
+clean separation: real load is 123ms, the rest is user time.
+
+### Session C — `object_max` rare-outlier surfaces
+Once that noise was filtered, the residual real outliers were
+`object_max` peaks of 16-26ms during scrolling at z=0.5 in populated
+areas. Addressed by `556cb999` (object_draw AABB skip with sprite-
+overhang margin). Next test will confirm impact.
 
 ## In-flight (separate branch, not in this PR)
 
