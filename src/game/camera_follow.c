@@ -16,10 +16,34 @@
 
 // === Tunables ===
 //
-// Real-time edge tracking: when the PC moves past the safe-zone edge we
-// move the camera by the same delta per tick to keep the PC pinned at
-// the edge. No tween — matches the PC's sprite motion exactly.
+// Edge tracking — two regimes blended smoothly:
 //
+//   1. STEADY-STATE PIN (small gap): when the PC is within
+//      CATCH_UP_BLEND_MIN_GAP of the safe-zone edge, we apply the full
+//      screen delta each tick. PC stays glued to the edge. Matches the
+//      sprite motion 1:1, no lag.
+//
+//   2. EASED CATCH-UP (large gap): when the PC is much further out —
+//      typical case being "user manually scrolled away from PC, then PC
+//      starts moving again, gap to safe zone is hundreds of px" — a
+//      one-tick 1:1 pin would lurch the whole way in a single frame.
+//      Instead apply CATCH_UP_RATE × gap (with a max-per-tick cap so
+//      truly enormous gaps don't go faster than ~720px/sec). This is
+//      mathematically an exponential approach, which reads as ease-out:
+//      fast at first, decelerating as we close.
+//
+//   3. BLEND BAND between the two: linearly interpolates so there's no
+//      visible velocity discontinuity at the threshold.
+//
+// At rate 0.20, equilibrium gap for a 5px/tick PC velocity is ~25px, so
+// MIN_GAP=10 / MAX_GAP=40 puts the blend window straddling that
+// equilibrium — the eased path naturally lands the PC inside the 1:1
+// regime, no oscillation.
+#define FOLLOW_CATCH_UP_RATE          0.20f
+#define FOLLOW_CATCH_UP_BLEND_MIN_GAP 10    // gap ≤ this: pure 1:1 pin
+#define FOLLOW_CATCH_UP_BLEND_MAX_GAP 40    // gap ≥ this: pure eased
+#define FOLLOW_CATCH_UP_MAX_PER_TICK  60    // hard velocity cap
+
 // When the PC stops, we don't snap-stop the camera. The camera was
 // moving (because PC was moving and we were tracking), and momentum is
 // preserved with an exponential damp: the camera continues in the same
@@ -185,6 +209,35 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
     *y2 = usable_bot - margin_y_bot;
 }
 
+// Convert a raw per-axis gap (screen pixels needed to pin PC to the
+// safe-zone edge) into the screen-pixel delta we actually apply this
+// tick. Implements the two-regime blend described next to the tunables:
+//
+//   small gap (|d| <= MIN_GAP)      → return d unchanged (1:1 pin)
+//   large gap (|d| >= MAX_GAP)      → return sign(d) * min(|d| * RATE,
+//                                                          MAX_PER_TICK)
+//   between                         → linear lerp of the two
+//
+// Sign is preserved throughout; only magnitude is shaped.
+static int compute_blended_apply(int delta_screen)
+{
+    int abs_d = (delta_screen < 0) ? -delta_screen : delta_screen;
+    if (abs_d <= FOLLOW_CATCH_UP_BLEND_MIN_GAP) {
+        return delta_screen;
+    }
+    int eased_mag = (int)((float)abs_d * FOLLOW_CATCH_UP_RATE);
+    if (eased_mag > FOLLOW_CATCH_UP_MAX_PER_TICK) {
+        eased_mag = FOLLOW_CATCH_UP_MAX_PER_TICK;
+    }
+    int eased = (delta_screen > 0) ? eased_mag : -eased_mag;
+    if (abs_d >= FOLLOW_CATCH_UP_BLEND_MAX_GAP) {
+        return eased;
+    }
+    float t = (float)(abs_d - FOLLOW_CATCH_UP_BLEND_MIN_GAP)
+            / (float)(FOLLOW_CATCH_UP_BLEND_MAX_GAP - FOLLOW_CATCH_UP_BLEND_MIN_GAP);
+    return (int)((float)delta_screen * (1.0f - t) + (float)eased * t);
+}
+
 void camera_follow_ping(void)
 {
     if (!s_follow_enabled) {
@@ -282,24 +335,35 @@ void camera_follow_ping(void)
         return;
     }
 
-    // PC is past the safe-zone edge — move the camera by the exact
-    // delta needed to pin them at the edge this frame. Matches sprite
-    // motion 1:1, no tween, no lurch.
+    // PC is past the safe-zone edge — close the gap. Small gaps get a
+    // 1:1 pin (camera matches the sprite step-for-step, no lag). Large
+    // gaps (typical when PC starts moving from far off-screen after a
+    // manual scroll) get an eased catch-up via compute_blended_apply.
+    // The blend band between them avoids any visible velocity
+    // discontinuity at the threshold.
 
     // Smallest screen-px delta needed to push PC back to the edge.
     // Negative on the right/bottom side, positive on the left/top.
-    int dx_screen = 0;
-    int dy_screen = 0;
+    int gap_x = 0;
+    int gap_y = 0;
     if (pc_screen_x > sz_x2) {
-        dx_screen = sz_x2 - pc_screen_x;
+        gap_x = sz_x2 - pc_screen_x;
     } else if (pc_screen_x < sz_x1) {
-        dx_screen = sz_x1 - pc_screen_x;
+        gap_x = sz_x1 - pc_screen_x;
     }
     if (pc_screen_y > sz_y2) {
-        dy_screen = sz_y2 - pc_screen_y;
+        gap_y = sz_y2 - pc_screen_y;
     } else if (pc_screen_y < sz_y1) {
-        dy_screen = sz_y1 - pc_screen_y;
+        gap_y = sz_y1 - pc_screen_y;
     }
+    if (gap_x == 0 && gap_y == 0) {
+        return;
+    }
+
+    // Shape each axis independently so a large vertical gap doesn't
+    // throttle a tight horizontal pin (and vice versa).
+    int dx_screen = compute_blended_apply(gap_x);
+    int dy_screen = compute_blended_apply(gap_y);
     if (dx_screen == 0 && dy_screen == 0) {
         return;
     }
