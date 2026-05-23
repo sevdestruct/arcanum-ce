@@ -66,6 +66,25 @@
 #define FOLLOW_MAX_VEL_ORIGIN 14.0f
 #define FOLLOW_VEL_CUTOFF     0.25f
 
+// PC animation updates OBJ_F_OFFSET_X/Y in chunks at the anim-frame
+// rate (~3–4 render frames per anim step), so the raw "PC past
+// safe-zone edge by N pixels" gap jumps in matching staircases. Track
+// that raw gap directly and the camera target velocity inherits the
+// staircase — visible as a pulsing motion synchronized with PC's anim
+// frames.
+//
+// Fix: low-pass the gap itself before deriving target velocity. After
+// smoothing, the target sees a continuous curve regardless of how the
+// underlying anim stepped. Combined with the existing velocity
+// low-pass below, the camera moves at PC's AVERAGE speed continuously
+// between anim frames instead of jolting in sync with them.
+//
+// alpha=0.30 → tau ~50ms (3 frames @ 60Hz) — fast enough to track
+// real velocity changes (PC stops, direction reversal) without
+// noticeable lag, slow enough to smear across PC's 3–4 frame stepping
+// cadence.
+#define FOLLOW_GAP_SMOOTH_ALPHA 0.30f
+
 // Safe-zone fractions of the usable viewport. The "no-camera-move"
 // zone is the centered rect of (usable_w * (1 - 2*FRAC_X)) by
 // (usable_h * (1 - top_frac - bot_frac)).
@@ -117,6 +136,21 @@ static bool s_user_override_armed;
 static float s_cam_vx_origin;
 static float s_cam_vy_origin;
 
+// Low-passed safe-zone gap (zoomed-screen px). Smooths out PC's
+// anim-frame stepping so the derived target velocity is continuous.
+static float s_smoothed_gap_x;
+static float s_smoothed_gap_y;
+
+// Sub-pixel accumulator for applying velocity to camera origin. Camera
+// origin can only be set in integer pixels (int64_t), but our velocity
+// is fractional. Adding velocity to this accumulator each tick and
+// extracting the integer part guarantees that, over time, the camera
+// moves at exactly cam_v origin-px/tick — no rounding bias, no
+// per-frame "every other tick we apply N+1 instead of N" oscillation
+// that shows up as visible micro-jitter at small velocities.
+static float s_subpixel_x;
+static float s_subpixel_y;
+
 // Origin after the last tick we drove. Used to detect EXTERNAL camera
 // jumps: anything that moved the origin between ticks without going
 // through our apply path — portrait click, inventory open, dialog
@@ -134,6 +168,10 @@ void camera_follow_init(void)
     s_user_override_armed = false;
     s_cam_vx_origin = 0.0f;
     s_cam_vy_origin = 0.0f;
+    s_smoothed_gap_x = 0.0f;
+    s_smoothed_gap_y = 0.0f;
+    s_subpixel_x = 0.0f;
+    s_subpixel_y = 0.0f;
     s_last_origin_valid = false;
 }
 
@@ -156,6 +194,10 @@ void camera_follow_note_user_camera_move(void)
     // Kill momentum — user is steering, we don't get to coast.
     s_cam_vx_origin = 0.0f;
     s_cam_vy_origin = 0.0f;
+    s_smoothed_gap_x = 0.0f;
+    s_smoothed_gap_y = 0.0f;
+    s_subpixel_x = 0.0f;
+    s_subpixel_y = 0.0f;
 }
 
 // Compute the PC's current on-screen pixel coords (accounting for
@@ -260,12 +302,16 @@ static bool handle_external_jump(int64_t cam_ox, int64_t cam_oy)
         return false;
     }
 
-    // Stale velocity: zero it. (note_user_camera_move would also do
-    // this if we call it, but we zero unconditionally so the
-    // PC-in-safe-zone branch below doesn't carry stale momentum past
-    // the jump either.)
+    // Stale velocity + filter state: zero everything. (note_user_camera_move
+    // would also do this if we call it, but we zero unconditionally so the
+    // PC-in-safe-zone branch below doesn't carry stale momentum, stale gap
+    // smoothing, or stale sub-pixel residual past the jump either.)
     s_cam_vx_origin = 0.0f;
     s_cam_vy_origin = 0.0f;
+    s_smoothed_gap_x = 0.0f;
+    s_smoothed_gap_y = 0.0f;
+    s_subpixel_x = 0.0f;
+    s_subpixel_y = 0.0f;
 
     int64_t pc_obj = player_get_local_pc_obj();
     if (pc_obj != OBJ_HANDLE_NULL) {
@@ -310,6 +356,10 @@ void camera_follow_ping(void)
         s_last_origin_valid = false;
         s_cam_vx_origin = 0.0f;
         s_cam_vy_origin = 0.0f;
+        s_smoothed_gap_x = 0.0f;
+        s_smoothed_gap_y = 0.0f;
+        s_subpixel_x = 0.0f;
+        s_subpixel_y = 0.0f;
         return;
     }
 
@@ -348,76 +398,105 @@ void camera_follow_ping(void)
             // user holding the wheel.
             s_cam_vx_origin = 0.0f;
             s_cam_vy_origin = 0.0f;
+            s_smoothed_gap_x = 0.0f;
+            s_smoothed_gap_y = 0.0f;
+            s_subpixel_x = 0.0f;
+            s_subpixel_y = 0.0f;
             s_last_origin_x = cam_ox;
             s_last_origin_y = cam_oy;
             return;
         }
     }
 
-    // === Compute per-tick TARGET velocity ================================
-    float target_vx = 0.0f;
-    float target_vy = 0.0f;
+    // === Compute RAW gap (zoomed screen pixels) ==========================
+    // When PC is idle, raw gap is forced to 0 so the gap smoother below
+    // unwinds any prior tracking gap → camera target naturally decays
+    // toward zero, no special-case "drift settle" branch needed.
+    float raw_gap_x = 0.0f;
+    float raw_gap_y = 0.0f;
+    float z = iso_zoom_current();
+    if (z <= 0.0f) z = 1.0f;
     if (!pc_idle) {
         int pc_screen_x, pc_screen_y;
         if (compute_pc_screen_pos(pc_obj, &pc_screen_x, &pc_screen_y)) {
             int sz_x1, sz_y1, sz_x2, sz_y2;
             compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
 
-            int gap_x = 0;
-            int gap_y = 0;
             if (pc_screen_x > sz_x2) {
-                gap_x = sz_x2 - pc_screen_x;
+                raw_gap_x = (float)(sz_x2 - pc_screen_x);
             } else if (pc_screen_x < sz_x1) {
-                gap_x = sz_x1 - pc_screen_x;
+                raw_gap_x = (float)(sz_x1 - pc_screen_x);
             }
             if (pc_screen_y > sz_y2) {
-                gap_y = sz_y2 - pc_screen_y;
+                raw_gap_y = (float)(sz_y2 - pc_screen_y);
             } else if (pc_screen_y < sz_y1) {
-                gap_y = sz_y1 - pc_screen_y;
-            }
-
-            if (gap_x != 0 || gap_y != 0) {
-                // Screen-px gap → origin-px (zoom-aware). The zoom
-                // transform pivots at screen center, so an unzoomed
-                // delta D produces a zoomed delta D*z; invert to get
-                // the origin-px move we need.
-                float z = iso_zoom_current();
-                if (z <= 0.0f) z = 1.0f;
-                target_vx = (float)gap_x / z;
-                target_vy = (float)gap_y / z;
-
-                // Per-axis cap so huge gaps don't fling the camera.
-                if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
-                if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
-                if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
-                if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
+                raw_gap_y = (float)(sz_y1 - pc_screen_y);
             }
         }
     }
+
+    // === Smooth the gap to filter PC anim-frame stepping =================
+    // Raw gap jumps in 5–10 px increments synchronized with PC's anim
+    // frames; smoothing it before the velocity stage gives the camera a
+    // continuous target so it moves at PC's average speed between anim
+    // frames instead of pulsing in sync with them.
+    s_smoothed_gap_x += (raw_gap_x - s_smoothed_gap_x) * FOLLOW_GAP_SMOOTH_ALPHA;
+    s_smoothed_gap_y += (raw_gap_y - s_smoothed_gap_y) * FOLLOW_GAP_SMOOTH_ALPHA;
+
+    // Convert smoothed gap → target velocity (origin px/tick).
+    // The zoom transform pivots at screen center, so an unzoomed
+    // delta D produces a zoomed delta D*z; invert to get the
+    // origin-px move we need.
+    float target_vx = s_smoothed_gap_x / z;
+    float target_vy = s_smoothed_gap_y / z;
+
+    // Per-axis cap so huge gaps (large user scroll, off-camera start)
+    // don't fling the camera.
+    if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
+    if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
+    if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
+    if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
 
     // === Drive CURRENT velocity toward target ============================
     // Asymmetric low-pass: snappy ramp-up while tracking is active
     // (target != 0), gentle ramp-down when target is zero (PC stopped
     // or re-entered safe zone — camera glides to rest, doesn't snap).
-    // The transition between regimes happens automatically as target
-    // toggles, so the same primitive handles ramp-in, steady tracking,
-    // and ramp-out with no special-case branches.
+    // Second smoothing layer on top of gap smoothing; the cascade gives
+    // a critically-damped feel without explicit spring math.
     float alpha_x = (fabsf(target_vx) > 0.01f) ? FOLLOW_VEL_RAMP_UP : FOLLOW_VEL_RAMP_DOWN;
     float alpha_y = (fabsf(target_vy) > 0.01f) ? FOLLOW_VEL_RAMP_UP : FOLLOW_VEL_RAMP_DOWN;
     s_cam_vx_origin += (target_vx - s_cam_vx_origin) * alpha_x;
     s_cam_vy_origin += (target_vy - s_cam_vy_origin) * alpha_y;
 
-    // === Apply ===========================================================
+    // === Apply with sub-pixel accumulator ================================
+    // Settled? Zero everything (incl. residuals) and bail.
     if (fabsf(s_cam_vx_origin) < FOLLOW_VEL_CUTOFF
-        && fabsf(s_cam_vy_origin) < FOLLOW_VEL_CUTOFF) {
+        && fabsf(s_cam_vy_origin) < FOLLOW_VEL_CUTOFF
+        && fabsf(s_smoothed_gap_x) < FOLLOW_VEL_CUTOFF
+        && fabsf(s_smoothed_gap_y) < FOLLOW_VEL_CUTOFF) {
         s_cam_vx_origin = 0.0f;
         s_cam_vy_origin = 0.0f;
+        s_smoothed_gap_x = 0.0f;
+        s_smoothed_gap_y = 0.0f;
+        s_subpixel_x = 0.0f;
+        s_subpixel_y = 0.0f;
         s_last_origin_x = cam_ox;
         s_last_origin_y = cam_oy;
         return;
     }
-    int dx = (int)roundf(s_cam_vx_origin);
-    int dy = (int)roundf(s_cam_vy_origin);
+
+    // Accumulate fractional velocity, extract integer part to apply.
+    // (int) truncates toward zero in C; residual = remainder. Over
+    // time, sum of applied dx exactly matches integral of velocity —
+    // no rounding bias, no per-frame "round up / round down"
+    // oscillation that shows up as micro-jitter at low speeds.
+    s_subpixel_x += s_cam_vx_origin;
+    s_subpixel_y += s_cam_vy_origin;
+    int dx = (int)s_subpixel_x;
+    int dy = (int)s_subpixel_y;
+    s_subpixel_x -= (float)dx;
+    s_subpixel_y -= (float)dy;
+
     if (dx == 0 && dy == 0) {
         s_last_origin_x = cam_ox;
         s_last_origin_y = cam_oy;
