@@ -44,13 +44,23 @@
 // snappier wall-time behavior (a known limitation; acceptable for
 // the smoothness vs. complexity trade-off in this module).
 //
-//   MAX_VEL = 12   → ceiling on cam_v. Far-gap catch-up settles here;
-//                    also sets the tanh saturation point. Lowered
-//                    from 14 — less aggressive at very large gaps.
+// Reference: dialog_camera tweens any distance in 400ms with a
+// smoothstep ease (DIALOGUE_CAM_TWEEN_MS in dialog_camera.c). We're
+// targeting a similar cinematic feel for off-camera catch-up — slow,
+// deliberate, eased — while keeping zero lag at steady-state tracking.
 //
-//   MAX_ACCEL = 2  → per-tick |cam_v| change cap. Smooths the curve's
-//                    transitions (especially ramp-up from rest and
-//                    ramp-down on PC re-entry to safe zone).
+//   MAX_VEL = 8    → ceiling on cam_v. Sets the tanh saturation
+//                    point. With the tanh curve, mid-range gaps
+//                    (40–100 origin-px) take ~250–400ms to close,
+//                    roughly matching the dialog tween cadence.
+//                    Lower → slower / more cinematic. Higher →
+//                    snappier.
+//
+//   MAX_ACCEL = 1.0 → per-tick |cam_v| change cap. Smooths velocity
+//                     transitions, especially ramp-up from rest. At
+//                     1.0, ramp 0→MAX_VEL takes ~8 ticks (~130ms) —
+//                     visibly eased like dialog camera's smoothstep
+//                     start. Lower → more ease. Higher → more snap.
 //
 //   DRIFT_DAMPING = 0.85 → applied when pc_idle. cam_v *= 0.85/tick
 //                    until below CUTOFF. From v0=5: total drift ~33
@@ -58,8 +68,43 @@
 //
 //   CUTOFF = 0.25  → below this |cam_v| (origin px/tick) we zero out
 //                    and bail. Avoids endless sub-pixel invalidations.
-#define FOLLOW_MAX_VEL_ORIGIN  12.0f
-#define FOLLOW_MAX_ACCEL       2.0f
+//
+// Continuous-tracking smoothness: feed-forward on PC's smoothed
+// world-space velocity, so the camera moves at PC's AVERAGE speed
+// continuously between anim steps (not just when a gap appears).
+// PC's OBJ_F_OFFSET updates in chunks every 3-4 render frames; without
+// FF, cam_v drops to zero between those chunks → world scroll has the
+// same staircase as the PC anim. With FF, cam_v stays at the smoothed
+// avg speed → world scrolls continuously.
+//
+//   PC_V_SMOOTH_ALPHA = 0.15 → per-tick low-pass on PC velocity. Tau
+//                              ~100ms; converges to PC's avg speed
+//                              over ~30 ticks of walking. Also acts as
+//                              "drift on stop" — when PC stops,
+//                              smoothed velocity decays naturally over
+//                              the same time constant. Higher → more
+//                              responsive but more jittery FF; lower
+//                              → smoother but more onset lag.
+//
+//   GAP_GAIN = 0.25         → spring gain on position error.
+//                              cam_v_target = FF + GAP_GAIN * gap.
+//                              Higher = tighter pin to edge; lower =
+//                              more PC sway during walking. 0.25 keeps
+//                              PC within ~1-2 origin-px of the edge
+//                              at steady state.
+#define FOLLOW_PC_V_SMOOTH_ALPHA 0.15f
+#define FOLLOW_GAP_GAIN          0.25f
+
+// Quick tuning guide for taste:
+//   Camera too fast / abrupt?       lower MAX_VEL and/or MAX_ACCEL
+//   Camera too slow / lethargic?    raise MAX_VEL and/or MAX_ACCEL
+//   Catch-up ramp not eased enough? lower MAX_ACCEL alone
+//   Far-gap top speed too racy?     lower MAX_VEL alone
+//   World scroll feels chunky?      lower PC_V_SMOOTH_ALPHA (more FF
+//                                    smoothing, longer drift)
+//   PC visibly lags behind edge?    raise GAP_GAIN (tighter pin)
+#define FOLLOW_MAX_VEL_ORIGIN  8.0f
+#define FOLLOW_MAX_ACCEL       1.0f
 #define FOLLOW_DRIFT_DAMPING   0.85f
 #define FOLLOW_VEL_CUTOFF      0.25f
 
@@ -151,6 +196,20 @@ static float s_cam_vy_origin;
 static float s_subpixel_x;
 static float s_subpixel_y;
 
+// Smoothed PC velocity (camera-independent world-space, origin-px/tick).
+// Low-passed from the per-tick delta of PC's world position. Used as
+// feed-forward in cam_v target so the camera coasts at PC's average
+// speed between anim-frame steps → continuous world scroll.
+static float s_pc_v_smooth_x;
+static float s_pc_v_smooth_y;
+
+// Previous tick's PC world position (camera-independent) for computing
+// raw per-tick PC velocity. The s_pc_world_prev_valid flag handles
+// first-tick / post-reset (where we have no baseline to diff against).
+static int64_t s_pc_world_prev_x;
+static int64_t s_pc_world_prev_y;
+static bool s_pc_world_prev_valid;
+
 // Scroll accumulator: counts note_user_camera_move calls within a
 // recent time window. Only triggers the user-override cooldown once
 // the count exceeds FOLLOW_SCROLL_NOTE_THRESHOLD; otherwise the
@@ -178,6 +237,9 @@ void camera_follow_init(void)
     s_cam_vy_origin = 0.0f;
     s_subpixel_x = 0.0f;
     s_subpixel_y = 0.0f;
+    s_pc_v_smooth_x = 0.0f;
+    s_pc_v_smooth_y = 0.0f;
+    s_pc_world_prev_valid = false;
     s_scroll_note_count = 0;
     s_last_scroll_note_ts = 0;
     s_last_origin_valid = false;
@@ -185,13 +247,18 @@ void camera_follow_init(void)
 
 // Zero all motion state — used by every code path that yields camera
 // motion to user input (scroll, external jump). Keeps "stop fighting
-// the user" consistent.
+// the user" consistent. Also invalidates the PC-velocity baseline so
+// the next tick starts fresh (no spurious velocity from comparing
+// against a pre-yield position).
 static void zero_motion_state(void)
 {
     s_cam_vx_origin = 0.0f;
     s_cam_vy_origin = 0.0f;
     s_subpixel_x = 0.0f;
     s_subpixel_y = 0.0f;
+    s_pc_v_smooth_x = 0.0f;
+    s_pc_v_smooth_y = 0.0f;
+    s_pc_world_prev_valid = false;
 }
 
 // Directly arm the user-override cooldown — used by handle_external_jump
@@ -435,6 +502,37 @@ void camera_follow_ping(void)
         }
     }
 
+    // === Update smoothed PC velocity (camera-independent FF) =============
+    // Read PC's world-space position (unzoomed; cam_origin subtracted so
+    // the value is invariant to camera moves). Per-tick delta gives PC's
+    // raw velocity in origin-px/tick. Low-pass to filter PC's anim-frame
+    // stepping; the smoothed value drives feed-forward in target_v
+    // below, so the camera coasts at PC's average speed continuously
+    // between anim chunks — world scrolls smoothly, not in jerks.
+    {
+        int64_t pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+        int64_t pc_sx_unz, pc_sy_unz;
+        location_xy(pc_loc, &pc_sx_unz, &pc_sy_unz);
+        int pc_offset_x = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X);
+        int pc_offset_y = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y);
+        // location_xy already includes cam_ox in its result; subtract
+        // it to get a camera-independent world position (so the same
+        // PC standing still gives the same value regardless of how the
+        // camera has shifted).
+        int64_t pc_world_x = pc_sx_unz + pc_offset_x + 40 - cam_ox;
+        int64_t pc_world_y = pc_sy_unz + pc_offset_y + 20 - cam_oy;
+
+        if (s_pc_world_prev_valid) {
+            float raw_pc_vx = (float)(pc_world_x - s_pc_world_prev_x);
+            float raw_pc_vy = (float)(pc_world_y - s_pc_world_prev_y);
+            s_pc_v_smooth_x += (raw_pc_vx - s_pc_v_smooth_x) * FOLLOW_PC_V_SMOOTH_ALPHA;
+            s_pc_v_smooth_y += (raw_pc_vy - s_pc_v_smooth_y) * FOLLOW_PC_V_SMOOTH_ALPHA;
+        }
+        s_pc_world_prev_x = pc_world_x;
+        s_pc_world_prev_y = pc_world_y;
+        s_pc_world_prev_valid = true;
+    }
+
     // === Compute target velocity from raw gap ============================
     // Two regimes:
     //
@@ -495,18 +593,48 @@ void camera_follow_ping(void)
             float gap_x_orig = (float)gap_x_eff / z;
             float gap_y_orig = (float)gap_y_eff / z;
 
-            // Distance-proportional, eased, capped target velocity:
-            //   target = sign(gap) * MAX_VEL * tanh(|gap_origin| / MAX_VEL)
+            // Target velocity = feed-forward + spring, gated PER AXIS
+            // on the deadband:
             //
-            // Near 1:1 for small gaps (tanh(x) ≈ x), gracefully
-            // saturating to MAX_VEL at large gaps. No threshold, no
-            // discontinuity. The smooth saturation IS the "speed
-            // scales with distance, with a comfortable ceiling"
-            // relationship.
-            target_vx = FOLLOW_MAX_VEL_ORIGIN
-                * tanhf(gap_x_orig / FOLLOW_MAX_VEL_ORIGIN);
-            target_vy = FOLLOW_MAX_VEL_ORIGIN
-                * tanhf(gap_y_orig / FOLLOW_MAX_VEL_ORIGIN);
+            //   target_axis = -smoothed_pc_v_axis          (feed-forward)
+            //               + GAP_GAIN * tanh(gap_orig / MAX_VEL) * MAX_VEL
+            //                                              (spring on gap)
+            //   …but ONLY when gap_axis_raw != 0 (PC is past the edge
+            //   on that axis). When gap_axis is 0 (PC inside the safe
+            //   zone on that axis), target_axis stays 0 — deadband
+            //   respected, FF doesn't pull the camera across the zone.
+            //
+            // Without this per-axis gate, FF would drive the camera
+            // every tick that PC is moving, defeating the safe-zone
+            // entirely (most visibly after map/save load when PC is
+            // recentered inside the zone — camera would follow PC the
+            // moment they took a step).
+            //
+            // The FF sign is negated: if PC moves east (pc_v positive),
+            // cam_origin must DECREASE for PC to stay framed (see
+            // location.c:140-141 where pc_screen = cam_origin + f(loc)),
+            // so cam_v is the negative of PC's world velocity.
+            //
+            // The spring term closes any residual position error
+            // (smoothed FF lags PC's instantaneous step by alpha
+            // amount; spring catches it back up). tanh keeps the
+            // spring distance-proportional with a comfortable ceiling,
+            // so off-camera resume still feels eased rather than
+            // sproingy at huge gaps.
+            if (gap_x_raw != 0) {
+                target_vx = -s_pc_v_smooth_x
+                    + FOLLOW_GAP_GAIN * FOLLOW_MAX_VEL_ORIGIN
+                      * tanhf(gap_x_orig / FOLLOW_MAX_VEL_ORIGIN);
+                if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
+                if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
+            }
+            if (gap_y_raw != 0) {
+                target_vy = -s_pc_v_smooth_y
+                    + FOLLOW_GAP_GAIN * FOLLOW_MAX_VEL_ORIGIN
+                      * tanhf(gap_y_orig / FOLLOW_MAX_VEL_ORIGIN);
+                if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
+                if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
+            }
         }
     }
 
