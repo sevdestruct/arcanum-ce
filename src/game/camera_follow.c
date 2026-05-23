@@ -16,14 +16,23 @@
 
 // === Tunables ===
 //
-// Real-time edge tracking only: when the PC moves past the safe-zone
-// edge we move the camera by the same delta per tick to keep the PC
-// pinned at the edge. No tween — matches the PC's sprite motion
-// exactly. When the PC stops, the camera stops with them — no extra
-// movement after they reach the destination. The previous version
-// also did a "drift settle" recenter on stop, but the user explicitly
-// wanted that gone: the camera should only ever move because the PC
-// is actively pushing on the safe-zone edge.
+// Real-time edge tracking: when the PC moves past the safe-zone edge we
+// move the camera by the same delta per tick to keep the PC pinned at
+// the edge. No tween — matches the PC's sprite motion exactly.
+//
+// When the PC stops, we don't snap-stop the camera. The camera was
+// moving (because PC was moving and we were tracking), and momentum is
+// preserved with an exponential damp: the camera continues in the same
+// direction for a moment, decelerating smoothly. Subtle continuation,
+// not a long coast. Per-tick damping factor; at typical 60Hz ticks this
+// works out to ~250ms total drift from a ~5px/tick starting velocity.
+// (Higher refresh rates → proportionally shorter wall-time drift; an
+// acceptable simplification vs full frame-rate-independent decay math.)
+#define FOLLOW_DRIFT_DAMPING      0.88f
+// Below this magnitude (camera-origin pixels per tick) we treat the
+// drift as finished and stop applying it. 0.5 means "less than a pixel
+// per tick" — invisible motion.
+#define FOLLOW_DRIFT_CUTOFF       0.5f
 
 // Safe-zone fractions of the usable viewport. The "no-camera-move" zone
 // is the centered rect of (usable_w * (1 - 2*FRAC_X)) by
@@ -64,6 +73,12 @@ static unsigned int s_user_override_until_ts;   // tig_timer ms timestamp
 static bool s_user_override_armed;              // override active AND PC hasn't moved since
 static bool s_pc_was_idle_last_tick;            // for detecting "PC just started moving"
 
+// Momentum drift state. Camera-origin pixels per tick. Updated each
+// tick of active edge-tracking; bled off via exponential damp once PC
+// goes idle.
+static float s_drift_vx_origin;
+static float s_drift_vy_origin;
+
 void camera_follow_init(void)
 {
     settings_register(&settings, CAMERA_FOLLOWS_PLAYER_KEY, "0", NULL);
@@ -71,6 +86,8 @@ void camera_follow_init(void)
     s_user_override_until_ts = 0;
     s_user_override_armed = false;
     s_pc_was_idle_last_tick = true;
+    s_drift_vx_origin = 0.0f;
+    s_drift_vy_origin = 0.0f;
 }
 
 void camera_follow_note_user_camera_move(void)
@@ -90,6 +107,10 @@ void camera_follow_note_user_camera_move(void)
     if (camera_tween_is_active() && !dialog_camera_is_animating()) {
         camera_tween_cancel();
     }
+    // Kill any momentum drift too — user is steering, the camera should
+    // do exactly what they say, not coast a bit further.
+    s_drift_vx_origin = 0.0f;
+    s_drift_vy_origin = 0.0f;
 }
 
 // Compute the PC's CURRENT on-screen pixel coords (accounting for sub-
@@ -195,14 +216,48 @@ void camera_follow_ping(void)
             s_user_override_armed = false;
             // Fall through to follow logic below.
         } else {
+            // Drift is also a camera movement — don't let it survive
+            // the user grabbing the wheel.
+            s_drift_vx_origin = 0.0f;
+            s_drift_vy_origin = 0.0f;
             return;
         }
     }
 
-    // No drift-on-stop: the camera only ever moves because the PC is
-    // actively pushing on the safe-zone edge. When PC stops, camera
-    // stops too — no extra movement after they reach the destination.
+    // Fresh motion → drift is stale, clear it so we don't briefly
+    // continue from a previous run.
+    if (pc_just_started_moving) {
+        s_drift_vx_origin = 0.0f;
+        s_drift_vy_origin = 0.0f;
+    }
+
+    // === PC IDLE: apply residual drift, decay, return ==================
+    // While the PC was tracking outside the safe zone, each tick stored
+    // the camera-origin delta as a "velocity" sample. When PC stops, we
+    // keep applying that velocity with exponential decay so the camera
+    // glides to a stop in the direction it was already moving — natural
+    // continuation, no snap-stop, no recenter.
     if (pc_idle) {
+        if (fabsf(s_drift_vx_origin) < FOLLOW_DRIFT_CUTOFF
+            && fabsf(s_drift_vy_origin) < FOLLOW_DRIFT_CUTOFF) {
+            s_drift_vx_origin = 0.0f;
+            s_drift_vy_origin = 0.0f;
+            return;
+        }
+        int dx = (int)roundf(s_drift_vx_origin);
+        int dy = (int)roundf(s_drift_vy_origin);
+        if (dx != 0 || dy != 0) {
+            int64_t cam_ox, cam_oy;
+            location_origin_get(&cam_ox, &cam_oy);
+            location_origin_pixel_set(cam_ox + dx, cam_oy + dy);
+            tc_scroll(dx, dy);
+            gamelib_invalidate_rect(NULL);
+        }
+        // Exponential damp — same factor every tick. At ~16ms ticks this
+        // gives ~250ms of perceptible drift from a typical tracking
+        // velocity, fading to nothing.
+        s_drift_vx_origin *= FOLLOW_DRIFT_DAMPING;
+        s_drift_vy_origin *= FOLLOW_DRIFT_DAMPING;
         return;
     }
 
@@ -215,9 +270,15 @@ void camera_follow_ping(void)
     compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
 
     // PC is moving. Inside the safe-zone deadband → camera holds.
+    // Also bleed off any leftover drift velocity per tick (so if PC
+    // walks back inside the safe zone after a tracking burst, the
+    // momentum dies cleanly instead of triggering a drift on the next
+    // stop).
     bool pc_in_safe_zone = pc_screen_x >= sz_x1 && pc_screen_x <= sz_x2
                         && pc_screen_y >= sz_y1 && pc_screen_y <= sz_y2;
     if (pc_in_safe_zone) {
+        s_drift_vx_origin *= FOLLOW_DRIFT_DAMPING;
+        s_drift_vy_origin *= FOLLOW_DRIFT_DAMPING;
         return;
     }
 
@@ -263,4 +324,13 @@ void camera_follow_ping(void)
     // camera_tween_ping does. No-op when no conversation active.
     tc_scroll(dx_origin, dy_origin);
     gamelib_invalidate_rect(NULL);
+
+    // Stash this tick's velocity for the momentum-drift path that
+    // fires when PC stops. We use the raw per-tick delta we just
+    // applied — no smoothing window, no averaging. That keeps the
+    // drift direction perfectly aligned with the last burst of
+    // tracking (which is what the user perceives as "the direction
+    // the camera was going").
+    s_drift_vx_origin = (float)dx_origin;
+    s_drift_vy_origin = (float)dy_origin;
 }
