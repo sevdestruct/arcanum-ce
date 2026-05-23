@@ -7,7 +7,7 @@ across the work itself.
 
 ## TL;DR
 
-After 28 commits (mix of perf wins, bug fixes, configuration, and
+After 30 commits (mix of perf wins, bug fixes, configuration, and
 instrumentation), measured on the same play scenario:
 
 | Metric                          |    Before |     After |  Δ          |
@@ -217,6 +217,26 @@ keep using it.
   separate from modal menu wrapping. Latest test: `gamelib_load`
   measured at 123ms (fast), confirmed by data that a 4.5s "ESC
   spike" was 123ms of real load work + ~4.4s of user-in-menu time.
+- **`c56c81e6`** Skip first 2 perf samples after F9-on. Cold-cache
+  outliers (47ms object_max, 108ms tig_ping) at the very first
+  iteration after toggle were polluting worst-case numbers. Now
+  every report reflects steady-state only.
+
+### Sound subsystem fixes
+
+- **`38fe0a04`** (already in Session A) — sound file cache bumped
+  20 → 256 files / 1MB → 64MB. Eliminates re-eviction hitches
+  during normal play.
+- **`a918c0e5`** Async first-play sound loader. The residual
+  first-play sound hitch (file read + decode on main thread, ~100-
+  150ms once per never-before-heard sound) was the last user-
+  visible perf issue after the cache bump. Worker thread does the
+  file read; main-thread drain in `tig_sound_update` inserts into
+  the cache + calls AIL_quick_load_mem + AIL_quick_play. Opt-out
+  via `sound async load=0` in arcanum.cfg.
+- **`20c2378f`** NULL-deref fix for async sound — don't set
+  `snd->active=1` during the pending window or other code paths
+  (stop, fade, volume) would touch the still-NULL audio_handle.
 
 ## Per-session findings worth keeping in the PR notes
 
@@ -251,6 +271,26 @@ overhang margin).
 - Software-path render pipeline declared **done**: render work
   consistently fits in one vsync cycle; remaining frame-time
   variance is vsync + cross-loop accumulation, not engine cost
+
+### Session E — async sound loader confirmation + measurement hygiene
+181-interval test after the async sound loader landed (`a918c0e5` +
+`20c2378f` NULL-deref fix). 8 intervals showed notable sound activity
+(first-play of new monster/area sounds), but:
+- **0** `[megahitch] event: SoundGame...` entries
+- **0** `tig_ping` megahitches
+- Worst single SoundGame ping max = 8.57ms (steady-state activity,
+  no disk-load hitch)
+
+The async path works: file read happens off the main thread; sound
+plays within ~100ms of trigger via the next tig_sound_update tick.
+First-play disk + decode no longer blocks the frame.
+
+One regression-looking outlier (47ms object_max) turned out to be the
+first interval after F9-on — a cold-cache artifact also seen in the
+prior session's first interval (108ms tig_ping). Added a
+warmup-skip (`c56c81e6`) so the perf accumulators skip the first 2
+loop iterations after toggle-on; worst-case numbers now reflect
+steady-state only.
 
 ## In-flight (separate branch, not in this PR)
 
