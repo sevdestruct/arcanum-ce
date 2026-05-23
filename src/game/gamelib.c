@@ -372,6 +372,19 @@ static int gamelib_zoom_perf_key_repeat_samples = 0;
 static uint64_t gamelib_zoom_perf_event_dispatch_total_ns = 0;
 static uint64_t gamelib_zoom_perf_event_dispatch_max_ns = 0;
 static int gamelib_zoom_perf_event_dispatch_samples = 0;
+// Per-render-pass accumulators. iso_redraw is dominated by gamelib_draw_game
+// which calls light/tile/object/roof in sequence. Breaking out each pass
+// lets us identify which one drives the heavy-frame (10-20ms iso_redraw)
+// spikes during scroll-at-zoom-out.
+static uint64_t gamelib_zoom_perf_pass_light_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_light_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_tile_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_tile_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_object_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_object_max_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_roof_total_ns = 0;
+static uint64_t gamelib_zoom_perf_pass_roof_max_ns = 0;
+static int gamelib_zoom_perf_pass_samples = 0;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
 
 // 0x4020F0
@@ -1092,6 +1105,15 @@ void gamelib_zoom_perf_toggle(void)
     gamelib_zoom_perf_event_dispatch_total_ns = 0;
     gamelib_zoom_perf_event_dispatch_max_ns = 0;
     gamelib_zoom_perf_event_dispatch_samples = 0;
+    gamelib_zoom_perf_pass_light_total_ns = 0;
+    gamelib_zoom_perf_pass_light_max_ns = 0;
+    gamelib_zoom_perf_pass_tile_total_ns = 0;
+    gamelib_zoom_perf_pass_tile_max_ns = 0;
+    gamelib_zoom_perf_pass_object_total_ns = 0;
+    gamelib_zoom_perf_pass_object_max_ns = 0;
+    gamelib_zoom_perf_pass_roof_total_ns = 0;
+    gamelib_zoom_perf_pass_roof_max_ns = 0;
+    gamelib_zoom_perf_pass_samples = 0;
     char line[128];
     snprintf(line, sizeof(line), "[zoom-perf] %s\n",
         gamelib_zoom_perf_enabled ? "ON" : "OFF");
@@ -1652,6 +1674,28 @@ bool gamelib_draw(void)
                             tig_debug_printf("%s", extra);
                             gamelib_zoom_perf_log(extra);
                         }
+
+                        // Fifth line: render-pass breakdown. Identifies
+                        // which pass dominates the heavy iso_redraw
+                        // frames (the ones that overrun the 8.3ms
+                        // ProMotion budget and cause remaining stutter).
+                        if (gamelib_zoom_perf_pass_samples > 0) {
+                            double n = (double)gamelib_zoom_perf_pass_samples;
+                            float al = (float)((double)gamelib_zoom_perf_pass_light_total_ns / n / 1e6);
+                            float at = (float)((double)gamelib_zoom_perf_pass_tile_total_ns / n / 1e6);
+                            float ao = (float)((double)gamelib_zoom_perf_pass_object_total_ns / n / 1e6);
+                            float ar = (float)((double)gamelib_zoom_perf_pass_roof_total_ns / n / 1e6);
+                            float ml = (float)((double)gamelib_zoom_perf_pass_light_max_ns / 1e6);
+                            float mt = (float)((double)gamelib_zoom_perf_pass_tile_max_ns / 1e6);
+                            float mo = (float)((double)gamelib_zoom_perf_pass_object_max_ns / 1e6);
+                            float mr = (float)((double)gamelib_zoom_perf_pass_roof_max_ns / 1e6);
+                            char passes[384];
+                            snprintf(passes, sizeof(passes),
+                                "[zoom-perf]   passes: light avg %.2fms max %.2fms | tile avg %.2fms max %.2fms | object avg %.2fms max %.2fms | roof avg %.2fms max %.2fms\n",
+                                al, ml, at, mt, ao, mo, ar, mr);
+                            tig_debug_printf("%s", passes);
+                            gamelib_zoom_perf_log(passes);
+                        }
                     }
 
                     gamelib_zoom_perf_ping_total_ns = 0;
@@ -1676,6 +1720,15 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_event_dispatch_total_ns = 0;
                     gamelib_zoom_perf_event_dispatch_max_ns = 0;
                     gamelib_zoom_perf_event_dispatch_samples = 0;
+                    gamelib_zoom_perf_pass_light_total_ns = 0;
+                    gamelib_zoom_perf_pass_light_max_ns = 0;
+                    gamelib_zoom_perf_pass_tile_total_ns = 0;
+                    gamelib_zoom_perf_pass_tile_max_ns = 0;
+                    gamelib_zoom_perf_pass_object_total_ns = 0;
+                    gamelib_zoom_perf_pass_object_max_ns = 0;
+                    gamelib_zoom_perf_pass_roof_total_ns = 0;
+                    gamelib_zoom_perf_pass_roof_max_ns = 0;
+                    gamelib_zoom_perf_pass_samples = 0;
                 }
             }
 
@@ -2590,11 +2643,39 @@ bool gamelib_pc_lens_follows_player(void)
 void gamelib_draw_game(GameDrawInfo* draw_info)
 {
     if (tig_video_3d_begin_scene() == TIG_OK) {
+        bool perf_on = gamelib_zoom_perf_enabled;
+        uint64_t t0;
+
+        t0 = perf_on ? gamelib_zoom_perf_now_ns() : 0;
         light_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_light_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_light_max_ns) gamelib_zoom_perf_pass_light_max_ns = d;
+            t0 = gamelib_zoom_perf_now_ns();
+        }
         tile_draw(draw_info);
-        sub_43C690(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_tile_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_tile_max_ns) gamelib_zoom_perf_pass_tile_max_ns = d;
+        }
+        sub_43C690(draw_info);  // bucketed in 'tile' bucket above-or-below if we cared; here it falls between
+        if (perf_on) t0 = gamelib_zoom_perf_now_ns();
         object_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_object_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_object_max_ns) gamelib_zoom_perf_pass_object_max_ns = d;
+            t0 = gamelib_zoom_perf_now_ns();
+        }
         roof_draw(draw_info);
+        if (perf_on) {
+            uint64_t d = gamelib_zoom_perf_now_ns() - t0;
+            gamelib_zoom_perf_pass_roof_total_ns += d;
+            if (d > gamelib_zoom_perf_pass_roof_max_ns) gamelib_zoom_perf_pass_roof_max_ns = d;
+            gamelib_zoom_perf_pass_samples++;
+        }
         if (!gamelib_zoom_world_pass_active) {
             tb_draw(draw_info);
             tf_draw(draw_info);
