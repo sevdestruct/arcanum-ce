@@ -2,6 +2,7 @@
 
 #include <math.h>
 
+#include "game/camera_tween.h"
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
 #include "game/location.h"
@@ -35,15 +36,10 @@
 #define DIALOGUE_CAM_AESTHETIC_Y  20.0f  // breathing room top/bottom base (×zoom)
 #define DIALOGUE_CAM_AESTHETIC_X   120   // breathing room left/right (more screen equity)
 
-// Tween duration in milliseconds.
-#define DIALOGUE_CAM_TWEEN_MS 400.0f
+// Tween duration in milliseconds. Passed into the shared camera_tween
+// engine (camera_tween.c) which owns the actual smoothstep math.
+#define DIALOGUE_CAM_TWEEN_MS 400u
 
-static bool cam_tween_active;
-static int64_t cam_start_ox;
-static int64_t cam_start_oy;
-static int64_t cam_target_ox;
-static int64_t cam_target_oy;
-static unsigned int cam_tween_start_time;
 static float cam_pre_dialog_zoom;
 static float cam_dialog_zoom_floor; // lowest zoom target reached during this session
 static bool cam_zoom_saved;
@@ -74,7 +70,6 @@ void dialog_camera_init(void)
     settings_register(&settings, DIALOGUE_CAMERA_MODE_KEY,       "0", NULL);
     settings_register(&settings, DIALOGUE_CAMERA_TWEEN_BACK_KEY, "0", NULL);
     settings_register(&settings, DIALOGUE_CAMERA_ZOOM_TO_FIT_KEY, "1", NULL);
-    cam_tween_active = false;
     cam_zoom_saved = false;
     cam_dialog_zoom_floor = ISO_ZOOM_MAX;
     cam_zoom_restore_pending = false;
@@ -83,7 +78,7 @@ void dialog_camera_init(void)
 
 bool dialog_camera_is_animating(void)
 {
-    return cam_tween_active;
+    return camera_tween_is_active();
 }
 
 
@@ -315,17 +310,11 @@ static void compute_target(int64_t pc_loc, int64_t npc_loc, int mode,
     (void)tmp;
 }
 
+// Thin shim — the real tween engine lives in camera_tween.c so
+// camera_follow can share it.
 static void start_tween(int64_t dx, int64_t dy)
 {
-    if (dx == 0 && dy == 0) {
-        return;
-    }
-
-    location_origin_get(&cam_start_ox, &cam_start_oy);
-    cam_target_ox = cam_start_ox + dx;
-    cam_target_oy = cam_start_oy + dy;
-    tig_timer_now(&cam_tween_start_time);
-    cam_tween_active = true;
+    camera_tween_by(dx, dy, DIALOGUE_CAM_TWEEN_MS);
 }
 
 void dialog_camera_start(int64_t pc_obj, int64_t npc_obj)
@@ -384,51 +373,25 @@ void dialog_camera_end(int64_t pc_obj)
 
 void dialog_camera_ping(void)
 {
-    // Fire zoom restore on the first draw tick after dialog_camera_end, provided
-    // dialog_camera_start hasn't cancelled it (mid-session NPC handoff cancels
-    // in the game-logic phase of the same tick, before draw runs).
-    // Fire zoom restore only when we're no longer in a dialogue session.
-    // cam_zoom_saved is true while inside a session (set by dialog_camera_start,
-    // cleared by dialog_camera_end).  If start was called after end (mid-session
-    // NPC handoff), cam_zoom_saved will be true here and we skip.
+    // Fire zoom restore on the first draw tick after dialog_camera_end,
+    // provided dialog_camera_start hasn't cancelled it (mid-session NPC
+    // handoff cancels in the game-logic phase of the same tick, before
+    // draw runs). Fire zoom restore only when we're no longer in a
+    // dialogue session. cam_zoom_saved is true while inside a session
+    // (set by dialog_camera_start, cleared by dialog_camera_end). If
+    // start was called after end (mid-session NPC handoff), cam_zoom_saved
+    // will be true here and we skip.
     if (cam_zoom_restore_pending && !cam_zoom_saved) {
         iso_zoom_set_target(cam_zoom_restore_target);
         cam_zoom_restore_pending = false;
         gamelib_invalidate_rect(NULL);
     }
 
-    if (!cam_tween_active) {
-        return;
-    }
-
-    int elapsed = tig_timer_elapsed(cam_tween_start_time);
-    float t = (float)elapsed / DIALOGUE_CAM_TWEEN_MS;
-    if (t > 1.0f) {
-        t = 1.0f;
-        cam_tween_active = false;
-        // Tween done — recompute bubble placement against the settled viewport.
+    // Tween stepping itself moved to camera_tween_ping (called from the
+    // main loop next to dialog_camera_ping). We just react to "tween
+    // finished" here so bubble positions get recomputed once the camera
+    // settles — same behavior as before the refactor.
+    if (camera_tween_just_finished()) {
         tb_invalidate_positions();
     }
-
-    // Smooth-step easing: s = t²(3 - 2t).
-    float s = t * t * (3.0f - 2.0f * t);
-
-    int64_t desired_ox = cam_start_ox
-        + (int64_t)((float)(cam_target_ox - cam_start_ox) * s);
-    int64_t desired_oy = cam_start_oy
-        + (int64_t)((float)(cam_target_oy - cam_start_oy) * s);
-
-    int64_t cur_ox, cur_oy;
-    location_origin_get(&cur_ox, &cur_oy);
-
-    int64_t ddx = desired_ox - cur_ox;
-    int64_t ddy = desired_oy - cur_oy;
-
-    if (ddx != 0 || ddy != 0) {
-        location_origin_pixel_set(desired_ox, desired_oy);
-        tc_scroll((int)ddx, (int)ddy);
-    }
-
-    // Keep the draw loop running while the tween is active.
-    gamelib_invalidate_rect(NULL);
 }

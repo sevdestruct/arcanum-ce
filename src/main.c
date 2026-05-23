@@ -17,6 +17,8 @@
 #include "game/critter.h"
 #include "game/descriptions.h"
 #include "game/dialog.h"
+#include "game/camera_follow.h"
+#include "game/camera_tween.h"
 #include "game/dialog_camera.h"
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
@@ -360,7 +362,9 @@ int main(int argc, char** argv)
     // Must init after gamelib_init so that settings are already loaded —
     // iso_zoom_init registers a setting and applies the loaded value.
     iso_zoom_init();
+    camera_tween_init();   // generic tween engine — must precede any consumers
     dialog_camera_init();
+    camera_follow_init();
 
     if (strstr(lpCmdLine, "-dialogcheck") != NULL) {
         dialog_check();
@@ -1064,6 +1068,16 @@ static void handle_zoom_key_repeat(void)
             : ZOOM_KEY_REPEAT_INTERVAL_FAST_MS);
 }
 
+// Wrap scroll_start with the camera-follow override note so the auto-
+// follow camera knows the user is steering the view manually.
+// camera_follow_note_user_camera_move is a no-op when the feature is
+// disabled, so this is zero-cost for users who haven't opted in.
+static void user_scroll_start(int direction)
+{
+    scroll_start(direction);
+    camera_follow_note_user_camera_move();
+}
+
 // 0x401F50
 void handle_mouse_scroll(void)
 {
@@ -1108,11 +1122,11 @@ void handle_mouse_scroll(void)
                 // around 800x600 / a small absolute pixel tolerance, not a
                 // fraction of the window width.
                 if (rel_x < tolerance) {
-                    scroll_start(SCROLL_DIRECTION_UP_LEFT);
+                    user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
                 } else if (rel_x >= ww - tolerance) {
-                    scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+                    user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
                 } else {
-                    scroll_start(SCROLL_DIRECTION_UP);
+                    user_scroll_start(SCROLL_DIRECTION_UP);
                 }
                 return;
             }
@@ -1128,25 +1142,25 @@ void handle_mouse_scroll(void)
     // scrolling still triggers when the cursor overshoots the bounds.
     if (mouse_state.x < tolerance) {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
         } else {
-            scroll_start(SCROLL_DIRECTION_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_LEFT);
         }
     } else if (mouse_state.x >= width - tolerance) {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_RIGHT);
         }
     } else {
         if (mouse_state.y < tolerance) {
-            scroll_start(SCROLL_DIRECTION_UP);
+            user_scroll_start(SCROLL_DIRECTION_UP);
         } else if (mouse_state.y >= height - tolerance) {
-            scroll_start(SCROLL_DIRECTION_DOWN);
+            user_scroll_start(SCROLL_DIRECTION_DOWN);
         } else {
             scroll_stop();
         }
@@ -1158,24 +1172,24 @@ void handle_keyboard_scroll(void)
 {
     if (tig_kb_is_key_pressed(SDL_SCANCODE_UP)) {
         if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-            scroll_start(SCROLL_DIRECTION_UP_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_UP_LEFT);
         } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-            scroll_start(SCROLL_DIRECTION_UP_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_UP_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_UP);
+            user_scroll_start(SCROLL_DIRECTION_UP);
         }
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_DOWN)) {
         if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-            scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_LEFT);
         } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-            scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
+            user_scroll_start(SCROLL_DIRECTION_DOWN_RIGHT);
         } else {
-            scroll_start(SCROLL_DIRECTION_DOWN);
+            user_scroll_start(SCROLL_DIRECTION_DOWN);
         }
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-        scroll_start(SCROLL_DIRECTION_LEFT);
+        user_scroll_start(SCROLL_DIRECTION_LEFT);
     } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-        scroll_start(SCROLL_DIRECTION_RIGHT);
+        user_scroll_start(SCROLL_DIRECTION_RIGHT);
     }
 }
 

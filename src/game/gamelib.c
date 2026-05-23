@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "game/camera_follow.h"
+#include "game/camera_tween.h"
 #include "game/dialog_camera.h"
 #include "game/iso_zoom.h"
 #include "game/location.h"
@@ -1328,7 +1330,12 @@ bool gamelib_draw(void)
     }
 
     iso_zoom_ping();
+    // Order matters: tween_ping advances any in-flight tween; the
+    // policy modules below (dialog_camera_ping, camera_follow_ping)
+    // react to "just finished" or decide whether to start a new tween.
+    camera_tween_ping();
     dialog_camera_ping();
+    camera_follow_ping();
     z = iso_zoom_current();
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
