@@ -16,44 +16,50 @@
 
 // === Tunables ===========================================================
 //
-// Direct 1:1 tracking with per-tick velocity acceleration cap. The key
-// insight from the smoothing-makes-it-worse iteration:
+// Target velocity is a distance-proportional curve that asymptotes to
+// MAX_VEL at long distances:
 //
-//   For PC to APPEAR STABLE on screen, the camera must ABSORB PC's
-//   per-tick motion. PC stays pinned at the safe-zone edge; the WORLD
-//   steps under PC. Any velocity smoothing introduces lag → PC visibly
-//   slides past the edge on each anim step before the camera catches
-//   up. That slide IS the visible "step" — smoothing makes it worse.
+//   target_v = sign(gap) * MAX_VEL * tanh(|gap_origin| / MAX_VEL)
 //
-// So at steady state we do exactly: cam_v = target_v (no filter). The
-// only smoothing is the per-tick acceleration cap — limits how much
-// cam_v can change in a single tick, which gives smooth ramps on
-// transitions (tracking onset, off-camera catch-up, direction
-// reversal) without putting any lag on the steady-state.
+// Why tanh:
+//   - For small gaps (|gap| << MAX_VEL), tanh(x) ≈ x → target ≈ gap
+//     ≈ near-1:1 tracking (only ~5 origin-px of equilibrium lag at
+//     PC's typical walking speed — barely visible).
+//   - As |gap| grows, the curve smoothly saturates: at gap = MAX_VEL,
+//     target = 0.76·MAX_VEL; at 2·MAX_VEL, 0.96·MAX_VEL; asymptotic.
+//   - Distance-proportional in the middle range, capped at extremes.
+//     "Far PC" doesn't race; "close PC" doesn't whip; both are eased.
 //
-// Tunings (60Hz tick rate assumed):
+// Layered on top: a per-tick accel cap smooths the moment-to-moment
+// velocity changes (especially on transition into catch-up and out of
+// it). Low MAX_ACCEL = longer ease; high = snappier. We pick 2.0,
+// which means it takes ~7 ticks (~120ms) for cam_v to ramp from rest
+// to MAX_VEL, and a similar interval to decelerate back to steady
+// tracking speed — comfortable to watch, never jolting.
 //
-//   MAX_ACCEL = 5  → per-tick velocity change cap. Higher → snappier
-//                    transitions / less ease. Lower → smoother ramps,
-//                    but more PC lag past edge during catch-up. At 5
-//                    on a typical PC step of 5 origin-px, cam_v
-//                    reaches PC's speed in 1–2 ticks, so 1:1 takes
-//                    over essentially immediately.
+// Drift damping kicks in only when PC is truly idle (real stop, not
+// inter-anim-frame pause). Subtle inertia continuation.
 //
-//   MAX_VEL = 14   → hard cap on cam_v itself. Limits off-camera
-//                    catch-up speed so a huge gap doesn't fling.
-//                    ~3× walking speed.
+// All sized for a 60 Hz tick rate. Higher refresh = proportionally
+// snappier wall-time behavior (a known limitation; acceptable for
+// the smoothness vs. complexity trade-off in this module).
 //
-//   DRIFT_DAMPING = 0.85 → only used when PC is IDLE (real stop, not
-//                    inter-anim-frame pause). cam_v *= 0.85 each tick
-//                    until cutoff. From v0=5, total drift distance is
-//                    ~33 origin-px over ~20 ticks (~330ms): subtle
-//                    continuation, well within the safe zone.
+//   MAX_VEL = 12   → ceiling on cam_v. Far-gap catch-up settles here;
+//                    also sets the tanh saturation point. Lowered
+//                    from 14 — less aggressive at very large gaps.
 //
-//   CUTOFF = 0.25  → below this magnitude (origin px/tick) we zero
-//                    velocity. Avoids endless sub-pixel invalidations.
-#define FOLLOW_MAX_ACCEL       5.0f
-#define FOLLOW_MAX_VEL_ORIGIN  14.0f
+//   MAX_ACCEL = 2  → per-tick |cam_v| change cap. Smooths the curve's
+//                    transitions (especially ramp-up from rest and
+//                    ramp-down on PC re-entry to safe zone).
+//
+//   DRIFT_DAMPING = 0.85 → applied when pc_idle. cam_v *= 0.85/tick
+//                    until below CUTOFF. From v0=5: total drift ~33
+//                    origin-px over ~20 ticks (~330ms).
+//
+//   CUTOFF = 0.25  → below this |cam_v| (origin px/tick) we zero out
+//                    and bail. Avoids endless sub-pixel invalidations.
+#define FOLLOW_MAX_VEL_ORIGIN  12.0f
+#define FOLLOW_MAX_ACCEL       2.0f
 #define FOLLOW_DRIFT_DAMPING   0.85f
 #define FOLLOW_VEL_CUTOFF      0.25f
 
@@ -486,14 +492,21 @@ void camera_follow_ping(void)
             // Convert effective gap (zoomed screen px) → origin px.
             // Zoom transform pivots at screen center; unzoomed delta D
             // produces zoomed delta D*z, so invert by dividing.
-            target_vx = (float)gap_x_eff / z;
-            target_vy = (float)gap_y_eff / z;
+            float gap_x_orig = (float)gap_x_eff / z;
+            float gap_y_orig = (float)gap_y_eff / z;
 
-            // Per-axis cap so huge gaps don't fling the camera.
-            if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
-            if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
-            if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
-            if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
+            // Distance-proportional, eased, capped target velocity:
+            //   target = sign(gap) * MAX_VEL * tanh(|gap_origin| / MAX_VEL)
+            //
+            // Near 1:1 for small gaps (tanh(x) ≈ x), gracefully
+            // saturating to MAX_VEL at large gaps. No threshold, no
+            // discontinuity. The smooth saturation IS the "speed
+            // scales with distance, with a comfortable ceiling"
+            // relationship.
+            target_vx = FOLLOW_MAX_VEL_ORIGIN
+                * tanhf(gap_x_orig / FOLLOW_MAX_VEL_ORIGIN);
+            target_vy = FOLLOW_MAX_VEL_ORIGIN
+                * tanhf(gap_y_orig / FOLLOW_MAX_VEL_ORIGIN);
         }
     }
 
