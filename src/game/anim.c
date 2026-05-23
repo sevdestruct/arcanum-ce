@@ -3519,6 +3519,14 @@ bool anim_is_idle(int64_t obj)
     tig_art_id_t art_id;
 
     index = anim_find_first(obj);
+    if (index < 0) {
+        // No anim queued for this obj — treat as idle. anim_find_first
+        // returns -1 when nothing matches, and the following pointer
+        // arithmetic on -1 would read before anim_run_info and may crash
+        // depending on memory layout (e.g. when camera_follow_ping polls
+        // PC idle state at main-menu time before any anim has been queued).
+        return true;
+    }
     run_info = &(anim_run_info[index]);
     if (run_info->current_goal != 0) {
         return false;
