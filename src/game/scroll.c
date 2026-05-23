@@ -4,6 +4,7 @@
 
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
+#include "game/perception_fog.h"
 #include "game/tb.h"
 #include "game/gsound.h"
 #include "game/location.h"
@@ -347,8 +348,10 @@ void scroll_start(int direction)
 
     // Retrieve the effective scroll distance.
     distance = scroll_distance_get();
-    if (distance == 0) {
-        // No distance limit.
+    if (distance == 0 || perception_fog_is_enabled()) {
+        // No distance limit (ScrollDist=0), or perception fog overlay is
+        // active (fog vignette acts as the perception boundary — use map
+        // edges as the only scroll constraint).
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
         scroll_by(dx, dy);
@@ -557,6 +560,9 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
+    /* Camera moved — fog ellipse center must be recomputed next draw. */
+    perception_fog_mark_dirty();
+
     // CE: Force full-redraw on every scroll, regardless of zoom.
     //
     // The legacy hardware-scroll path at zoom=1.0 (the `else` branch
@@ -579,9 +585,11 @@ void scroll_by(int64_t dx, int64_t dy)
     // The legacy hardware-scroll branch is preserved below (dead)
     // for reference; a future cleaner fix could route the scroll
     // through a scratch video buffer to avoid the overlapping blit.
+    // Fog also needs full-redraw to avoid hardware-scroll dragging
+    // fogged pixels into newly revealed tiles.
     if (true) {
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
-    } else if (z != 1.0f || tb_any_active()) {
+    } else if (z != 1.0f || tb_any_active() || perception_fog_is_enabled()) {
         // At non-unity zoom, or when speech bubbles are visible, the hardware
         // scroll optimization leaves stale bubble pixels. Force a full redraw.
         scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
@@ -695,6 +703,55 @@ int scroll_distance_get(void)
 }
 
 /**
+ * Returns the perception-based pixel leash limits for the current player.
+ *
+ * hor_out is the maximum horizontal pixel displacement, vert_out the
+ * vertical one.  Both are 0 when ScrollDist=0 (unlimited / no leash).
+ */
+void scroll_perception_pixel_limits(int* hor_out, int* vert_out)
+{
+    int distance = scroll_distance_get();
+    if (distance == 0) {
+        *hor_out  = 0;
+        *vert_out = 0;
+        return;
+    }
+    *hor_out  = 80 * distance;
+    *vert_out = 40 * distance;
+}
+
+/**
+ * Returns the local PC's current rendered position in viewport screen
+ * pixel coordinates, including the per-object walk-animation offset.
+ *
+ * scroll_center is tile-quantized (only updates on tile-boundary crossings),
+ * so using it for the fog ellipse centre would step the fog one tile at a
+ * time.  The PC's OBJ_F_OFFSET_X/Y fields advance every animation frame
+ * while walking — sourcing from them produces a smoothly-following centre.
+ *
+ * Falls back to scroll_center when no PC is available (e.g. main menu).
+ */
+void scroll_get_player_screen_pos(int* sx, int* sy)
+{
+    int64_t pc_obj = player_get_local_pc_obj();
+    int64_t cx, cy;
+
+    if (pc_obj != OBJ_HANDLE_NULL) {
+        int64_t loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+        int ox = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X);
+        int oy = obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y);
+        location_xy(loc, &cx, &cy);
+        *sx = (int)cx + 40 + ox;
+        *sy = (int)cy + 20 + oy;
+        return;
+    }
+
+    location_xy(scroll_center, &cx, &cy);
+    *sx = (int)cx + 40;
+    *sy = (int)cy + 20;
+}
+
+/**
  * Sets the center location which is used to determine maximum allowed scrolling
  * distance.
  *
@@ -703,6 +760,7 @@ int scroll_distance_get(void)
 void scroll_set_center(int64_t location)
 {
     scroll_center = location;
+    perception_fog_mark_dirty(); /* player moved — re-center fog ellipse */
 }
 
 /**

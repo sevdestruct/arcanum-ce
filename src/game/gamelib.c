@@ -53,6 +53,7 @@
 #include "game/name.h"
 #include "game/newspaper.h"
 #include "game/party.h"
+#include "game/perception_fog.h"
 #include "game/player.h"
 #include "game/portrait.h"
 #include "game/quest.h"
@@ -73,6 +74,7 @@
 #include "game/tech.h"
 #include "game/teleport.h"
 #include "game/tf.h"
+#include "game/scroll.h"
 #include "game/tile.h"
 #include "game/tile_block.h"
 #include "game/tile_script.h"
@@ -202,6 +204,7 @@ static GameLibModule gamelib_modules[] = {
     { "MonsterGen", monstergen_init, monstergen_reset, NULL, NULL, monstergen_exit, NULL, NULL, monstergen_save, monstergen_load, monstergen_resize },
     { "Party", party_init, party_reset, NULL, 0, party_exit, NULL, NULL, NULL, NULL, NULL },
     { "gameinit", gameinit_init, gameinit_reset, gameinit_mod_load, gameinit_mod_unload, gameinit_exit, NULL, NULL, NULL, NULL, NULL },
+    { "PerceptionFog", perception_fog_init, NULL, NULL, NULL, perception_fog_exit, NULL, NULL, NULL, NULL, perception_fog_resize },
 };
 
 #define MODULE_COUNT ((int)SDL_arraysize(gamelib_modules))
@@ -1333,6 +1336,18 @@ bool gamelib_draw(void)
     camera_tween_ping();
     dialog_camera_ping();
     camera_follow_ping();
+
+    /* Feature A: enforce Perception-based zoom floor every frame so the
+     * player cannot zoom out beyond what the scroll leash would allow. */
+    {
+        int hor_limit, vert_limit;
+        scroll_perception_pixel_limits(&hor_limit, &vert_limit);
+        iso_zoom_update_perception_floor(
+            gamelib_iso_content_rect.width,
+            gamelib_iso_content_rect.height,
+            hor_limit, vert_limit);
+    }
+
     z = iso_zoom_current();
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
@@ -1483,6 +1498,26 @@ bool gamelib_draw(void)
             TigRect zoom_content_rect = { active_x, active_y, active_w, active_h };
             object_set_iso_content_rect(&zoom_content_rect);
             light_set_iso_content_rect(&zoom_content_rect);
+        } else if (perception_fog_is_enabled()
+                   && gamelib_draw_func == gamelib_draw_game) {
+            /* Feature B (non-zoom path): the incremental dirty-rect system
+             * preserves the previous frame's fogged pixels in the buffer.
+             * NPC movement adds a small clean rect over that fogged content;
+             * when fog is re-applied the NPC area gets one layer and the rest
+             * gets a second layer, causing progressive darkening and sprite
+             * holes.  Force a full-viewport redraw each frame so fog is always
+             * applied to a freshly rendered scene. */
+            node = gamelib_dirty_rects_head;
+            while (node != NULL) {
+                next = node->next;
+                tig_rect_node_destroy(node);
+                node = next;
+            }
+            gamelib_dirty_rects_head = tig_rect_node_create();
+            if (gamelib_dirty_rects_head != NULL) {
+                gamelib_dirty_rects_head->rect = gamelib_iso_content_rect;
+                gamelib_dirty_rects_head->next = NULL;
+            }
         }
         if (gamelib_zoom_perf_enabled && zoom_active) {
             // Snapshot the area the renderer is about to touch. After
@@ -1843,6 +1878,10 @@ bool gamelib_draw(void)
                 }
             }
 
+            /* Feature B: composite perception fog over world frame, under
+             * the HUD so floating text / turn-based UI stays visible. */
+            perception_fog_draw(gamelib_iso_window_vb);
+
             // Re-run fixed-screen HUD draws (tc/tf/tb) directly onto
             // iso_window_vb at normal viewport coordinates. They rendered into
             // world_vb at fixed coords outside the scale-blit src rect, so
@@ -1887,6 +1926,17 @@ bool gamelib_draw(void)
                 tig_window_invalidate_rect(&rect);
                 tig_rect_node_destroy(node);
                 node = next;
+            }
+
+            /* Feature B: composite perception fog over the non-zoomed game
+             * frame.  When fog is active we also do a full-viewport invalidate
+             * so fog-modified pixels outside the incremental dirty rects reach
+             * the display. */
+            if (gamelib_draw_func == gamelib_draw_game) {
+                perception_fog_draw(gamelib_iso_window_vb);
+                if (perception_fog_is_enabled()) {
+                    tig_window_invalidate_rect(NULL);
+                }
             }
         }
         ret = true;
