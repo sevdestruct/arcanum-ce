@@ -2063,6 +2063,10 @@ bool gamelib_save(const char* name, const char* description)
     duration = tig_timer_elapsed(start_time);
     tig_debug_printf("gamelib_save(): Save Complete.  Total time: %d ms.\n", duration);
 
+    if (gamelib_zoom_perf_enabled && duration > 100) {
+        gamelib_perf_log_event("gamelib_save", (uint64_t)duration * 1000000ull);
+    }
+
     return true;
 }
 
@@ -2191,6 +2195,10 @@ bool gamelib_load(const char* name)
 
     duration = tig_timer_elapsed(start_time);
     tig_debug_printf("gamelib_load: Load Complete.  Total time: %d ms.\n", duration);
+
+    if (gamelib_zoom_perf_enabled && duration > 100) {
+        gamelib_perf_log_event("gamelib_load", (uint64_t)duration * 1000000ull);
+    }
 
     return true;
 }
