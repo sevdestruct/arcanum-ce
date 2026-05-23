@@ -14,94 +14,117 @@
 #include "game/tc.h"
 #include "tig/timer.h"
 
-// === Tunables ===
+// === Tunables ===========================================================
 //
-// Edge tracking — two regimes blended smoothly:
+// Unified velocity-based driver. Each tick:
 //
-//   1. STEADY-STATE PIN (small gap): when the PC is within
-//      CATCH_UP_BLEND_MIN_GAP of the safe-zone edge, we apply the full
-//      screen delta each tick. PC stays glued to the edge. Matches the
-//      sprite motion 1:1, no lag.
+//   1. TARGET velocity (origin-px/tick, per-axis):
+//        - PC moving AND outside safe zone → gap-to-edge / zoom, capped
+//          at MAX_VEL_ORIGIN per axis.
+//        - PC inside safe zone OR idle     → 0.
 //
-//   2. EASED CATCH-UP (large gap): when the PC is much further out —
-//      typical case being "user manually scrolled away from PC, then PC
-//      starts moving again, gap to safe zone is hundreds of px" — a
-//      one-tick 1:1 pin would lurch the whole way in a single frame.
-//      Instead apply CATCH_UP_RATE × gap (with a max-per-tick cap so
-//      truly enormous gaps don't go faster than ~720px/sec). This is
-//      mathematically an exponential approach, which reads as ease-out:
-//      fast at first, decelerating as we close.
+//   2. CURRENT velocity is low-pass filtered toward target with
+//      asymmetric alpha:
+//        - target != 0 → RAMP_UP  (responsive: PC is leading)
+//        - target == 0 → RAMP_DOWN (gentle: settle / drift)
 //
-//   3. BLEND BAND between the two: linearly interpolates so there's no
-//      visible velocity discontinuity at the threshold.
+//   3. Current velocity is applied to camera origin (rounded to int px).
 //
-// At rate 0.20, equilibrium gap for a 5px/tick PC velocity is ~25px, so
-// MIN_GAP=10 / MAX_GAP=40 puts the blend window straddling that
-// equilibrium — the eased path naturally lands the PC inside the 1:1
-// regime, no oscillation.
-#define FOLLOW_CATCH_UP_RATE          0.20f
-#define FOLLOW_CATCH_UP_BLEND_MIN_GAP 10    // gap ≤ this: pure 1:1 pin
-#define FOLLOW_CATCH_UP_BLEND_MAX_GAP 40    // gap ≥ this: pure eased
-#define FOLLOW_CATCH_UP_MAX_PER_TICK  60    // hard velocity cap
+// This one primitive replaces the prior trio of (1) 1:1 edge pin, (2)
+// blended catch-up for off-camera starts, and (3) drift settle on stop.
+// All transitions flow through the same low-pass:
+//
+//   - Crossing the safe-zone edge: target jumps from 0 to non-zero,
+//     low-pass smoothly ramps current velocity up to match.
+//   - PC stops or re-enters safe zone: target jumps to 0, low-pass
+//     smoothly ramps current down — camera glides to rest WITHOUT
+//     waiting for PC to reach its destination.
+//   - Big gap (off-camera start after a manual scroll): target hits
+//     MAX_VEL cap, current ramps up to capped speed, then naturally
+//     decelerates as gap shrinks (target shrinks proportionally).
+//
+// Tunings (60Hz tick rate assumed; higher refresh = proportionally
+// shorter wall-time durations, an acceptable simplification vs full
+// frame-rate-independent decay math).
+//
+//   RAMP_UP=0.20  → ~80ms time const, ~190ms to 90% of target.
+//                   Snappy enough that tracking onset feels responsive,
+//                   soft enough that there's a visible ease.
+//   RAMP_DOWN=0.07 → ~210ms time const, ~700ms to 5% of initial.
+//                   Subtle continued glide after PC stops or enters the
+//                   safe zone, dampening as it goes. Total drift
+//                   distance at typical walking speed (~5 origin
+//                   px/tick) ≈ v0 / alpha ≈ 70 origin-px — comfortably
+//                   inside the safe zone, never pushes PC past it.
+//   MAX_VEL=14    → caps catch-up speed when gap is huge (user scrolled
+//                   far). ~3× PC walking speed; covers a full-screen
+//                   gap in ~1 sec including ramp.
+//   CUTOFF=0.25   → below this magnitude (origin px/tick) we zero
+//                   velocity; avoids endless sub-pixel invalidations.
+#define FOLLOW_VEL_RAMP_UP    0.20f
+#define FOLLOW_VEL_RAMP_DOWN  0.07f
+#define FOLLOW_MAX_VEL_ORIGIN 14.0f
+#define FOLLOW_VEL_CUTOFF     0.25f
 
-// When the PC stops, we don't snap-stop the camera. The camera was
-// moving (because PC was moving and we were tracking), and momentum is
-// preserved with an exponential damp: the camera continues in the same
-// direction for a moment, decelerating smoothly. Subtle continuation,
-// not a long coast. Per-tick damping factor; at typical 60Hz ticks this
-// works out to ~250ms total drift from a ~5px/tick starting velocity.
-// (Higher refresh rates → proportionally shorter wall-time drift; an
-// acceptable simplification vs full frame-rate-independent decay math.)
-#define FOLLOW_DRIFT_DAMPING      0.88f
-// Below this magnitude (camera-origin pixels per tick) we treat the
-// drift as finished and stop applying it. 0.5 means "less than a pixel
-// per tick" — invisible motion.
-#define FOLLOW_DRIFT_CUTOFF       0.5f
-
-// Safe-zone fractions of the usable viewport. The "no-camera-move" zone
-// is the centered rect of (usable_w * (1 - 2*FRAC_X)) by
+// Safe-zone fractions of the usable viewport. The "no-camera-move"
+// zone is the centered rect of (usable_w * (1 - 2*FRAC_X)) by
 // (usable_h * (1 - top_frac - bot_frac)).
 //
-// Horizontal margin is screen-ratio-aware. A reference 4:3 layout gets
+// Horizontal margin is screen-ratio-aware: a reference 4:3 layout gets
 // FRAC_X_BASE; wider screens get a slightly larger fraction so the
 // deadband stays visually balanced (wide screens have proportionally
 // more sideways "look-ahead" room).
 #define FOLLOW_SAFE_FRAC_X_BASE   0.22f
-#define FOLLOW_SAFE_FRAC_X_WIDE   0.30f  // applied at aspect >= 16:9
+#define FOLLOW_SAFE_FRAC_X_WIDE   0.30f
 #define FOLLOW_REF_ASPECT         (4.0f / 3.0f)
 #define FOLLOW_WIDE_ASPECT        (16.0f / 9.0f)
 
-// Vertical safe-zone fractions are asymmetric because the iso PC sprite
-// extends UP from its tile (head) more than DOWN (foot/shadow). Giving
-// the top a larger fraction keeps the head away from the HUD bar AND
-// the top edge during diagonal movement.
+// Vertical fractions are asymmetric: the iso PC sprite extends UP from
+// its tile (head) more than DOWN (foot/shadow), so the top margin is
+// larger to keep the head away from the HUD bar AND the top edge
+// during diagonal movement.
 #define FOLLOW_SAFE_FRAC_Y_TOP    0.32f
 #define FOLLOW_SAFE_FRAC_Y_BOT    0.20f
 
-// Cooldown after a manual user camera move. Auto-follow stays off until
-// (cooldown expired) AND (PC has started motion since the override). The
-// AND keeps the camera where the user put it when the user isn't moving
-// the PC — you can manually pan and read a sign without the camera
-// snapping back the moment the cooldown ticks out.
+// Cooldown after a manual user camera move (mouse-edge scroll,
+// keyboard arrow, portrait click, UI recenter). Auto-follow stays off
+// until (cooldown expired) AND (PC currently moving). The AND keeps
+// the camera where the user put it whenever PC is idle — you can
+// manually pan and read a sign without the camera snapping back the
+// instant the cooldown ticks out. The `!pc_idle` check (instead of the
+// prior "PC just transitioned to moving" gate) makes resume work even
+// when the PC has been walking continuously the whole time.
 #define FOLLOW_USER_COOLDOWN_MS   3000u
 
-// === State ===
+// Anything bigger than this (origin px between consecutive ticks)
+// counts as an external camera jump (UI recenter, portrait click,
+// dialog tween conclusion, etc.) and engages the cooldown. Bigger than
+// any reasonable per-tick auto-follow apply (capped at MAX_VEL_ORIGIN
+// ≈ 14), comfortably less than a "click portrait, camera jumps across
+// the map" sort of move.
+#define FOLLOW_JUMP_THRESHOLD_PX  64
 
-// Cached cfg flag — checked once per init (could be hot-reloaded by
-// re-registering but vsync_mode/etc don't either; consistent with the
-// rest of the project's settings pattern).
+// === State ==============================================================
+
 static bool s_follow_enabled;
 
-// User-override state
-static unsigned int s_user_override_until_ts;   // tig_timer ms timestamp
-static bool s_user_override_armed;              // override active AND PC hasn't moved since
-static bool s_pc_was_idle_last_tick;            // for detecting "PC just started moving"
+// User-override state.
+static unsigned int s_user_override_until_ts;
+static bool s_user_override_armed;
 
-// Momentum drift state. Camera-origin pixels per tick. Updated each
-// tick of active edge-tracking; bled off via exponential damp once PC
-// goes idle.
-static float s_drift_vx_origin;
-static float s_drift_vy_origin;
+// Current camera velocity, in CAMERA-ORIGIN pixels per tick. Low-pass
+// filtered toward a per-tick target inside camera_follow_ping.
+static float s_cam_vx_origin;
+static float s_cam_vy_origin;
+
+// Origin after the last tick we drove. Used to detect EXTERNAL camera
+// jumps: anything that moved the origin between ticks without going
+// through our apply path — portrait click, inventory open, dialog
+// tween final position, map load, etc. We engage the cooldown when we
+// see one so we don't immediately snap back over the new framing.
+static int64_t s_last_origin_x;
+static int64_t s_last_origin_y;
+static bool s_last_origin_valid;
 
 void camera_follow_init(void)
 {
@@ -109,9 +132,9 @@ void camera_follow_init(void)
     s_follow_enabled = settings_get_value(&settings, CAMERA_FOLLOWS_PLAYER_KEY) != 0;
     s_user_override_until_ts = 0;
     s_user_override_armed = false;
-    s_pc_was_idle_last_tick = true;
-    s_drift_vx_origin = 0.0f;
-    s_drift_vy_origin = 0.0f;
+    s_cam_vx_origin = 0.0f;
+    s_cam_vy_origin = 0.0f;
+    s_last_origin_valid = false;
 }
 
 void camera_follow_note_user_camera_move(void)
@@ -123,30 +146,29 @@ void camera_follow_note_user_camera_move(void)
     tig_timer_now(&now);
     s_user_override_until_ts = (unsigned int)now + FOLLOW_USER_COOLDOWN_MS;
     s_user_override_armed = true;
-    // Cancel any auto-follow tween already in flight so it doesn't fight
-    // the user's scroll. dialog_camera tweens are explicit/modal — we
-    // leave those alone. (We can't distinguish here, but the only auto-
-    // follow callers are us anyway; dialog_camera tweens during a
-    // dialog/cinematic when the user isn't free-scrolling.)
+    // Cancel any auto-follow tween already in flight so it doesn't
+    // fight the user's scroll. Dialog camera tweens are modal — we
+    // leave those alone. (We can't distinguish here, but the only
+    // auto-follow caller of camera_tween is dialog_camera anyway.)
     if (camera_tween_is_active() && !dialog_camera_is_animating()) {
         camera_tween_cancel();
     }
-    // Kill any momentum drift too — user is steering, the camera should
-    // do exactly what they say, not coast a bit further.
-    s_drift_vx_origin = 0.0f;
-    s_drift_vy_origin = 0.0f;
+    // Kill momentum — user is steering, we don't get to coast.
+    s_cam_vx_origin = 0.0f;
+    s_cam_vy_origin = 0.0f;
 }
 
-// Compute the PC's CURRENT on-screen pixel coords (accounting for sub-
-// tile OFFSET_X/Y during movement animation) and the zoom-scaled
+// Compute the PC's current on-screen pixel coords (accounting for
+// sub-tile OFFSET_X/Y during movement animation) and the zoom-scaled
 // position the user perceives.
 //
 // Coordinate convention (verified against location.c:140-141):
-// `location_xy(loc, &sx, &sy)` returns SCREEN pixel coords — it already
-// includes `location_origin_x/y` in the result. So `pc_sx` here IS the
-// PC's current on-screen unzoomed position; we must NOT add cam_ox a
-// second time (early version of this code did, and the resulting
-// alternating-target loop caused the camera to spiral infinitely).
+// `location_xy(loc, &sx, &sy)` returns SCREEN pixel coords — it
+// already includes `location_origin_x/y` in the result. So `pc_sx`
+// here IS the PC's current on-screen unzoomed position; we must NOT
+// add cam_ox a second time (early version of this code did, and the
+// resulting alternating-target loop caused the camera to spiral
+// infinitely).
 static bool compute_pc_screen_pos(int64_t pc_obj, int* out_sx, int* out_sy)
 {
     int64_t pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
@@ -155,8 +177,8 @@ static bool compute_pc_screen_pos(int64_t pc_obj, int* out_sx, int* out_sy)
     pc_sx += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_X) + 40;  // tile center
     pc_sy += obj_field_int32_get(pc_obj, OBJ_F_OFFSET_Y) + 20;
 
-    // Apply zoom to get what the user actually perceives. Zoom pivots
-    // around the screen center; pre-zoom screen position is just pc_sx.
+    // Zoom pivots around screen center; apply transform for the
+    // perceived position.
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
     float z = iso_zoom_current();
@@ -171,22 +193,18 @@ static bool compute_pc_screen_pos(int64_t pc_obj, int* out_sx, int* out_sy)
 }
 
 // Compute safe-zone bounds for the PC's tile-center on-screen position.
-// All returned values are in SCREEN pixels (post-zoom). Inside this rect
-// the camera does NOT auto-follow.
+// All returned values are in SCREEN pixels (post-zoom). Inside this
+// rect the camera does NOT auto-follow.
 static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
 {
     TigRect cr;
     gamelib_get_iso_content_rect(&cr);
 
-    // Usable area excludes the HUD chrome.
     int usable_top = GAME_UI_BAR_TOP;
     int usable_bot = cr.height - GAME_UI_BAR_BOTTOM;
     int usable_w   = cr.width;
     int usable_h   = usable_bot - usable_top;
 
-    // Horizontal margin: lerp between BASE (4:3) and WIDE (16:9) by
-    // current aspect. Beyond 16:9 we clamp to WIDE so ultrawides don't
-    // end up with the safe zone hugging the PC.
     float aspect = (cr.height > 0)
         ? (float)cr.width / (float)cr.height
         : FOLLOW_REF_ASPECT;
@@ -198,8 +216,6 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
         + (FOLLOW_SAFE_FRAC_X_WIDE - FOLLOW_SAFE_FRAC_X_BASE) * t_aspect;
     int margin_x = (int)((float)usable_w * frac_x);
 
-    // Vertical: asymmetric — more top margin (head extends up in iso),
-    // less bottom margin (foot is near tile origin).
     int margin_y_top = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_TOP);
     int margin_y_bot = (int)((float)usable_h * FOLLOW_SAFE_FRAC_Y_BOT);
 
@@ -209,192 +225,215 @@ static void compute_safe_zone(int* x1, int* y1, int* x2, int* y2)
     *y2 = usable_bot - margin_y_bot;
 }
 
-// Convert a raw per-axis gap (screen pixels needed to pin PC to the
-// safe-zone edge) into the screen-pixel delta we actually apply this
-// tick. Implements the two-regime blend described next to the tunables:
+// Detect a camera origin jump caused by code outside this module
+// (UI recenter, portrait click, dialog tween final position, map
+// load). Always zero our residual velocity — the prior tick's velocity
+// was computed against the pre-jump origin and is meaningless after
+// the warp. Then decide whether to engage the cooldown:
 //
-//   small gap (|d| <= MIN_GAP)      → return d unchanged (1:1 pin)
-//   large gap (|d| >= MAX_GAP)      → return sign(d) * min(|d| * RATE,
-//                                                          MAX_PER_TICK)
-//   between                         → linear lerp of the two
+//   - If the jump LEFT PC inside the safe zone, the jumper wanted the
+//     camera framed on PC (portrait click, "recenter on PC" UI button,
+//     map load placing PC at screen center). Engaging the cooldown
+//     would just delay follow from resuming — instead accept the new
+//     framing as our baseline and let follow tick normally.
 //
-// Sign is preserved throughout; only magnitude is shaped.
-static int compute_blended_apply(int delta_screen)
+//   - If the jump moved the view AWAY from PC (PC now outside safe
+//     zone), the jumper was framing something else (a spell effect, a
+//     conversation NPC, mouse-edge scroll). Engage the cooldown so we
+//     don't snap back over their framing.
+//
+// Returns true if the cooldown was engaged.
+static bool handle_external_jump(int64_t cam_ox, int64_t cam_oy)
 {
-    int abs_d = (delta_screen < 0) ? -delta_screen : delta_screen;
-    if (abs_d <= FOLLOW_CATCH_UP_BLEND_MIN_GAP) {
-        return delta_screen;
+    if (!s_last_origin_valid) {
+        // First observation; nothing to compare against.
+        s_last_origin_x = cam_ox;
+        s_last_origin_y = cam_oy;
+        s_last_origin_valid = true;
+        return false;
     }
-    int eased_mag = (int)((float)abs_d * FOLLOW_CATCH_UP_RATE);
-    if (eased_mag > FOLLOW_CATCH_UP_MAX_PER_TICK) {
-        eased_mag = FOLLOW_CATCH_UP_MAX_PER_TICK;
+    int64_t ddx = cam_ox - s_last_origin_x;
+    int64_t ddy = cam_oy - s_last_origin_y;
+    if (ddx < 0) ddx = -ddx;
+    if (ddy < 0) ddy = -ddy;
+    if (ddx <= FOLLOW_JUMP_THRESHOLD_PX && ddy <= FOLLOW_JUMP_THRESHOLD_PX) {
+        return false;
     }
-    int eased = (delta_screen > 0) ? eased_mag : -eased_mag;
-    if (abs_d >= FOLLOW_CATCH_UP_BLEND_MAX_GAP) {
-        return eased;
+
+    // Stale velocity: zero it. (note_user_camera_move would also do
+    // this if we call it, but we zero unconditionally so the
+    // PC-in-safe-zone branch below doesn't carry stale momentum past
+    // the jump either.)
+    s_cam_vx_origin = 0.0f;
+    s_cam_vy_origin = 0.0f;
+
+    int64_t pc_obj = player_get_local_pc_obj();
+    if (pc_obj != OBJ_HANDLE_NULL) {
+        int pc_screen_x, pc_screen_y;
+        if (compute_pc_screen_pos(pc_obj, &pc_screen_x, &pc_screen_y)) {
+            int sz_x1, sz_y1, sz_x2, sz_y2;
+            compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
+            if (pc_screen_x >= sz_x1 && pc_screen_x <= sz_x2
+                && pc_screen_y >= sz_y1 && pc_screen_y <= sz_y2) {
+                // PC framed in safe zone post-jump — accept new
+                // baseline, no cooldown.
+                return false;
+            }
+        }
     }
-    float t = (float)(abs_d - FOLLOW_CATCH_UP_BLEND_MIN_GAP)
-            / (float)(FOLLOW_CATCH_UP_BLEND_MAX_GAP - FOLLOW_CATCH_UP_BLEND_MIN_GAP);
-    return (int)((float)delta_screen * (1.0f - t) + (float)eased * t);
+
+    // PC framed outside safe zone post-jump — user / system is looking
+    // elsewhere. Engage cooldown.
+    camera_follow_note_user_camera_move();
+    return true;
 }
 
 void camera_follow_ping(void)
 {
     if (!s_follow_enabled) {
+        // Keep the origin tracker dormant when feature is off so toggling
+        // the cfg flag mid-session doesn't spuriously fire on the first
+        // tick after enable.
+        s_last_origin_valid = false;
         return;
     }
-    // Dialogue camera owns the view during a dialog session. Don't fight
-    // it; the user expects the framed shot to stay framed.
+    // Dialogue camera owns the view during a dialog session. Reset
+    // the origin tracker each tick we yield so the first post-dialog
+    // tick treats the dialog-tween's final origin as the new baseline
+    // — without this, the post-dialog jump (potentially large, since
+    // dialog camera frames the conversation) would engage the
+    // cooldown, and the user would have to wait 3s for follow to
+    // resume after a normal conversation. That's the wrong UX; the
+    // safe-zone check inside handle_external_jump still arms cooldown
+    // for any subsequent jump that leaves PC outside the safe zone.
     if (dialog_camera_is_animating()) {
+        s_last_origin_valid = false;
+        s_cam_vx_origin = 0.0f;
+        s_cam_vy_origin = 0.0f;
         return;
     }
 
     int64_t pc_obj = player_get_local_pc_obj();
     if (pc_obj == OBJ_HANDLE_NULL) {
+        s_last_origin_valid = false;
         return;
     }
 
-    bool pc_idle = anim_is_idle(pc_obj);
-    bool pc_just_started_moving = s_pc_was_idle_last_tick && !pc_idle;
-    s_pc_was_idle_last_tick = pc_idle;
+    // === Detect external camera jumps ====================================
+    // Any code outside this module that moved the origin between ticks
+    // (portrait click, UI recenter, dialog tween conclusion, map load)
+    // → engage cooldown so we don't slam back to PC over their framing.
+    int64_t cam_ox, cam_oy;
+    location_origin_get(&cam_ox, &cam_oy);
+    handle_external_jump(cam_ox, cam_oy);
 
-    // User-override gate: only disarm when both (cooldown expired) AND
-    // (PC started a new motion since the override). Until then, leave
-    // the camera where the user put it.
+    bool pc_idle = anim_is_idle(pc_obj);
+
+    // === User-override gate ==============================================
+    // Disarm only when BOTH (cooldown expired) AND (PC currently
+    // moving). The "currently moving" check (vs the prior
+    // "just-transitioned" check) makes resume work even when PC is
+    // walking continuously the whole time — old gate would stay armed
+    // forever in that case because the idle→moving transition never
+    // happened during the cooldown window.
     if (s_user_override_armed) {
         tig_timestamp_t now;
         tig_timer_now(&now);
         bool cooldown_expired = (unsigned int)now >= s_user_override_until_ts;
-        if (cooldown_expired && pc_just_started_moving) {
+        if (cooldown_expired && !pc_idle) {
             s_user_override_armed = false;
-            // Fall through to follow logic below.
+            // Fall through to drive logic below.
         } else {
-            // Drift is also a camera movement — don't let it survive
-            // the user grabbing the wheel.
-            s_drift_vx_origin = 0.0f;
-            s_drift_vy_origin = 0.0f;
+            // Drift is camera motion too — don't let it survive the
+            // user holding the wheel.
+            s_cam_vx_origin = 0.0f;
+            s_cam_vy_origin = 0.0f;
+            s_last_origin_x = cam_ox;
+            s_last_origin_y = cam_oy;
             return;
         }
     }
 
-    // Fresh motion → drift is stale, clear it so we don't briefly
-    // continue from a previous run.
-    if (pc_just_started_moving) {
-        s_drift_vx_origin = 0.0f;
-        s_drift_vy_origin = 0.0f;
-    }
+    // === Compute per-tick TARGET velocity ================================
+    float target_vx = 0.0f;
+    float target_vy = 0.0f;
+    if (!pc_idle) {
+        int pc_screen_x, pc_screen_y;
+        if (compute_pc_screen_pos(pc_obj, &pc_screen_x, &pc_screen_y)) {
+            int sz_x1, sz_y1, sz_x2, sz_y2;
+            compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
 
-    // === PC IDLE: apply residual drift, decay, return ==================
-    // While the PC was tracking outside the safe zone, each tick stored
-    // the camera-origin delta as a "velocity" sample. When PC stops, we
-    // keep applying that velocity with exponential decay so the camera
-    // glides to a stop in the direction it was already moving — natural
-    // continuation, no snap-stop, no recenter.
-    if (pc_idle) {
-        if (fabsf(s_drift_vx_origin) < FOLLOW_DRIFT_CUTOFF
-            && fabsf(s_drift_vy_origin) < FOLLOW_DRIFT_CUTOFF) {
-            s_drift_vx_origin = 0.0f;
-            s_drift_vy_origin = 0.0f;
-            return;
+            int gap_x = 0;
+            int gap_y = 0;
+            if (pc_screen_x > sz_x2) {
+                gap_x = sz_x2 - pc_screen_x;
+            } else if (pc_screen_x < sz_x1) {
+                gap_x = sz_x1 - pc_screen_x;
+            }
+            if (pc_screen_y > sz_y2) {
+                gap_y = sz_y2 - pc_screen_y;
+            } else if (pc_screen_y < sz_y1) {
+                gap_y = sz_y1 - pc_screen_y;
+            }
+
+            if (gap_x != 0 || gap_y != 0) {
+                // Screen-px gap → origin-px (zoom-aware). The zoom
+                // transform pivots at screen center, so an unzoomed
+                // delta D produces a zoomed delta D*z; invert to get
+                // the origin-px move we need.
+                float z = iso_zoom_current();
+                if (z <= 0.0f) z = 1.0f;
+                target_vx = (float)gap_x / z;
+                target_vy = (float)gap_y / z;
+
+                // Per-axis cap so huge gaps don't fling the camera.
+                if (target_vx >  FOLLOW_MAX_VEL_ORIGIN) target_vx =  FOLLOW_MAX_VEL_ORIGIN;
+                if (target_vx < -FOLLOW_MAX_VEL_ORIGIN) target_vx = -FOLLOW_MAX_VEL_ORIGIN;
+                if (target_vy >  FOLLOW_MAX_VEL_ORIGIN) target_vy =  FOLLOW_MAX_VEL_ORIGIN;
+                if (target_vy < -FOLLOW_MAX_VEL_ORIGIN) target_vy = -FOLLOW_MAX_VEL_ORIGIN;
+            }
         }
-        int dx = (int)roundf(s_drift_vx_origin);
-        int dy = (int)roundf(s_drift_vy_origin);
-        if (dx != 0 || dy != 0) {
-            int64_t cam_ox, cam_oy;
-            location_origin_get(&cam_ox, &cam_oy);
-            location_origin_pixel_set(cam_ox + dx, cam_oy + dy);
-            tc_scroll(dx, dy);
-            gamelib_invalidate_rect(NULL);
-        }
-        // Exponential damp — same factor every tick. At ~16ms ticks this
-        // gives ~250ms of perceptible drift from a typical tracking
-        // velocity, fading to nothing.
-        s_drift_vx_origin *= FOLLOW_DRIFT_DAMPING;
-        s_drift_vy_origin *= FOLLOW_DRIFT_DAMPING;
+    }
+
+    // === Drive CURRENT velocity toward target ============================
+    // Asymmetric low-pass: snappy ramp-up while tracking is active
+    // (target != 0), gentle ramp-down when target is zero (PC stopped
+    // or re-entered safe zone — camera glides to rest, doesn't snap).
+    // The transition between regimes happens automatically as target
+    // toggles, so the same primitive handles ramp-in, steady tracking,
+    // and ramp-out with no special-case branches.
+    float alpha_x = (fabsf(target_vx) > 0.01f) ? FOLLOW_VEL_RAMP_UP : FOLLOW_VEL_RAMP_DOWN;
+    float alpha_y = (fabsf(target_vy) > 0.01f) ? FOLLOW_VEL_RAMP_UP : FOLLOW_VEL_RAMP_DOWN;
+    s_cam_vx_origin += (target_vx - s_cam_vx_origin) * alpha_x;
+    s_cam_vy_origin += (target_vy - s_cam_vy_origin) * alpha_y;
+
+    // === Apply ===========================================================
+    if (fabsf(s_cam_vx_origin) < FOLLOW_VEL_CUTOFF
+        && fabsf(s_cam_vy_origin) < FOLLOW_VEL_CUTOFF) {
+        s_cam_vx_origin = 0.0f;
+        s_cam_vy_origin = 0.0f;
+        s_last_origin_x = cam_ox;
+        s_last_origin_y = cam_oy;
+        return;
+    }
+    int dx = (int)roundf(s_cam_vx_origin);
+    int dy = (int)roundf(s_cam_vy_origin);
+    if (dx == 0 && dy == 0) {
+        s_last_origin_x = cam_ox;
+        s_last_origin_y = cam_oy;
         return;
     }
 
-    int pc_screen_x, pc_screen_y;
-    if (!compute_pc_screen_pos(pc_obj, &pc_screen_x, &pc_screen_y)) {
-        return;
-    }
-
-    int sz_x1, sz_y1, sz_x2, sz_y2;
-    compute_safe_zone(&sz_x1, &sz_y1, &sz_x2, &sz_y2);
-
-    // PC is moving. Inside the safe-zone deadband → camera holds.
-    // Also bleed off any leftover drift velocity per tick (so if PC
-    // walks back inside the safe zone after a tracking burst, the
-    // momentum dies cleanly instead of triggering a drift on the next
-    // stop).
-    bool pc_in_safe_zone = pc_screen_x >= sz_x1 && pc_screen_x <= sz_x2
-                        && pc_screen_y >= sz_y1 && pc_screen_y <= sz_y2;
-    if (pc_in_safe_zone) {
-        s_drift_vx_origin *= FOLLOW_DRIFT_DAMPING;
-        s_drift_vy_origin *= FOLLOW_DRIFT_DAMPING;
-        return;
-    }
-
-    // PC is past the safe-zone edge — close the gap. Small gaps get a
-    // 1:1 pin (camera matches the sprite step-for-step, no lag). Large
-    // gaps (typical when PC starts moving from far off-screen after a
-    // manual scroll) get an eased catch-up via compute_blended_apply.
-    // The blend band between them avoids any visible velocity
-    // discontinuity at the threshold.
-
-    // Smallest screen-px delta needed to push PC back to the edge.
-    // Negative on the right/bottom side, positive on the left/top.
-    int gap_x = 0;
-    int gap_y = 0;
-    if (pc_screen_x > sz_x2) {
-        gap_x = sz_x2 - pc_screen_x;
-    } else if (pc_screen_x < sz_x1) {
-        gap_x = sz_x1 - pc_screen_x;
-    }
-    if (pc_screen_y > sz_y2) {
-        gap_y = sz_y2 - pc_screen_y;
-    } else if (pc_screen_y < sz_y1) {
-        gap_y = sz_y1 - pc_screen_y;
-    }
-    if (gap_x == 0 && gap_y == 0) {
-        return;
-    }
-
-    // Shape each axis independently so a large vertical gap doesn't
-    // throttle a tight horizontal pin (and vice versa).
-    int dx_screen = compute_blended_apply(gap_x);
-    int dy_screen = compute_blended_apply(gap_y);
-    if (dx_screen == 0 && dy_screen == 0) {
-        return;
-    }
-
-    // Screen-pixel delta is in ZOOMED space (after the *z transform in
-    // compute_pc_screen_pos). Camera origin is in unzoomed-screen-pixel
-    // space (since location_xy adds it pre-zoom). The zoom transform
-    // pivots at screen center, so an unzoomed delta of D produces a
-    // zoomed delta of D*z. Invert: unzoomed delta = zoomed delta / z.
-    float z = iso_zoom_current();
-    if (z <= 0.0f) z = 1.0f;
-    int dx_origin = (int)((float)dx_screen / z);
-    int dy_origin = (int)((float)dy_screen / z);
-    if (dx_origin == 0 && dy_origin == 0) {
-        return;
-    }
-
-    int64_t cam_ox, cam_oy;
-    location_origin_get(&cam_ox, &cam_oy);
-    location_origin_pixel_set(cam_ox + dx_origin, cam_oy + dy_origin);
+    int64_t new_ox = cam_ox + dx;
+    int64_t new_oy = cam_oy + dy;
+    location_origin_pixel_set(new_ox, new_oy);
     // Keep floating text in conversation overlays synced, same as
-    // camera_tween_ping does. No-op when no conversation active.
-    tc_scroll(dx_origin, dy_origin);
+    // camera_tween_ping does. No-op when no conversation is active.
+    tc_scroll(dx, dy);
     gamelib_invalidate_rect(NULL);
 
-    // Stash this tick's velocity for the momentum-drift path that
-    // fires when PC stops. We use the raw per-tick delta we just
-    // applied — no smoothing window, no averaging. That keeps the
-    // drift direction perfectly aligned with the last burst of
-    // tracking (which is what the user perceives as "the direction
-    // the camera was going").
-    s_drift_vx_origin = (float)dx_origin;
-    s_drift_vy_origin = (float)dy_origin;
+    // Save the origin we just drove to as our baseline for next-tick
+    // external-jump detection.
+    s_last_origin_x = new_ox;
+    s_last_origin_y = new_oy;
 }
