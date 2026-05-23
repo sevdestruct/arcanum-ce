@@ -111,21 +111,6 @@ int tig_video_window_get(SDL_Window** window_ptr);
 int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
-// CE: per-pixel see-through composite for near-black source pixels.
-// Near-black pixels blend with the underlay VB; non-near-black pixels
-// copy through opaque. underlay_origin_x/y locate the screen's (0,0)
-// inside the underlay VB — for a fullscreen underlay window (e.g. iso)
-// these are the negation of the underlay window's frame.x/y. If
-// underlay_video_buffer is NULL, fall back to reading the screen
-// itself for the blend (stale pixels).
-int tig_video_blit_near_black_alpha(TigVideoBuffer* src_video_buffer,
-    TigRect* src_rect,
-    TigRect* dst_rect,
-    TigVideoBuffer* underlay_video_buffer,
-    int underlay_offset_x,
-    int underlay_offset_y,
-    uint8_t threshold,
-    uint8_t opacity);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 // Hint the next tig_video_flip to upload only `rect` of the surface to the GPU
@@ -180,6 +165,17 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 int tig_video_buffer_get_pixel_color(TigVideoBuffer* video_buffer, int x, int y, unsigned int* color);
 int tig_video_buffer_tint(TigVideoBuffer* video_buffer, TigRect* rect, tig_color_t tint_color, TigVideoBufferTintMode mode);
+
+// CE: scan the rect for pixels whose R, G, B are all ≤ threshold
+// ("near-black") and overwrite them with the VB's color_key so the
+// next SDL blit treats those pixels as transparent. Used by the
+// translucent-black-UI tint pathway to bake panel art's dark
+// regions to color-key transparency at window creation, after which
+// the standard color-key blit shows whatever's beneath through the
+// holes. NEON-vectorized fast path on Apple Silicon.
+int tig_video_buffer_replace_near_black_with_color_key(TigVideoBuffer* video_buffer,
+    TigRect* rect,
+    uint8_t threshold);
 int tig_video_buffer_save_to_bmp(TigVideoBufferSaveToBmpInfo* save_info);
 int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_buffer_ptr, unsigned int flags);
 

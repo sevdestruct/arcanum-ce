@@ -420,15 +420,12 @@ bool gamelib_init(GameInitInfo* init_info)
     settings_register(&settings, DIFFICULTY_KEY, "1", difficulty_changed);
     difficulty_changed();
 
-    // CE: optional near-black see-through alpha on the HUD bar +
-    // inventory family of windows + modal dialogs. The tig-side
-    // modal hook applies the effect at modal-create time so quit /
-    // confirm dialogs blend with whatever's beneath them.
+    // CE: optional translucent-black effect on the HUD bar (and any
+    // other window that opts in via intgame_apply_translucent_black).
+    // Dialog-backdrop-style tint: pre-bake the bar's near-black pixels
+    // to color-key transparency, per-tick subtract-tint the iso pixels
+    // under the bar, plain hardware color-key blit in compositor.
     settings_register(&settings, TRANSLUCENT_BLACK_UI_KEY, "1", NULL);
-    tig_window_modal_translucent_black_set(
-        settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY) != 0,
-        8,
-        128);
 
     // CE: Opt-in for vanilla "snap camera to PC on overlay open". Default
     // off — opening Inventory / Logbook / Schematic / Written / Options

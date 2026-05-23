@@ -198,12 +198,18 @@ void intgame_hud_restore_after_rotwin(void);
 // top bar is visible, 0 otherwise). Used by fate_ui / sleep_ui to
 // dock their panels flush at screen-top when the bar is cropped.
 int intgame_hud_top_offset(void);
-// CE: invalidate the world (iso VB) behind any HUD strip that opts in
-// to per-pixel see-through. Called every game tick so the world keeps
-// repainting under the bar's transparent regions and the alpha-blend
-// composite has fresh world pixels to blend against. No-op when no
-// strip has near-black-alpha enabled.
+// CE: per-tick hook called BEFORE iso_redraw. Marks the iso VB
+// under any HUD strip using the translucent-black tint pathway as
+// dirty, so iso_redraw repaints fresh world pixels there. The
+// post-iso_redraw companion intgame_hud_tick_apply_tint then darkens
+// those pixels. Throttled at non-1.0 zoom (every 3rd tick) to avoid
+// hammering the scaled world→iso blit.
 void intgame_hud_tick_invalidate_alpha_strips(void);
+// CE: per-tick hook called AFTER iso_redraw. Darkens the iso VB
+// pixels under any HUD strip using the translucent-black tint
+// pathway, so the bar's pre-baked color-key holes show "tinted iso
+// world" through them when the compositor draws the bar over iso.
+void intgame_hud_tick_apply_tint(void);
 // CE: half of the bottom-strip's currently cropped-out height (in design
 // coords). 0 when stage is FULL. Used by the dialog options backdrop
 // (tc.c) to drop its position down into the freed space when the bar

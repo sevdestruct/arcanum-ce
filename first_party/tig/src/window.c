@@ -66,22 +66,6 @@ typedef struct TigWindow {
     // paint; otherwise frame alone defines visibility.
     bool has_clip;
     TigRect clip_rect;
-    // CE: optional per-pixel see-through for "near-black" pixels in
-    // this window's VB. When enabled, the compositor blends each
-    // near-black source pixel with the destination at the configured
-    // opacity (255 = fully opaque, 0 = fully transparent) instead of
-    // copying. "Near-black" = max(R,G,B) <= near_black_threshold per
-    // channel — so 010008 / 000808 / 000000 all qualify at the default
-    // threshold without snagging dark chrome detail.
-    bool near_black_alpha_enabled;
-    uint8_t near_black_threshold;
-    uint8_t near_black_opacity;
-    // CE: underlay window whose VB pixels supply the "destination" half
-    // of the near-black blend. Bypasses the top-down compositor's stale-
-    // dst problem (the world hasn't drawn to screen yet when the bar
-    // composites). Typically the iso window. Falls back to reading
-    // from the screen surface if invalid.
-    tig_window_handle_t near_black_underlay;
 } TigWindow;
 
 static int tig_window_free_index(void);
@@ -98,15 +82,6 @@ static void tig_window_modal_dialog_exit(void);
 
 // 0x5BED98
 static tig_window_handle_t tig_window_modal_dialog_window_handle = TIG_WINDOW_HANDLE_INVALID;
-
-// CE: opt-in for per-pixel see-through alpha on modal dialogs. When
-// enabled, tig_window_modal_dialog auto-wires the modal window to
-// blend its near-black pixels with whatever non-modal window sits
-// directly beneath it in the stack (typically the iso world window
-// in-game, or the main menu when in menus). Configured by gamelib.
-static bool tig_window_modal_translucent_enabled = false;
-static uint8_t tig_window_modal_translucent_threshold = 16;
-static uint8_t tig_window_modal_translucent_opacity = 128;
 
 // 0x5BEDA0
 static TigRect tig_window_modal_dialog_bounds = { 0, 0, MODAL_DIALOG_WIDTH, MODAL_DIALOG_HEIGHT };
@@ -227,10 +202,6 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->color_key = window_data->color_key;
     win->num_buttons = 0;
     win->has_clip = false;
-    win->near_black_alpha_enabled = false;
-    win->near_black_threshold = 0;
-    win->near_black_opacity = 255;
-    win->near_black_underlay = TIG_WINDOW_HANDLE_INVALID;
 
     vb_create_info.flags = 0;
 
@@ -626,35 +597,6 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             vb_blit_info.dst_video_buffer = dst_video_buffer;
                             vb_blit_info.dst_rect = &blt_dst_rect;
                             tig_video_buffer_blit(&vb_blit_info);
-                        } else if (win->near_black_alpha_enabled) {
-                            // CE: see-through near-black blit path. Used
-                            // by HUD bars that opt in to letting the world
-                            // show through their black panel regions.
-                            // Sample the underlay VB directly so the blend
-                            // gets fresh world pixels instead of stale
-                            // screen pixels under the bar.
-                            TigVideoBuffer* under_vb = NULL;
-                            int under_off_x = 0;
-                            int under_off_y = 0;
-                            if (win->near_black_underlay != TIG_WINDOW_HANDLE_INVALID) {
-                                int uidx = tig_window_handle_to_index(win->near_black_underlay);
-                                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-                                    TigWindow* uw = &(windows[uidx]);
-                                    under_vb = uw->video_buffer;
-                                    // Screen (sx,sy) maps to underlay VB
-                                    // (sx - uw->frame.x, sy - uw->frame.y).
-                                    under_off_x = -uw->frame.x;
-                                    under_off_y = -uw->frame.y;
-                                }
-                            }
-                            tig_video_blit_near_black_alpha(src_video_buffer,
-                                &blt_src_rect,
-                                &blt_dst_rect,
-                                under_vb,
-                                under_off_x,
-                                under_off_y,
-                                win->near_black_threshold,
-                                win->near_black_opacity);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
@@ -725,27 +667,6 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             vb_blit_info.src_rect = &blt_src_rect;
             vb_blit_info.dst_rect = &blt_dst_rect;
             tig_video_buffer_blit(&vb_blit_info);
-        } else if (wins[v38]->near_black_alpha_enabled) {
-            TigVideoBuffer* under_vb2 = NULL;
-            int under_off_x2 = 0;
-            int under_off_y2 = 0;
-            if (wins[v38]->near_black_underlay != TIG_WINDOW_HANDLE_INVALID) {
-                int uidx = tig_window_handle_to_index(wins[v38]->near_black_underlay);
-                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-                    TigWindow* uw = &(windows[uidx]);
-                    under_vb2 = uw->video_buffer;
-                    under_off_x2 = -uw->frame.x;
-                    under_off_y2 = -uw->frame.y;
-                }
-            }
-            tig_video_blit_near_black_alpha(wins[v38]->video_buffer,
-                &blt_src_rect,
-                &blt_dst_rect,
-                under_vb2,
-                under_off_x2,
-                under_off_y2,
-                wins[v38]->near_black_threshold,
-                wins[v38]->near_black_opacity);
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
         }
@@ -1749,46 +1670,6 @@ int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* c
     return TIG_OK;
 }
 
-int tig_window_near_black_alpha_set(tig_window_handle_t window_handle,
-    bool enabled,
-    tig_window_handle_t underlay_handle,
-    uint8_t threshold,
-    uint8_t opacity)
-{
-    int window_index;
-    TigWindow* win;
-
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
-        return TIG_ERR_INVALID_PARAM;
-    }
-    if (!tig_window_initialized) {
-        return TIG_ERR_NOT_INITIALIZED;
-    }
-    window_index = tig_window_handle_to_index(window_handle);
-    win = &(windows[window_index]);
-    bool was_enabled = win->near_black_alpha_enabled;
-    win->near_black_alpha_enabled = enabled;
-    win->near_black_threshold = threshold;
-    win->near_black_opacity = opacity;
-    win->near_black_underlay = underlay_handle;
-    // Force a recomposite of the whole window so the new mode applies
-    // immediately rather than waiting on the next region invalidation.
-    if (was_enabled != enabled) {
-        tig_window_invalidate_rect(&(win->frame));
-    }
-    return TIG_OK;
-}
-
-int tig_window_modal_translucent_black_set(bool enabled,
-    uint8_t threshold,
-    uint8_t opacity)
-{
-    tig_window_modal_translucent_enabled = enabled;
-    tig_window_modal_translucent_threshold = threshold;
-    tig_window_modal_translucent_opacity = opacity;
-    return TIG_OK;
-}
-
 // 0x51EA10
 int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** video_buffer_ptr)
 {
@@ -1893,50 +1774,6 @@ int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModal
 
     if (tig_window_create(&window_data, &tig_window_modal_dialog_window_handle) != TIG_OK) {
         return TIG_ERR_GENERIC;
-    }
-
-    // CE: if gamelib opted modals into near-black see-through, find
-    // an underlay window whose frame FULLY CONTAINS the modal rect so
-    // every modal pixel has a fresh source to blend with. We walk down
-    // from the topmost non-modal non-hidden window — usually picks the
-    // mainmenu window when in a menu, or the iso world window in-game
-    // (the bar partially overlaps the modal so it'd leave gaps).
-    if (tig_window_modal_translucent_enabled) {
-        tig_window_handle_t underlay = TIG_WINDOW_HANDLE_INVALID;
-        int modal_idx = tig_window_handle_to_index(tig_window_modal_dialog_window_handle);
-        TigWindow* modal_w = &(windows[modal_idx]);
-        for (int i = tig_window_num_windows - 1; i >= 0; i--) {
-            tig_window_handle_t h = tig_window_stack[i];
-            int wi = tig_window_handle_to_index(h);
-            if (wi == modal_idx) {
-                continue;
-            }
-            TigWindow* w = &(windows[wi]);
-            if ((w->flags & TIG_WINDOW_HIDDEN) != 0) {
-                continue;
-            }
-            if ((w->flags & TIG_WINDOW_MODAL) != 0) {
-                continue;
-            }
-            // Require full containment: pixels outside the underlay's
-            // frame fall back to stale screen reads, which converges
-            // to black across frames.
-            if (modal_w->frame.x < w->frame.x
-                || modal_w->frame.y < w->frame.y
-                || modal_w->frame.x + modal_w->frame.width > w->frame.x + w->frame.width
-                || modal_w->frame.y + modal_w->frame.height > w->frame.y + w->frame.height) {
-                continue;
-            }
-            underlay = h;
-            break;
-        }
-        if (underlay != TIG_WINDOW_HANDLE_INVALID) {
-            tig_window_near_black_alpha_set(tig_window_modal_dialog_window_handle,
-                true,
-                underlay,
-                tig_window_modal_translucent_threshold,
-                tig_window_modal_translucent_opacity);
-        }
     }
 
     tig_window_modal_dialog_create_buttons(modal_info->type, tig_window_modal_dialog_window_handle);

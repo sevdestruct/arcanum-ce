@@ -561,6 +561,12 @@ void main_loop(void)
             gamelib_perf_record_iso_redraw_ns(bucket_iso_redraw_ns);
             perf_t0 = now;
         }
+        // CE: tint the iso VB pixels under any HUD window that opts
+        // into the translucent-black tint pathway. Runs once after
+        // iso_redraw has refreshed those pixels, so the composite
+        // reads the darkened version through the bar's pre-baked
+        // color-key holes.
+        intgame_hud_tick_apply_tint();
         tig_window_display();
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();

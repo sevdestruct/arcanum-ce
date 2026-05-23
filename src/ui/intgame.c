@@ -941,6 +941,14 @@ static bool dword_64C6B0;
 // 0x64C6B4
 static bool intgame_iso_interface_created;
 
+// CE: translucent-black tint pathway opt-in flag. Set true when the
+// bar is created with TRANSLUCENT_BLACK_UI_KEY on. Read by:
+//   - intgame_hud_tick_invalidate_alpha_strips (per-tick: marks iso
+//     under the bar dirty so iso_redraw refreshes it)
+//   - intgame_hud_tick_apply_tint (per-tick after iso_redraw: tints
+//     the freshly-rendered iso pixels under the bar)
+static bool intgame_hud_bar_uses_tint = false;
+
 // 0x64C6B8
 static int intgame_mode_stack_size;
 
@@ -1273,17 +1281,26 @@ void iso_interface_create(tig_window_handle_t window_handle)
         window_data.rect.y = 0;
         tig_window_blit_art(dword_64C4F8[index], &art_blit_info);
 
-        // CE: bottom strip opts into per-pixel see-through for the
-        // panel art's near-black background. Threshold 8 catches the
-        // mixed near-black shades (010008, 000808, 000000) exactly
-        // without snagging dark chrome detail; opacity 128 = 50%
-        // src / 50% dst. The iso window is the underlay — the
-        // blend samples its VB directly (which always has the current
-        // world content) instead of reading the stale screen surface.
+        // CE: bottom strip opts into the translucent-black see-through
+        // for its panel art's near-black regions. Dialog-backdrop-style
+        // tint: pre-bake the bar's near-black pixels to color-key
+        // transparency in the bar's VB (one-shot), then a per-tick
+        // hook (intgame_hud_tick_apply_tint) darkens the iso pixels
+        // under the bar so the tinted world shows through the holes.
         // Gated by the TranslucentBlackUI cfg flag.
         if (index == 1 && settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-            tig_window_near_black_alpha_set(dword_64C4F8[index],
-                true, intgame_iso_window, 8, 128);
+            TigVideoBuffer* bar_vb = NULL;
+            if (tig_window_vbid_get(dword_64C4F8[index], &bar_vb) == TIG_OK
+                && bar_vb != NULL) {
+                TigRect bake = {
+                    0, 0,
+                    intgame_interface_window_frames[index].width,
+                    intgame_interface_window_frames[index].height
+                };
+                tig_video_buffer_replace_near_black_with_color_key(bar_vb,
+                    &bake, 8);
+            }
+            intgame_hud_bar_uses_tint = true;
         }
     }
 
@@ -9562,47 +9579,105 @@ int intgame_hud_bottom_gap_offset(void)
     }
 }
 
+// CE: per-tick hook called from main.c BEFORE iso_redraw. Marks the
+// iso world under any window using the translucent-black tint
+// pathway as dirty, so iso_redraw repaints fresh world pixels into
+// the iso VB. The post-iso_redraw tint pass then darkens those
+// pixels in place. Throttled at non-1.0 zoom because the world→iso
+// scaled blit is the expensive step and a 20Hz refresh of the
+// see-through underlay is visually indistinguishable from 60Hz.
 void intgame_hud_tick_invalidate_alpha_strips(void)
 {
-    // Currently only the bottom strip + (optionally) the big window opt
-    // in to per-pixel see-through. Tell gamelib to repaint the world
-    // under each every tick so the alpha-blend composite has fresh
-    // world pixels to blend against.
     if (!intgame_iso_interface_created) {
         return;
     }
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        return;
+    }
+    if (!intgame_hud_bar_uses_tint) {
+        return;
+    }
+
+    static unsigned int tick_counter = 0;
+    tick_counter++;
+    unsigned int throttle = 1;
+    {
+        float z = iso_zoom_current();
+        if (z != 1.0f) {
+            throttle = 3;
+        }
+    }
+    if ((tick_counter % throttle) != 0) {
+        return;
+    }
+
     if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
         TigWindowData wd;
         if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
             iso_invalidate_rect(&wd.rect);
         }
     }
-    if (intgame_big_window_locked
-        && intgame_big_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-        TigWindowData bwd;
-        if (tig_window_data(intgame_big_window_handle, &bwd) == TIG_OK) {
-            iso_invalidate_rect(&bwd.rect);
-        }
-    }
 }
 
-// CE: Apply the optional TranslucentBlackUI effect to a window. Used
-// by inventory / paperdoll / loot / barter screens (and anything else
-// sharing the intgame_big_window_handle) to opt in/out at lock/unlock
-// time, since the big window is shared across UIs that may or may not
-// want the effect. enable=false disables it.
+// CE: per-tick hook called from main.c AFTER iso_redraw. For each
+// window opted into the translucent-black tint pathway, darken the
+// iso VB pixels under that window's rect so the pre-baked color-key
+// holes in the chrome show "tinted iso world" through them. The
+// compositor then does a plain hardware color-key blit — no per-
+// pixel CPU work in its inner loop. Same architectural pattern as
+// the dialog options backdrop tint in tc.c.
+void intgame_hud_tick_apply_tint(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        return;
+    }
+    if (!intgame_hud_bar_uses_tint) {
+        return;
+    }
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
+    TigVideoBuffer* iso_vb = NULL;
+    if (tig_window_vbid_get(intgame_iso_window, &iso_vb) != TIG_OK
+        || iso_vb == NULL) {
+        return;
+    }
+
+    TigWindowData iso_wd;
+    TigWindowData bar_wd;
+    if (tig_window_data(intgame_iso_window, &iso_wd) != TIG_OK) {
+        return;
+    }
+    if (tig_window_data(dword_64C4F8[1], &bar_wd) != TIG_OK) {
+        return;
+    }
+
+    // Bar rect in iso-VB-local coords.
+    TigRect local;
+    local.x = bar_wd.rect.x - iso_wd.rect.x;
+    local.y = bar_wd.rect.y - iso_wd.rect.y;
+    local.width = bar_wd.rect.width;
+    local.height = bar_wd.rect.height;
+
+    // Subtractive tint — darken the iso pixels under the bar's
+    // color-key holes by a constant per channel.
+    tig_video_buffer_tint(iso_vb,
+        &local,
+        tig_color_make(30, 30, 30),
+        TIG_VIDEO_BUFFER_TINT_MODE_SUB);
+}
+
+// CE: Apply the translucent-black effect to a window. Currently a
+// no-op stub kept for ABI compatibility while we decide whether to
+// generalize the bar's tint pathway to other UIs (charedit / inven
+// / wmap / mainmenu Options). For now those windows show opaque
+// chrome — the see-through effect only applies to the HUD bar.
 void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable)
 {
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
-        return;
-    }
-    if (enable && !settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-        // Cfg disables the feature globally — ensure the window has
-        // alpha cleared in case it was set by a prior owner.
-        tig_window_near_black_alpha_set(window_handle, false,
-            TIG_WINDOW_HANDLE_INVALID, 0, 0);
-        return;
-    }
-    tig_window_near_black_alpha_set(window_handle, enable,
-        intgame_iso_window, 8, 128);
+    (void)window_handle;
+    (void)enable;
 }
