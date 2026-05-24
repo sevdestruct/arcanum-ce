@@ -1292,6 +1292,17 @@ void iso_interface_create(tig_window_handle_t window_handle)
             TigVideoBuffer* bar_vb = NULL;
             if (tig_window_vbid_get(dword_64C4F8[index], &bar_vb) == TIG_OK
                 && bar_vb != NULL) {
+                // CRITICAL: enable SDL color-key matching on the bar's
+                // surface so the baked near-black pixels actually
+                // composite as transparent. Without this call the bake
+                // just stores the color-key value as a pixel color and
+                // SDL_BlitSurface copies it through opaque. Using the
+                // art's own color_key value keeps any "transparent"
+                // pixels already in the art (there shouldn't be any
+                // for art 184, but the value is well-defined) aligned
+                // with what we're about to bake.
+                tig_video_buffer_set_color_key(bar_vb,
+                    (int)art_anim_data.color_key);
                 TigRect bake = {
                     0, 0,
                     intgame_interface_window_frames[index].width,
@@ -9640,6 +9651,10 @@ void intgame_hud_tick_apply_tint(void)
     if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
         return;
     }
+    // HIDDEN stage: no visible bar → no need to tint anything.
+    if (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN) {
+        return;
+    }
 
     TigVideoBuffer* iso_vb = NULL;
     if (tig_window_vbid_get(intgame_iso_window, &iso_vb) != TIG_OK
@@ -9656,12 +9671,37 @@ void intgame_hud_tick_apply_tint(void)
         return;
     }
 
-    // Bar rect in iso-VB-local coords.
+    // Pick the iso-VB-local rect that matches the visible portion of
+    // the bar in the current TAB stage. Tinting beyond the visible
+    // chrome would leave a dark backplate sticking out past the crop
+    // (the bug the user spotted). In each non-FULL stage the chrome
+    // is clipped to a sub-band; the tint must follow that clip
+    // exactly so darkening happens only behind real bar pixels.
     TigRect local;
-    local.x = bar_wd.rect.x - iso_wd.rect.x;
-    local.y = bar_wd.rect.y - iso_wd.rect.y;
-    local.width = bar_wd.rect.width;
-    local.height = bar_wd.rect.height;
+    int sx = bar_wd.rect.x - iso_wd.rect.x;
+    int sy = bar_wd.rect.y - iso_wd.rect.y;
+    switch (intgame_hud_stage) {
+    case INTGAME_HUD_STAGE_FULL:
+        local.x = sx;
+        local.y = sy;
+        local.width = bar_wd.rect.width;
+        local.height = bar_wd.rect.height;
+        break;
+    case INTGAME_HUD_STAGE_MEDIUM:
+        local.x = sx + INTGAME_HUD_MEDIUM_BAND_X;
+        local.y = sy + INTGAME_HUD_MEDIUM_BAND_Y;
+        local.width = INTGAME_HUD_MEDIUM_BAND_W;
+        local.height = INTGAME_HUD_MEDIUM_BAND_H;
+        break;
+    case INTGAME_HUD_STAGE_MINI:
+        local.x = sx + INTGAME_HUD_MINI_BAND_X;
+        local.y = sy + INTGAME_HUD_MINI_BAND_Y;
+        local.width = INTGAME_HUD_MINI_BAND_W;
+        local.height = INTGAME_HUD_MINI_BAND_H;
+        break;
+    default:
+        return;
+    }
 
     // Subtractive tint — darken the iso pixels under the bar's
     // color-key holes by a constant per channel.
