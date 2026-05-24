@@ -706,10 +706,20 @@ void tc_render_internal(TigRectListNode* node)
             // Copy the window content to the backdrop buffer, tint it, and copy
             // it back.
             tig_window_blit(&win_to_vb_blt);
+            // CE: MUL tint matches the HUD's translucent-black approach
+            // — multiplies the underlay per channel so colors scale
+            // proportionally and the underlay's hue survives. Picked
+            // 128 (= 50% retention) to align with the HUD bar's in-
+            // game darken (intgame_translucent_black_pick uses 127 in
+            // its "darken amount" convention; tig's MUL convention is
+            // the inverse, so 255-127 = 128 → same visual amount).
+            // The earlier SUB(18) burned bright reds / oranges in
+            // dark iso regions toward gray, hurting readability of
+            // what's under the dialog options.
             tig_video_buffer_tint(tc_backdrop_video_buffer,
                 &dst_rect,
-                tig_color_make(18, 18, 18),
-                TIG_VIDEO_BUFFER_TINT_MODE_SUB);
+                tig_color_make(128, 128, 128),
+                TIG_VIDEO_BUFFER_TINT_MODE_MUL);
 
             // CE: round the corners visually by un-tinting a tiny stair-
             // step at each corner. After tinting backdrop, re-copy iso
