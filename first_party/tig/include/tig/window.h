@@ -142,6 +142,39 @@ int tig_window_move(tig_window_handle_t window_handle, int x, int y);
 // buttons, art — intact for instant restore).
 int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* clip_rect);
 
+// CE: opt the given window into the translucent-black tint pathway.
+// When enabled, the compositor's blit for this window replaces near-
+// black source pixels with MUL-darkened underlay-VB pixels at the
+// same screen position; other pixels copy through opaque. Used by
+// the HUD bar to show a darkened world through its dark panel art.
+//
+// underlay_handle: window whose VB supplies the live world pixels
+// (typically the iso world). r/g/b: per-channel "darken by N out
+// of 255" — 0 = preserve channel, 255 = zero it. The multiply
+// preserves the underlay's hue (channels scale in proportion to
+// their original value) instead of clipping channels independently
+// the way a saturating subtract would. Pass enabled=false to
+// disable.
+int tig_window_tint_enable(tig_window_handle_t window_handle,
+    bool enabled,
+    tig_window_handle_t underlay_handle,
+    uint8_t threshold,
+    uint8_t r,
+    uint8_t g,
+    uint8_t b);
+
+// CE: globally configure auto-tint on modal dialogs created by
+// tig_window_modal_dialog. Enable when an in-play game session
+// exists (passing the iso window handle as underlay). Disable when
+// no iso world exists — pre-game modals over the title screen stay
+// opaque so the mainmenu_bg isn't darkened behind them.
+int tig_window_modal_tint_set(bool enabled,
+    tig_window_handle_t underlay_handle,
+    uint8_t threshold,
+    uint8_t r,
+    uint8_t g,
+    uint8_t b);
+
 #ifdef __cplusplus
 }
 #endif

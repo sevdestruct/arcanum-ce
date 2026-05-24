@@ -1173,6 +1173,10 @@ void gamelib_zoom_perf_toggle(void)
 {
     gamelib_zoom_perf_enabled = !gamelib_zoom_perf_enabled;
     tig_video_flip_perf_set_enabled(gamelib_zoom_perf_enabled);
+    // CE: ride the same toggle to enable per-call timing of the
+    // translucent-black tint composite blit, so the perf-log dump
+    // can report tint cost alongside the existing flip breakdown.
+    tig_video_tint_blit_perf_set_enabled(gamelib_zoom_perf_enabled);
     gamelib_zoom_perf_frames = 0;
     gamelib_zoom_perf_full_frames = 0;
     gamelib_zoom_perf_total_render_ns = 0;
@@ -1758,6 +1762,35 @@ bool gamelib_draw(void)
                             partial_pct);
                         tig_debug_printf("%s", loop_line);
                         gamelib_zoom_perf_log(loop_line);
+
+                        // CE: translucent-black tint composite blit
+                        // cost. Per-call avg/max and total time spent
+                        // across the window, so the alpha-blend and
+                        // MUL-tint pathways can be compared head to
+                        // head between branches. Only fires when at
+                        // least one tint blit ran in the window —
+                        // expected zero when the cfg is off or no
+                        // tint-opted-in window is visible.
+                        TigVideoTintBlitPerf tint_perf;
+                        tig_video_tint_blit_perf_get(&tint_perf);
+                        tig_video_tint_blit_perf_reset();
+                        if (tint_perf.samples > 0) {
+                            float avg_us = (float)((double)tint_perf.total_ns
+                                / (double)tint_perf.samples / 1e3);
+                            float max_us = (float)((double)tint_perf.max_ns / 1e3);
+                            float total_ms = (float)((double)tint_perf.total_ns / 1e6);
+                            double avg_px = (double)tint_perf.pixels_total
+                                / (double)tint_perf.samples;
+                            char tint_line[256];
+                            snprintf(tint_line, sizeof(tint_line),
+                                "[zoom-perf]   tint-blit: samples %d, avg %.1fus max %.1fus, total %.1fms, avg %.0f px/call (%.1fM px total)\n",
+                                tint_perf.samples,
+                                avg_us, max_us, total_ms,
+                                avg_px,
+                                (double)tint_perf.pixels_total / 1e6);
+                            tig_debug_printf("%s", tint_line);
+                            gamelib_zoom_perf_log(tint_line);
+                        }
 
                         // Fourth line: remaining main-loop buckets that
                         // sit between the measured slots above —

@@ -221,4 +221,18 @@ int intgame_hud_bottom_gap_offset(void);
 // (or enable=false), this clears any prior alpha state on the window.
 void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable);
 
+// CE: re-evaluate which underlay window the modal-dialog auto-tint
+// should sample (mainmenu backdrop when mainmenu is up, iso world
+// during gameplay, none in pre-game 800x600). Call whenever UI
+// context flips: iso interface create/destroy, mainmenu open/close.
+void intgame_refresh_modal_tint(void);
+
+// CE: re-evaluate the HUD bar's tint underlay using the same
+// context-aware picker. The bar's tint was originally locked in at
+// iso_interface_create time and never updated; this lets pre-game
+// new-char / pregen / charedit (where the bar is shown as a chrome
+// band over the mainmenu backdrop) point the tint at the mainmenu
+// bg instead of an unloaded iso world.
+void intgame_refresh_hud_bar_tint(void);
+
 #endif /* ARCANUM_UI_INTGAME_H_ */

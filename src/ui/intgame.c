@@ -1281,37 +1281,26 @@ void iso_interface_create(tig_window_handle_t window_handle)
         window_data.rect.y = 0;
         tig_window_blit_art(dword_64C4F8[index], &art_blit_info);
 
-        // CE: bottom strip opts into the translucent-black see-through
-        // for its panel art's near-black regions. Dialog-backdrop-style
-        // tint: pre-bake the bar's near-black pixels to color-key
-        // transparency in the bar's VB (one-shot), then a per-tick
-        // hook (intgame_hud_tick_apply_tint) darkens the iso pixels
-        // under the bar so the tinted world shows through the holes.
-        // Gated by the TranslucentBlackUI cfg flag.
+        // CE: bottom strip opts into the translucent-black tint
+        // pathway: the compositor runs tig_video_blit_near_black_tinted
+        // for this window, replacing near-black source pixels with
+        // subtract-tinted underlay pixels at blit time. Direct-paint
+        // architecture — bypasses the layered screen-surface route
+        // that fails for the iso world (which uses VIDEO_MEMORY and
+        // doesn't reliably paint to the compositor's intermediate
+        // surface).
+        //
+        // Underlay + subtract amount are picked by
+        // intgame_refresh_hud_bar_tint based on current UI context
+        // (mainmenu backdrop with heavier subtract when the mainmenu
+        // is up — covers the pre-game new-char/charedit flow where
+        // the bar is visible over the mainmenu_bg backdrop — or iso
+        // world with the standard subtract during active gameplay).
+        // The refresh helper gets re-invoked from mainmenu open/close
+        // transitions so the underlay tracks context as it changes.
         if (index == 1 && settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-            TigVideoBuffer* bar_vb = NULL;
-            if (tig_window_vbid_get(dword_64C4F8[index], &bar_vb) == TIG_OK
-                && bar_vb != NULL) {
-                // CRITICAL: enable SDL color-key matching on the bar's
-                // surface so the baked near-black pixels actually
-                // composite as transparent. Without this call the bake
-                // just stores the color-key value as a pixel color and
-                // SDL_BlitSurface copies it through opaque. Using the
-                // art's own color_key value keeps any "transparent"
-                // pixels already in the art (there shouldn't be any
-                // for art 184, but the value is well-defined) aligned
-                // with what we're about to bake.
-                tig_video_buffer_set_color_key(bar_vb,
-                    (int)art_anim_data.color_key);
-                TigRect bake = {
-                    0, 0,
-                    intgame_interface_window_frames[index].width,
-                    intgame_interface_window_frames[index].height
-                };
-                tig_video_buffer_replace_near_black_with_color_key(bar_vb,
-                    &bake, 8);
-            }
             intgame_hud_bar_uses_tint = true;
+            intgame_refresh_hud_bar_tint();
         }
     }
 
@@ -1338,6 +1327,20 @@ void iso_interface_create(tig_window_handle_t window_handle)
 
     intgame_iso_interface_created = true;
     dword_64C530 = 0;
+
+    // CE: now that the iso world window exists, refresh the modal-
+    // dialog auto-tint underlay choice. With no mainmenu up, this
+    // resolves to the iso world — so modals created from here on
+    // (in-game quit/confirm dialogs, save-overwrite prompts) get
+    // the translucent-black tint applied with iso as the underlay.
+    // The same helpers are called from iso_interface_destroy and
+    // from mainmenu open/close to keep both the modal underlay and
+    // the HUD bar's underlay correct as context changes. The HUD
+    // bar's initial picker call already ran above (it just got
+    // opted into the tint pathway) but pick it again here in case
+    // the mainmenu was somehow up during iso_interface_create.
+    intgame_refresh_modal_tint();
+    intgame_refresh_hud_bar_tint();
 
     for (index = 0; index < 11; index++) {
         iwid = find_interface_window_index(intgame_rotwin_text_frame[index].rect.x, intgame_rotwin_text_frame[index].rect.y);
@@ -1459,6 +1462,8 @@ void iso_interface_destroy(void)
     int index;
 
     if (intgame_iso_interface_created) {
+        intgame_hud_bar_uses_tint = false;
+
         for (index = 0; index < 2; index++) {
             tig_window_destroy(dword_64C4F8[index]);
         }
@@ -1475,6 +1480,24 @@ void iso_interface_destroy(void)
                 intgame_maintain_fs_windows[index] = TIG_WINDOW_HANDLE_INVALID;
             }
         }
+
+        // CE: reset the in-game flag so intgame_apply_translucent_black
+        // (and any other "are we in-play?" check) correctly returns
+        // false after quit-to-title. Vanilla never cleared this on
+        // destroy — fine for vanilla because nothing read the flag
+        // outside the creator, but the translucent-black gating reads
+        // it and would tint pre-game UIs against a stale iso underlay
+        // (the last loaded world) if we leave it set.
+        intgame_iso_interface_created = false;
+
+        // CE: refresh modal-dialog auto-tint underlay now that the iso
+        // window is gone. With no mainmenu up either, this resolves to
+        // "no underlay" and disables the modal-tint pathway — pre-game
+        // modals between sessions stay opaque. If a mainmenu IS up at
+        // this point (quit-to-title path: mainmenu_ui_active became
+        // true before iso interface tears down), this picks the
+        // mainmenu backdrop instead.
+        intgame_refresh_modal_tint();
     }
 
     tig_video_buffer_destroy(dword_64C474);
@@ -9590,44 +9613,14 @@ int intgame_hud_bottom_gap_offset(void)
     }
 }
 
-// CE: per-tick hook called from main.c BEFORE iso_redraw. Marks the
-// iso world under any window using the translucent-black tint
-// pathway as dirty, so iso_redraw repaints fresh world pixels into
-// the iso VB. The post-iso_redraw tint pass then darkens those
-// pixels in place. Throttled at non-1.0 zoom because the world→iso
-// scaled blit is the expensive step and a 20Hz refresh of the
-// see-through underlay is visually indistinguishable from 60Hz.
+// CE: per-tick iso-invalidate hook. In the current direct-paint
+// tint architecture (tig_video_blit_near_black_tinted reads iso's
+// VB directly each composite), no extra invalidation is needed —
+// iso_redraw's natural dirty-rect system keeps the VB fresh wherever
+// the world has changed, and the compositor reads it as-is. Kept as
+// a no-op stub so the main-loop call site stays linkable.
 void intgame_hud_tick_invalidate_alpha_strips(void)
 {
-    if (!intgame_iso_interface_created) {
-        return;
-    }
-    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
-        return;
-    }
-    if (!intgame_hud_bar_uses_tint) {
-        return;
-    }
-
-    static unsigned int tick_counter = 0;
-    tick_counter++;
-    unsigned int throttle = 1;
-    {
-        float z = iso_zoom_current();
-        if (z != 1.0f) {
-            throttle = 3;
-        }
-    }
-    if ((tick_counter % throttle) != 0) {
-        return;
-    }
-
-    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
-        TigWindowData wd;
-        if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
-            iso_invalidate_rect(&wd.rect);
-        }
-    }
 }
 
 // CE: per-tick hook called from main.c AFTER iso_redraw. For each
@@ -9637,87 +9630,189 @@ void intgame_hud_tick_invalidate_alpha_strips(void)
 // compositor then does a plain hardware color-key blit — no per-
 // pixel CPU work in its inner loop. Same architectural pattern as
 // the dialog options backdrop tint in tc.c.
+// CE: also a no-op now. The tint happens at composite time inside
+// tig_video_blit_near_black_tinted (reads iso VB directly, writes
+// subtract-tinted result to screen). No pre-composite iso-VB
+// mutation is needed, which also avoids conflicting with tc.c's
+// dialog-options backdrop tint (the chamfered corners come back).
 void intgame_hud_tick_apply_tint(void)
 {
-    if (!intgame_iso_interface_created) {
+}
+
+// CE: Tint parameters chosen for the current UI context — both the
+// underlay window and the subtract amount applied to its pixels
+// before they replace the panel's near-black source. Returned by
+// intgame_translucent_black_pick().
+typedef struct {
+    tig_window_handle_t underlay;
+    uint8_t threshold;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} IntgameTintParams;
+
+// CE: pick the right underlay + tint amount for the translucent-
+// black pathway based on current UI context.
+//
+// Priority:
+//   1. If the mainmenu is up AND has a hi-res backdrop window
+//      (mainmenu_bg / per-screen *_bg.bmp baked in), use that
+//      backdrop's VB. Menu backdrops are high-luminance and the
+//      user wants the chrome to stay the dominant surface, with
+//      only a faint hint of bg bleeding through. The mainmenu
+//      backdrop is preferred over the iso world because the
+//      mainmenu's full-screen backdrop hides iso entirely; dark
+//      panel pixels should reveal what the user can actually see
+//      (the menu bg), not stale or unloaded iso content beneath.
+//   2. Else if the iso interface exists (active gameplay, no
+//      mainmenu chrome), use the iso world VB. World content is
+//      darker than menu bg, so a lighter darken keeps world detail
+//      visible through the chrome's near-black areas.
+//   3. Else (early-init-only, or any state without a sensible
+//      underlay), underlay=INVALID — caller disables tint.
+//
+// The tint blit (tig_video_blit_near_black_tinted) uses a per-
+// channel MULTIPLY: output = underlay * (255 - tint) / 256. So
+// r/g/b are "darken by N out of 255" values — 0 preserves a
+// channel, 255 zeroes it. Multiply preserves the underlay's hue
+// (unlike a saturating subtract, which clips channels independently
+// and visibly burns colors).
+//
+// At native 800x600 the mainmenu has no separate backdrop window;
+// the in-game shortcut path also skips the backdrop in hi-res.
+// Both fall through to iso as the underlay, which is correct since
+// the panel doesn't fully cover the world in those cases.
+static IntgameTintParams intgame_translucent_black_pick(void)
+{
+    IntgameTintParams params = {
+        .underlay = TIG_WINDOW_HANDLE_INVALID,
+        .threshold = 8,
+        .r = 0, .g = 0, .b = 0,
+    };
+    if (mainmenu_ui_is_active()) {
+        tig_window_handle_t backdrop = mainmenu_ui_get_backdrop_handle();
+        if (backdrop != TIG_WINDOW_HANDLE_INVALID) {
+            params.underlay = backdrop;
+            // ~80% darken
+            params.r = 204;
+            params.g = 204;
+            params.b = 204;
+            return params;
+        }
+    }
+    if (intgame_iso_interface_is_created()) {
+        params.underlay = intgame_iso_window;
+        // ~50% darken — matches the dialog options backdrop's
+        // MUL(128) for visual parity.
+        params.r = 128;
+        params.g = 128;
+        params.b = 128;
+    }
+    return params;
+}
+
+// CE: Apply the translucent-black tint pathway to a window. Used
+// by inventory / paperdoll / loot / barter / world map / charedit /
+// in-play Options-Save-Load / mainmenu sub-windows to opt in/out
+// at open / close time. The compositor runs
+// tig_video_blit_near_black_tinted for opted-in windows, replacing
+// near-black source pixels with subtract-tinted underlay pixels.
+//
+// The underlay + tint amount are context-aware (see
+// intgame_translucent_black_pick): mainmenu backdrop with a heavier
+// subtract when the mainmenu is up, iso world with the standard
+// subtract during active gameplay, neither when no sensible
+// underlay exists.
+//
+// When disabling (enable=false) the gates don't matter — we just
+// turn it off unconditionally so a previously-opted-in window
+// doesn't keep the effect when its UI closes.
+void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    if (!enable) {
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
         return;
     }
     if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        // Cfg off — clear any leftover tint from a previous session.
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    IntgameTintParams p = intgame_translucent_black_pick();
+    if (p.underlay == TIG_WINDOW_HANDLE_INVALID) {
+        // No sensible underlay (pre-game title screen on 800x600, or
+        // mainmenu-not-up + iso-not-up — the latter only at very
+        // early init). User explicitly doesn't want dark panel
+        // pixels punching through to mainmenu_bg or the unloaded
+        // game world.
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    tig_window_tint_enable(window_handle, true,
+        p.underlay, p.threshold, p.r, p.g, p.b);
+}
+
+// CE: re-pick the modal-dialog auto-tint params based on current
+// UI context. Called whenever the relevant state flips: iso
+// interface create/destroy, mainmenu open/close. Without this hook
+// the underlay was locked in at iso_interface_create time and
+// stayed iso even after the mainmenu opened over the world — modals
+// raised from the pause menu (Save overwrite confirms, Quit confirm,
+// etc.) would punch through to the iso world they were supposed to
+// hide.
+void intgame_refresh_modal_tint(void)
+{
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        tig_window_modal_tint_set(false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    IntgameTintParams p = intgame_translucent_black_pick();
+    if (p.underlay == TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_modal_tint_set(false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    tig_window_modal_tint_set(true,
+        p.underlay, p.threshold, p.r, p.g, p.b);
+}
+
+// CE: re-pick the HUD bar's tint params for the current context.
+// The bar is opted into the tint pathway at iso_interface_create
+// time with whatever the picker returns; whenever UI context flips
+// (mainmenu opens/closes), this gets called again to refresh —
+// otherwise the bar's tint underlay stays locked to iso even when
+// the bar is visible over a mainmenu (notably the pre-game new-
+// char / pregen / charedit flow, where the iso strips are shown
+// as a band and the bar's near-black pixels would knock through
+// to an unloaded iso world). The bar window itself is destroyed
+// in iso_interface_destroy and the tint state with it, so we don't
+// need a dedicated "disable" path here.
+void intgame_refresh_hud_bar_tint(void)
+{
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
         return;
     }
     if (!intgame_hud_bar_uses_tint) {
         return;
     }
-    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        tig_window_tint_enable(dword_64C4F8[1], false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
         return;
     }
-    // HIDDEN stage: no visible bar → no need to tint anything.
-    if (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN) {
+    IntgameTintParams p = intgame_translucent_black_pick();
+    if (p.underlay == TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_tint_enable(dword_64C4F8[1], false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
         return;
     }
-
-    TigVideoBuffer* iso_vb = NULL;
-    if (tig_window_vbid_get(intgame_iso_window, &iso_vb) != TIG_OK
-        || iso_vb == NULL) {
-        return;
-    }
-
-    TigWindowData iso_wd;
-    TigWindowData bar_wd;
-    if (tig_window_data(intgame_iso_window, &iso_wd) != TIG_OK) {
-        return;
-    }
-    if (tig_window_data(dword_64C4F8[1], &bar_wd) != TIG_OK) {
-        return;
-    }
-
-    // Pick the iso-VB-local rect that matches the visible portion of
-    // the bar in the current TAB stage. Tinting beyond the visible
-    // chrome would leave a dark backplate sticking out past the crop
-    // (the bug the user spotted). In each non-FULL stage the chrome
-    // is clipped to a sub-band; the tint must follow that clip
-    // exactly so darkening happens only behind real bar pixels.
-    TigRect local;
-    int sx = bar_wd.rect.x - iso_wd.rect.x;
-    int sy = bar_wd.rect.y - iso_wd.rect.y;
-    switch (intgame_hud_stage) {
-    case INTGAME_HUD_STAGE_FULL:
-        local.x = sx;
-        local.y = sy;
-        local.width = bar_wd.rect.width;
-        local.height = bar_wd.rect.height;
-        break;
-    case INTGAME_HUD_STAGE_MEDIUM:
-        local.x = sx + INTGAME_HUD_MEDIUM_BAND_X;
-        local.y = sy + INTGAME_HUD_MEDIUM_BAND_Y;
-        local.width = INTGAME_HUD_MEDIUM_BAND_W;
-        local.height = INTGAME_HUD_MEDIUM_BAND_H;
-        break;
-    case INTGAME_HUD_STAGE_MINI:
-        local.x = sx + INTGAME_HUD_MINI_BAND_X;
-        local.y = sy + INTGAME_HUD_MINI_BAND_Y;
-        local.width = INTGAME_HUD_MINI_BAND_W;
-        local.height = INTGAME_HUD_MINI_BAND_H;
-        break;
-    default:
-        return;
-    }
-
-    // Subtractive tint — darken the iso pixels under the bar's
-    // color-key holes by a constant per channel.
-    tig_video_buffer_tint(iso_vb,
-        &local,
-        tig_color_make(30, 30, 30),
-        TIG_VIDEO_BUFFER_TINT_MODE_SUB);
-}
-
-// CE: Apply the translucent-black effect to a window. Currently a
-// no-op stub kept for ABI compatibility while we decide whether to
-// generalize the bar's tint pathway to other UIs (charedit / inven
-// / wmap / mainmenu Options). For now those windows show opaque
-// chrome — the see-through effect only applies to the HUD bar.
-void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable)
-{
-    (void)window_handle;
-    (void)enable;
+    tig_window_tint_enable(dword_64C4F8[1], true,
+        p.underlay, p.threshold, p.r, p.g, p.b);
 }

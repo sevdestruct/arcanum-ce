@@ -116,6 +116,14 @@ static bool tig_video_present_dirty_rect_valid;
 static bool tig_video_flip_perf_enabled = false;
 static TigVideoFlipPerf tig_video_flip_perf;
 
+// CE: per-call timing for tig_video_blit_near_black_tinted. Used to
+// quantify the translucent-black tint pathway's CPU cost so we can
+// compare it against the alpha-blend variant in the sibling branch.
+// Driven by the same F9 perf toggle so collection turns on/off
+// alongside the existing flip-perf counters.
+static bool tig_video_tint_blit_perf_enabled = false;
+static TigVideoTintBlitPerf tig_video_tint_blit_perf;
+
 // 0x51F330
 int tig_video_init(TigInitInfo* init_info)
 {
@@ -290,6 +298,208 @@ int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect*
     return TIG_OK;
 }
 
+// CE: composite a window's VB to the screen, replacing "near-black"
+// source pixels with subtract-tinted underlay-VB pixels at the same
+// screen position. Other source pixels copy through opaque.
+//
+// Direct-paint architecture (same as the old near_black_alpha blit):
+// reads the underlay VB directly so it doesn't depend on the lower
+// window having actually painted the screen surface. The screen-
+// surface route was unreliable for the iso world window because it
+// uses TIG_WINDOW_VIDEO_MEMORY — its SDL_Surface isn't necessarily
+// in sync with what reaches the screen during composite, so a
+// color-key blit would leave holes showing stale black instead of
+// the live world.
+//
+// underlay_offset_x/y locate the screen's (0, 0) inside the underlay
+// VB — for a fullscreen underlay window (e.g. iso) at frame (0, 0)
+// these are 0. Fallback (NULL underlay): just blit src opaque.
+//
+// `tint_r/g/b` express how much to DARKEN each underlay channel on
+// a 0..255 scale: 0 = no darkening (full underlay brightness), 255
+// = full black. Math is a per-channel MULTIPLY (output = underlay *
+// (255 - tint) / 256), so channels scale in proportion and the
+// underlay's hue survives — unlike a saturating subtract, which
+// clips low channels independently and visibly shifts color toward
+// whichever channel was strongest (the "color burn" we hit earlier
+// when using SUB). NEON-vectorized fast path on Apple Silicon.
+int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    uint8_t threshold,
+    uint8_t tint_r,
+    uint8_t tint_g,
+    uint8_t tint_b)
+{
+    // CE: timing for the tint pathway perf comparison (F9-gated).
+    // Wrapping the whole function so the surface lock/unlock cost
+    // is included — that's part of the real per-call price.
+    uint64_t perf_t0 = tig_video_tint_blit_perf_enabled
+        ? SDL_GetPerformanceCounter()
+        : 0;
+
+    if (!tig_video_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    if (src_video_buffer == NULL || src_video_buffer->surface == NULL
+        || tig_video_state.surface == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    TigRect clamped_dst;
+    int rc = tig_rect_intersection(dst_rect, &stru_610388, &clamped_dst);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+    int dx_off = clamped_dst.x - dst_rect->x;
+    int dy_off = clamped_dst.y - dst_rect->y;
+
+    SDL_Surface* src = src_video_buffer->surface;
+    SDL_Surface* dst = tig_video_state.surface;
+    SDL_Surface* under = (underlay_video_buffer != NULL)
+        ? underlay_video_buffer->surface
+        : NULL;
+
+    if (!SDL_LockSurface(src)) return TIG_ERR_GENERIC;
+    if (!SDL_LockSurface(dst)) { SDL_UnlockSurface(src); return TIG_ERR_GENERIC; }
+    if (under != NULL && !SDL_LockSurface(under)) {
+        SDL_UnlockSurface(dst);
+        SDL_UnlockSurface(src);
+        return TIG_ERR_GENERIC;
+    }
+
+    int src_pitch_px = src->pitch / 4;
+    int dst_pitch_px = dst->pitch / 4;
+    int under_pitch_px = (under != NULL) ? (under->pitch / 4) : 0;
+    uint32_t* src_base = (uint32_t*)src->pixels
+        + (src_rect->y + dy_off) * src_pitch_px
+        + (src_rect->x + dx_off);
+    uint32_t* dst_base = (uint32_t*)dst->pixels
+        + clamped_dst.y * dst_pitch_px
+        + clamped_dst.x;
+    uint32_t* under_base = NULL;
+    if (under != NULL) {
+        int uy = clamped_dst.y + underlay_offset_y;
+        int ux = clamped_dst.x + underlay_offset_x;
+        if (uy < 0 || ux < 0 || uy >= under->h || ux >= under->w) {
+            under = NULL;
+        } else {
+            under_base = (uint32_t*)under->pixels + uy * under_pitch_px + ux;
+        }
+    }
+
+    // Convert "darken by N out of 255" to per-channel multiply
+    // factors (N=0 → factor 255 = full brightness; N=255 → 0).
+    uint8_t factor_r = (uint8_t)(255 - tint_r);
+    uint8_t factor_g = (uint8_t)(255 - tint_g);
+    uint8_t factor_b = (uint8_t)(255 - tint_b);
+
+    int w = clamped_dst.width;
+    int h = clamped_dst.height;
+    for (int y = 0; y < h; y++) {
+        uint32_t* sp = src_base + y * src_pitch_px;
+        uint32_t* dp = dst_base + y * dst_pitch_px;
+        uint32_t* up = (under_base != NULL) ? (under_base + y * under_pitch_px) : NULL;
+        int x = 0;
+#if TIG_HAVE_NEON
+        if (w >= 4 && up != NULL) {
+            uint8x16_t thresh_v = vdupq_n_u8(threshold);
+            uint8x16_t alpha_clear = vreinterpretq_u8_u32(vdupq_n_u32(0x00FFFFFFu));
+            uint8x16_t alpha_set = vreinterpretq_u8_u32(vdupq_n_u32(0xFF000000u));
+            uint32x4_t allones = vdupq_n_u32(0xFFFFFFFFu);
+            // Factor as a 4-byte pixel (X=0, R, G, B) replicated per lane.
+            // X (alpha lane) doesn't matter — we mask it out after the
+            // multiply and force alpha back to 0xFF below.
+            uint32_t factor_pix = ((uint32_t)factor_r << 16)
+                                | ((uint32_t)factor_g << 8)
+                                | (uint32_t)factor_b;
+            uint8x16_t factor_v = vreinterpretq_u8_u32(vdupq_n_u32(factor_pix));
+            for (; x + 4 <= w; x += 4) {
+                uint32x4_t s4 = vld1q_u32(sp + x);
+                uint32x4_t u4 = vld1q_u32(up + x);
+                // Near-black mask per pixel.
+                uint8x16_t s_rgb = vandq_u8(vreinterpretq_u8_u32(s4), alpha_clear);
+                uint8x16_t le = vcleq_u8(s_rgb, thresh_v);
+                uint32x4_t le_u32 = vreinterpretq_u32_u8(le);
+                uint32x4_t nb_mask = vceqq_u32(le_u32, allones);
+                // Per-channel multiply: 8-bit underlay × 8-bit factor →
+                // 16-bit product, then rounding shift-right by 8 to
+                // approximate /255 (max error 1 LSB per channel). Hue
+                // survives because each channel scales independently in
+                // proportion to its underlay value.
+                uint8x16_t u_b = vreinterpretq_u8_u32(u4);
+                uint16x8_t mul_lo = vmull_u8(vget_low_u8(u_b),
+                                             vget_low_u8(factor_v));
+                uint16x8_t mul_hi = vmull_u8(vget_high_u8(u_b),
+                                             vget_high_u8(factor_v));
+                uint8x8_t res_lo = vqrshrn_n_u16(mul_lo, 8);
+                uint8x8_t res_hi = vqrshrn_n_u16(mul_hi, 8);
+                uint8x16_t tinted = vcombine_u8(res_lo, res_hi);
+                // Force alpha lane back to 0xFF (the multiply produced
+                // whatever the factor's X×underlay-X happens to be).
+                tinted = vorrq_u8(vandq_u8(tinted, alpha_clear), alpha_set);
+                uint32x4_t tinted32 = vreinterpretq_u32_u8(tinted);
+                // Select: near-black → MUL-tinted underlay; else → src.
+                uint32x4_t out = vbslq_u32(nb_mask, tinted32, s4);
+                vst1q_u32(dp + x, out);
+            }
+        }
+#endif
+        for (; x < w; x++) {
+            uint32_t s = sp[x];
+            uint8_t sr = (uint8_t)(s >> 16);
+            uint8_t sg = (uint8_t)(s >> 8);
+            uint8_t sb = (uint8_t)s;
+            if (sr <= threshold && sg <= threshold && sb <= threshold) {
+                if (up != NULL) {
+                    uint32_t u = up[x];
+                    uint8_t ur = (uint8_t)(u >> 16);
+                    uint8_t ug = (uint8_t)(u >> 8);
+                    uint8_t ub = (uint8_t)u;
+                    // (under * factor + 128) >> 8 matches the NEON
+                    // rounding shift, giving consistent results across
+                    // the SIMD and scalar paths.
+                    int rr = ((int)ur * (int)factor_r + 128) >> 8;
+                    int gg = ((int)ug * (int)factor_g + 128) >> 8;
+                    int bb = ((int)ub * (int)factor_b + 128) >> 8;
+                    if (rr > 255) rr = 255;
+                    if (gg > 255) gg = 255;
+                    if (bb > 255) bb = 255;
+                    dp[x] = 0xFF000000u
+                        | ((uint32_t)rr << 16)
+                        | ((uint32_t)gg << 8)
+                        | (uint32_t)bb;
+                } else {
+                    dp[x] = s;
+                }
+            } else {
+                dp[x] = s;
+            }
+        }
+    }
+
+    if (under != NULL) SDL_UnlockSurface(under);
+    SDL_UnlockSurface(dst);
+    SDL_UnlockSurface(src);
+
+    if (tig_video_tint_blit_perf_enabled) {
+        uint64_t perf_t1 = SDL_GetPerformanceCounter();
+        uint64_t ns = (uint64_t)((double)(perf_t1 - perf_t0)
+            * 1e9 / (double)SDL_GetPerformanceFrequency());
+        tig_video_tint_blit_perf.total_ns += ns;
+        if (ns > tig_video_tint_blit_perf.max_ns) {
+            tig_video_tint_blit_perf.max_ns = ns;
+        }
+        tig_video_tint_blit_perf.samples++;
+        tig_video_tint_blit_perf.pixels_total +=
+            (uint64_t)clamped_dst.width * (uint64_t)clamped_dst.height;
+    }
+
+    return TIG_OK;
+}
+
 // 0x51F7C0
 int tig_video_fill(const TigRect* rect, tig_color_t color)
 {
@@ -348,6 +558,26 @@ void tig_video_flip_perf_get(TigVideoFlipPerf* out)
 void tig_video_flip_perf_reset(void)
 {
     memset(&tig_video_flip_perf, 0, sizeof(tig_video_flip_perf));
+}
+
+void tig_video_tint_blit_perf_set_enabled(bool enabled)
+{
+    tig_video_tint_blit_perf_enabled = enabled;
+    if (enabled) {
+        memset(&tig_video_tint_blit_perf, 0, sizeof(tig_video_tint_blit_perf));
+    }
+}
+
+void tig_video_tint_blit_perf_get(TigVideoTintBlitPerf* out)
+{
+    if (out != NULL) {
+        *out = tig_video_tint_blit_perf;
+    }
+}
+
+void tig_video_tint_blit_perf_reset(void)
+{
+    memset(&tig_video_tint_blit_perf, 0, sizeof(tig_video_tint_blit_perf));
 }
 
 int tig_video_set_vsync_mode(int mode)
@@ -725,14 +955,19 @@ int tig_video_buffer_data(TigVideoBuffer* video_buffer, TigVideoBufferData* vide
 // 0x520450
 int tig_video_buffer_set_color_key(TigVideoBuffer* video_buffer, int color_key)
 {
-    if ((video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) == 0) {
-        return TIG_ERR_GENERIC;
-    }
-
+    // CE: enable color-key matching on the surface unconditionally
+    // (was guarded on TIG_VIDEO_BUFFER_COLOR_KEY, which is only auto-
+    // set at create time for windows created with TIG_WINDOW_TRANSPARENT
+    // — the guard silently rejected late opt-ins like the HUD bar's
+    // dialog-style translucent-black bake). SDL_SetSurfaceColorKey
+    // works on any surface; the tig flag is just a tracking bool we
+    // flip alongside so subsequent code sees the surface as having
+    // color-key.
     if (!SDL_SetSurfaceColorKey(video_buffer->surface, true, color_key)) {
         return TIG_ERR_GENERIC;
     }
 
+    video_buffer->flags |= TIG_VIDEO_BUFFER_COLOR_KEY;
     video_buffer->color_key = color_key;
 
     return TIG_OK;

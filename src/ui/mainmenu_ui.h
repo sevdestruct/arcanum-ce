@@ -70,6 +70,19 @@ void mainmenu_ui_start_at_window(MainMenuWindowType window_type);
 void sub_5412D0(void);
 bool mainmenu_ui_handle(void);
 bool mainmenu_ui_is_active(void);
+
+// CE: handle of the hi-res full-screen backdrop window (mainmenu_bg
+// or per-screen *_bg.bmp baked into its VB). Returns
+// TIG_WINDOW_HANDLE_INVALID at native 800x600 (no separate backdrop
+// is created — the panel itself is the full screen) or whenever
+// the mainmenu isn't currently showing.
+//
+// Used as the underlay for the translucent-black tint pathway so
+// the menu panel's dark areas knock through to the menu's
+// background art instead of the iso world beneath. Without this
+// the tint always targeted the iso VB even when the iso world was
+// occluded by the mainmenu backdrop.
+tig_window_handle_t mainmenu_ui_get_backdrop_handle(void);
 TigWindowModalDialogChoice mainmenu_ui_confirm_quit(void);
 void mainmenu_ui_reset(void);
 void mainmenu_ui_open(void);

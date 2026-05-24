@@ -1880,6 +1880,17 @@ bool mainmenu_ui_is_active(void)
     return mainmenu_ui_active;
 }
 
+// CE: see mainmenu_ui.h. Returns the hi-res backdrop window handle
+// (the one with mainmenu_bg / per-screen *_bg.bmp baked into its VB)
+// when the mainmenu is up in hi-res, or TIG_WINDOW_HANDLE_INVALID
+// otherwise. Used by the translucent-black tint pathway as the
+// underlay-VB source so menu panel dark areas reveal the menu's bg
+// instead of the iso world.
+tig_window_handle_t mainmenu_ui_get_backdrop_handle(void)
+{
+    return mainmenu_ui_backdrop_handle;
+}
+
 // 0x541690
 TigWindowModalDialogChoice mainmenu_ui_confirm_quit(void)
 {
@@ -5535,16 +5546,33 @@ void mainmenu_ui_create_window_func(bool should_display)
     window->refresh_text_flags |= 0x20;
     mainmenu_ui_active = true;
 
-    // CE: when the menu is being shown over a running game (in-play /
-    // in-play-locked / options), enable near-black see-through alpha
-    // on this menu sub-window so iso world peeks through dark panel
-    // regions. Covers Save / Load / Options / etc. since they all
-    // create their tig window through this same function. Out-of-game
-    // menus skip — no world to show.
-    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
-        && stru_5C36B0[mainmenu_ui_type][0]) {
+    // CE: opt this menu sub-window into the translucent-black tint
+    // pathway. intgame_apply_translucent_black auto-picks the
+    // underlay based on context: in hi-res the mainmenu backdrop
+    // (mainmenu_bg / per-screen *_bg.bmp) is preferred over the iso
+    // world, so dark panel pixels reveal a darkened menu background
+    // rather than the iso world the user can't see anyway. At
+    // 800x600 (no backdrop) it falls through to iso during gameplay
+    // or auto-disables in pre-game. This unifies the look across
+    // pre-game main menu, in-game pause menu, and the Save/Load/
+    // Options sub-windows; the old "in-play-only" gate is gone
+    // because the underlay choice now handles pre-game safely.
+    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID) {
         intgame_apply_translucent_black(mainmenu_ui_window_handle, true);
     }
+
+    // CE: now that the mainmenu's backdrop is up (in hi-res), refresh
+    // the modal-dialog auto-tint AND the HUD bar's tint underlay so
+    // both point at the backdrop instead of whatever was selected
+    // before (typically the iso world from iso_interface_create).
+    // Modals raised from inside the mainmenu — overwrite confirms,
+    // quit confirm, etc. — now see through to menu bg. The HUD bar
+    // matters for the pre-game new-char / pregen / charedit flow,
+    // where the bar is shown as a chrome band over the mainmenu
+    // backdrop — without this its near-black pixels would punch
+    // through to an unloaded iso world.
+    intgame_refresh_modal_tint();
+    intgame_refresh_hud_bar_tint();
 
     if (window->refresh_func != NULL) {
         window->refresh_func(NULL);
@@ -5667,6 +5695,18 @@ void sub_546DD0(void)
         }
 
         mainmenu_ui_active = false;
+
+        // CE: mainmenu (and its backdrop) are gone — refresh both
+        // the modal-dialog auto-tint and the HUD bar's tint so they
+        // fall back to iso underlay if we're still in-game, or
+        // disable if we returned to a pre-game state. Without this,
+        // the next modal raised in gameplay would still target the
+        // now-destroyed backdrop window handle as its underlay, and
+        // the HUD bar (which uses a heavier subtract while pointed
+        // at the menu backdrop) would keep that look in active
+        // gameplay.
+        intgame_refresh_modal_tint();
+        intgame_refresh_hud_bar_tint();
     }
 }
 

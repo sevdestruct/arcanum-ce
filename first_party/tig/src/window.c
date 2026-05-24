@@ -66,6 +66,18 @@ typedef struct TigWindow {
     // paint; otherwise frame alone defines visibility.
     bool has_clip;
     TigRect clip_rect;
+    // CE: optional translucent-black pathway. When enabled, the
+    // compositor routes this window's blit through
+    // tig_video_blit_near_black_tinted, which replaces near-black
+    // source pixels with subtract-tinted underlay pixels and copies
+    // other pixels through opaque. Used by the HUD bar to show a
+    // darkened world through its dark panel regions.
+    bool tint_enabled;
+    uint8_t tint_threshold;
+    uint8_t tint_r;
+    uint8_t tint_g;
+    uint8_t tint_b;
+    tig_window_handle_t tint_underlay;
 } TigWindow;
 
 static int tig_window_free_index(void);
@@ -82,6 +94,21 @@ static void tig_window_modal_dialog_exit(void);
 
 // 0x5BED98
 static tig_window_handle_t tig_window_modal_dialog_window_handle = TIG_WINDOW_HANDLE_INVALID;
+
+// CE: modal-dialog auto-tint state. When enabled (configured by
+// gamelib at iso-interface-create time and cleared at destroy),
+// tig_window_modal_dialog auto-calls tig_window_tint_enable on each
+// modal it creates so the modal's near-black panel regions show
+// the tinted iso world through them — same effect we apply to the
+// HUD bar. Disabled in pre-game contexts (gamelib never sets it
+// before iso is up) so the title-screen mainmenu_bg doesn't get
+// darkened behind quit-confirmation dialogs.
+static bool tig_window_modal_tint_enabled = false;
+static tig_window_handle_t tig_window_modal_tint_underlay = TIG_WINDOW_HANDLE_INVALID;
+static uint8_t tig_window_modal_tint_threshold = 8;
+static uint8_t tig_window_modal_tint_r = 30;
+static uint8_t tig_window_modal_tint_g = 30;
+static uint8_t tig_window_modal_tint_b = 30;
 
 // 0x5BEDA0
 static TigRect tig_window_modal_dialog_bounds = { 0, 0, MODAL_DIALOG_WIDTH, MODAL_DIALOG_HEIGHT };
@@ -202,6 +229,12 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->color_key = window_data->color_key;
     win->num_buttons = 0;
     win->has_clip = false;
+    win->tint_enabled = false;
+    win->tint_threshold = 0;
+    win->tint_r = 0;
+    win->tint_g = 0;
+    win->tint_b = 0;
+    win->tint_underlay = TIG_WINDOW_HANDLE_INVALID;
 
     vb_create_info.flags = 0;
 
@@ -597,6 +630,36 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             vb_blit_info.dst_video_buffer = dst_video_buffer;
                             vb_blit_info.dst_rect = &blt_dst_rect;
                             tig_video_buffer_blit(&vb_blit_info);
+                        } else if (win->tint_enabled) {
+                            // CE: translucent-black tint pathway — near-
+                            // black source pixels get replaced with
+                            // subtract-tinted underlay pixels read
+                            // directly from the underlay VB (bypasses
+                            // the layered screen-surface route, which is
+                            // unreliable when the underlay window uses
+                            // VIDEO_MEMORY).
+                            TigVideoBuffer* under_vb = NULL;
+                            int under_off_x = 0;
+                            int under_off_y = 0;
+                            if (win->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
+                                int uidx = tig_window_handle_to_index(win->tint_underlay);
+                                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
+                                    TigWindow* uw = &(windows[uidx]);
+                                    under_vb = uw->video_buffer;
+                                    under_off_x = -uw->frame.x;
+                                    under_off_y = -uw->frame.y;
+                                }
+                            }
+                            tig_video_blit_near_black_tinted(src_video_buffer,
+                                &blt_src_rect,
+                                &blt_dst_rect,
+                                under_vb,
+                                under_off_x,
+                                under_off_y,
+                                win->tint_threshold,
+                                win->tint_r,
+                                win->tint_g,
+                                win->tint_b);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
@@ -667,6 +730,29 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             vb_blit_info.src_rect = &blt_src_rect;
             vb_blit_info.dst_rect = &blt_dst_rect;
             tig_video_buffer_blit(&vb_blit_info);
+        } else if (wins[v38]->tint_enabled) {
+            TigVideoBuffer* under_vb = NULL;
+            int under_off_x = 0;
+            int under_off_y = 0;
+            if (wins[v38]->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
+                int uidx = tig_window_handle_to_index(wins[v38]->tint_underlay);
+                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
+                    TigWindow* uw = &(windows[uidx]);
+                    under_vb = uw->video_buffer;
+                    under_off_x = -uw->frame.x;
+                    under_off_y = -uw->frame.y;
+                }
+            }
+            tig_video_blit_near_black_tinted(wins[v38]->video_buffer,
+                &blt_src_rect,
+                &blt_dst_rect,
+                under_vb,
+                under_off_x,
+                under_off_y,
+                wins[v38]->tint_threshold,
+                wins[v38]->tint_r,
+                wins[v38]->tint_g,
+                wins[v38]->tint_b);
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
         }
@@ -1670,6 +1756,78 @@ int tig_window_clip_rect_set(tig_window_handle_t window_handle, const TigRect* c
     return TIG_OK;
 }
 
+// CE: opt the given window into the translucent-black tint pathway.
+// When enabled, the compositor uses tig_video_blit_near_black_tinted
+// to composite this window — near-black source pixels get replaced
+// with subtract-tinted underlay pixels (showing the world darkened
+// through the bar's dark panel regions), all other pixels copy
+// through opaque.
+//
+// underlay_handle = the window whose VB supplies the live underlay
+// pixels (typically the iso world). Passing INVALID falls back to
+// opaque copy for near-black (the feature effectively disabled).
+//
+// `r/g/b` = the constant subtracted from each underlay pixel for
+// the tint effect (use 30/30/30 to match the dialog options
+// backdrop's default tint).
+// CE: globally configure the modal-dialog auto-tint. When enabled
+// is true and the underlay handle is valid, tig_window_modal_dialog
+// auto-calls tig_window_tint_enable on each modal it creates so
+// modal-dialog near-black panel regions show the tinted world
+// through them. Gamelib enables this when an in-play iso session
+// starts, disables when it ends, so pre-game modals (title-screen
+// quit confirm etc.) stay fully opaque over the mainmenu_bg.
+int tig_window_modal_tint_set(bool enabled,
+    tig_window_handle_t underlay_handle,
+    uint8_t threshold,
+    uint8_t r,
+    uint8_t g,
+    uint8_t b)
+{
+    tig_window_modal_tint_enabled = enabled;
+    tig_window_modal_tint_underlay = underlay_handle;
+    tig_window_modal_tint_threshold = threshold;
+    tig_window_modal_tint_r = r;
+    tig_window_modal_tint_g = g;
+    tig_window_modal_tint_b = b;
+    return TIG_OK;
+}
+
+int tig_window_tint_enable(tig_window_handle_t window_handle,
+    bool enabled,
+    tig_window_handle_t underlay_handle,
+    uint8_t threshold,
+    uint8_t r,
+    uint8_t g,
+    uint8_t b)
+{
+    int window_index;
+    TigWindow* win;
+
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    if (!tig_window_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    window_index = tig_window_handle_to_index(window_handle);
+    win = &(windows[window_index]);
+
+    bool was_enabled = win->tint_enabled;
+    win->tint_enabled = enabled;
+    win->tint_threshold = threshold;
+    win->tint_r = r;
+    win->tint_g = g;
+    win->tint_b = b;
+    win->tint_underlay = underlay_handle;
+
+    if (was_enabled != enabled) {
+        // Force a recomposite so the new mode applies immediately.
+        tig_window_invalidate_rect(&(win->frame));
+    }
+    return TIG_OK;
+}
+
 // 0x51EA10
 int tig_window_vbid_get(tig_window_handle_t window_handle, TigVideoBuffer** video_buffer_ptr)
 {
@@ -1774,6 +1932,21 @@ int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModal
 
     if (tig_window_create(&window_data, &tig_window_modal_dialog_window_handle) != TIG_OK) {
         return TIG_ERR_GENERIC;
+    }
+
+    // CE: if gamelib has set us up for translucent-black modals
+    // (i.e. an in-play game session exists with an iso underlay),
+    // opt this modal window into the tint pathway so its near-black
+    // panel regions show the tinted world through them.
+    if (tig_window_modal_tint_enabled
+        && tig_window_modal_tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_tint_enable(tig_window_modal_dialog_window_handle,
+            true,
+            tig_window_modal_tint_underlay,
+            tig_window_modal_tint_threshold,
+            tig_window_modal_tint_r,
+            tig_window_modal_tint_g,
+            tig_window_modal_tint_b);
     }
 
     tig_window_modal_dialog_create_buttons(modal_info->type, tig_window_modal_dialog_window_handle);

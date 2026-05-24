@@ -111,6 +111,33 @@ int tig_video_window_get(SDL_Window** window_ptr);
 int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
+
+// CE: composite blit that replaces near-black source pixels with
+// MUL-darkened underlay pixels at the same screen position. Used by
+// the HUD bar's translucent-black pathway: the bar's panel art has
+// dark regions the user wants the world to peek through (with the
+// world darkened so chrome contrast stays readable). Reads the
+// underlay VB directly rather than relying on the screen surface
+// being painted by lower windows first — the iso world uses
+// VIDEO_MEMORY and its SDL_Surface isn't a reliable source of the
+// live world content during composite.
+//
+// `tint_r/g/b` are per-channel "darken by N out of 255" values: 0
+// preserves the channel, 255 zeroes it. Math is a per-channel
+// multiply (output = underlay * (255 - tint) / 256), which keeps
+// the underlay's hue. A saturating-subtract version was tried first
+// but visibly burned colors (channels clipped to 0 independently,
+// shifting hue toward whichever channel was strongest).
+int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    uint8_t threshold,
+    uint8_t tint_r,
+    uint8_t tint_g,
+    uint8_t tint_b);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 // Hint the next tig_video_flip to upload only `rect` of the surface to the GPU
@@ -137,6 +164,28 @@ typedef struct {
 void tig_video_flip_perf_set_enabled(bool enabled);
 void tig_video_flip_perf_get(TigVideoFlipPerf* out);
 void tig_video_flip_perf_reset(void);
+
+// CE: per-call timing for the translucent-black tint composite blit
+// (tig_video_blit_near_black_tinted). Lets us quantify the tint
+// pathway's CPU cost so it can be compared against the alpha-blend
+// variant in the sibling branch (same struct layout exists there
+// for tig_video_blit_near_black_alpha). Driven by the same F9 perf
+// toggle as the flip-perf counters so collection turns on/off
+// together.
+//
+// pixels_total counts the destination pixel area covered by each
+// call (clamped rect width × height) — divide by samples for the
+// average pixels-per-blit, multiply by samples for total pixels
+// touched in the window.
+typedef struct {
+    uint64_t total_ns;
+    uint64_t max_ns;
+    int samples;
+    uint64_t pixels_total;
+} TigVideoTintBlitPerf;
+void tig_video_tint_blit_perf_set_enabled(bool enabled);
+void tig_video_tint_blit_perf_get(TigVideoTintBlitPerf* out);
+void tig_video_tint_blit_perf_reset(void);
 
 // Reapply the renderer's vsync mode. Values match SDL_SetRenderVSync:
 //   1 = vsync on (default at init), 0 = vsync off, -1 = adaptive vsync
