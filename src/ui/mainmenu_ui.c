@@ -3757,6 +3757,23 @@ void mainmenu_ui_last_save_create(void)
             rect.height = 600;
             tig_window_fill(mainmenu_ui_window_handle, &rect, tig_color_make(0, 0, 0));
 
+            // CE: in hi-res the panel is 800x600 centered on a larger
+            // backdrop window (mainmenu_bg art). The black panel fill
+            // above only covers the panel; the backdrop's mainmenu_bg
+            // would stay visible around it during the load. Fill the
+            // backdrop too so the entire screen blacks out while the
+            // save loads.
+            if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+                TigRect backdrop_rect;
+                backdrop_rect.x = 0;
+                backdrop_rect.y = 0;
+                backdrop_rect.width = hrp_iso_window_width_get();
+                backdrop_rect.height = hrp_iso_window_height_get();
+                tig_window_fill(mainmenu_ui_backdrop_handle,
+                    &backdrop_rect,
+                    tig_color_make(0, 0, 0));
+            }
+
             rect.x = 340;
             rect.y = 210;
             rect.width = 200;
