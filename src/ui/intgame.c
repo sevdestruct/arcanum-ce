@@ -1933,20 +1933,38 @@ bool sub_54B5D0(TigMessage* msg)
     }
 
     if (intgame_dialog_process_event_func != NULL) {
+        // CE: mouse wheel falls through to the main loop's zoom
+        // handler (line 2912). The dialog UI doesn't use the wheel
+        // and zooming by wheel is the most natural mid-dialogue
+        // re-framing gesture.
+        if (msg->type == TIG_MESSAGE_MOUSE
+            && msg->data.mouse.event == TIG_MESSAGE_MOUSE_WHEEL) {
+            return false;
+        }
         if (msg->type != TIG_MESSAGE_KEYBOARD) {
             return intgame_dialog_process_event_func(msg);
         }
 
-        if (msg->data.keyboard.pressed) {
-            return intgame_dialog_process_event_func(msg);
+        // CE: a few keys are useful enough mid-conversation to be
+        // worth letting through to the main loop instead of feeding
+        // them to the dialog filter. ESC and O were already
+        // whitelisted (pause menu / options); zoom in/out and TAB
+        // (HUD cycle) join them so the player can re-frame the scene
+        // and adjust chrome density without ending the conversation.
+        // The dialog UI doesn't bind these keys, and the speech-
+        // bubble / dialog-options positioning is already TAB-stage
+        // aware so cycling stage during dialogue places text
+        // correctly relative to the current HUD layout.
+        SDL_Scancode sc = msg->data.keyboard.scancode;
+        bool whitelisted = sc == SDL_SCANCODE_ESCAPE
+            || sc == SDL_SCANCODE_O
+            || sc == SDL_SCANCODE_EQUALS
+            || sc == SDL_SCANCODE_MINUS
+            || sc == SDL_SCANCODE_TAB;
+        if (whitelisted) {
+            return false;
         }
-
-        if (msg->data.keyboard.scancode != SDL_SCANCODE_ESCAPE
-            && msg->data.keyboard.scancode != SDL_SCANCODE_O) {
-            return intgame_dialog_process_event_func(msg);
-        }
-
-        return false;
+        return intgame_dialog_process_event_func(msg);
     }
 
     if (combat_turn_based_is_active()) {
@@ -3126,6 +3144,16 @@ void intgame_process_event(TigMessage* msg)
                 break;
             case TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP:
                 dword_64C6D8 = false;
+                break;
+            case TIG_MESSAGE_MOUSE_WHEEL:
+                // CE: mirror MODE_MAIN's wheel→zoom dispatch so
+                // trackpad/wheel zoom works mid-dialogue. Pairs with
+                // the dialog-filter pass-through in sub_54B5D0
+                // (without that, the wheel never reaches here).
+                if (iso_zoom_is_available()) {
+                    iso_zoom_wheel(msg->data.mouse.dy);
+                    gamelib_invalidate_rect(NULL);
+                }
                 break;
             case TIG_MESSAGE_MOUSE_IDLE:
                 sub_551910(msg);
@@ -9456,9 +9484,11 @@ void intgame_hud_user_toggle(void)
 
     if (entering_mini) {
         intgame_hud_enter_mini_with_skills();
-        return;
-    }
-    if (leaving_mini) {
+        // Fall through to the populate hook below so MINI's slim row
+        // gets the current context immediately (during dialogue, the
+        // speaker NPC's name; out of dialogue, the natural hover/
+        // target info) instead of waiting for the next rollover.
+    } else if (leaving_mini) {
         // Sync the secondary buttons back to RELEASED so the next K
         // / M press behaves as an activation, not a dismiss-of-stale.
         tig_button_state_change(
@@ -9469,10 +9499,35 @@ void intgame_hud_user_toggle(void)
             TIG_BUTTON_STATE_RELEASED);
         if (intgame_iso_window_type != ROTWIN_TYPE_MSG) {
             iso_interface_window_swap(ROTWIN_TYPE_MSG);
-            return;
         }
     }
     intgame_hud_apply_clips();
+
+    // CE: after any TAB transition that leaves the bar in a visible
+    // stage (FULL, MEDIUM, or MINI — anything except HIDDEN), re-
+    // populate the rotwin content. Without this, switching stages
+    // leaves the rotwin showing whatever was last written (or blank
+    // if nothing) until the next mouse rollover or speaker focus
+    // event fires the natural refresh. During dialogue, push the
+    // active speaker NPC explicitly so "talking to X" reappears
+    // immediately; the examine path routes correctly for whatever
+    // rotwin type is active (MSG → portrait+text, SKILLS/etc → str
+    // into the slim row via display_str). Out of dialogue, fall
+    // back to the natural target/hover refresh.
+    if (intgame_hud_stage != INTGAME_HUD_STAGE_HIDDEN) {
+        int64_t dialog_npc = dialog_ui_get_local_pc_npc_obj();
+        if (dialog_npc != OBJ_HANDLE_NULL) {
+            int64_t pc_obj = player_get_local_pc_obj();
+            if (pc_obj != OBJ_HANDLE_NULL) {
+                char buffer[2000];
+                object_examine(dialog_npc, pc_obj, buffer);
+                intgame_examine_object(pc_obj, dialog_npc, buffer);
+                object_hover_obj_set(dialog_npc);
+            }
+        } else if (intgame_iso_window_type == ROTWIN_TYPE_MSG) {
+            iso_interface_refresh();
+        }
+    }
 }
 
 // Auto-pop to MEDIUM when the user invokes a rotwin (K/M/etc.)

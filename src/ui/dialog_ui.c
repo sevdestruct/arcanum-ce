@@ -257,6 +257,16 @@ bool dialog_ui_is_local_pc_in_dialog(void)
     return dialog_ui_local_pc_dialog_active;
 }
 
+// CE: see dialog_ui.h. Returns the local PC's current dialogue NPC,
+// or OBJ_HANDLE_NULL if no dialogue is active.
+int64_t dialog_ui_get_local_pc_npc_obj(void)
+{
+    if (!dialog_ui_local_pc_dialog_active) {
+        return OBJ_HANDLE_NULL;
+    }
+    return sub_567420(player_get_local_pc_obj())->state.npc_obj;
+}
+
 // 0x567A20
 void dialog_ui_notify_dialog_ended(int64_t obj)
 {
