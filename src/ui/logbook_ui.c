@@ -24,6 +24,7 @@
 #include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/types.h"
+#include "ui/ui_anim.h"
 
 enum LogbookUiButton {
     LOGBOOK_UI_BUTTON_TURN_PAGE_LEFT,
@@ -672,6 +673,14 @@ void logbook_ui_create(void)
     gsound_play_sfx(SND_INTERFACE_BOOK_OPEN, 1);
 
     logbook_ui_created = true;
+
+    // CE: spring-driven entrance — scales 92% → 100% with alpha 0 → 1
+    // on the shared big-window. Logbook does not opt into translucent
+    // black, so the compositor uses the cheap transform-only blit
+    // (SDL_BlitSurfaceScaled + alpha mod, ~10× cheaper than the
+    // integrated tinted path).
+    ui_anim_window_show(logbook_ui_window, UI_ANIM_ANCHOR_CENTER,
+        0.92f, NULL);
 }
 
 /**
@@ -684,6 +693,13 @@ void logbook_ui_destroy(void)
     if (!logbook_ui_created) {
         return;
     }
+
+    // CE: cancel any in-flight ui_anim tween and reset the window's
+    // transform to natural. Closing mid-entrance otherwise leaves
+    // the spring still targeting (1.0, 1.0) but the window hidden;
+    // the next open finds a tween in flight and retargets from
+    // stale values — produces a "stuck mid-scale" wobble on re-open.
+    ui_anim_cancel_for_window(logbook_ui_window);
 
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
     intgame_big_window_unlock();

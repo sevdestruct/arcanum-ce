@@ -35,6 +35,7 @@
 #include "ui/skill_ui.h"
 #include "ui/spell_ui.h"
 #include "ui/tb_ui.h"
+#include "ui/ui_anim.h"
 
 typedef enum InvenUiPanel {
     INVEN_UI_PANEL_INVENTORY,
@@ -1114,6 +1115,14 @@ bool inven_ui_create(int64_t pc_obj, int64_t target_obj, int mode)
     inven_ui_arrange_vertical = false;
     inven_ui_created = true;
 
+    // CE: spring-driven entrance — scales 92% → 100% with alpha 0 → 1
+    // on the shared big-window. The compositor's integrated transform-
+    // tinted blit applies the near-black see-through tint during the
+    // scale phase too, so the panel reads its final "tinted" look
+    // from the first frame (no snap-to-tinted on settle).
+    ui_anim_window_show(inven_ui_window_handle, UI_ANIM_ANCHOR_CENTER,
+        0.92f, NULL);
+
     return true;
 }
 
@@ -1127,6 +1136,15 @@ void inven_ui_destroy(void)
     if (!inven_ui_created) {
         return;
     }
+
+    // CE: cancel any in-flight ui_anim tween (entrance scale+alpha or
+    // tint-reveal fade) and reset the window's transform / tint_reveal
+    // to their natural state. Without this, closing inventory mid-
+    // entrance leaves the spring still targeting (1.0, 1.0) but the
+    // window hidden; the next open finds a tween in flight and
+    // retargets from stale values instead of seeding fresh — produces
+    // a "stuck mid-scale" wobble on the re-open.
+    ui_anim_cancel_for_window(inven_ui_window_handle);
 
     inven_ui_created = false;
     sub_4A53B0(inven_ui_pc_obj, 0);

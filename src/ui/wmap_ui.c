@@ -26,6 +26,7 @@
 #include "ui/intgame.h"
 #include "ui/textedit_ui.h"
 #include "ui/types.h"
+#include "ui/ui_anim.h"
 
 typedef enum WmapUiMode {
     WMAP_UI_MODE_WORLD,
@@ -1266,6 +1267,17 @@ void wmap_ui_open_internal(void)
     wmap_ui_mode_info[wmap_ui_mode].refresh();
 
     ui_toggle_primary_button(UI_PRIMARY_BUTTON_WORLDMAP, false);
+
+    // CE: spring-driven entrance — placed AFTER refresh() so the
+    // animation captures the actual world / town map content rather
+    // than the paper-bg fallback that wmap_ui_create blitted at the
+    // start. Without this ordering the entrance briefly shows the
+    // paper before the live map draws over it (visible "glitch
+    // flash" at the start of the scale-in).
+    if (wmap_ui_created && wmap_ui_window != TIG_WINDOW_HANDLE_INVALID) {
+        ui_anim_window_show(wmap_ui_window, UI_ANIM_ANCHOR_CENTER,
+            0.92f, NULL);
+    }
 }
 
 // 0x560AA0
@@ -1428,6 +1440,14 @@ void wmap_ui_close(void)
     }
 
     if (intgame_mode_set(INTGAME_MODE_MAIN) && wmap_ui_created) {
+        // CE: cancel any in-flight ui_anim tween and reset the window's
+        // transform / tint_reveal to natural. Closing mid-entrance
+        // otherwise leaves the spring still targeting (1.0, 1.0) but
+        // the window hidden; the next open finds a tween in flight and
+        // retargets from stale values — produces a "stuck mid-scale"
+        // wobble on the re-open.
+        ui_anim_cancel_for_window(wmap_ui_window);
+
         sub_564070(false);
         wmap_ui_state_set(WMAP_UI_STATE_NORMAL);
         intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);

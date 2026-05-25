@@ -185,7 +185,7 @@ static bool options_ui_modlist_initialized;
  *
  * 0x589280
  */
-void options_ui_start(OptionsUiTab tab, tig_window_handle_t window_handle, bool in_play)
+void options_ui_start(OptionsUiTab tab, tig_window_handle_t window_handle, bool in_play, int panel_y_offset)
 {
     int index;
     CyclicUiControlInfo control_info;
@@ -243,7 +243,7 @@ void options_ui_start(OptionsUiTab tab, tig_window_handle_t window_handle, bool 
         control_info.mes_file_path = meta->mes;
         control_info.value_changed_callback = meta->setter;
         control_info.x = options_ui_controls_x[index];
-        control_info.y = options_ui_controls_y[index];
+        control_info.y = options_ui_controls_y[index] - panel_y_offset;
 
         // Query initial value.
         if (meta->getter != NULL) {

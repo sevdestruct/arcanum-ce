@@ -256,6 +256,15 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
             // Non-credits (or custom-BG fallback): load slide directly into
             // a video buffer and blit it through the window pipeline.
             if (tig_video_buffer_load_from_bmp(bmp_path, &video_buffer, 0x01) == TIG_OK) {
+                // CE: opt-in legacy vignette / side gradient — applies
+                // only when LEGACY_MENU_VIGNETTE_KEY is on AND the
+                // user is on the legacy (non-custom-bg) credits path
+                // (custom_override means a custom credits bg art is
+                // present, which already supplies its own framing).
+                if (!custom_override
+                    && settings_get_value(&settings, LEGACY_MENU_VIGNETTE_KEY)) {
+                    gamelib_apply_legacy_vignette_to_vb(video_buffer);
+                }
                 blit_info.type = TIG_WINDOW_BLIT_VIDEO_BUFFER_TO_WINDOW;
                 blit_info.vb_blit_flags = 0;
                 blit_info.src_rect = &rect;

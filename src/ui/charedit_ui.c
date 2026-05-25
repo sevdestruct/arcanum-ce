@@ -27,6 +27,7 @@
 #include "ui/skill_ui.h"
 #include "ui/spell_ui.h"
 #include "ui/tech_ui.h"
+#include "ui/ui_anim.h"
 
 typedef enum ChareditStat {
     CHAREDIT_STAT_UNSPENT_POINTS,
@@ -153,6 +154,7 @@ static bool charedit_spells_win_message_filter(TigMessage* msg);
 static bool charedit_scheme_win_message_filter(TigMessage* msg);
 static bool charedit_labels_init(void);
 static void charedit_labels_exit(void);
+static void charedit_show_subwindows_on_entrance_complete(void* ctx);
 static void charedit_refresh_alignment_aptitude_bars(void);
 static void sub_55EFB0(void);
 static void sub_55EFE0(void);
@@ -1113,11 +1115,14 @@ bool charedit_open(int64_t obj, ChareditMode mode)
         return false;
     }
 
-    tig_window_show(charedit_skills_win);
-    tig_window_show(charedit_spells_win);
-    tig_window_show(charedit_tech_win);
-    tig_window_show(charedit_scheme_win);
-    sub_51E850(charedit_skills_win);
+    // CE: subwindows (skills/spells/tech/scheme) are deferred — they
+    // sit on top of the big-window's scaled VB and would pop into
+    // place instantly while the parent is still spring-scaling. The
+    // on_complete callback at the bottom of charedit_open does the
+    // tig_window_show + sub_51E850 once the parent settles. When the
+    // anim cfg is disabled, on_complete fires synchronously inside
+    // ui_anim_window_show_with_complete so the show calls happen
+    // immediately — matching the no-animation behavior.
 
     if (charedit_mode == CHAREDIT_MODE_PASSIVE) {
         for (index = 0; index < 15; index++) {
@@ -1252,13 +1257,52 @@ bool charedit_open(int64_t obj, ChareditMode mode)
         combat_auto_attack_set(0);
     }
 
+    // CE: spring-driven entrance — scales 92% → 100% with alpha 0 → 1
+    // on the shared big-window. The on_complete callback shows the
+    // skill/spell/tech/scheme subwindows once the parent settles, so
+    // they don't pop in above the spring-scaled parent (the user
+    // reported them appearing instantly while the parent was still
+    // animating — they were tig_window_show'd above, but that call
+    // was removed; the show happens here in on_complete instead).
+    ui_anim_window_show_with_complete(charedit_window_handle,
+        UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
+        charedit_show_subwindows_on_entrance_complete, NULL);
+
     return true;
+}
+
+// CE: ui_anim on_complete — runs when the parent's entrance spring
+// settles. Shows all 4 subwindows (the original code's pattern: all
+// shown then skills brought to top; the other 3 are visible-in-tig-
+// terms but hidden behind skills in z-order, so only skills shows).
+// Guarded against the case where charedit_close was called mid-
+// entrance — fires the callback after the cancel, but charedit_created
+// is false so we skip the show.
+static void charedit_show_subwindows_on_entrance_complete(void* ctx)
+{
+    (void)ctx;
+    if (!charedit_created) {
+        return;
+    }
+    tig_window_show(charedit_skills_win);
+    tig_window_show(charedit_spells_win);
+    tig_window_show(charedit_tech_win);
+    tig_window_show(charedit_scheme_win);
+    sub_51E850(charedit_skills_win);
 }
 
 // 0x55A150
 void charedit_close(void)
 {
     if (charedit_created) {
+        // CE: cancel any in-flight ui_anim tween and reset the window's
+        // transform / tint_reveal to natural. Closing mid-entrance
+        // otherwise leaves the spring still targeting (1.0, 1.0) but
+        // the window hidden; the next open finds a tween in flight and
+        // retargets from stale values — produces a "stuck mid-scale"
+        // wobble on the re-open.
+        ui_anim_cancel_for_window(charedit_window_handle);
+
         charedit_created = false;
         if (charedit_mode == CHAREDIT_MODE_ACTIVE || charedit_mode == CHAREDIT_MODE_PASSIVE) {
             intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);

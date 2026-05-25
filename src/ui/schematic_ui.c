@@ -16,6 +16,7 @@
 #include "ui/gameuilib.h"
 #include "ui/intgame.h"
 #include "ui/tb_ui.h"
+#include "ui/ui_anim.h"
 
 #define SCHEMATIC_F_NAME 0
 #define SCHEMATIC_F_DESCRIPTION 1
@@ -674,6 +675,12 @@ void schematic_ui_create(void)
     gsound_play_sfx(SND_INTERFACE_BOOK_OPEN, 1);
 
     schematic_ui_created = true;
+
+    // CE: spring-driven entrance — scales 92% → 100% with alpha 0 → 1
+    // on the shared big-window. Schematic does not opt into translucent
+    // black, so the compositor uses the cheap transform-only blit.
+    ui_anim_window_show(schematic_ui_window, UI_ANIM_ANCHOR_CENTER,
+        0.92f, NULL);
 }
 
 /**
@@ -686,6 +693,13 @@ void schematic_ui_destroy(void)
     if (!schematic_ui_created) {
         return;
     }
+
+    // CE: cancel any in-flight ui_anim tween and reset the window's
+    // transform to natural. Without this, closing mid-entrance leaves
+    // the spring still targeting (1.0, 1.0) but the window hidden;
+    // the next open finds a tween in flight and retargets from stale
+    // values — produces a "stuck mid-scale" wobble on re-open.
+    ui_anim_cancel_for_window(schematic_ui_window);
 
     // Disable the PC lens.
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
