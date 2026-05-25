@@ -27,6 +27,12 @@ void tb_add(int64_t obj, int type, const char* str);
 void tb_expire_in(int64_t obj, int seconds);
 void tb_notify_moved(int64_t obj, int64_t loc, int offset_x, int offset_y);
 void tb_remove(int64_t obj);
+// CE: like tb_remove but starts an exit fade-out (~380ms) before
+// destroying the bubble. Use for dialogue-end / choice-selection
+// paths so the bubble doesn't snap invisible mid-conversation.
+// Object-death / teleport paths should keep using tb_remove so the
+// bubble is gone the same frame as its owner.
+void tb_remove_with_fade(int64_t obj);
 void tb_clear(void);
 void tb_invalidate_positions(void);
 bool tb_any_active(void);

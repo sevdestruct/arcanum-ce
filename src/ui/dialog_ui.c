@@ -299,7 +299,10 @@ bool dialog_ui_process_option(DialogUiEntry* entry, int option)
         TB_TYPE_GREEN,
         TB_EXPIRE_DEFAULT,
         entry->state.options[option]);
-    tb_remove(entry->state.npc_obj);
+    // CE: fade the NPC's bubble out as the player picks a choice
+    // instead of snapping it gone — matches the rest of the
+    // dialogue's animated transitions.
+    tb_remove_with_fade(entry->state.npc_obj);
     dialog_ui_speech_stop();
     sub_413130(&(entry->state), option);
 

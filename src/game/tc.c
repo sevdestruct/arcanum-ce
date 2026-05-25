@@ -1,5 +1,7 @@
 #include "game/tc.h"
 
+#include "ui/ui_anim.h"
+
 /**
  * The number of lines in the text conversation.
  */
@@ -138,8 +140,17 @@ static const char* tc_options[TEXT_CONVERSATION_LINES];
 static bool tc_active;
 // CE: vertical offset (design-coord pixels) applied to the dialog
 // options backdrop so it sits lower when the HUD bar is cropped.
-// Driven by intgame via tc_set_bottom_gap_offset().
+// Driven by intgame via tc_set_bottom_gap_offset(); the value is
+// spring-tweened by ui_anim_int_to so rapid TAB stage cycling reads
+// as a smooth glide.
 static int tc_bottom_gap_offset = 0;
+
+// CE: most recent target value the gap-offset is springing toward —
+// remembered so tc_set_bottom_gap_offset can early-return when called
+// repeatedly with the same target (which happens on every redraw of
+// some stages). Distinct from tc_bottom_gap_offset which holds the
+// in-flight tween value.
+static int tc_bottom_gap_target = 0;
 // Remember the last compact value seen by tc_clear so we can re-lay
 // out at any time (e.g. on a gap-offset change) without needing the
 // caller to re-pass it.
@@ -439,29 +450,55 @@ void tc_set_bottom_gap_offset(int offset)
     if (tc_editor) {
         return;
     }
-    if (offset == tc_bottom_gap_offset) {
+    if (offset == tc_bottom_gap_target) {
         return;
     }
 
-    // Invalidate the old position so the world repaints under it.
-    if (tc_active && tc_iso_window_invalidate_rect != NULL) {
-        tc_iso_window_invalidate_rect(&tc_content_rect);
+    tc_bottom_gap_target = offset;
+
+    // Spring the gap-offset toward the new target. tc_ping picks up
+    // the interpolated value each frame, recomputes the dialog rect
+    // y, and issues the necessary invalidations as the rect moves —
+    // no need to invalidate from here. ui_anim_int_to retargets a
+    // live tween in place (preserves velocity), so rapid TAB cycling
+    // through stages reads as one continuous glide rather than a
+    // series of snaps.
+    ui_anim_int_to(&tc_bottom_gap_offset, offset, NULL);
+
+    // When the animation cfg is disabled, ui_anim_int_to writes the
+    // end value synchronously — tc_ping will still pick it up next
+    // frame and invalidate. No need to special-case that here.
+}
+
+void tc_ping(void)
+{
+    if (tc_editor || !tc_active || tc_iso_window_invalidate_rect == NULL) {
+        return;
     }
 
-    tc_bottom_gap_offset = offset;
-
-    // Recompute y using the last-known compact value. Width/x stay
-    // the same so we only need to adjust y.
     int bottom_margin = (tc_last_compact ? 37 : 159) - tc_bottom_gap_offset;
     if (bottom_margin < 0) {
         bottom_margin = 0;
     }
-    tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - bottom_margin;
+    int new_y = tc_iso_window_rect.height - tc_content_rect.height - bottom_margin;
 
-    // Invalidate the new position so it paints in.
-    if (tc_active && tc_iso_window_invalidate_rect != NULL) {
-        tc_iso_window_invalidate_rect(&tc_content_rect);
+    if (new_y == tc_content_rect.y) {
+        return;
     }
+
+    // Invalidate the union of the old position and the new position
+    // so the iso world repaints over both regions. The rect shifts
+    // only vertically (width / x are fixed by tc_clear).
+    TigRect dirty = tc_content_rect;
+    if (new_y < tc_content_rect.y) {
+        dirty.height += tc_content_rect.y - new_y;
+        dirty.y = new_y;
+    } else {
+        dirty.height += new_y - tc_content_rect.y;
+    }
+
+    tc_content_rect.y = new_y;
+    tc_iso_window_invalidate_rect(&dirty);
 }
 
 /**

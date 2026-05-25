@@ -450,6 +450,16 @@ bool dialog_load(const char* path, int* dlg_ptr)
 // 0x412F40
 void dialog_unload(int dlg)
 {
+    // CE: gamelib_exit iterates modules backwards, so dialog_exit
+    // runs BEFORE map_exit. When the user quits during an active
+    // dialogue, map_exit's object cleanup fires
+    // dialog_ui_notify_object_destroyed → dialog_ui_end_dialog →
+    // dialog_unload(stale dlg) against a now-freed dialog_files
+    // (NULL after dialog_exit). Guard the deref — by quit time
+    // refcount bookkeeping is irrelevant anyway.
+    if (dialog_files == NULL) {
+        return;
+    }
     dialog_files[dlg].refcount--;
 }
 

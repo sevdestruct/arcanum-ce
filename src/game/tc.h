@@ -21,6 +21,18 @@ TigRect tc_get_content_rect(void);
 // pixels — used to reclaim half the visual real-estate that the cropped
 // HUD bar leaves behind. Pushed from intgame's HUD-stage transitions.
 // 0 = original position (just above the full bar). Higher = lower.
+//
+// The offset is tweened via ui_anim_int_to so rapid TAB-HUD stage
+// cycling produces a smooth glide rather than a snap. tc_ping (called
+// each frame from gamelib_draw) picks up the interpolated value,
+// recomputes the backdrop rect, and invalidates the affected screen
+// region so the iso world repaints underneath.
 void tc_set_bottom_gap_offset(int offset);
+
+// CE: per-frame integrator hook — recomputes the dialog backdrop's
+// vertical position from the (possibly mid-tween) gap-offset value
+// and invalidates the screen region if the rect moved. Cheap when no
+// tween is active (early return on value-unchanged).
+void tc_ping(void);
 
 #endif /* ARCANUM_GAME_TC_H_ */
