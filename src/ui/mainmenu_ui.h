@@ -83,6 +83,23 @@ bool mainmenu_ui_is_active(void);
 // the tint always targeted the iso VB even when the iso world was
 // occluded by the mainmenu backdrop.
 tig_window_handle_t mainmenu_ui_get_backdrop_handle(void);
+
+// CE: true when the persistent backdrop has bespoke custom-bg art
+// (mainmenu_bg.bmp or per-screen *_bg.bmp) loaded into its VB.
+// False when no custom UI art is available — the backdrop is just
+// empty black filler around the legacy panel chrome. The translucent-
+// black tint pathway uses this to decide whether to use the backdrop
+// or the panel as the tint underlay.
+bool mainmenu_ui_has_custom_backdrop_art(void);
+
+// CE: returns the current per-screen panel handle (mainmenu / pause
+// / Options / Save / Load / etc.). For custom-UI shell menus this is
+// aliased to the backdrop; for sub-windows and for legacy / no-
+// custom-bg mode it's a separate window with the screen's chrome art
+// painted in. Used as the tint underlay for legacy menus so modals
+// raised over the menu reveal the legacy chrome through the tint
+// instead of falling through to the pregame world.
+tig_window_handle_t mainmenu_ui_get_panel_handle(void);
 TigWindowModalDialogChoice mainmenu_ui_confirm_quit(void);
 void mainmenu_ui_reset(void);
 void mainmenu_ui_open(void);

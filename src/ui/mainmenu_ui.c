@@ -1,5 +1,6 @@
 #include "ui/mainmenu_ui.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -44,6 +45,7 @@
 #include "ui/slide_ui.h"
 #include "ui/spell_ui.h"
 #include "ui/textedit_ui.h"
+#include "ui/ui_anim.h"
 #include "ui/wmap_rnd.h"
 #include "ui/wmap_ui.h"
 
@@ -144,9 +146,15 @@ static bool main_menu_button_create(MainMenuButtonInfo* info, int width, int hei
 static bool main_menu_button_create_ex(MainMenuButtonInfo* info, int width, int height, unsigned int flags);
 static void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str, TigRect* rect, unsigned int flags);
 static void sub_546DD0(void);
+static bool mainmenu_ui_is_top_level(MainMenuWindowType t);
+static bool mainmenu_ui_is_shell_menu(MainMenuWindowType t);
+static void mainmenu_ui_finalize_close(void* ctx_v);
+static void mainmenu_ui_destroy_persistent_backdrop(void);
+static void mainmenu_ui_bg_finalize_exit(void* ctx_v);
 static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void);
 static void mainmenu_ui_blit_custom_bg_to_window(tig_window_handle_t wnd, TigRect win_rect);
 static void mainmenu_ui_blit_custom_bg_at(tig_window_handle_t wnd, TigRect win_screen_rect, TigRect local_rect);
+static void mainmenu_ui_apply_legacy_vignette(tig_window_handle_t window);
 static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect);
 static bool mainmenu_ui_load_bg_vb(MainMenuWindowType type);
 static void mainmenu_ui_free_custom_bg(void);
@@ -202,6 +210,30 @@ static bool dword_5C3620 = true;
 static tig_window_handle_t mainmenu_ui_window_handle = TIG_WINDOW_HANDLE_INVALID;
 
 static tig_window_handle_t mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+
+// CE: cached offsets from 800x600 design space into the persistent
+// backdrop's local coords. Set once when the backdrop is first
+// created in mainmenu_ui_create_window_func. The backdrop is sized
+// screen-width × MM_BG_OVERDRAW (slightly larger than the screen so
+// it can recede to 0.96 without exposing black edges), so the
+// design-space (0, 0) origin lands at ((ow - 800)/2, (oh - 600)/2)
+// inside the backdrop's VB.
+//
+// Shell menus (mainmenu / pause / single-player / pick-new-or-pregen)
+// host their buttons + text directly on the backdrop — there's no
+// separate per-screen panel for them. mainmenu_ui_refresh_text and
+// main_menu_button_create_ex apply these offsets centrally whenever
+// the host window equals mainmenu_ui_backdrop_handle, so every text /
+// button positioning path (initial create, rollover refresh, the
+// per-frame redraw_foreground in video-playback mode) ends up at the
+// same screen position regardless of which call site initiated it.
+//
+// Sub-window panels (Options / NewChar / Load / Save / ...) are their
+// own tig windows positioned via hrp_apply, so they ignore these
+// offsets — the centralized helpers no-op for non-backdrop hosts.
+static int mainmenu_ui_backdrop_offset_x = 0;
+static int mainmenu_ui_backdrop_offset_y = 0;
+
 static TigVideoBuffer* mainmenu_ui_custom_bg_vb = NULL;
 static int mainmenu_ui_custom_bg_width = 0;
 static int mainmenu_ui_custom_bg_height = 0;
@@ -235,6 +267,53 @@ static tig_window_handle_t mainmenu_ui_bottom_bar_cover_window_handles[3] = {
     TIG_WINDOW_HANDLE_INVALID,
     TIG_WINDOW_HANDLE_INVALID,
 };
+
+// CE: captured tig window handles for a hide-animation-deferred destroy.
+// sub_546DD0 (close current menu sub-window) captures the live PANEL
+// handle into this single-instance ctx, clears the static handle
+// variable (so the next mainmenu_ui_create_window_func can proceed
+// cleanly while the OLD panel is still composited and animating out),
+// and starts the hide animation. When the panel's hide spring settles,
+// ui_anim fires mainmenu_ui_finalize_close which destroys the captured
+// panel.
+//
+// The BACKDROP is NOT included here — it persists across sub-window
+// swaps so the bg art doesn't pulse on every menu navigation. It only
+// recedes / un-recedes on top↔sub transitions, and is destroyed when
+// the mainmenu session ends (mainmenu_ui_handle returns).
+//
+// Cover strips ARE captured: they're per-sub-window chrome and need to
+// be destroyed when their sub-window closes.
+//
+// Single-slot — only one deferred close can be in flight at a time. If
+// sub_546DD0 is called while a previous deferred close is still pending
+// (rapid menu navigation), we force-flush the previous destroys
+// synchronously before starting the new deferred close.
+typedef struct MainmenuUiCloseCtx {
+    bool in_flight;
+    tig_window_handle_t panel;
+    tig_window_handle_t top_cover;
+    tig_window_handle_t bottom_covers[3];
+} MainmenuUiCloseCtx;
+
+static MainmenuUiCloseCtx mainmenu_ui_pending_close;
+
+// CE: persistent-backdrop state. Tracks whether the backdrop is
+// currently "receded" (scale 0.96, when displaying a sub-window) or at
+// rest (scale 1.0, when at top mainmenu). The transition between these
+// states is the only time the backdrop's transform animates — once
+// receded, it STAYS receded across sub-window swaps. Default false
+// (rest) on every new mainmenu session.
+static bool mainmenu_ui_bg_receded = false;
+
+// CE: true when the mainmenu_ui_handle loop has ended and the bg exit
+// tween (fade-out + scale to 0.96) is in flight. The on_complete
+// (mainmenu_ui_bg_finalize_exit) destroys the backdrop only when this
+// flag is still set — a re-open mid-fade clears it and retargets the
+// tween back to the entrance state, in which case the previous
+// callback fires harmlessly. Pattern mirrors fate_ui/sleep_ui's
+// dismiss_pending guard.
+static bool mainmenu_ui_bg_exit_pending = false;
 
 // 0x5C3680
 static TigRect mainmenu_ui_bottom_bar_cover_rects[3] = {
@@ -1363,6 +1442,15 @@ static char byte_64C394[128];
 // 0x64C414
 static MainMenuWindowType mainmenu_ui_window_type;
 
+// CE: tracks the most recently closed mainmenu window type. Captured
+// in sub_546DD0 before the close clears state, read by
+// mainmenu_ui_create_window_func to decide whether the *previous*
+// screen should suppress the new screen's entrance animation
+// (currently: legacy CREDITS → MAINMENU transition, which the
+// credits' own slideshow fade-out already covers).
+static MainMenuWindowType mainmenu_ui_prev_window_type = MM_WINDOW_0;
+
+
 // 0x64C418
 static bool mainmenu_ui_start_new_game;
 
@@ -1434,6 +1522,7 @@ bool mainmenu_ui_init(GameInitInfo* init_info)
     }
 
     settings_register(&settings, "show version", "0", NULL);
+    settings_register(&settings, LEGACY_MENU_VIGNETTE_KEY, "0", NULL);
 
     mainmenu_fonts_init();
 
@@ -1585,6 +1674,25 @@ void mainmenu_ui_start(MainMenuType type)
     tig_timer_now(&mm_start_ts);
 
     if (!mainmenu_ui_active) {
+        // CE: defensive — if MM_TYPE_DEFAULT (pre-game main menu) is
+        // requested while we're currently in an in-game menu type,
+        // redirect to MM_TYPE_IN_PLAY (pause menu). MAIN MENU during
+        // gameplay is an inconsistent state where ESC has no path
+        // back to the game and the user gets stuck. This catches
+        // stray gameuilib_wants_mainmenu_set() calls (e.g. from
+        // multiplayer disconnect callbacks via sub_4A2A30) that
+        // would otherwise force MAIN MENU mid-game.
+        //
+        // Use the PREVIOUS mainmenu_ui_type's "in_game" flag
+        // (stru_5C36B0[type][0]) rather than player_get_local_pc_obj()
+        // — the latter can return a stub PC in some pre-game states
+        // and would mis-route the very first main menu open at cold
+        // start. The static type is initialized to MM_TYPE_DEFAULT,
+        // whose in_game flag is false, so cold start is unaffected.
+        if (type == MM_TYPE_DEFAULT && stru_5C36B0[mainmenu_ui_type][0]) {
+            type = MM_TYPE_IN_PLAY;
+        }
+
         mainmenu_ui_num_windows = 0;
 
         // CE: Hide main interface to prevent world view and top/bottom bars
@@ -1703,6 +1811,45 @@ void sub_5412D0(void)
     sub_5412E0(false);
 }
 
+// CE: pump the game loop briefly so a pending panel exit
+// animation (started by mainmenu_ui_close) has a chance to play
+// through and trigger its destroy callback. Used by the new-game
+// start path before it kicks off gfade_run + teleport_do, which
+// would otherwise block the loop, freeze the panel mid-animation,
+// and resume it later — visible as a doubled fade.
+//
+// Intentionally LIMITED to what the panel animation actually
+// needs: ui_anim_ping (advances the spring), intgame_hud_ping
+// (applies HUD slide updates if any), and tig_window_display
+// (composites + flips the frame). We do NOT call gamelib_ping
+// here — that fans out to every module's ping (teleport, time
+// events, scripts, etc.), and during this pump the new game's
+// world state is half-set-up (PC created in SHOP, but map not
+// loaded yet via teleport_do which fires AFTER us). Letting
+// arbitrary module pings run mid-pump risks firing time-events
+// or polling teleport state in an inconsistent context — the
+// user once saw the PC missing + opening dialogue not triggering,
+// which fits that pattern.
+//
+// timeout_ms caps the wait so we don't hang if the anim never
+// settles (e.g. cfg-disabled fast-path that completes synchronously
+// inside mainmenu_ui_close, leaving in_flight false — loop exits
+// on the first check, so no wasted frames).
+static void mainmenu_ui_pump_until_close_settled(int timeout_ms)
+{
+    tig_timestamp_t start;
+    tig_timer_now(&start);
+    while (mainmenu_ui_pending_close.in_flight) {
+        tig_ping();
+        ui_anim_ping();
+        intgame_hud_ping();
+        tig_window_display();
+        if (tig_timer_elapsed(start) >= timeout_ms) {
+            break;
+        }
+    }
+}
+
 // 0x5412E0
 void sub_5412E0(bool a1)
 {
@@ -1731,8 +1878,25 @@ void sub_5412E0(bool a1)
             mainmenu_ui_auto_equip_items_on_start = false;
         }
 
+        // CE: start the menu's exit animation BEFORE the
+        // fade-to-black + teleport_do, then pump the game loop
+        // until the panel's scale-out completes. Previously the
+        // close ran AFTER teleport_do — the menu's exit
+        // animation ended up playing OVER the just-faded-in
+        // game world (reading as a doubled fade: "fades to black,
+        // fades in still on menu, then game").
+        //
+        // For the non-new-game branch (e.g. simple ESC exit), the
+        // close still runs synchronously below — no fade in flight
+        // to fight, so the legacy behavior is preserved.
+        bool start_new_game = mainmenu_ui_start_new_game;
+        if (start_new_game) {
+            mainmenu_ui_close(false);
+            mainmenu_ui_pump_until_close_settled(400);
+        }
+
         if (mainmenu_ui_window_type != MM_WINDOW_0 || !stru_5C36B0[mainmenu_ui_type][1]) {
-            if (mainmenu_ui_start_new_game) {
+            if (start_new_game) {
                 mainmenu_ui_start_new_game = false;
 
                 map = map_by_type(MAP_TYPE_START_MAP);
@@ -1750,6 +1914,27 @@ void sub_5412E0(bool a1)
                 fade_data.steps = 64;
                 fade_data.duration = 3.0f;
                 gfade_run(&fade_data);
+
+                // CE: with the screen now fully faded to black, tear
+                // down the menu backdrop synchronously — invisible
+                // to the user, and removes the last menu-era window
+                // so teleport_do's later FADE_IN reveals the game
+                // world directly instead of the mainmenu bg. Without
+                // this, the user saw the backdrop briefly come back
+                // through the fade-in before the menu's async exit
+                // animation caught up.
+                mainmenu_ui_destroy_persistent_backdrop();
+                // CE: re-evaluate the HUD bar's translucent-black
+                // underlay NOW. The bar's tint was pointing at the
+                // backdrop we just freed; if we leave it dangling,
+                // the next tig_window_display (fired from
+                // teleport_ping during fade-in) calls
+                // tig_video_blit_near_black_tinted, which calls
+                // SDL_LockSurface on the freed VB and segfaults.
+                // The picker falls through to iso world (or no
+                // underlay) now that no backdrop is up.
+                intgame_refresh_hud_bar_tint();
+                intgame_refresh_modal_tint();
 
                 teleport_data.flags = TELEPORT_MOVIE1 | TELEPORT_MOVIE2 | TELEPORT_FADE_IN;
                 teleport_data.obj = pc_obj;
@@ -1784,7 +1969,9 @@ void sub_5412E0(bool a1)
             }
         }
 
-        mainmenu_ui_close(false);
+        if (!start_new_game) {
+            mainmenu_ui_close(false);
+        }
     }
 
     intgame_refresh_cursor();
@@ -1871,6 +2058,46 @@ bool mainmenu_ui_handle(void)
         tig_window_display();
     }
 
+    // CE: session end — mainmenu_ui_active dropped to false, the loop
+    // is exiting. Force-flush any pending deferred panel destroy so
+    // we don't leak tig windows, then START the bg exit animation
+    // ASYNCHRONOUSLY and return. The main game loop's ui_anim_ping
+    // advances the spring over the next few frames; when it settles,
+    // mainmenu_ui_bg_finalize_exit fires and destroys the backdrop.
+    //
+    // Going async (vs the previous blocking pump) is what makes the
+    // exit interruptible: if the user re-opens the mainmenu via ESC
+    // or button mid-fade, the next mainmenu_ui_create_window_func
+    // call clears the exit-pending flag and retargets the bg tween
+    // back to entrance — preserving current spring value for a
+    // smooth reversal, no waiting for the exit to finish.
+    if (mainmenu_ui_pending_close.in_flight) {
+        mainmenu_ui_finalize_close(&mainmenu_ui_pending_close);
+    }
+
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        if (mainmenu_ui_has_custom_bg) {
+            // Custom UI: animate the backdrop's bg art out
+            // (scale + alpha) so the menu visually dismisses into
+            // the world / pre-game black behind it.
+            ui_anim_profile_t exit_profile = { 300, 1.2f };
+            float exit_from = mainmenu_ui_bg_receded ? 0.96f : 1.0f;
+            mainmenu_ui_bg_exit_pending = true;
+            ui_anim_window_transform_from_to_with_complete(
+                mainmenu_ui_backdrop_handle,
+                exit_from, 1.0f, 0.96f, 0.0f,
+                UI_ANIM_ANCHOR_CENTER, &exit_profile,
+                mainmenu_ui_bg_finalize_exit, NULL);
+        } else {
+            // Legacy / no-custom-bg: destroy backdrop
+            // synchronously. The backdrop is just empty black
+            // filler — fading it out doesn't add anything
+            // visually, and a mid-fade re-open would expose a
+            // rate-mismatched retarget against a fresh panel.
+            mainmenu_ui_destroy_persistent_backdrop();
+        }
+    }
+
     return true;
 }
 
@@ -1889,6 +2116,18 @@ bool mainmenu_ui_is_active(void)
 tig_window_handle_t mainmenu_ui_get_backdrop_handle(void)
 {
     return mainmenu_ui_backdrop_handle;
+}
+
+// CE: see mainmenu_ui.h.
+bool mainmenu_ui_has_custom_backdrop_art(void)
+{
+    return mainmenu_ui_has_custom_bg;
+}
+
+// CE: see mainmenu_ui.h.
+tig_window_handle_t mainmenu_ui_get_panel_handle(void)
+{
+    return mainmenu_ui_window_handle;
 }
 
 // 0x541690
@@ -1959,6 +2198,19 @@ void mainmenu_ui_open(void)
 // 0x5417A0
 void mainmenu_ui_close(bool back)
 {
+    // CE: bail when the mainmenu has already been closed (e.g. by
+    // a sub_5412D0 exit-to-game called from inside a button's
+    // execute_func mid-load). Otherwise a queued ESC processed
+    // after the load completes would call this with mainmenu_ui_
+    // active=false, sub_546DD0 would no-op, and the back=true
+    // path would pop the window stack and re-open the parent
+    // menu — leaving the user stuck on a NEW MAINMENU panel
+    // while the game has already loaded behind it, with no way
+    // to ESC back to the game (ESC on MAINMENU is ignored).
+    if (!mainmenu_ui_active) {
+        return;
+    }
+
     if (main_menu_window_info[mainmenu_ui_window_type]->exit_func != NULL) {
         main_menu_window_info[mainmenu_ui_window_type]->exit_func();
     }
@@ -2207,11 +2459,21 @@ void mainmenu_ui_create_options(void)
     mainmenu_ui_window_type = MM_WINDOW_OPTIONS;
     mainmenu_ui_create_window_func(false);
     dword_64C440 = 0;
-    options_ui_start(OPTIONS_UI_TAB_GAME, mainmenu_ui_window_handle, stru_5C36B0[mainmenu_ui_type][1] == 0);
+    options_ui_start(OPTIONS_UI_TAB_GAME, mainmenu_ui_window_handle,
+        stru_5C36B0[mainmenu_ui_type][1] == 0,
+        mainmenu_ui_window_rect.y);
     mainmenu_ui_draw_version();
 
     pc_lens.window_handle = mainmenu_ui_window_handle;
-    pc_lens.rect = &stru_5C4490;
+    // CE: stru_5C4490 is in design coords. When the panel's design
+    // origin shifts down (hi-res top crop), every drawn element
+    // anchored to design space has to subtract the same offset so
+    // it lands on the right screen pixel relative to the cropped
+    // chrome. The pc_lens icon is one of those — without this, the
+    // icon ended up 41px below where the chrome art expects it.
+    TigRect lens_rect = stru_5C4490;
+    lens_rect.y -= mainmenu_ui_window_rect.y;
+    pc_lens.rect = &lens_rect;
     tig_art_interface_id_create(670, 0, 0, 0, &pc_lens.art_id);
     if (stru_5C36B0[mainmenu_ui_type][0]) {
         pc_obj = player_get_local_pc_obj();
@@ -2302,13 +2564,19 @@ void sub_541E20(int a1)
         dword_64C440 = a1;
         switch (dword_64C440) {
         case 0:
-            options_ui_start(OPTIONS_UI_TAB_GAME, mainmenu_ui_window_handle, stru_5C36B0[mainmenu_ui_type][1] == 0);
+            options_ui_start(OPTIONS_UI_TAB_GAME, mainmenu_ui_window_handle,
+                stru_5C36B0[mainmenu_ui_type][1] == 0,
+                mainmenu_ui_window_rect.y);
             break;
         case 1:
-            options_ui_start(OPTIONS_UI_TAB_VIDEO, mainmenu_ui_window_handle, stru_5C36B0[mainmenu_ui_type][1] == 0);
+            options_ui_start(OPTIONS_UI_TAB_VIDEO, mainmenu_ui_window_handle,
+                stru_5C36B0[mainmenu_ui_type][1] == 0,
+                mainmenu_ui_window_rect.y);
             break;
         case 2:
-            options_ui_start(OPTIONS_UI_TAB_AUDIO, mainmenu_ui_window_handle, stru_5C36B0[mainmenu_ui_type][1] == 0);
+            options_ui_start(OPTIONS_UI_TAB_AUDIO, mainmenu_ui_window_handle,
+                stru_5C36B0[mainmenu_ui_type][1] == 0,
+                mainmenu_ui_window_rect.y);
             break;
         }
     }
@@ -4763,6 +5031,20 @@ bool main_menu_button_create_ex(MainMenuButtonInfo* info, int width, int height,
     } else {
         button_data.window_handle = mainmenu_ui_window_handle;
         button_data.y -= mainmenu_ui_window_rect.y;
+        // CE: shell-menu buttons live on the persistent backdrop
+        // (no separate panel). The backdrop's local coords are
+        // offset from design space by ((ow-800)/2, (oh-600)/2)
+        // because the backdrop is screen-sized × MM_BG_OVERDRAW
+        // with the 800x600 design area centered inside it. Add the
+        // cached offset so design-space info->x/y land at the
+        // right screen position for any resolution. Sub-window
+        // panels are positioned via hrp_apply so their interior
+        // coords already match design space and this no-ops.
+        if (mainmenu_ui_window_handle == mainmenu_ui_backdrop_handle
+            && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+            button_data.x += mainmenu_ui_backdrop_offset_x;
+            button_data.y += mainmenu_ui_backdrop_offset_y;
+        }
     }
 
     if ((info->flags & 0x2) != 0) {
@@ -4976,6 +5258,18 @@ static void mainmenu_ui_blit_custom_bg_at(tig_window_handle_t wnd, TigRect win_s
     tig_window_copy_from_vbuffer(wnd, &dst_r, mainmenu_ui_custom_bg_vb, &src_r);
 }
 
+// CE: thin wrapper around the shared gamelib helper — extracts the
+// panel window's video buffer and delegates the actual pixel work.
+// See gamelib_apply_legacy_vignette_to_vb for the full behavior +
+// resolution gating.
+static void mainmenu_ui_apply_legacy_vignette(tig_window_handle_t window)
+{
+    TigVideoBuffer* vb;
+    if (window == TIG_WINDOW_HANDLE_INVALID) return;
+    if (tig_window_vbid_get(window, &vb) != TIG_OK) return;
+    gamelib_apply_legacy_vignette_to_vb(vb);
+}
+
 // Restore the text area from the currently active backdrop source so shared
 // morph-text entries can stay transparent over custom backgrounds.
 static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle, TigRect* rect)
@@ -5010,6 +5304,23 @@ static void mainmenu_ui_restore_text_backdrop(tig_window_handle_t window_handle,
 
     dst_rect = src_rect;
 
+    // CE: for hi-res Options the panel was created with src_rect.y =
+    // mainmenu_ui_window_rect.y (= 41) — see the panel blit in
+    // mainmenu_ui_create_window_func. So panel-local y N corresponds
+    // to art y N+41. mainmenu_ui_refresh_text passes rect already
+    // translated to panel-local for sub-window panels, so we need
+    // to add the same offset back when sampling from the source art
+    // to restore the chrome under the text. Otherwise the restored
+    // pixels come from 41 rows higher in the art (= the cropped
+    // header chrome) and look misaligned baked into the buttons.
+    bool is_hires = (hrp_iso_window_width_get() > 800
+        || hrp_iso_window_height_get() > 600);
+    if (is_hires
+        && mainmenu_ui_window_type == MM_WINDOW_OPTIONS
+        && window_handle == mainmenu_ui_window_handle) {
+        src_rect.y += mainmenu_ui_window_rect.y;
+    }
+
     art_blit_info.flags = 0;
     art_blit_info.art_id = art_id;
     art_blit_info.src_rect = &src_rect;
@@ -5035,7 +5346,14 @@ static void mainmenu_ui_reapply_custom_bg(void)
         return;
     }
 
-    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
+    // CE: re-blit the panel's bg too, but ONLY for shell menus (which
+    // have an OPAQUE panel with bg painted into it — see panel
+    // creation block for the policy split). Sub-window panels are
+    // TIG_WINDOW_TRANSPARENT and composite through to the backdrop,
+    // so painting bg redundantly inside them would just re-create
+    // the panel/backdrop scale-mismatch tear during animations.
+    if (mainmenu_ui_is_shell_menu(mainmenu_ui_window_type)
+        && mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
         && tig_window_data(mainmenu_ui_window_handle, &window_data) == TIG_OK) {
         mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_window_handle, window_data.rect);
     }
@@ -5075,6 +5393,12 @@ void mainmenu_ui_create_window_func(bool should_display)
     bool v1 = false;
     int idx;
     int rc;
+    // CE: true if THIS call to create_window_func created the
+    // persistent backdrop fresh (start of a mainmenu session). Used
+    // below to trigger the bg entrance animation. Subsequent calls
+    // in the same session reuse the existing backdrop and leave
+    // this false.
+    bool created_backdrop_now = false;
 
     if (dword_64C388) {
         should_display = false;
@@ -5121,49 +5445,155 @@ void mainmenu_ui_create_window_func(bool should_display)
         && (save_load_screen
             || mainmenu_ui_window_type == MM_WINDOW_OPTIONS);
 
-    // Skip the cosmetic top/bottom bar covers around Save / Load / Last-
-    // Save at hi-res, regardless of how the screen was reached. There's
-    // never a HUD info-bar use case for those screens, so the cover band
-    // is always pure cosmetic chrome that the user wants gone.
-    // At 800x600 those covers ARE the vanilla menu chrome — keep them.
-    bool skip_bar_covers = is_hires && save_load_screen;
+    // CE: shortcut paths (Cmd+O / Cmd+S / Cmd+L / plain O while in
+    // game) want NO backdrop — the menu draws over the live game
+    // world. But if a previous mainmenu session is still mid-fade
+    // when the shortcut fires (user ESC'd out of pause and
+    // immediately pressed O), the backdrop window is still alive
+    // (mainmenu_ui_bg_exit_pending == true) and the bg animation
+    // state machine further down would retarget it back to the
+    // entrance state — leaving the pause-menu bg painted behind
+    // the Options panel instead of the live game world.
+    //
+    // Force-destroy the backdrop immediately on shortcut entry to
+    // prevent that retargeting from happening. Cancels the in-
+    // flight exit tween (mainmenu_ui_destroy_persistent_backdrop
+    // doesn't go through the spring) and frees the bg VB.
+    if (skip_hires_scaffold
+        && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        mainmenu_ui_bg_exit_pending = false;
+        mainmenu_ui_destroy_persistent_backdrop();
+    }
 
-    if (!skip_hires_scaffold
-        && (hrp_iso_window_width_get() > 800 || hrp_iso_window_height_get() > 600)) {
+    // Skip the cosmetic top/bottom bar covers around Save / Load / Last-
+    // Save AND Options at hi-res. There's never a HUD info-bar use case
+    // for those screens, so the cover band is always pure cosmetic
+    // chrome that the user wants gone. skip_bar_covers also forces the
+    // backdrop bg to mainmenu_bg.bmp (instead of the per-screen
+    // *_bg.bmp), which would otherwise re-introduce the chrome bar at
+    // the bottom of the screen for Options (the options_bg.bmp art has
+    // the bottom info-bar chrome baked in, visible where the cropped
+    // Options panel doesn't cover).
+    // At 800x600 those covers ARE the vanilla menu chrome — keep them.
+    bool skip_bar_covers = is_hires
+        && (save_load_screen || mainmenu_ui_window_type == MM_WINDOW_OPTIONS);
+
+    // CE: chargen / shop screens keep the bottom-bar-cover wings (those
+    // frame the HUD info-bar band the chargen UI uses) but DROP the
+    // decorative top header in hi-res. The header is purely cosmetic
+    // chrome that the user finds redundant on a wide modern screen,
+    // and at 800x600 the original game art already includes it as part
+    // of the panel.
+    bool chargen_screen =
+        mainmenu_ui_window_type == MM_WINDOW_NEW_CHAR
+        || mainmenu_ui_window_type == MM_WINDOW_PREGEN_CHAR
+        || mainmenu_ui_window_type == MM_WINDOW_CHAREDIT
+        || mainmenu_ui_window_type == MM_WINDOW_SHOP;
+    bool skip_top_bar_cover = skip_bar_covers
+        || (is_hires && chargen_screen);
+
+    // Always create the persistent backdrop (when not on a shortcut
+    // path that wants to render over the live game world). The
+    // backdrop serves two purposes:
+    //   1) Custom-UI: holds the bg art (mainmenu_bg.bmp etc) —
+    //      visible everywhere the panel isn't.
+    //   2) Legacy / vanilla / no-custom-bg: black filler behind
+    //      the legacy panel. Needed even at 800x600 because the
+    //      panel entrance/exit animation scales the panel down
+    //      momentarily, and without a backdrop the area exposed
+    //      around the scaled-down panel would reveal the pregame
+    //      world (or whatever was behind).
+    //
+    // The size gate (>800 || >600) was removed — the legacy panel
+    // animations need fill behind them at any resolution. The
+    // overdraw cost is small (a screen-sized window with black
+    // fill) and the visual benefit is meaningful.
+    if (!skip_hires_scaffold) {
         TigWindowData backdrop_data;
         MainMenuWindowType backdrop_bg_type;
+        // CE: oversize the backdrop slightly so that when it recedes
+        // (scale 0.96) the screen is still fully covered — no black
+        // edges exposed. Oversize factor = 1.0 / RECEDE_SCALE; the
+        // frame extends off-screen on each side by half the surplus.
+        // At rest (scale 1.0) the user sees the SCREEN-sized center
+        // of the backdrop VB; at receded (0.96) the user sees the
+        // entire oversized VB shrunk to fit the screen. The bg art
+        // (mainmenu_bg.bmp is 1920x1080) is sampled wider/taller
+        // than the screen for the overdraw region to land on real
+        // pixels — relies on the asset being larger than the screen.
+        const float MM_BG_OVERDRAW = 1.0f / 0.96f;
+        int sw = hrp_iso_window_width_get();
+        int sh = hrp_iso_window_height_get();
+        int ow = (int)((float)sw * MM_BG_OVERDRAW + 0.5f);
+        int oh = (int)((float)sh * MM_BG_OVERDRAW + 0.5f);
         // Not ALWAYS_ON_TOP: the per-screen mainmenu_ui_window is itself
         // ALWAYS_ON_TOP and sits above the backdrop. For CHAREDIT (no main
         // window — uses intgame_big_window), we move the big window to the
         // top of its z-class so it lands above this backdrop.
         backdrop_data.flags = TIG_WINDOW_MESSAGE_FILTER;
-        backdrop_data.rect.x = 0;
-        backdrop_data.rect.y = 0;
-        backdrop_data.rect.width = hrp_iso_window_width_get();
-        backdrop_data.rect.height = hrp_iso_window_height_get();
+        backdrop_data.rect.x = -(ow - sw) / 2;
+        backdrop_data.rect.y = -(oh - sh) / 2;
+        backdrop_data.rect.width = ow;
+        backdrop_data.rect.height = oh;
         backdrop_data.background_color = tig_color_make(0, 0, 0);
         backdrop_data.color_key = tig_color_make(0, 0, 0);
         backdrop_data.message_filter = mainmenu_ui_message_filter;
-        // For chrome-less Save / Load (main-menu Load Game in particular),
-        // skip the per-screen *_bg.bmp art and force the plain mainmenu_bg
-        // backdrop. The screen-specific arts (loadgame_bg / savegame_bg)
-        // have the HUD chrome painted into them; using them as the backdrop
-        // would re-introduce the "bottom HUD" the bar-cover skip just
-        // removed. Plain mainmenu_bg is what the user wants showing behind
-        // the panel here.
-        backdrop_bg_type = skip_bar_covers
+        // Shell menus (mainmenu / pause / single-player / pick-new-or-
+        // pregen) and Save/Load all use the plain mainmenu_bg.bmp as
+        // their backdrop. Their per-screen *_bg.bmp arts have legacy
+        // chrome painted in that we no longer want to show (the panel
+        // is gone for shell menus; for Save/Load the chrome was the
+        // info-bar at the bottom). Other sub-windows (Options /
+        // NewChar / Charedit / Credits / ...) use their own bg art.
+        backdrop_bg_type = (skip_bar_covers
+                || mainmenu_ui_is_shell_menu(mainmenu_ui_window_type))
             ? MM_WINDOW_MAINMENU
             : mainmenu_ui_bg_window_type_resolve();
-        if (tig_window_create(&backdrop_data, &mainmenu_ui_backdrop_handle) == TIG_OK) {
+
+        // CE: persistent backdrop — if a previous create in this
+        // mainmenu session already created the backdrop window, just
+        // reuse it. Re-load the bg VB (different sub-windows can want
+        // different bg art) and re-blit onto the existing window. The
+        // window's transform state is preserved (already at receded
+        // 0.96 if a sub-window was previously shown), avoiding the
+        // bg-pulse-per-window-change visual.
+        if (mainmenu_ui_backdrop_handle == TIG_WINDOW_HANDLE_INVALID) {
+            if (tig_window_create(&backdrop_data, &mainmenu_ui_backdrop_handle) == TIG_OK) {
+                created_backdrop_now = true;
+                // Cache the design-space → backdrop-local offsets so
+                // shell-menu buttons + text land centered on screen
+                // regardless of resolution.
+                mainmenu_ui_backdrop_offset_x = (ow - 800) / 2;
+                mainmenu_ui_backdrop_offset_y = (oh - 600) / 2;
+            }
+        }
+        if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
             if (mainmenu_ui_load_bg_vb(backdrop_bg_type)) {
                 mainmenu_ui_has_custom_bg = true;
-                // The per-window panel overlay (later down the function)
-                // blits this same custom bg through the panel's chromakeys
-                // when !is_fallback. For Save / Load that overlay would
-                // paint mainmenu_bg through the panel — also unwanted.
-                // Mark it as fallback to suppress the overlay; the backdrop
-                // alone carries the mainmenu_bg art.
-                if (skip_bar_covers) {
+                // is_fallback gates two things:
+                //   1) the per-window panel overlay later down the
+                //      function — blits the bg through the panel's
+                //      chromakey when !is_fallback. For Save/Load/
+                //      Options this would paint mainmenu_bg through
+                //      the panel chrome, which we don't want.
+                //   2) mainmenu_ui_restore_text_backdrop — uses the
+                //      custom bg as the restore source when
+                //      !is_fallback, otherwise falls through to
+                //      blitting background_art_num (the panel chrome
+                //      art) over the text area.
+                //
+                // For shell menus (backdrop-as-host: buttons + text
+                // live directly on the backdrop), restore MUST use
+                // the custom bg — falling through to the chrome art
+                // would paint decorative panel pixels over the
+                // backdrop's bg and leave white-ish halos where
+                // text rolls over. Leave is_fallback false for them.
+                //
+                // For Save/Load/Options the chrome restore path is
+                // correct (their text lives on the panel, not the
+                // backdrop) so is_fallback stays true.
+                if (skip_bar_covers
+                    && !mainmenu_ui_is_shell_menu(mainmenu_ui_window_type)) {
                     mainmenu_ui_custom_bg_is_fallback = true;
                 }
                 mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_backdrop_handle, backdrop_data.rect);
@@ -5175,22 +5605,17 @@ void mainmenu_ui_create_window_func(bool should_display)
         // the strip content (rotwin / info bar / counters) underneath the
         // way upstream's z-compositing always did.
         //
-        // Exceptions — DON'T promote:
-        //
-        //  - Pre-game Options (main menu flavor, no game in session):
-        //    nothing meaningful to show in the strip, and the panel is
-        //    cropped down by 157px so any visible strip would just hang
-        //    in empty space. Let the backdrop cover it.
-        //
-        //  - Save / Load / Last-Save (any path): we don't want the HUD
-        //    band visible. If a previous game session populated the
-        //    strip windows, promoting them above the backdrop would
-        //    bleed the HUD through the mainmenu_bg backdrop. The
-        //    strip-management block further down does the explicit
-        //    hide; skipping promote here avoids a brief visible flash.
-        if ((mainmenu_ui_window_type != MM_WINDOW_OPTIONS
-                || stru_5C36B0[mainmenu_ui_type][0])
-            && !save_load_screen) {
+        // CE: only character-creation screens (new-char / pregen /
+        // charedit) legitimately use the bottom HUD strip as part
+        // of their layout. Every other menu screen hides it via
+        // intgame_iso_strips_hide_full() further down — skip the
+        // promote here on those paths so the strip doesn't flash
+        // visible between promote and hide.
+        bool screen_uses_hud_strip =
+            mainmenu_ui_window_type == MM_WINDOW_NEW_CHAR
+            || mainmenu_ui_window_type == MM_WINDOW_PREGEN_CHAR
+            || mainmenu_ui_window_type == MM_WINDOW_CHAREDIT;
+        if (screen_uses_hud_strip) {
             intgame_iso_strips_promote();
         }
     }
@@ -5222,43 +5647,240 @@ void mainmenu_ui_create_window_func(bool should_display)
         //
         // Hi-res only — at native 800x600 the panel IS the screen and the
         // bottom 157px is the legitimate (vanilla) info-bar area.
+        //
+        // CE: also crop the TOP 41px decorative header off Options at
+        // hi-res — same rationale as the bottom: no content lives in
+        // those rows. After both crops the Options panel is 800x402.
+        // Button positions (read in design space and translated via
+        // mainmenu_ui_window_rect.y) ride along correctly. src_rect.y
+        // is set from rect.y in the Options blit branch below so the
+        // panel's VB actually shows art y=41..443.
         if (is_hires
-            && mainmenu_ui_window_type == MM_WINDOW_OPTIONS
-            && mainmenu_ui_window_rect.height > 157) {
-            mainmenu_ui_window_rect.height -= 157;
+            && mainmenu_ui_window_type == MM_WINDOW_OPTIONS) {
+            if (mainmenu_ui_window_rect.height > 157) {
+                mainmenu_ui_window_rect.height -= 157;
+            }
+            if (mainmenu_ui_window_rect.height > 41) {
+                mainmenu_ui_window_rect.y += 41;
+                mainmenu_ui_window_rect.height -= 41;
+            }
         }
 
         if (tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
-            window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP | TIG_WINDOW_MESSAGE_FILTER;
-            window_data.rect = mainmenu_ui_window_rect;
-            window_data.background_color = art_anim_data.color_key;
-            window_data.color_key = art_anim_data.color_key;
-            window_data.message_filter = mainmenu_ui_message_filter;
-            hrp_apply(&(window_data.rect), GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
+            // CE: host-window strategy depends on the menu type.
+            //
+            // - SHELL MENUS (mainmenu / pause / pause-locked / single-
+            //   player / pick-new-or-pregen):
+            //     NO separate panel window. The persistent backdrop
+            //     hosts the shell's buttons + text directly —
+            //     mainmenu_ui_window_handle is aliased to
+            //     mainmenu_ui_backdrop_handle so all the downstream
+            //     button/text positioning code keeps working. The
+            //     centralized offset (mainmenu_ui_backdrop_offset_*)
+            //     applied inside mainmenu_ui_refresh_text and
+            //     main_menu_button_create_ex translates the 800x600
+            //     design coords into the backdrop's local coords so
+            //     everything ends up centered on screen at any
+            //     resolution.
+            //
+            //     This is what's required to play nicely with the
+            //     video-playback bg: video frames overwrite the
+            //     backdrop's VB each frame, then video-playback's
+            //     redraw_foreground re-blits buttons + re-renders
+            //     text from the original button/text data — both go
+            //     through the same offset-aware helpers, so rollover
+            //     and idle states stay aligned regardless of
+            //     animation phase or frame number.
+            //
+            // - SUB-WINDOWS (Options / Load / Save / NewChar /
+            //   Charedit / Credits / ...):
+            //     TRANSPARENT panel — chrome art painted, no bg paint
+            //     overlay. The chromakey'd regions composite through
+            //     to the persistent backdrop (which carries the bg
+            //     art or live video). Sub-window panels animate
+            //     scale + alpha for entrance/exit independently of
+            //     the backdrop.
+            bool is_shell = mainmenu_ui_is_shell_menu(mainmenu_ui_window_type);
+            // CE: only use the backdrop-as-host shortcut when ALL of:
+            //   - this is a shell menu (mainmenu / pause / single-
+            //     player / pick-new-or-pregen)
+            //   - the persistent backdrop exists (hi-res mode)
+            //   - a custom bg art was successfully loaded
+            //   - the bg isn't a generic mainmenu_bg fallback for
+            //     a screen whose normal bg art has chrome baked in
+            //
+            // Otherwise fall back to legacy OPAQUE panel rendering:
+            //   - vanilla 800x600: no backdrop, panel chrome is the
+            //     entire visual.
+            //   - hi-res no-custom-bg: backdrop exists but is empty;
+            //     panel chrome provides the menu visual, backdrop
+            //     shows as black around it.
+            //   - sub-windows: their per-screen chrome panel is the
+            //     visual anchor; custom bg is painted into the panel
+            //     overlay so its chromakey'd regions show the bg.
+            bool use_backdrop_host = is_shell
+                && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
+                && mainmenu_ui_has_custom_bg
+                && !mainmenu_ui_custom_bg_is_fallback;
 
-            src_rect.x = mainmenu_ui_window_rect.x;
-            src_rect.y = 0;
-            src_rect.width = mainmenu_ui_window_rect.width;
-            src_rect.height = mainmenu_ui_window_rect.height;
+            if (use_backdrop_host) {
+                // Shell: re-use the backdrop as the host window.
+                // mainmenu_ui_window_rect stays as the 800x600 design
+                // rect — downstream code reads its .y for partial-
+                // rect button-y adjustment (which is 0 for shell
+                // menus so no-op).
+                mainmenu_ui_window_handle = mainmenu_ui_backdrop_handle;
 
-            dst_rect.x = 0;
-            dst_rect.y = 0;
-            dst_rect.width = mainmenu_ui_window_rect.width;
-            dst_rect.height = mainmenu_ui_window_rect.height;
+                // CE: when transitioning sub→backdrop-hosted-shell
+                // (e.g. ESC out of Options to mainmenu), the still-
+                // animating sub-window panel is ALWAYS_ON_TOP and
+                // the backdrop (now the shell's host) is MIDDLE z-
+                // class. Without intervention the dying sub panel
+                // would sit on top of the new shell for the
+                // ~260ms hide animation, blocking clicks to the
+                // shell's buttons — the user reported this as
+                // mis-clicking risk on rapid dismissals. Flush
+                // the pending close synchronously so the sub
+                // panel is destroyed immediately and the
+                // backdrop-hosted shell is clickable from frame 1.
+                // The visual cost is losing the panel's fade-out
+                // animation in this specific transition, but the
+                // backdrop's own scale-up to 1.0 still provides
+                // visual continuity of "entering the shell".
+                //
+                // Legacy / no-custom-bg path is untouched: the new
+                // shell panel is also ALWAYS_ON_TOP (created
+                // newer), so z-order puts it above the dying sub
+                // panel and clicks already work — no need to
+                // sacrifice the hide animation there.
+                if (mainmenu_ui_pending_close.in_flight) {
+                    mainmenu_ui_finalize_close(&mainmenu_ui_pending_close);
+                }
+            } else {
+                // Legacy / separate-panel path. Almost always OPAQUE
+                // (no TIG_WINDOW_TRANSPARENT) — matches the original
+                // Arcanum render path. Chrome art is blitted in; if
+                // a custom bg is present it's also painted into the
+                // panel so the panel's background matches the
+                // backdrop's. No chromakey composite — every pixel
+                // of the panel is visible.
+                //
+                // EXCEPTION: Options panel at vanilla 800x600 (and
+                // any case where the panel isn't cropped to omit the
+                // bottom rotwin band). The user wants a rotwin-sized
+                // hole knocked out at the bottom-center so the iso
+                // HUD's rotwin shows through (in-game shortcut Options
+                // path). For these cases, set TIG_WINDOW_TRANSPARENT
+                // and fill the rotwin rect with the color-key after
+                // blitting chrome. Hi-res Options is already cropped
+                // (height reduced by 157px) so it doesn't cover the
+                // rotwin area — no KO needed there.
+                bool ko_rotwin =
+                    (mainmenu_ui_window_type == MM_WINDOW_OPTIONS
+                     && mainmenu_ui_window_rect.height > 488);
 
-            art_blit_info.flags = 0;
-            art_blit_info.art_id = art_id;
-            art_blit_info.src_rect = &src_rect;
-            art_blit_info.dst_rect = &dst_rect;
+                window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP
+                    | TIG_WINDOW_MESSAGE_FILTER;
+                if (ko_rotwin) {
+                    window_data.flags |= TIG_WINDOW_TRANSPARENT;
+                }
+                window_data.rect = mainmenu_ui_window_rect;
+                window_data.background_color = art_anim_data.color_key;
+                window_data.color_key = art_anim_data.color_key;
+                window_data.message_filter = mainmenu_ui_message_filter;
+                hrp_apply(&(window_data.rect), GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
 
-            if (tig_window_create(&window_data, &mainmenu_ui_window_handle) != TIG_OK) {
-                tig_debug_printf("mainmenu_ui_create_window_func: ERROR: tig_art_anim_data failed!\n");
-                exit(EXIT_SUCCESS); // FIXME: Should be `EXIT_FAILURE`.
-            }
+                src_rect.x = mainmenu_ui_window_rect.x;
+                // CE: hi-res Options crops the top 41 header rows
+                // off the source art (along with the bottom 157). The
+                // src_rect.y offset routes the blit past those rows.
+                // Save/Load already shifts mainmenu_ui_window_rect.y
+                // to 41 in its partial-rect definition but its art is
+                // laid out so y=0..400 IS the panel body — for those
+                // src.y stays 0. The is_hires + Options gate is the
+                // single special case.
+                src_rect.y = (is_hires
+                        && mainmenu_ui_window_type == MM_WINDOW_OPTIONS)
+                    ? mainmenu_ui_window_rect.y
+                    : 0;
+                src_rect.width = mainmenu_ui_window_rect.width;
+                src_rect.height = mainmenu_ui_window_rect.height;
 
-            tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
-            if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
-                mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_window_handle, window_data.rect);
+                dst_rect.x = 0;
+                dst_rect.y = 0;
+                dst_rect.width = mainmenu_ui_window_rect.width;
+                dst_rect.height = mainmenu_ui_window_rect.height;
+
+                art_blit_info.flags = 0;
+                art_blit_info.art_id = art_id;
+                art_blit_info.src_rect = &src_rect;
+                art_blit_info.dst_rect = &dst_rect;
+
+                if (tig_window_create(&window_data, &mainmenu_ui_window_handle) != TIG_OK) {
+                    tig_debug_printf("mainmenu_ui_create_window_func: ERROR: tig_art_anim_data failed!\n");
+                    exit(EXIT_SUCCESS); // FIXME: Should be `EXIT_FAILURE`.
+                }
+
+                tig_window_blit_art(mainmenu_ui_window_handle, &art_blit_info);
+
+                // Paint the custom bg overlay into the panel when
+                // available (and not a fallback overlay-suppress case
+                // like Save/Load where the mainmenu_bg fallback is
+                // backdrop-only). Matches the original CE custom-bg
+                // pattern: the panel's bg slice and the backdrop's
+                // bg slice come from the same source, so the panel's
+                // chromakey'd regions composite seamlessly into the
+                // surrounding backdrop bg without visible seams.
+                if (mainmenu_ui_has_custom_bg
+                    && !mainmenu_ui_custom_bg_is_fallback) {
+                    mainmenu_ui_blit_custom_bg_to_window(
+                        mainmenu_ui_window_handle, window_data.rect);
+                }
+
+                // CE: opt-in elliptical-vignette fade on legacy
+                // chrome. Only fires when:
+                //   - no custom-bg art is loaded (custom UI is
+                //     designed for the full screen and doesn't
+                //     need a vignette)
+                //   - the user enabled LEGACY_MENU_VIGNETTE_KEY
+                //   - the screen is a "non-functional" art panel:
+                //     mainmenu / pause / single-player landing,
+                //     plus the loading splash transitions
+                //     (WINDOW_0 / WINDOW_1) and the intro /
+                //     credits screens. Functional dialogs (Options,
+                //     Save/Load, NewChar / PickChar, Charedit)
+                //     are excluded — their chrome readability
+                //     matters.
+                //
+                // One-shot post-process — happens once per panel
+                // creation, no per-frame cost.
+                bool vignette_eligible =
+                    mainmenu_ui_window_type == MM_WINDOW_MAINMENU
+                    || mainmenu_ui_window_type == MM_WINDOW_MAINMENU_IN_PLAY
+                    || mainmenu_ui_window_type == MM_WINDOW_MAINMENU_IN_PLAY_LOCKED
+                    || mainmenu_ui_window_type == MM_WINDOW_SINGLE_PLAYER
+                    || mainmenu_ui_window_type == MM_WINDOW_PICK_NEW_OR_PREGEN
+                    || mainmenu_ui_window_type == MM_WINDOW_0
+                    || mainmenu_ui_window_type == MM_WINDOW_1
+                    || mainmenu_ui_window_type == MM_WINDOW_INTRO
+                    || mainmenu_ui_window_type == MM_WINDOW_CREDITS;
+                if (vignette_eligible
+                    && !mainmenu_ui_has_custom_bg
+                    && settings_get_value(&settings, LEGACY_MENU_VIGNETTE_KEY)) {
+                    mainmenu_ui_apply_legacy_vignette(mainmenu_ui_window_handle);
+                }
+
+                // KO the rotwin rect after chrome + bg are painted,
+                // so the fill is the LAST thing in the panel's VB at
+                // that area. Rect matches the iso HUD's rotwin
+                // (between the bottom_bar_cover_rects[0/1/2] center
+                // band): 410x112 at (195, 488) in design space.
+                if (ko_rotwin) {
+                    TigRect rotwin_ko = { 195, 488, 410, 112 };
+                    tig_window_fill(mainmenu_ui_window_handle,
+                        &rotwin_ko,
+                        art_anim_data.color_key);
+                }
             }
         }
     } else {
@@ -5309,30 +5931,69 @@ void mainmenu_ui_create_window_func(bool should_display)
     // them defensively here. intgame_iso_strips_hide_full() short-
     // circuits when no iso interface ever existed, so the fresh-boot
     // main-menu case stays a no-op.
-    if (is_hires) {
-        // Chrome-less panel: hide the iso HUD strip band entirely.
-        //   - Save / Load / Last-Save on ANY path — those panels live on
-        //     mainmenu_bg (or the game world for shortcut access) and
-        //     never want a HUD band.
-        //   - Options whenever a game is in session — both the pause-menu
-        //     route AND the shortcut route. The user expects Options to
-        //     "draw over" without a HUD band; main-menu Options (no game)
-        //     already has no live strip to worry about.
+    // CE: HUD strip management — runs for both hi-res and vanilla.
+    //
+    // Strips visible (used as bottom info-bar / rotwin underlay):
+    //   - Character-creation screens always (newchar / pregen
+    //     / charedit) — their panel layout uses the strip as
+    //     part of the chrome.
+    //   - In VANILLA 800x600 mode: Options / Save / Load /
+    //     Last-Save also keep strips visible — their full-height
+    //     panel uses the rotwin KO (TRANSPARENT + color_key fill)
+    //     to expose the HUD area as underlay. Hi-res versions
+    //     crop the panel and fill the exposed band with the
+    //     backdrop instead — strips hidden there.
+    //
+    // Strips hidden (panel covers screen, no underlay needed):
+    //   - Shell menus (mainmenu / pause / pause-locked / single
+    //     player / pick-new-or-pregen) at any resolution.
+    //   - Hi-res Options / Save / Load (cropped panel).
+    //   - Intro / Credits / etc.
+    //
+    // PREVIOUSLY this block was gated on `is_hires` only — that
+    // left vanilla 800x600 shell menus showing the bottom HUD
+    // bar through the panel during entrance/exit scale animation
+    // (panel < 100% scale = smaller than its design rect, area
+    // around exposes the still-visible HUD bar). intgame_hide()'s
+    // re-show of the bottom strip was right for hi-res chargen
+    // screens but wrong for vanilla shell menus. Run the same
+    // hide/show logic for vanilla too.
+    bool screen_uses_hud_strip =
+        mainmenu_ui_window_type == MM_WINDOW_NEW_CHAR
+        || mainmenu_ui_window_type == MM_WINDOW_PREGEN_CHAR
+        || mainmenu_ui_window_type == MM_WINDOW_CHAREDIT
+        || mainmenu_ui_window_type == MM_WINDOW_SHOP;
+    if (!is_hires
+        && (mainmenu_ui_window_type == MM_WINDOW_OPTIONS
+            || mainmenu_ui_window_type == MM_WINDOW_SAVE_GAME
+            || mainmenu_ui_window_type == MM_WINDOW_LOAD_GAME
+            || mainmenu_ui_window_type == MM_WINDOW_LAST_SAVE_GAME)) {
+        screen_uses_hud_strip = true;
+    }
+    if (!screen_uses_hud_strip) {
+        intgame_iso_strips_hide_full();
+        // CE: re-show the iso world window behind the bg
+        // backdrop on in-game menu paths. mainmenu_ui_start
+        // calls intgame_hide() up-front which hides the iso
+        // window — without this re-show, the bg entrance
+        // animation would fade in over BLACK instead of the
+        // live game world. We re-show whenever there's a
+        // chance the world matters behind the bg:
         //
-        // Everything else (new-char / pregen / charedit / pause menu /
-        // misc. menus) keeps the band visible: the bar cover chromakey
-        // lets it show through and provides the in-game chrome look —
-        // restoring the regression where new-char lost the HUD strip.
-        bool chrome_less_panel = save_load_screen
-            || (mainmenu_ui_window_type == MM_WINDOW_OPTIONS && is_in_game);
-        if (chrome_less_panel) {
-            intgame_iso_strips_hide_full();
-            if (skip_hires_scaffold) {
-                intgame_iso_world_show();
-            }
-        } else {
-            intgame_iso_strips_show_as_band();
+        //   - skip_hires_scaffold: in-game shortcut paths
+        //     (Cmd+O Options / Cmd+S Save / Cmd+L Load) that
+        //     never had a backdrop to begin with — original
+        //     behavior; not new.
+        //   - is_in_game: any menu opened with the in-game
+        //     flag set (pause menu = MM_TYPE_IN_PLAY,
+        //     pause-locked, in-game sub-windows). Bg fades
+        //     in OVER the world rather than over black; the
+        //     exit fade reveals the world progressively too.
+        if (skip_hires_scaffold || is_in_game) {
+            intgame_iso_world_show();
         }
+    } else {
+        intgame_iso_strips_show_as_band();
     }
 
     if (v1) {
@@ -5383,7 +6044,7 @@ void mainmenu_ui_create_window_func(bool should_display)
         }
 
         tig_art_interface_id_create(336, 0, 0, 0, &art_id);
-        if (!skip_bar_covers && tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
+        if (!skip_top_bar_cover && tig_art_anim_data(art_id, &art_anim_data) == TIG_OK) {
             window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP | TIG_WINDOW_MESSAGE_FILTER;
             window_data.rect = mainmenu_ui_top_bar_cover_rect;
             window_data.background_color = art_anim_data.color_key;
@@ -5417,11 +6078,11 @@ void mainmenu_ui_create_window_func(bool should_display)
             if (mainmenu_ui_has_custom_bg && !mainmenu_ui_custom_bg_is_fallback) {
                 mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_top_bar_cover_window_handle, window_data.rect);
             }
-        } else if (!skip_bar_covers) {
+        } else if (!skip_top_bar_cover) {
             // Only treat a missing top bar cover as fatal when we *expected*
-            // to draw chrome. skip_bar_covers (Save / Load / Last-Save)
-            // deliberately omits the bar covers, so the "no art" branch is
-            // the success path there.
+            // to draw chrome. skip_top_bar_cover (Save / Load / Last-Save,
+            // Options, hi-res chargen) deliberately omits it, so the
+            // "no art" branch is the success path there.
             if (!v1) {
                 tig_debug_printf("mainmenu_ui_create_window_func: ERROR: tig_art_anim_data2 failed!\n");
                 exit(EXIT_SUCCESS); // FIXME: Should be `EXIT_FAILURE`.
@@ -5563,19 +6224,214 @@ void mainmenu_ui_create_window_func(bool should_display)
     window->refresh_text_flags |= 0x20;
     mainmenu_ui_active = true;
 
-    // CE: opt this menu sub-window into the translucent-black tint
-    // pathway. intgame_apply_translucent_black auto-picks the
-    // underlay based on context: in hi-res the mainmenu backdrop
-    // (mainmenu_bg / per-screen *_bg.bmp) is preferred over the iso
-    // world, so dark panel pixels reveal a darkened menu background
-    // rather than the iso world the user can't see anyway. At
-    // 800x600 (no backdrop) it falls through to iso during gameplay
-    // or auto-disables in pre-game. This unifies the look across
-    // pre-game main menu, in-game pause menu, and the Save/Load/
-    // Options sub-windows; the old "in-play-only" gate is gone
-    // because the underlay choice now handles pre-game safely.
-    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-        intgame_apply_translucent_black(mainmenu_ui_window_handle, true);
+    // CE: the panel is now TIG_WINDOW_TRANSPARENT and the persistent
+    // backdrop carries the bg art at full screen. We deliberately do
+    // NOT enable the translucent-black tint pathway on the panel
+    // anymore: tig_video_blit_near_black_tinted writes ALL src
+    // pixels (it doesn't honor color_key), so enabling tint on a
+    // TRANSPARENT panel would re-introduce the keyed-color magenta
+    // overpaint in the chromakey'd panel regions that TRANSPARENT
+    // was meant to skip. The dark chrome borders inside the panel
+    // stay solid dark (no see-through effect on chrome itself), but
+    // the keyed regions correctly composite-through to the backdrop
+    // bg behind. Net visual: same overall look, no scale-mismatch
+    // tear between panel and backdrop.
+
+    // CE: panel entrance animation — scales + fades in.
+    //
+    // Skip when the window handle is the backdrop alias (custom-UI
+    // shell case): the backdrop has its own transform tween driven
+    // by the bg state machine below, and a second show() on the same
+    // handle would conflict.
+    //
+    // EXCEPTION: the credits flow. mainmenu_ui_credits_create sets
+    // mainmenu_ui_custom_bg_window_type_override + bg_type=CREDITS
+    // before calling mainmenu_ui_open to create the MAINMENU panel
+    // with credits-bg art underneath. The slide_ui then plays a
+    // slideshow on top with its own fade transitions — adding a
+    // panel scale-in here reads as a redundant "pop" inside the
+    // slideshow's fade.
+    //
+    // Two animation variants for non-backdrop-alias panels:
+    //
+    //  - LEGACY SHELL menus with separate panel (vanilla 800x600
+    //    or hi-res no-custom-bg + shell type): match the backdrop's
+    //    entrance exactly — scale 0.98→1.0, alpha=1, 300ms. Same
+    //    profile + same scale range = panel and backdrop grow in
+    //    lockstep, so the panel chrome never exposes a difference
+    //    between its own scale and the backdrop's filler around it.
+    //
+    //  - Everything else (sub-window panels in either mode, custom-
+    //    UI sub-windows): Phase 1.1 entrance — scale 0.92→1.0 +
+    //    alpha 0→1, default entrance profile. The more pronounced
+    //    scale + alpha-in pop is appropriate when the panel is a
+    //    distinct sub-screen appearing over a different bg.
+    bool panel_is_backdrop_alias =
+        (mainmenu_ui_window_handle == mainmenu_ui_backdrop_handle
+         && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID);
+    bool entering_credits_overlay =
+        (mainmenu_ui_custom_bg_window_type_override
+         && mainmenu_ui_custom_bg_window_type == MM_WINDOW_CREDITS);
+    // For legacy session-entrance (no custom bg + backdrop being
+    // freshly created), the panel show is chained from the
+    // backdrop fade-in's on_complete — skip firing it here so
+    // the sequence runs cleanly. For other cases (sub-windows,
+    // custom UI shell, transitions where the backdrop already
+    // exists), fire the panel show now.
+    if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
+        && !panel_is_backdrop_alias
+        && !entering_credits_overlay) {
+        ui_anim_window_show(mainmenu_ui_window_handle,
+            UI_ANIM_ANCHOR_CENTER, 0.92f, NULL);
+
+        // CE: animate the chrome covers in tandem with the panel so the
+        // chargen / shell window enters as ONE composite — not just a
+        // middle panel scaling in over already-snapped-in header /
+        // wings. Same anchor + scale-from so all pieces feel like one
+        // unit. The covers were created above; they're at their final
+        // positions, ui_anim_window_show seeds the transform to scale
+        // 0.92 / alpha 0 and springs to (1, 1).
+        if (mainmenu_ui_top_bar_cover_window_handle != TIG_WINDOW_HANDLE_INVALID) {
+            ui_anim_window_show(mainmenu_ui_top_bar_cover_window_handle,
+                UI_ANIM_ANCHOR_CENTER, 0.92f, NULL);
+        }
+        for (int ci = 0; ci < 3; ci++) {
+            if (mainmenu_ui_bottom_bar_cover_window_handles[ci] != TIG_WINDOW_HANDLE_INVALID) {
+                ui_anim_window_show(mainmenu_ui_bottom_bar_cover_window_handles[ci],
+                    UI_ANIM_ANCHOR_CENTER, 0.92f, NULL);
+            }
+        }
+        // CE: HUD strip used as band by chargen / vanilla Options-Save-
+        // Load is the bottom-most chunk of the same composite. Animate
+        // it in too — but ONLY when entering band mode from a non-
+        // band menu (e.g. MAIN_MENU → NEW_CHAR). On band↔band
+        // transitions (NEW_CHAR → CHAREDIT → SHOP) the band stays
+        // visible across the swap; firing ui_anim_window_show would
+        // briefly snap its transform to (0.92, 0) and animate up,
+        // creating a visible flicker for ~200ms on every chargen
+        // step. Detecting via prev_window_type is reliable because
+        // sub_546DD0 captures it right before the close runs.
+        bool prev_was_band =
+            mainmenu_ui_prev_window_type == MM_WINDOW_NEW_CHAR
+            || mainmenu_ui_prev_window_type == MM_WINDOW_PREGEN_CHAR
+            || mainmenu_ui_prev_window_type == MM_WINDOW_CHAREDIT
+            || mainmenu_ui_prev_window_type == MM_WINDOW_SHOP;
+        if ((chargen_screen || (!is_hires && save_load_screen)
+                || (!is_hires && mainmenu_ui_window_type == MM_WINDOW_OPTIONS))
+            && !prev_was_band) {
+            tig_window_handle_t band = intgame_get_band_bar_handle();
+            if (band != TIG_WINDOW_HANDLE_INVALID) {
+                ui_anim_window_show(band,
+                    UI_ANIM_ANCHOR_CENTER, 0.92f, NULL);
+            }
+        }
+    }
+
+    // CE: persistent-backdrop animation state machine.
+    //
+    //  - SESSION ENTRANCE (created_backdrop_now == true):
+    //      Bg fades + scales in from (0.98, 0) to the resting target
+    //      state. If the user opened into a shell menu, target is
+    //      (1.0, 1.0). If they opened directly into a sub-window
+    //      (e.g. in-game Cmd+O for Options), target is (0.96, 1.0).
+    //      300ms settle, damping 1.2.
+    //
+    //  - RE-OPEN MID-EXIT (mainmenu_ui_bg_exit_pending was set):
+    //      A previous session was fading out — clear the pending
+    //      flag and retarget the in-flight tween to the new entrance
+    //      target. ui_anim_window_transform_to preserves the current
+    //      spring value + velocity, so the fade reverses smoothly
+    //      from wherever it was. The previous on_complete
+    //      (mainmenu_ui_bg_finalize_exit) fires harmlessly during the
+    //      retarget because exit_pending is now false.
+    //
+    //  - SHELL ↔ SUB-WINDOW RECEDE / SCALE-UP:
+    //      Backdrop scales 1.0 ↔ 0.96 on transitions between shell
+    //      and sub-window states. Both directions 240ms, damping 1.2.
+    //      The retarget pattern handles rapid back-and-forth (user
+    //      hammering ESC / buttons) — current value preserved, new
+    //      target swapped in.
+    //
+    //  - INTRA-SHELL OR INTRA-SUB SWAPS:
+    //      No bg animation (shell menus all hold at 1.0; sub-windows
+    //      all hold at 0.96).
+    //
+    //  - SESSION EXIT:
+    //      Started in mainmenu_ui_handle's post-loop and runs async
+    //      in the main game loop's ui_anim_ping.
+    // Backdrop animation state machine. Runs whenever a backdrop
+    // exists — animating an empty backdrop (no custom bg) is mostly
+    // invisible (scale of black = black; alpha of black against
+    // black-tig-default = unchanged) and is necessary because the
+    // initial mainmenu open at cold start often goes through a
+    // bgless WINDOW_0 splash before transitioning to MAINMENU. If
+    // we suppress the WINDOW_0 animation, the spring state isn't
+    // primed and the follow-up MAINMENU transition reads
+    // bg_receded as still-default → no animation fires either.
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        bool want_receded = !mainmenu_ui_is_shell_menu(mainmenu_ui_window_type);
+        float target_scale = want_receded ? 0.96f : 1.0f;
+
+        if (created_backdrop_now) {
+            // CE: bg entrance — backdrop scales 0.98 → 1.0/0.96
+            // over 300ms.
+            //
+            // Alpha fade-in (alpha 0→1) when EITHER:
+            //   - Custom UI bg art is loaded (the user wants to
+            //     see the custom art fade in), OR
+            //   - We're pre-game (cold-start main menu, no game
+            //     world behind to expose during the fade).
+            //
+            // No alpha fade (alpha=1 from frame 1) for the legacy
+            // IN-GAME case (e.g. ESC into pause menu over an
+            // active game world). Fading alpha 0→1 there would
+            // momentarily reveal the live game world through the
+            // partially-transparent black backdrop.
+            float alpha_from =
+                (mainmenu_ui_has_custom_bg || !is_in_game) ? 0.0f : 1.0f;
+            ui_anim_profile_t entrance_profile = { 300, 1.2f };
+            ui_anim_window_transform_from_to(
+                mainmenu_ui_backdrop_handle,
+                0.98f, alpha_from, target_scale, 1.0f,
+                UI_ANIM_ANCHOR_CENTER, &entrance_profile);
+            mainmenu_ui_bg_receded = want_receded;
+        } else if (mainmenu_ui_bg_exit_pending) {
+            // Reverse course mid-exit. Clear flag BEFORE retargeting
+            // so the previous on_complete (when fired by the retarget)
+            // sees a cleared flag and no-ops the destroy. The exit
+            // tween is still active, so the from_* values are ignored
+            // — retarget preserves current spring value + velocity.
+            mainmenu_ui_bg_exit_pending = false;
+            ui_anim_profile_t entrance_profile = { 300, 1.2f };
+            ui_anim_window_transform_from_to(mainmenu_ui_backdrop_handle,
+                1.0f, 1.0f, target_scale, 1.0f,
+                UI_ANIM_ANCHOR_CENTER, &entrance_profile);
+            mainmenu_ui_bg_receded = want_receded;
+        } else if (want_receded != mainmenu_ui_bg_receded) {
+            // sub ↔ shell scale transition. Shell-menu buttons +
+            // text ride this transform on the backdrop — no
+            // separate panel animation.
+            //
+            // Asymmetric timing: recede (shell→sub, scale-down)
+            // gets 240ms — slower to read as "settling into a
+            // sub-screen". Return (sub→shell, scale-up) gets
+            // 180ms — snappy so dismissing the sub-window feels
+            // immediate, not slow.
+            //
+            // IMPORTANT: seed the spring from the CURRENT visual
+            // scale rather than the from-default of 1.0. The
+            // previous transition's spring settled and cleared its
+            // slot (tig holds the visual via transform_set, but
+            // ui_anim has no active state), so without an explicit
+            // from-value the new spring would start at 1.0 → 1.0
+            // for the sub→shell case (already at target = snap).
+            float current_scale = mainmenu_ui_bg_receded ? 0.96f : 1.0f;
+            ui_anim_profile_t bg_profile = { want_receded ? 240 : 180, 1.2f };
+            ui_anim_window_transform_from_to(mainmenu_ui_backdrop_handle,
+                current_scale, 1.0f, target_scale, 1.0f,
+                UI_ANIM_ANCHOR_CENTER, &bg_profile);
+            mainmenu_ui_bg_receded = want_receded;
+        }
     }
 
     // CE: now that the mainmenu's backdrop is up (in hi-res), refresh
@@ -5603,12 +6459,37 @@ void mainmenu_ui_create_window_func(bool should_display)
 // 0x546B40
 void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str, TigRect* rect, unsigned int flags)
 {
+    TigRect host_rect;
     TigRect text_rect;
     TigFont font_desc;
     tig_font_handle_t* fonts;
     int pass;
 
-    text_rect = *rect;
+    // CE: every text render path (initial create, rollover state
+    // refresh, per-frame redraw_foreground in video-playback mode)
+    // funnels through here. If the host window is the persistent
+    // backdrop (shell menu case), translate the caller-supplied
+    // design-space rect into backdrop-local coords ONCE and use the
+    // result for both the bg restore and the glyph write. Centralizing
+    // here means callers stay design-space-only and rollover never
+    // jumps because some code path forgot the offset.
+    host_rect = *rect;
+    if (window_handle == mainmenu_ui_backdrop_handle
+        && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        host_rect.x += mainmenu_ui_backdrop_offset_x;
+        host_rect.y += mainmenu_ui_backdrop_offset_y;
+    } else if (window_handle == mainmenu_ui_window_handle
+        && window_handle != TIG_WINDOW_HANDLE_INVALID) {
+        // CE: sub-window panel — design-space rect needs to be
+        // translated to panel-local coords by subtracting the
+        // panel's design y-offset. Required when the panel was
+        // cropped (hi-res Options shifts rect.y to 41) so labels
+        // and other text drawn through this helper track the
+        // chrome graphic, not the uncropped art's coords. Buttons
+        // already do this subtraction in main_menu_button_create_ex.
+        host_rect.y -= mainmenu_ui_window_rect.y;
+    }
+    text_rect = host_rect;
 
     if ((flags & 0x1) == 0) {
         fonts = (flags & 0x10) != 0 ? dword_64C0CC[0] : dword_64C210;
@@ -5657,7 +6538,10 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
             }
         }
 
-        mainmenu_ui_restore_text_backdrop(window_handle, rect);
+        // Restore receives the offset-applied rect (host-local
+        // coords) so the bg sample lands at the actual on-screen
+        // text area, not the design-space origin.
+        mainmenu_ui_restore_text_backdrop(window_handle, &host_rect);
 
         for (pass = 0; pass < 3; pass++) {
             tig_font_push(fonts[pass]);
@@ -5671,12 +6555,142 @@ void mainmenu_ui_refresh_text(tig_window_handle_t window_handle, const char* str
     }
 }
 
+// CE: returns true for the "shell" mainmenu types — main menu, pause
+// menu (in-play + locked variants), single-player landing, and the
+// pick-new-or-pregen "new game" landing. These are all UX-equivalent
+// from the bg's perspective: bg sits at full scale (1.0), recedes
+// only when transitioning into a real sub-window (Options / Load /
+// Save / NewChar / Charedit / Credits / ...). Transitions BETWEEN
+// shell menus (e.g. main menu → single player → pick new game)
+// don't recede or scale the bg at all.
+//
+// Shell menus also:
+//   - Skip painting the legacy chrome — they're visually JUST
+//     bg + buttons. The custom-UI mainmenu_bg art replaces the
+//     panel decoration entirely.
+//   - Skip the scale/fade entrance + exit on the panel. Buttons
+//     appear/disappear with the snap show/hide. The bg's recede
+//     (when applicable) is the only animation.
+//
+// is_top_level was the original name for the same predicate; it
+// stays as an alias because the bg-recede logic uses the same set.
+static bool mainmenu_ui_is_shell_menu(MainMenuWindowType t)
+{
+    return t == MM_WINDOW_MAINMENU
+        || t == MM_WINDOW_MAINMENU_IN_PLAY
+        || t == MM_WINDOW_MAINMENU_IN_PLAY_LOCKED
+        || t == MM_WINDOW_SINGLE_PLAYER
+        || t == MM_WINDOW_PICK_NEW_OR_PREGEN;
+}
+
+static bool mainmenu_ui_is_top_level(MainMenuWindowType t)
+{
+    return mainmenu_ui_is_shell_menu(t);
+}
+
 // 0x546DD0
+// CE: ui_anim on_complete callback — fired when the panel's hide
+// spring settles (~260ms after sub_546DD0 starts the exit). Destroys
+// the panel + cover strips that the now-departing menu sub-window
+// owned. The backdrop is NOT touched here — it persists across the
+// whole mainmenu session and only the OUTER mainmenu_ui_handle exit
+// destroys it.
+static void mainmenu_ui_finalize_close(void* ctx_v)
+{
+    MainmenuUiCloseCtx* ctx = (MainmenuUiCloseCtx*)ctx_v;
+    int idx;
+    if (!ctx->in_flight) {
+        return;
+    }
+    if (ctx->panel != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_destroy(ctx->panel);
+        ctx->panel = TIG_WINDOW_HANDLE_INVALID;
+    }
+    for (idx = 0; idx < 3; idx++) {
+        if (ctx->bottom_covers[idx] != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_destroy(ctx->bottom_covers[idx]);
+            ctx->bottom_covers[idx] = TIG_WINDOW_HANDLE_INVALID;
+        }
+    }
+    if (ctx->top_cover != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_destroy(ctx->top_cover);
+        ctx->top_cover = TIG_WINDOW_HANDLE_INVALID;
+    }
+    ctx->in_flight = false;
+}
+
+// CE: ui_anim on_complete — fires when the bg exit fade-out tween
+// settles. Guarded by mainmenu_ui_bg_exit_pending: if a re-open
+// mid-fade cleared the flag (retargeting the tween back to the
+// entrance state), this callback no-ops because the previous
+// "destroy" intent was overridden. Otherwise we tear down the
+// backdrop here, completing the deferred exit. Pattern matches
+// fate/sleep slide reverse.
+static void mainmenu_ui_bg_finalize_exit(void* ctx_v)
+{
+    (void)ctx_v;
+    if (!mainmenu_ui_bg_exit_pending) {
+        return;
+    }
+    mainmenu_ui_bg_exit_pending = false;
+    mainmenu_ui_destroy_persistent_backdrop();
+}
+
+// CE: destroy the persistent backdrop. Called by either the bg-exit
+// on_complete (normal session-end path) or directly during session-
+// end cleanup (cfg-disabled / abort paths). Resets bg_receded so the
+// next session starts from rest.
+static void mainmenu_ui_destroy_persistent_backdrop(void)
+{
+    bool had_backdrop = (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID);
+    if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_destroy(mainmenu_ui_backdrop_handle);
+        mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+    }
+    if (mainmenu_ui_has_custom_bg) {
+        mainmenu_ui_free_custom_bg();
+        mainmenu_ui_has_custom_bg = false;
+    }
+    mainmenu_ui_bg_receded = false;
+
+    // CE: the modal-dialog tint and HUD bar tint pick their underlay
+    // via intgame_translucent_black_pick, which previously favoured
+    // the backdrop window whenever its handle was valid. Now that
+    // we've just freed that handle, the picker would otherwise
+    // continue handing the stale (freed) window to the compositor
+    // for tinted blits — SDL_LockSurface'ing freed memory and
+    // either crashing or rendering the tinted area as solid black.
+    // Re-pick the underlay now so it falls through to iso world
+    // (during gameplay) or no-tint (pre-game).
+    if (had_backdrop) {
+        intgame_refresh_modal_tint();
+        intgame_refresh_hud_bar_tint();
+    }
+}
+
 void sub_546DD0(void)
 {
     int index;
 
     if (mainmenu_ui_active) {
+        // CE: remember what we're closing so the next
+        // create_window_func can make context-aware decisions
+        // (e.g. suppress the new screen's entrance animation
+        // when the previous screen was CREDITS — the credits
+        // slideshow's own fade-out already covers the visual
+        // transition and an extra panel scale-in reads as
+        // redundant).
+        mainmenu_ui_prev_window_type = mainmenu_ui_window_type;
+
+        // CE: if a previous close's deferred destroy is still pending
+        // (rapid menu navigation — e.g. user clicked Back during the
+        // tail of an exit animation), flush it synchronously before
+        // capturing the new handles. Single-slot ctx — can't carry two
+        // pending closes at once.
+        if (mainmenu_ui_pending_close.in_flight) {
+            mainmenu_ui_finalize_close(&mainmenu_ui_pending_close);
+        }
+
         sub_549450();
         timeevent_clear_all_typed(TIMEEVENT_TYPE_MAINMENU);
 
@@ -5684,34 +6698,135 @@ void sub_546DD0(void)
             stru_64B870[index].art_id = TIG_ART_ID_INVALID;
         }
 
-        if (mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID
-            && tig_window_destroy(mainmenu_ui_window_handle) == TIG_OK) {
-            mainmenu_ui_window_handle = TIG_WINDOW_HANDLE_INVALID;
-        }
+        // CE: exit policy splits on host-window strategy.
+        //
+        // - BACKDROP-HOSTED shell (mainmenu_ui_window_handle ==
+        //   mainmenu_ui_backdrop_handle): no panel to animate or
+        //   destroy. Buttons live on the backdrop, so we destroy
+        //   them in place and re-blit the bg art over the text
+        //   area to wipe the painted glyphs. The backdrop survives
+        //   the swap — its own scale tween (handled in the bg
+        //   state machine in create_window_func) is the shell's
+        //   exit animation if there is one.
+        //
+        // - SEPARATE PANEL (sub-windows always; shell menus in
+        //   vanilla / no-custom-bg fallback): capture the panel +
+        //   cover handles into the deferred-close ctx and start
+        //   the panel's hide-animation. on_complete
+        //   (mainmenu_ui_finalize_close) destroys the captured
+        //   handles when the spring settles. The backdrop (if any)
+        //   is persistent across the swap.
+        bool is_backdrop_hosted =
+            (mainmenu_ui_window_handle == mainmenu_ui_backdrop_handle
+             && mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID);
 
-        for (index = 0; index < 3; index++) {
-            if (mainmenu_ui_bottom_bar_cover_window_handles[index] != TIG_WINDOW_HANDLE_INVALID
-                && tig_window_destroy(mainmenu_ui_bottom_bar_cover_window_handles[index]) == TIG_OK) {
-                mainmenu_ui_bottom_bar_cover_window_handles[index] = TIG_WINDOW_HANDLE_INVALID;
+        if (is_backdrop_hosted) {
+            // Backdrop-hosted shell exit. Destroy buttons on the
+            // backdrop, then re-blit the bg art to clear painted
+            // text. The next create_window_func paints fresh
+            // buttons + text on the same backdrop. In video-
+            // playback mode the bg is the current video frame
+            // which gets repainted by the per-frame tick anyway —
+            // the one-shot bg blit here keeps the still-image
+            // case clean.
+            TigWindowData backdrop_data;
+            tig_window_button_destroy(mainmenu_ui_backdrop_handle);
+            if (mainmenu_ui_has_custom_bg
+                && !mainmenu_ui_custom_bg_is_fallback
+                && tig_window_data(mainmenu_ui_backdrop_handle, &backdrop_data) == TIG_OK) {
+                mainmenu_ui_blit_custom_bg_to_window(
+                    mainmenu_ui_backdrop_handle, backdrop_data.rect);
+            }
+            mainmenu_ui_pending_close.in_flight = false;
+            mainmenu_ui_pending_close.panel = TIG_WINDOW_HANDLE_INVALID;
+            mainmenu_ui_pending_close.top_cover = TIG_WINDOW_HANDLE_INVALID;
+            for (index = 0; index < 3; index++) {
+                mainmenu_ui_pending_close.bottom_covers[index] = TIG_WINDOW_HANDLE_INVALID;
+            }
+        } else {
+            // Separate-panel exit (sub-windows, vanilla / no-bg
+            // shells). Capture handles for deferred destruction
+            // after the hide animation settles.
+            mainmenu_ui_pending_close.in_flight = true;
+            mainmenu_ui_pending_close.panel = mainmenu_ui_window_handle;
+            mainmenu_ui_pending_close.top_cover = mainmenu_ui_top_bar_cover_window_handle;
+            for (index = 0; index < 3; index++) {
+                mainmenu_ui_pending_close.bottom_covers[index] = mainmenu_ui_bottom_bar_cover_window_handles[index];
             }
         }
 
-        if (mainmenu_ui_top_bar_cover_window_handle != TIG_WINDOW_HANDLE_INVALID
-            && tig_window_destroy(mainmenu_ui_top_bar_cover_window_handle) == TIG_OK) {
-            mainmenu_ui_top_bar_cover_window_handle = TIG_WINDOW_HANDLE_INVALID;
+        mainmenu_ui_window_handle = TIG_WINDOW_HANDLE_INVALID;
+        mainmenu_ui_top_bar_cover_window_handle = TIG_WINDOW_HANDLE_INVALID;
+        for (index = 0; index < 3; index++) {
+            mainmenu_ui_bottom_bar_cover_window_handles[index] = TIG_WINDOW_HANDLE_INVALID;
         }
 
-        if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
-            && tig_window_destroy(mainmenu_ui_backdrop_handle) == TIG_OK) {
-            mainmenu_ui_backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
-        }
-
-        if (mainmenu_ui_has_custom_bg) {
-            mainmenu_ui_free_custom_bg();
-            mainmenu_ui_has_custom_bg = false;
-        }
+        // NOTE: custom_bg_vb is NOT freed here anymore — the next
+        // sub-window's create_window_func loads a fresh bg via
+        // mainmenu_ui_load_bg_vb, which frees the previous VB. If
+        // there's no next create (session end), the destroy fn frees
+        // it.
 
         mainmenu_ui_active = false;
+
+        if (!is_backdrop_hosted) {
+            // Separate panel: Phase 1.1 exit — hide from (1.0, 1.0)
+            // to (0.92, 0) over EXIT-profile-default time. Cover
+            // strips destroyed by the panel's on_complete.
+            //
+            // CE: also animate the chrome covers (top header + bottom
+            // wings) and the HUD strip band out at the same time, so
+            // the whole chargen / shell composite exits as one piece
+            // — not just a middle panel collapsing while the chrome
+            // around it snaps off. on_complete is only wired to the
+            // panel; the covers complete around the same time (same
+            // profile) and finalize_close destroys them all.
+            if (mainmenu_ui_pending_close.panel != TIG_WINDOW_HANDLE_INVALID) {
+                ui_anim_window_hide(mainmenu_ui_pending_close.panel,
+                    UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
+                    mainmenu_ui_finalize_close, &mainmenu_ui_pending_close);
+                if (mainmenu_ui_pending_close.top_cover != TIG_WINDOW_HANDLE_INVALID) {
+                    ui_anim_window_hide(mainmenu_ui_pending_close.top_cover,
+                        UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
+                        NULL, NULL);
+                }
+                for (index = 0; index < 3; index++) {
+                    if (mainmenu_ui_pending_close.bottom_covers[index] != TIG_WINDOW_HANDLE_INVALID) {
+                        ui_anim_window_hide(
+                            mainmenu_ui_pending_close.bottom_covers[index],
+                            UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
+                            NULL, NULL);
+                    }
+                }
+                // HUD strip band — only fire the scale-fade hide on
+                // the band when we're ACTUALLY leaving band mode
+                // (i.e. the chargen→game new-game path, where the
+                // screen fades to black anyway). On chargen→chargen
+                // transitions the band stays in band mode through
+                // the swap, so applying a scale/alpha hide here
+                // would leave the band at (0.92, 0) — and the next
+                // chargen's entrance ui_anim_window_show, retargeting
+                // from a settled slot, doesn't always animate the
+                // band back to visible. Leave the band's transform
+                // untouched on chargen↔chargen; the new menu's
+                // show retarget then snaps from (1.0, 1.0) → (1.0,
+                // 1.0) (no-op), keeping the band visible the whole
+                // time. The new-game-start path covers the band with
+                // gfade_run + slide_prepare_offscreen so missing its
+                // exit animation here is invisible to the user.
+                if (intgame_hud_is_band_mode()
+                    && mainmenu_ui_start_new_game) {
+                    tig_window_handle_t band = intgame_get_band_bar_handle();
+                    if (band != TIG_WINDOW_HANDLE_INVALID) {
+                        ui_anim_window_hide(band,
+                            UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
+                            NULL, NULL);
+                    }
+                }
+            } else {
+                mainmenu_ui_finalize_close(&mainmenu_ui_pending_close);
+            }
+        }
 
         // CE: mainmenu (and its backdrop) are gone — refresh both
         // the modal-dialog auto-tint and the HUD bar's tint so they
@@ -5822,10 +6937,32 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                     || mainmenu_ui_window_type == MM_WINDOW_SAVE_GAME;
                 if (dismissible_window
                     && mainmenu_ui_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-                    TigWindowData menu_wd;
-                    if (tig_window_data(mainmenu_ui_window_handle, &menu_wd) == TIG_OK
+                    TigRect menu_rect;
+                    bool have_rect = false;
+                    // Shell menus alias mainmenu_ui_window_handle to
+                    // the persistent backdrop, whose rect extends
+                    // past the screen edges (overshoot for the
+                    // recede animation) — using it for dismiss
+                    // detection means clicks anywhere on screen
+                    // would register as "inside" and never dismiss.
+                    // For the dismiss check, use the design 800x600
+                    // rect centered on screen instead — matches the
+                    // visual footprint of the menu's buttons + text.
+                    if (mainmenu_ui_window_handle == mainmenu_ui_backdrop_handle) {
+                        menu_rect = mainmenu_ui_window_fullscreen_rect;
+                        hrp_apply(&menu_rect,
+                            GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
+                        have_rect = true;
+                    } else {
+                        TigWindowData menu_wd;
+                        if (tig_window_data(mainmenu_ui_window_handle, &menu_wd) == TIG_OK) {
+                            menu_rect = menu_wd.rect;
+                            have_rect = true;
+                        }
+                    }
+                    if (have_rect
                         && intgame_should_dismiss_overlay_click(
-                            original_screen_x, original_screen_y, &menu_wd.rect)) {
+                            original_screen_x, original_screen_y, &menu_rect)) {
                         if (in_game && mainmenu_ui_num_windows <= 1) {
                             sub_5412D0();
                         } else {
