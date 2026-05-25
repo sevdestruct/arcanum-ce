@@ -445,6 +445,11 @@ void tc_clear(bool compact)
     tc_content_rect.y = tc_iso_window_rect.height - tc_content_rect.height - bottom_margin;
 }
 
+bool tc_is_settling(void)
+{
+    return tc_bottom_gap_offset != tc_bottom_gap_target;
+}
+
 void tc_set_bottom_gap_offset(int offset)
 {
     if (tc_editor) {

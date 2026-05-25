@@ -10220,6 +10220,12 @@ void intgame_hud_bottom_band_design_x(int* out_x, int* out_w)
     if (out_w != NULL) *out_w = w;
 }
 
+bool intgame_hud_is_settling(void)
+{
+    return ui_anim_is_active(intgame_hud_top_slide_handle)
+        || ui_anim_is_active(intgame_hud_bottom_slide_handle);
+}
+
 // CE: per-tick iso-invalidate hook. In the current direct-paint
 // tint architecture (tig_video_blit_near_black_tinted reads iso's
 // VB directly each composite), no extra invalidation is needed —

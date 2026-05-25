@@ -1345,6 +1345,19 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
             && (ideal_x < tc.x + tc.width + TB_EDGE_MARGIN_PX);
         bool ideal_below = (ideal_y >= tc.y + tc.height / 2);
         int below_min = tc.y + tc.height + TB_EDGE_MARGIN_PX;
+        // CE: while TC or HUD is mid-animation (TAB-HUD stage transitions),
+        // the gap below TC and the HUD's clamp geometry are both in motion.
+        // If the bubble was already pinned above TC (apply_ui_clamp branch
+        // = TOP/LEFT/RIGHT), suppress the below-TC entry during the
+        // animation — otherwise the briefly-opened gap satisfies below_fits,
+        // the bubble drops below, and a couple frames later the animation
+        // closes the gap again and pushes the bubble back. Sliding the
+        // bubble smoothly with the moving UI is the desired feel.
+        bool ui_settling = tc_is_settling() || intgame_hud_is_settling();
+        bool prev_tc_was_pin = (prev_tc == TB_PUSH_TOP
+            || prev_tc == TB_PUSH_LEFT
+            || prev_tc == TB_PUSH_RIGHT);
+        bool inhibit_below_tc = ui_settling && prev_tc_was_pin;
 
         // CE: below_fits used to be `below_min <= vp_bottom`, but vp_bottom
         // is only tightened by HUD's TOP pin when the bubble's NATURAL
@@ -1374,7 +1387,7 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
         }
         bool below_fits = (below_min <= below_max_top);
 
-        if (x_over_tc && ideal_below && below_fits) {
+        if (x_over_tc && ideal_below && below_fits && !inhibit_below_tc) {
             if (below_min > vp_top) vp_top = below_min;
             new_tc = TB_PUSH_NONE;
         } else {

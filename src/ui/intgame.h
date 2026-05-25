@@ -287,6 +287,13 @@ int intgame_hud_bottom_top_crop(void);
 //   MINI    -> x=205, w=394
 //   HIDDEN  -> x=0,   w=0
 void intgame_hud_bottom_band_design_x(int* out_x, int* out_w);
+
+// CE: true while either bar's slide-offset is mid-tween toward a new
+// target (TAB-HUD stage transitions). Used by tb to inhibit pin-state
+// transitions during UI animations — bubbles slide with the moving
+// bars rather than flipping between pin choices as the geometry
+// briefly satisfies and unsatisfies different fit checks.
+bool intgame_hud_is_settling(void);
 // CE: enable/disable the optional near-black see-through alpha on the
 // given window. Gated by the TranslucentBlackUI cfg flag — when off
 // (or enable=false), this clears any prior alpha state on the window.

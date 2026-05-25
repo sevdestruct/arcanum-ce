@@ -35,4 +35,11 @@ void tc_set_bottom_gap_offset(int offset);
 // tween is active (early return on value-unchanged).
 void tc_ping(void);
 
+// CE: true while the bottom-gap offset is mid-tween toward a new target.
+// Used by tb to inhibit pin-state transitions during UI animations —
+// without this the bubble can briefly find space below TC (or lose it)
+// while the dialog box is sliding, flipping pin choice and jumping
+// the bubble back and forth.
+bool tc_is_settling(void);
+
 #endif /* ARCANUM_GAME_TC_H_ */
