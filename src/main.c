@@ -635,8 +635,17 @@ void main_loop(void)
                     switch (message.data.keyboard.scancode) {
                     case SDL_SCANCODE_ESCAPE: {
                         IntgameMode esc_mode = intgame_mode_get();
+                        // CE: SLEEP joins MAIN / DIALOG as a mode where ESC
+                        // routes straight to the in-play (pause) menu rather
+                        // than dismissing the panel. The sleep menu is a
+                        // small overlay (world visible behind it), more like
+                        // fate UI — which doesn't change intgame_mode and
+                        // inherits MAIN's ESC behavior by default. Keeping
+                        // sleep in the dismiss branch made ESC behave
+                        // inconsistently between the two similar overlays.
                         if (esc_mode != INTGAME_MODE_MAIN
-                            && esc_mode != INTGAME_MODE_DIALOG) {
+                            && esc_mode != INTGAME_MODE_DIALOG
+                            && esc_mode != INTGAME_MODE_SLEEP) {
                             intgame_mode_set(INTGAME_MODE_MAIN);
                             break;
                         }

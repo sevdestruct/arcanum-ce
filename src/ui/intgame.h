@@ -294,6 +294,14 @@ void intgame_hud_bottom_band_design_x(int* out_x, int* out_w);
 // bars rather than flipping between pin choices as the geometry
 // briefly satisfies and unsatisfies different fit checks.
 bool intgame_hud_is_settling(void);
+
+// CE: current value of the bottom-bar slide-from-bottom offset (design
+// pixels). 0 = bar at rest; INTGAME_HUD_BOTTOM_H = bar fully below the
+// screen edge. Animated during HIDDEN↔visible transitions and on
+// level-load entrance. Read by follower_ui so the toggle/scroller
+// chrome rides the bar's entrance/exit slide instead of floating at
+// rest while the bar is below the screen.
+int intgame_hud_bottom_slide_offset_get(void);
 // CE: enable/disable the optional near-black see-through alpha on the
 // given window. Gated by the TranslucentBlackUI cfg flag — when off
 // (or enable=false), this clears any prior alpha state on the window.

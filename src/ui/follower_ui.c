@@ -1395,29 +1395,62 @@ void follower_ui_ping(void)
         == follower_ui_special_button_rects_compact_mode[
             FOLLOWER_UI_BUTTON_TOGGLE - FOLLOWER_UI_SLOTS].y);
 
-    int target = compact ? 0 : intgame_hud_bottom_top_crop();
-    if (target != follower_ui_slide_target) {
-        follower_ui_slide_target = target;
-        ui_anim_int_to(&follower_ui_slide_offset, target,
+    // CE: the three special buttons sit at design x=0..67 (toggle is
+    // the widest; the two scrollers split that range). The bottom
+    // HUD's visible band is full-width in FULL but cropped to a
+    // centered band in MED (x=196..606) and MINI (x=205..599), and
+    // empty in HIDDEN. So in MED/MINI the buttons are in lateral
+    // negative space — riding the visible band's top crop puts them
+    // floating mid-screen with no bar pixels beneath, which looks
+    // detached. When that's the case, target the bar's full height
+    // instead so the buttons drop flush with the screen bottom (same
+    // as compact mode rest), giving them a clean home regardless of
+    // stage.
+    int stage_target;
+    if (compact) {
+        stage_target = 0;
+    } else {
+        int btn_x = follower_ui_button_rects[FOLLOWER_UI_BUTTON_TOGGLE].x;
+        int btn_w = follower_ui_button_rects[FOLLOWER_UI_BUTTON_TOGGLE].width;
+        int band_x = 0, band_w = 0;
+        intgame_hud_bottom_band_design_x(&band_x, &band_w);
+        bool over_band = (band_w > 0)
+            && (btn_x < band_x + band_w)
+            && (btn_x + btn_w > band_x);
+        // 159 = bottom HUD's design-coord height. Matches the
+        // intgame_hud_bottom_top_crop() value for HIDDEN stage, which
+        // is the existing "button at screen-bottom" offset.
+        stage_target = over_band
+            ? intgame_hud_bottom_top_crop()
+            : 159;
+    }
+    if (stage_target != follower_ui_slide_target) {
+        follower_ui_slide_target = stage_target;
+        ui_anim_int_to(&follower_ui_slide_offset, stage_target,
             &UI_ANIM_PROFILE_DEFAULT_SLIDE);
     }
 
-    if (follower_ui_slide_offset == s_last_applied) {
+    // CE: combine the TAB-stage offset (tweened) with the bar's own
+    // slide-from-bottom offset (level-load entrance, HIDDEN↔visible
+    // transitions). The bar's slide isn't through follower_ui's
+    // tween so we read it live each frame — this keeps the buttons
+    // glued to the bar through the entrance animation rather than
+    // floating at rest position while the bar is below the screen.
+    int total_offset = follower_ui_slide_offset
+        + intgame_hud_bottom_slide_offset_get();
+
+    if (total_offset == s_last_applied) {
         return;
     }
-    s_last_applied = follower_ui_slide_offset;
+    s_last_applied = total_offset;
 
-    // Re-apply the offset to all three special buttons. The base
-    // rect (in design coords) sits at button_rects[i]; we add the
-    // current offset and re-run hrp_apply to land at the right
-    // screen position for the active resolution.
     int idx;
     for (idx = FOLLOWER_UI_SLOTS; idx < FOLLOWER_UI_BUTTON_COUNT; idx++) {
         if (follower_ui_windows[idx] == TIG_WINDOW_HANDLE_INVALID) {
             continue;
         }
         TigRect r = follower_ui_button_rects[idx];
-        r.y += follower_ui_slide_offset;
+        r.y += total_offset;
         hrp_apply(&r, GRAVITY_LEFT | GRAVITY_BOTTOM);
         tig_window_move(follower_ui_windows[idx], r.x, r.y);
     }

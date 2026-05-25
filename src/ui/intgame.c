@@ -753,7 +753,12 @@ static bool intgame_mode_scrolling[INTGAME_MODE_COUNT] = {
     /*       INTGAME_MODE_DIALOG */ true,
     /*       INTGAME_MODE_BARTER */ false,
     /*         INTGAME_MODE_WMAP */ true,
-    /*        INTGAME_MODE_SLEEP */ false,
+    // CE: sleep panel is a small overlay; the world stays visible
+    // behind it and the menu has no keyboard navigation (selection
+    // is mouse-only). Leaving scrolling enabled lets the player
+    // edge-scroll / arrow-key the camera while deciding whether to
+    // sleep — useful for checking surroundings without dismissing.
+    /*        INTGAME_MODE_SLEEP */ true,
     /*      INTGAME_MODE_LOGBOOK */ false,
     /*        INTGAME_MODE_INVEN */ false,
     /*     INTGAME_MODE_CHAREDIT */ false,
@@ -3312,6 +3317,23 @@ void intgame_process_event(TigMessage* msg)
             break;
         default:
             break;
+        }
+        return;
+    case INTGAME_MODE_SLEEP:
+        // CE: sleep panel is a small overlay; the iso world stays
+        // visible behind it, so wheel→zoom is a useful re-frame
+        // gesture (matches MAIN / DIALOG behavior). Without this
+        // case the wheel would fall to the default below and be
+        // dropped, leaving the player unable to zoom while the
+        // sleep menu is open. Fate UI doesn't hit this because it
+        // doesn't change intgame mode — wheel routes through
+        // whatever mode (typically MAIN) was active.
+        if (msg->type == TIG_MESSAGE_MOUSE
+            && msg->data.mouse.event == TIG_MESSAGE_MOUSE_WHEEL) {
+            if (iso_zoom_is_available()) {
+                iso_zoom_wheel(msg->data.mouse.dy);
+                gamelib_invalidate_rect(NULL);
+            }
         }
         return;
     default:
@@ -10224,6 +10246,11 @@ bool intgame_hud_is_settling(void)
 {
     return ui_anim_is_active(intgame_hud_top_slide_handle)
         || ui_anim_is_active(intgame_hud_bottom_slide_handle);
+}
+
+int intgame_hud_bottom_slide_offset_get(void)
+{
+    return intgame_hud_bottom_slide_offset;
 }
 
 // CE: per-tick iso-invalidate hook. In the current direct-paint

@@ -1362,6 +1362,25 @@ bool gamelib_draw(void)
     // hide path put them. Run hud_ping first so slide_hide / slide_
     // show actually animate during the mainmenu navigation too.
     intgame_hud_ping();
+    // CE: follower / fate / sleep UI per-frame slide updates must
+    // also run before the gamelib_dirty early-return. They read
+    // ui_anim_ping's just-integrated spring values and call
+    // tig_window_move to apply them; if skipped on idle frames the
+    // tween updates land in chunks instead of per-frame, reading
+    // as stutter. (They appeared smooth during dialogue only
+    // because TC's invalidations were keeping gamelib_dirty true
+    // on those frames.) Each is a cheap no-op when its panel isn't
+    // moving.
+    follower_ui_ping();
+    fate_ui_ping();
+    sleep_ui_ping();
+    // CE: dialog choice box slide (tc_bottom_gap_offset spring) also
+    // belongs in the pre-dirty group. In practice TC's own
+    // invalidations keep gamelib_dirty true through its tween, but
+    // edge cases (dialogue starting while the game is paused on the
+    // first frame; TC settling after a pause window closes) can
+    // miss frames. Cheap no-op when the rect hasn't shifted.
+    tc_ping();
 
     if (!gamelib_dirty) {
         return false;
@@ -1374,28 +1393,12 @@ bool gamelib_draw(void)
     camera_tween_ping();
     dialog_camera_ping();
     camera_follow_ping();
-    // CE: dialog-options backdrop position update. Runs AFTER
-    // ui_anim_ping so it sees the just-integrated tweened
-    // tc_bottom_gap_offset; recomputes the backdrop rect y and
-    // issues the necessary invalidations on shift. Cheap when not
-    // mid-tween (early return on rect-unchanged).
-    tc_ping();
-    // CE: fate / sleep window slide-position update. Same pattern
-    // as tc_ping — reads the spring-tweened slide offset that
-    // ui_anim_ping just integrated and calls tig_window_move so the
-    // panels slide down on appear / slide up on dismiss. Cheap
-    // no-op when the panel isn't open and the slide isn't moving.
-    fate_ui_ping();
-    sleep_ui_ping();
-    // CE: follower toggle/scroller chrome rides the bottom HUD's
-    // TAB-stage top crop — same shared-anchor pattern as fate/
-    // sleep above. Cheap no-op when offset hasn't changed.
-    follower_ui_ping();
-    // Note: intgame_hud_ping is called earlier (before the
-    // gamelib_dirty early-return) so the slide can animate at the
-    // mainmenu where gamelib_dirty stays false. fate/sleep panels
-    // read intgame_hud_top_offset() each frame in their own pings
-    // and pick up the just-integrated value the same way.
+    // Note: intgame_hud_ping / follower_ui_ping / fate_ui_ping /
+    // sleep_ui_ping / tc_ping are all called earlier (before the
+    // gamelib_dirty early-return) so their slide animations
+    // integrate smoothly on idle frames too. They read
+    // intgame_hud_top_offset() / etc. each frame and pick up
+    // ui_anim_ping's just-integrated values the same way.
     z = iso_zoom_current();
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
