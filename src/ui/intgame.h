@@ -247,6 +247,12 @@ void intgame_hud_ping(void);
 // otherwise sit below the newly-created panel in z-order, leaving
 // the panel visible above the bar from frame 1).
 void intgame_hud_promote_top_strip(void);
+// CE: same pattern but for the bottom HUD strip. Called by follower_ui
+// after creating its toggle/scroller chrome (which init order puts
+// AFTER iso_interface_create → newer windows land on top by default).
+// Without this the chrome would float above the bar during the bar's
+// entrance/exit slide rather than disappearing behind it.
+void intgame_hud_promote_bottom_strip(void);
 // CE: per-tick hook called BEFORE iso_redraw. Marks the iso VB
 // under any HUD strip using the translucent-black tint pathway as
 // dirty, so iso_redraw repaints fresh world pixels there. The

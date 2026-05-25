@@ -9890,6 +9890,17 @@ void intgame_hud_promote_top_strip(void)
     tig_window_move_on_top(dword_64C4F8[0]);
 }
 
+void intgame_hud_promote_bottom_strip(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    tig_window_move_on_top(dword_64C4F8[1]);
+}
+
 tig_window_handle_t intgame_get_band_bar_handle(void)
 {
     if (!intgame_iso_interface_created) {

@@ -395,6 +395,14 @@ bool follower_ui_init(GameInitInfo* init_info)
         follower_ui_create(index);
     }
 
+    // CE: gameuilib init order puts Follower-UI after Iso, so the
+    // toggle/scroller chrome windows were just stacked ABOVE the bottom
+    // HUD bar. Promote the bar back to the top of its z-class so the
+    // chrome disappears behind it during the bar's entrance / exit
+    // slide instead of floating in front. Mirrors fate_ui / sleep_ui's
+    // intgame_hud_promote_top_strip call.
+    intgame_hud_promote_bottom_strip();
+
     // Determine the drop-down menu dimensions from the background art.
     tig_art_interface_id_create(FOLLOWER_UI_DROP_DOWN_MENU_ART, 0, 0, 0, &art_id);
     tig_art_frame_data(art_id, &art_frame_data);
