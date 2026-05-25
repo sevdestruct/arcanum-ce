@@ -315,6 +315,8 @@ set(SRCS
     "src/ui/textedit_ui.c"
     "src/ui/textedit_ui.h"
     "src/ui/types.h"
+    "src/ui/ui_anim.c"
+    "src/ui/ui_anim.h"
     "src/ui/wmap_rnd.c"
     "src/ui/wmap_rnd.h"
     "src/ui/wmap_ui.c"

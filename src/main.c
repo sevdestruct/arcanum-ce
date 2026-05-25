@@ -49,6 +49,7 @@
 #include "ui/dialog_ui.h"
 #include "ui/gameuilib.h"
 #include "ui/intgame.h"
+#include "ui/ui_anim.h"
 #include "ui/iso.h"
 #include "ui/logbook_ui.h"
 #include "ui/mainmenu_ui.h"
@@ -365,6 +366,10 @@ int main(int argc, char** argv)
     camera_tween_init();   // generic tween engine — must precede any consumers
     dialog_camera_init();
     camera_follow_init();
+    // CE: UI animation spring integrator. Must run after gamelib_init
+    // (reads the UI_ANIMATIONS cfg). Doesn't depend on any iso/world
+    // state, so order vs the camera modules doesn't matter.
+    ui_anim_init();
 
     if (strstr(lpCmdLine, "-dialogcheck") != NULL) {
         dialog_check();
