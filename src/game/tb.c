@@ -51,17 +51,6 @@
  * away from the NPC.
  */
 #define TB_DRIFT_MAX_PX 160
-// CE: extra horizontal drift tolerance applied to the SIDE-push
-// candidate's score when deciding whether to keep the bubble
-// pinned at the UI's edge vs. jump to a different push (top).
-// Bubble being "held" against a UI side isn't really drift-of-NPC,
-// it's the UI's own width getting in the way — so we suppress the
-// drift-excess penalty for the side score over a wider range,
-// keeping the bubble snug against the UI edge longer before the
-// snap to top fires. Doesn't affect the fade-out drift check; if
-// the NPC really does drift away, the bubble still fades at the
-// regular threshold. Scoring-side only.
-#define TB_DRIFT_UI_HORIZ_BONUS_PX 400
 
 /**
  * Vertical gap (screen pixels) inserted between stacked speech bubbles when
@@ -245,6 +234,20 @@ typedef enum TbPushState {
 // a clean HUD decision based on geometry, not inherit TC's pin.
 static TbPushState tb_hud_push_state[MAX_TEXT_BUBBLES];
 static TbPushState tb_tc_push_state[MAX_TEXT_BUBBLES];
+
+// CE: drift fade-out commitment. When the speaker drifts out of range
+// we start a fade-out at the bubble's current rect; tb_drift_locked
+// holds that rect for the duration of the fade so the bubble dies in
+// place instead of teleporting along with the speaker's continued
+// motion. If the speaker comes back close (within TB_DRIFT_MAX_PX of
+// the locked position) before alpha reaches 0, we reverse the fade.
+// If they come back far (or alpha already hit 0), we let the fade
+// finish and start a fresh entrance fade at the new natural rect —
+// "respawn after far jump" — instead of snapping the bubble across
+// the screen.
+static int  tb_drift_fade_start_x[MAX_TEXT_BUBBLES];
+static int  tb_drift_fade_start_y[MAX_TEXT_BUBBLES];
+static bool tb_drift_locked[MAX_TEXT_BUBBLES];
 // Entrance/exit fade timing — slower exit reads as "trailing off,"
 // the entrance is snappier so the bubble doesn't feel laggy. Reused
 // for the drift fades (same profile vars).
@@ -512,17 +515,6 @@ void tb_ping(tig_timestamp_t timestamp)
     int64_t oy;
     float z;
 
-    // Pre-invalidate last frame's resolved bubble positions so the game world
-    // redraws those areas before tb_draw runs this frame.  tb_resolve_overlaps
-    // may shift bubbles beyond the rect that tb_calc_rect invalidated, leaving
-    // the adjusted area outside the dirty-rect list at 1.0x zoom.  Marking the
-    // resolved rects dirty here ensures the blit always has full coverage.
-    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
-        if (tb_prev_resolved[idx].width > 0 && tb_prev_resolved[idx].height > 0) {
-            tb_iso_window_invalidate_rect(&tb_prev_resolved[idx]);
-        }
-    }
-
     for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
         // Check if the bubble has expired.
         if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0
@@ -559,24 +551,27 @@ void tb_ping(tig_timestamp_t timestamp)
         }
     }
 
-    // Re-evaluate bubble placement whenever the camera moves or zoom changes.
-    // This lets bubbles work back to their preferred position (TOP) as soon as
-    // the viewport opens up, without polling every frame — positions are only
-    // reset when something actually changed.
+    // Update camera-origin / zoom snapshot. tb_scroll_dx/dy is captured here
+    // even though the closest-edge pin chooser no longer uses it — kept for
+    // any future scroll-axis-aware behavior.
     location_origin_get(&ox, &oy);
     z = iso_zoom_current();
-    // CE: capture the scroll deltas every frame so tb_calc_rect can
-    // bias UI-push choices toward the scroll axis (sliding side-by
-    // along the UI feels natural during horizontal scroll; jumping
-    // over the UI feels jarring against the camera motion).
     tb_scroll_dx = ox - tb_last_origin_x;
     tb_scroll_dy = oy - tb_last_origin_y;
-    if (ox != tb_last_origin_x || oy != tb_last_origin_y || z != tb_last_zoom) {
-        tb_invalidate_positions();
-        tb_last_origin_x = ox;
-        tb_last_origin_y = oy;
-        tb_last_zoom = z;
-    }
+    tb_last_origin_x = ox;
+    tb_last_origin_y = oy;
+    tb_last_zoom = z;
+
+    // CE: invalidate the UNION of last frame's resolved rects and this
+    // frame's projected rects, so the dirty-rect system covers both the
+    // bubble's old position (now empty world space) and its new position
+    // (where the blit will land). Previously this only pre-invalidated
+    // last frame's rects, which meant the bubble's blit could miss
+    // dirty-rect coverage whenever its rect changed between frames
+    // (pin engagement on bump-in, alignment switch, overlap resolution
+    // shifting it sideways) — the bubble would visibly disappear for
+    // one frame and reappear once tb_prev_resolved caught up.
+    tb_invalidate_resolved_changes();
 }
 
 /**
@@ -702,6 +697,9 @@ void tb_add(int64_t obj, int type, const char* str)
                     tb_alpha_handle[idx] = ui_anim_int_to(
                         &tb_alpha[idx], 255, &tb_entrance_profile);
                 }
+                // Clear any drift-fade lock — bubble is being refreshed and
+                // should follow its natural placement again.
+                tb_drift_locked[idx] = false;
             }
             return;
         }
@@ -745,6 +743,7 @@ void tb_add(int64_t obj, int type, const char* str)
             tb_alpha[idx] = 0;
             tb_alpha_target[idx] = 255;
             tb_pending_remove[idx] = false;
+            tb_drift_locked[idx] = false;
             tb_alpha_handle[idx] = ui_anim_int_to(&tb_alpha[idx], 255,
                 &tb_entrance_profile);
         }
@@ -873,20 +872,23 @@ void tb_remove_with_fade(int64_t obj)
 }
 
 /**
- * Resets the rendered alignment of all active text bubbles to TB_ALIGN_INVALID
- * so they are repositioned on the next draw frame.  Call this after the camera
- * has finished panning so bubbles are placed with the final viewport in mind.
+ * Re-invalidates the dirty rects associated with each active bubble so
+ * 1.0x dirty-rect rendering picks up overlap-driven moves.  Called when
+ * the camera has scrolled or zoom changed.
+ *
+ * CE: previously also reset each bubble's rendered_align to INVALID to
+ * force a re-render every scroll frame.  That re-render mutated
+ * tb->rect.width mid-frame; since tb_calc_rect_ex runs twice per
+ * scroll frame (once via tb_invalidate_resolved_changes, again via
+ * tb_draw), the second call saw a different width than the first.
+ * For sprites near a screen edge that flipped a clamp and could
+ * flip the drift result — leading to alpha-tween retargets fighting
+ * each other within a single frame.  The reset is also redundant:
+ * tb_calc_rect_ex's natural "required_align != rendered_align"
+ * check re-renders on real alignment changes anyway.
  */
 void tb_invalidate_positions(void)
 {
-    int idx;
-
-    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
-        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) != 0) {
-            tb_text_bubbles[idx].rendered_align = TB_ALIGN_INVALID;
-        }
-    }
-
     tb_invalidate_resolved_changes();
 }
 
@@ -960,6 +962,9 @@ void tb_remove_internal(TextBubble* tb)
         tb_alpha_target[slot] = 0;
         tb_hud_push_state[slot] = TB_PUSH_NONE;
         tb_tc_push_state[slot] = TB_PUSH_NONE;
+        tb_drift_locked[slot] = false;
+        tb_drift_fade_start_x[slot] = 0;
+        tb_drift_fade_start_y[slot] = 0;
     }
 
     // Invalidate both the previously drawn resolved rects and the survivors'
@@ -1010,89 +1015,128 @@ void tb_calc_rect(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRe
     tb_calc_rect_ex(tb, loc, offset_x, offset_y, rect, NULL);
 }
 
-// CE: chooses the pin (top vs left vs right) for a bubble that
-// overlaps a rectangular UI obstacle (HUD band or TC), applies the
-// chosen pin's clamp to *vp_left/right/bottom and updates
-// *forced_align. Returns the chosen TbPushState for the caller to
-// commit. Used by tb_calc_rect_ex for both HUD and TC; the only
-// differences between the two are the UI rect edges and whether
-// the side-push alignment overrides an already-set forced_align
-// (HUD = override, TC = defer).
+// CE: picks a pin (TOP/LEFT/RIGHT) for a bubble against a rectangular
+// UI obstacle and applies its clamp to *vp_left/right/bottom (and
+// updates *forced_align for side pins). Returns the committed
+// TbPushState for the caller to remember. Used for both HUD and TC.
 //
-// Decision rules:
-//   - sticky-to-death: if previously side-pinned, stay side;
-//     if previously top-pinned, stay top.
-//   - fresh decision: raw displacement from natural — smaller
-//     jump wins. Drift excess multiplied by 1000 dominates so
-//     in-drift candidates always beat fade-zone candidates.
-//   - side push has a raw-distance cap (width/2 fresh, width*3
-//     when sticky or scrolling horizontally) past which it
-//     reads as a teleport and is disqualified.
-static TbPushState tb_pin_choose(
+// Closest-edge projection: from the bubble's NATURAL (ideal) position,
+// compute the minimum displacement required to escape via each of the
+// UI's three reachable edges (top, left, right). Smallest wins.
+// Side escapes are biased by (width/2 + margin) — the bubble's
+// structural overhang past its center — so wide bubbles don't lose
+// to top by default just because moving sideways visually means
+// moving width/2 past the edge.
+//
+// Stay-if-viable: if a prior frame's pin is still within drift
+// tolerance, keep it. If not but an alternative pin IS viable,
+// switch (saves the bubble from fading). If neither is viable,
+// keep the prior pin — let the bubble fade at its committed pin
+// rather than jump into another fade-zone position.
+//
+// Clamps are one-sided ("if (target < *vp_bottom) *vp_bottom = target"),
+// so when the bubble's natural position lies in the negative space
+// beside/above the UI, the clamp is a no-op against the existing
+// viewport bound. That's the property that lets us call this
+// unconditionally without a separate "x_over_band" gate.
+static TbPushState tb_apply_ui_clamp(
     int ui_left, int ui_right, int ui_top,
-    const TigRect* rect, int ideal_x, int ideal_y,
-    TbPushState prev_pin, bool scroll_horiz,
+    int ideal_x, int ideal_y,
+    int width, int height,
+    TbPushState prev_pin,
     int* vp_left, int* vp_right, int* vp_bottom,
     int* forced_align, bool align_override)
 {
-    int top_b = ui_top - rect->height - TB_EDGE_MARGIN_PX;
-    int top_push_dist = ideal_y - top_b;
-    int bubble_cx = rect->x + rect->width / 2;
-    int ui_cx = (ui_left + ui_right) / 2;
+    int margin = TB_EDGE_MARGIN_PX;
 
-    bool push_left;
-    if (prev_pin == TB_PUSH_LEFT)       push_left = true;
-    else if (prev_pin == TB_PUSH_RIGHT) push_left = false;
-    else                                push_left = bubble_cx < ui_cx;
-
-    int right_target = ui_left - TB_EDGE_MARGIN_PX - rect->width;
-    int left_target = ui_right + TB_EDGE_MARGIN_PX;
-    int side_target_x = push_left ? right_target : left_target;
-    int side_push_dist = push_left
-        ? (rect->x - right_target)
-        : (left_target - rect->x);
-
-    bool sticky_side = (prev_pin == TB_PUSH_LEFT || prev_pin == TB_PUSH_RIGHT);
-    bool side_cap_relaxed = sticky_side || scroll_horiz;
-    int side_push_max = side_cap_relaxed ? rect->width * 3 : rect->width / 2;
-
-    int drift_horiz_side = TB_DRIFT_MAX_PX + rect->width / 2
-        + TB_DRIFT_UI_HORIZ_BONUS_PX;
-    int top_excess = top_push_dist - TB_DRIFT_MAX_PX;
-    int side_dx = side_target_x > ideal_x
-        ? side_target_x - ideal_x : ideal_x - side_target_x;
-    int side_excess = side_dx - drift_horiz_side;
-    if (top_excess < 0) top_excess = 0;
-    if (side_excess < 0) side_excess = 0;
-
-    int top_score = top_excess * 1000 + top_push_dist;
-    int side_score = (side_push_dist < 0 || side_push_dist > side_push_max)
-        ? INT_MAX
-        : side_excess * 1000 + side_dx;
-
-    bool choose_side;
-    if (sticky_side)                  choose_side = true;
-    else if (prev_pin == TB_PUSH_TOP) choose_side = false;
-    else                              choose_side = (side_score < top_score);
-
-    if (choose_side) {
-        if (push_left) {
-            if (right_target < *vp_right) *vp_right = right_target;
-            if (align_override || *forced_align == TB_ALIGN_INVALID) {
-                *forced_align = TB_ALIGN_RIGHT;
-            }
-            return TB_PUSH_LEFT;
-        } else {
-            if (left_target > *vp_left) *vp_left = left_target;
-            if (align_override || *forced_align == TB_ALIGN_INVALID) {
-                *forced_align = TB_ALIGN_LEFT;
-            }
-            return TB_PUSH_RIGHT;
-        }
-    } else {
-        if (top_b < *vp_bottom) *vp_bottom = top_b;
-        return TB_PUSH_TOP;
+    // Does the bubble's natural rect overlap the UI's expanded rect?
+    // Bottom of UI is treated as off-screen (always overlapped on that side).
+    bool overlap = (ideal_x + width > ui_left - margin)
+                && (ideal_x < ui_right + margin)
+                && (ideal_y + height > ui_top - margin);
+    if (!overlap) {
+        return TB_PUSH_NONE;
     }
+
+    // Escapes from ideal position: minimum displacement to clear each edge.
+    int top_escape   = (ideal_y + height) - (ui_top - margin);
+    int left_escape  = (ideal_x + width)  - (ui_left - margin);
+    int right_escape = (ui_right + margin) - ideal_x;
+    if (top_escape   < 0) top_escape   = 0;
+    if (left_escape  < 0) left_escape  = 0;
+    if (right_escape < 0) right_escape = 0;
+
+    // Side bias: a bubble centered over a sprite has its left/right
+    // edges extending width/2 past the sprite's screen x. So any
+    // sprite inside the UI's x range has a baseline left_escape of
+    // at least (width/2 + margin) just from bubble structure, even
+    // when the sprite is at the very edge. Subtracting the baseline
+    // gives a comparable score: 0 means "sprite is at the edge,
+    // bubble barely overlaps", positive means "sprite is further in".
+    int side_bias = width / 2 + margin;
+    int top_score   = top_escape;
+    int left_score  = left_escape  - side_bias;
+    int right_score = right_escape - side_bias;
+    if (left_score  < 0) left_score  = 0;
+    if (right_score < 0) right_score = 0;
+
+    // Drift tolerances per pin direction. These mirror the axis-aware
+    // drift check at the end of tb_calc_rect_ex: TOP pin locks y,
+    // tolerable y displacement is TB_DRIFT_MAX_PX; SIDE pin locks x,
+    // tolerable x displacement is TB_DRIFT_MAX_PX + width/2 (the
+    // bubble's half-width is "free" because it doesn't reflect real
+    // speaker motion, just bubble centering).
+    int drift_top  = TB_DRIFT_MAX_PX;
+    int drift_side = TB_DRIFT_MAX_PX + width / 2;
+
+    // Closest-edge fresh winner.
+    TbPushState fresh = TB_PUSH_TOP;
+    int fresh_score = top_score;
+    if (left_score  < fresh_score) { fresh = TB_PUSH_LEFT;  fresh_score = left_score; }
+    if (right_score < fresh_score) { fresh = TB_PUSH_RIGHT; fresh_score = right_score; }
+
+    // Stay-if-viable.
+    TbPushState chosen;
+    if (prev_pin == TB_PUSH_NONE) {
+        chosen = fresh;
+    } else {
+        int prev_esc, prev_drift;
+        if (prev_pin == TB_PUSH_TOP)        { prev_esc = top_escape;   prev_drift = drift_top;  }
+        else if (prev_pin == TB_PUSH_LEFT)  { prev_esc = left_escape;  prev_drift = drift_side; }
+        else                                { prev_esc = right_escape; prev_drift = drift_side; }
+        int fresh_esc, fresh_drift;
+        if (fresh == TB_PUSH_TOP)           { fresh_esc = top_escape;   fresh_drift = drift_top;  }
+        else if (fresh == TB_PUSH_LEFT)     { fresh_esc = left_escape;  fresh_drift = drift_side; }
+        else                                { fresh_esc = right_escape; fresh_drift = drift_side; }
+
+        if (prev_esc <= prev_drift) {
+            chosen = prev_pin;          // viable, stay committed
+        } else if (fresh_esc <= fresh_drift) {
+            chosen = fresh;             // switch to save from fade
+        } else {
+            chosen = prev_pin;          // both unviable; let it fade at prev
+        }
+    }
+
+    // Apply the chosen pin's clamp.
+    if (chosen == TB_PUSH_TOP) {
+        int top_b = ui_top - margin - height;
+        if (top_b < *vp_bottom) *vp_bottom = top_b;
+    } else if (chosen == TB_PUSH_LEFT) {
+        int r = ui_left - margin - width;
+        if (r < *vp_right) *vp_right = r;
+        if (align_override || *forced_align == TB_ALIGN_INVALID) {
+            *forced_align = TB_ALIGN_RIGHT;
+        }
+    } else if (chosen == TB_PUSH_RIGHT) {
+        int l = ui_right + margin;
+        if (l > *vp_left) *vp_left = l;
+        if (align_override || *forced_align == TB_ALIGN_INVALID) {
+            *forced_align = TB_ALIGN_LEFT;
+        }
+    }
+
+    return chosen;
 }
 
 void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, TigRect* rect, TextBubblePlacementFlags* placement_flags)
@@ -1235,37 +1279,40 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
     TbPushState prev_tc  = slot_valid ? tb_tc_push_state[slot_idx]  : TB_PUSH_NONE;
     TbPushState new_hud = TB_PUSH_NONE;
     TbPushState new_tc  = TB_PUSH_NONE;
-    // Scroll-axis bias: when the camera is panning horizontally,
-    // side-push aligns with the visible motion and is allowed a
-    // wider raw-distance cap. Computed once per frame; the helper
-    // reads it for both UIs.
-    bool scroll_horiz = (llabs(tb_scroll_dx) > llabs(tb_scroll_dy))
-        && tb_scroll_dx != 0;
+    // CE: top bar lateral negative space. The top bar is 800px wide
+    // at design coords, centered horizontally. At higher resolutions
+    // the iso content extends past the top bar on the left and right
+    // sides — that lateral negative space is usable for bubbles
+    // whose x range doesn't overlap the top bar. Only apply the
+    // ui_top clamp (push bubble below the visible top bar) when
+    // the bubble's natural x is over the top bar's design x range.
+    //
+    // Unlike the bottom band, the top bar doesn't crop laterally
+    // per TAB stage — its width is always 800 when visible. So the
+    // condition is simpler: just an x-range overlap check.
+    int top_bar_screen_left = tb_iso_content_rect.x
+        + (tb_iso_content_rect.width - 800) / 2;
+    int top_bar_screen_right = top_bar_screen_left + 800;
     {
-        int t = tb_iso_content_rect.y + ui_top + TB_EDGE_MARGIN_PX;
-        if (t > vp_top) vp_top = t;
+        bool bubble_x_over_top_bar = (ui_top > 0)
+            && (rect->x < top_bar_screen_right + TB_EDGE_MARGIN_PX)
+            && (rect->x + rect->width > top_bar_screen_left - TB_EDGE_MARGIN_PX);
+        if (bubble_x_over_top_bar) {
+            int t = tb_iso_content_rect.y + ui_top + TB_EDGE_MARGIN_PX;
+            if (t > vp_top) vp_top = t;
+        }
 
-        bool bubble_x_over_band = (band_w_design > 0)
-            && (rect->x < band_screen_right + TB_EDGE_MARGIN_PX)
-            && (rect->x + rect->width > band_screen_left - TB_EDGE_MARGIN_PX);
-        // "Natural" y overlap = the bubble's *unclamped* ideal y range
-        // would extend into the band. If only the x overlaps (bubble
-        // sits well above band), fall back to the existing top clamp.
-        bool bubble_y_over_band = (ideal_y + rect->height
-            > band_top_y - TB_EDGE_MARGIN_PX);
-
-        if (bubble_x_over_band && bubble_y_over_band) {
-            new_hud = tb_pin_choose(
+        // HUD band — unified pin pass. The helper checks natural
+        // overlap internally and returns NONE when no clamp is
+        // needed; clamps are idempotent so the call is safe even
+        // when the bubble lives in lateral negative space.
+        if (band_w_design > 0) {
+            new_hud = tb_apply_ui_clamp(
                 band_screen_left, band_screen_right, band_top_y,
-                rect, ideal_x, ideal_y, prev_hud, scroll_horiz,
-                &vp_left, &vp_right, &vp_bottom, &forced_align,
-                /*align_override=*/true);
-        } else if (bubble_x_over_band) {
-            // No natural vertical overlap — just the standard top
-            // clamp (bubble above bar, no overlap).
-            int b = tb_iso_content_rect.y + tb_iso_content_rect.height
-                    - ui_bottom - rect->height - TB_EDGE_MARGIN_PX;
-            if (b < vp_bottom) vp_bottom = b;
+                ideal_x, ideal_y, rect->width, rect->height,
+                prev_hud,
+                &vp_left, &vp_right, &vp_bottom,
+                &forced_align, /*align_override=*/true);
         }
     }
 
@@ -1287,126 +1334,56 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
         }
     }
 
-    // Dialogue choice box — only present during dialogue.
-    //
-    // Two valid placement bands when the bubble overlaps tc horizontally:
-    //   ABOVE tc: y ∈ [vp_top, tc.y - margin - rect.h]
-    //   BELOW tc: y ∈ [tc.y + tc.h + margin, vp_bottom]
-    //
-    // The BELOW band is only usable when (a) it fits the bubble height
-    // between tc.bottom and the already-tightened vp_bottom (which has
-    // the bar's reservation applied), AND (b) ideal_y is naturally in
-    // the lower half — i.e. the NPC sprite is sitting below the tc
-    // panel, so placing the bubble below feels natural. Cropped HUD
-    // stages (MEDIUM/MINI/HIDDEN) free up vertical space below tc; this
-    // lets the bubble drop into that gap instead of jumping above tc.
+    // Dialogue choice box — unified pin pass with a below-TC special case
+    // preserved: when the speaker's natural y sits in TC's lower half AND
+    // there's room below TC, drop the bubble below TC instead of forcing
+    // it above. This matters most in cropped HUD stages where the gap
+    // beneath TC is the most natural place for a follower NPC's bubble.
     if (tc_is_active()) {
         TigRect tc = tc_get_content_rect();
-        bool x_over_tc = (rect->x < tc.x + tc.width + TB_EDGE_MARGIN_PX
-            && rect->x + rect->width > tc.x - TB_EDGE_MARGIN_PX);
-        // Natural vertical overlap with tc: ideal_y range crosses tc.y.
-        bool y_over_tc = (ideal_y < tc.y + tc.height + TB_EDGE_MARGIN_PX)
-            && (ideal_y + rect->height > tc.y - TB_EDGE_MARGIN_PX);
+        bool x_over_tc = (ideal_x + rect->width > tc.x - TB_EDGE_MARGIN_PX)
+            && (ideal_x < tc.x + tc.width + TB_EDGE_MARGIN_PX);
+        bool ideal_below = (ideal_y >= tc.y + tc.height / 2);
+        int below_min = tc.y + tc.height + TB_EDGE_MARGIN_PX;
 
-        if (x_over_tc && y_over_tc) {
-            new_tc = tb_pin_choose(
-                tc.x, tc.x + tc.width, tc.y,
-                rect, ideal_x, ideal_y, prev_tc, scroll_horiz,
-                &vp_left, &vp_right, &vp_bottom, &forced_align,
-                /*align_override=*/false);
-        } else if (x_over_tc) {
-            // Only horizontal overlap — keep above/below-gap logic.
-            int above_max = tc.y - TB_EDGE_MARGIN_PX - rect->height;
-            int below_min = tc.y + tc.height + TB_EDGE_MARGIN_PX;
-            bool below_fits = (below_min + rect->height
-                <= vp_bottom + rect->height);
-            bool ideal_below = (ideal_y >= tc.y + tc.height / 2);
-            if (below_fits && ideal_below) {
-                if (below_min > vp_top) vp_top = below_min;
+        // CE: below_fits used to be `below_min <= vp_bottom`, but vp_bottom
+        // is only tightened by HUD's TOP pin when the bubble's NATURAL
+        // position already overlaps HUD. For a bubble pinned high up
+        // against TC's top edge, natural is well above HUD, so HUD pin
+        // never fires and vp_bottom stays at "stay on screen" — making
+        // below_fits trivially true and dropping the bubble into a
+        // below_min position that lands inside the HUD bar. Next frame
+        // ideal_below flips and the bubble snaps back above TC. The
+        // flicker the user reported when bumping speaker up against TC.
+        //
+        // Real check: would a bubble placed at rect.y = below_min still
+        // be safe vs. HUD? Reuses the band geometry computed above.
+        // Outside the band's x range the bubble can use the lateral
+        // space all the way down to the screen edge.
+        int below_max_top;
+        {
+            bool below_x_over_band = (band_w_design > 0)
+                && (rect->x < band_screen_right + TB_EDGE_MARGIN_PX)
+                && (rect->x + rect->width > band_screen_left - TB_EDGE_MARGIN_PX);
+            if (below_x_over_band) {
+                below_max_top = band_top_y - TB_EDGE_MARGIN_PX - rect->height;
             } else {
-                if (above_max < vp_bottom) vp_bottom = above_max;
+                below_max_top = tb_iso_content_rect.y + tb_iso_content_rect.height
+                    - rect->height - TB_EDGE_MARGIN_PX;
             }
         }
-    }
+        bool below_fits = (below_min <= below_max_top);
 
-    // CE: sticky-to-death preserve + re-apply pin clamps.
-    //
-    // The HUD/TC blocks above only set the vp_* clamps when their
-    // active-overlap branch fires. When the bubble is sliding
-    // along a pin's edge and the speaker's natural position
-    // briefly slips out of strict overlap (e.g. natural_x exits
-    // band's x range while bubble was top-pinned, or natural_y
-    // exits while bubble was side-pinned), the block doesn't
-    // fire — so without re-application, the clamp vanishes and
-    // the bubble snaps from its pin position to natural. That's
-    // the "jump to other side of HUD that immediately fades"
-    // bug: the bubble visibly teleports to natural, the drift
-    // check then sees a large displacement and triggers fade.
-    //
-    // Fix: preserve unconditionally (sticky-to-death; the
-    // bubble's state lives until tb_remove_internal clears it
-    // on fade-out), then re-apply the pin's vp_* clamp based
-    // on new_hud / new_tc. Idempotent with the block's own
-    // clamp when the block fired, additive when it didn't.
-    if (new_hud == TB_PUSH_NONE && prev_hud != TB_PUSH_NONE) {
-        new_hud = prev_hud;
-    }
-    if (new_tc == TB_PUSH_NONE && prev_tc != TB_PUSH_NONE) {
-        new_tc = prev_tc;
-    }
-
-    // Asymmetric re-apply:
-    //
-    //   TOP pin → conditional on x_over_band. When the bubble's
-    //   natural.x is outside the band's x range, there's
-    //   nothing to obstruct, and the bubble drops into the
-    //   lateral negative space. Forcing the bubble to top_b
-    //   when it could be at natural.y in open lateral space
-    //   would ignore that available area.
-    //
-    //   LEFT/RIGHT pin → unconditional (within the bubble's
-    //   sticky-to-death state). The natural reading of a
-    //   side-pinned bubble is "I'm beside this UI" — as the
-    //   speaker walks up the bubble slides up along the side,
-    //   tracked by bubble.y = natural.y while bubble.x stays
-    //   pinned. If natural.x drifts too far from the pin, the
-    //   drift system fades the bubble at its committed pin
-    //   instead of jumping it into the open space above the UI.
-    //   That's the "horizontal pin and drift" behavior.
-    if (new_hud == TB_PUSH_TOP && band_w_design > 0) {
-        bool x_over_band = (rect->x < band_screen_right + TB_EDGE_MARGIN_PX)
-            && (rect->x + rect->width > band_screen_left - TB_EDGE_MARGIN_PX);
-        if (x_over_band) {
-            int top_b = tb_iso_content_rect.y + tb_iso_content_rect.height
-                - ui_bottom - rect->height - TB_EDGE_MARGIN_PX;
-            if (top_b < vp_bottom) vp_bottom = top_b;
-        }
-    } else if (new_hud == TB_PUSH_LEFT && band_w_design > 0) {
-        int t = band_screen_left - TB_EDGE_MARGIN_PX - rect->width;
-        if (t < vp_right) vp_right = t;
-        if (forced_align == TB_ALIGN_INVALID) forced_align = TB_ALIGN_RIGHT;
-    } else if (new_hud == TB_PUSH_RIGHT && band_w_design > 0) {
-        int t = band_screen_right + TB_EDGE_MARGIN_PX;
-        if (t > vp_left) vp_left = t;
-        if (forced_align == TB_ALIGN_INVALID) forced_align = TB_ALIGN_LEFT;
-    }
-    if (new_tc != TB_PUSH_NONE && tc_is_active()) {
-        TigRect tc = tc_get_content_rect();
-        if (new_tc == TB_PUSH_TOP) {
-            bool x_over_tc = (rect->x < tc.x + tc.width + TB_EDGE_MARGIN_PX)
-                && (rect->x + rect->width > tc.x - TB_EDGE_MARGIN_PX);
-            if (x_over_tc) {
-                int top_b = tc.y - TB_EDGE_MARGIN_PX - rect->height;
-                if (top_b < vp_bottom) vp_bottom = top_b;
-            }
-        } else if (new_tc == TB_PUSH_LEFT) {
-            int t = tc.x - TB_EDGE_MARGIN_PX - rect->width;
-            if (t < vp_right) vp_right = t;
-            if (forced_align == TB_ALIGN_INVALID) forced_align = TB_ALIGN_RIGHT;
-        } else if (new_tc == TB_PUSH_RIGHT) {
-            int t = tc.x + tc.width + TB_EDGE_MARGIN_PX;
-            if (t > vp_left) vp_left = t;
-            if (forced_align == TB_ALIGN_INVALID) forced_align = TB_ALIGN_LEFT;
+        if (x_over_tc && ideal_below && below_fits) {
+            if (below_min > vp_top) vp_top = below_min;
+            new_tc = TB_PUSH_NONE;
+        } else {
+            new_tc = tb_apply_ui_clamp(
+                tc.x, tc.x + tc.width, tc.y,
+                ideal_x, ideal_y, rect->width, rect->height,
+                prev_tc,
+                &vp_left, &vp_right, &vp_bottom,
+                &forced_align, /*align_override=*/false);
         }
     }
 
@@ -1441,8 +1418,8 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
     // changed since last call see an int_to retarget to the same
     // value (cheap no-op).
     // CE: commit each UI's sticky state independently so neither
-    // leaks direction into the other. Preserve + re-apply
-    // happened above (before the re-clamp).
+    // leaks direction into the other. Stay-if-viable handling lives
+    // inside tb_apply_ui_clamp itself.
     if (slot_valid) {
         tb_hud_push_state[slot_idx] = new_hud;
         tb_tc_push_state[slot_idx] = new_tc;
@@ -1472,17 +1449,25 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
             return;
         }
     } else if (drifted) {
+        // CE: enter drift-fade-out commitment. Snapshot the rect where the
+        // fade started so the bubble dies in place rather than tracking the
+        // speaker mid-fade (which would teleport the bubble along with them
+        // and read as a glitch). Continued drift while locked just keeps
+        // alpha dropping; rect stays at the snapshot via the override below.
+        if (slot_valid && !tb_drift_locked[slot_idx]) {
+            tb_drift_fade_start_x[slot_idx] = rect->x;
+            tb_drift_fade_start_y[slot_idx] = rect->y;
+            tb_drift_locked[slot_idx] = true;
+        }
         if (slot_valid && tb_alpha_target[slot_idx] != 0) {
             ui_anim_cancel(tb_alpha_handle[slot_idx]);
             tb_alpha_target[slot_idx] = 0;
             tb_alpha_handle[slot_idx] = ui_anim_int_to(&tb_alpha[slot_idx], 0,
                 &tb_fade_out_profile);
         }
-        // Once the fade has fully completed (alpha==0) we can stop
-        // emitting a rect entirely — that frees up the dirty-rect
-        // and overlap-resolution paths from chasing an invisible
-        // bubble. The non-zero path keeps the bubble's clamped
-        // rect so tb_draw still blits at the diminishing alpha.
+        // Once alpha has settled at 0, stop emitting a rect entirely —
+        // saves dirty-rect / overlap work on an invisible bubble. The
+        // slot stays alive so a speaker who comes back can respawn it.
         if (slot_valid && tb_alpha[slot_idx] == 0) {
             if (placement_flags != NULL) {
                 *placement_flags = 0;
@@ -1491,12 +1476,56 @@ void tb_calc_rect_ex(TextBubble* tb, int64_t loc, int offset_x, int offset_y, Ti
             return;
         }
     } else {
-        if (slot_valid && tb_alpha_target[slot_idx] != 255) {
+        // Not drifted. Three sub-cases depending on what the alpha tween is
+        // currently doing:
+        //   (a) Drift fade mid-flight (locked, alpha>0): speaker came back
+        //       in range. If the bubble's natural rect is within
+        //       TB_DRIFT_MAX_PX of the locked position, reverse the fade
+        //       smoothly (small return). If it's farther — a "far jump"
+        //       like a pin release or camera snap — keep the fade going
+        //       to completion at the locked position. We'll respawn at
+        //       the new natural rect in case (b).
+        //   (b) Drift fade completed (locked, alpha==0): unlock and
+        //       trigger a fresh entrance fade at the now-natural rect.
+        //       This is the "respawn at the new jump point" behavior.
+        //   (c) Normal not-drifted (unlocked): ensure target=255.
+        if (slot_valid && tb_drift_locked[slot_idx] && tb_alpha[slot_idx] > 0) {
+            int dx = rect->x - tb_drift_fade_start_x[slot_idx];
+            int dy = rect->y - tb_drift_fade_start_y[slot_idx];
+            long long dist_sq = (long long)dx * dx + (long long)dy * dy;
+            long long thr_sq  = (long long)TB_DRIFT_MAX_PX * TB_DRIFT_MAX_PX;
+            if (dist_sq <= thr_sq) {
+                tb_drift_locked[slot_idx] = false;
+                if (tb_alpha_target[slot_idx] != 255) {
+                    ui_anim_cancel(tb_alpha_handle[slot_idx]);
+                    tb_alpha_target[slot_idx] = 255;
+                    tb_alpha_handle[slot_idx] = ui_anim_int_to(&tb_alpha[slot_idx], 255,
+                        &tb_fade_in_profile);
+                }
+            }
+            // else: far jump — stay locked, let fade-out finish.
+        } else if (slot_valid && tb_drift_locked[slot_idx] && tb_alpha[slot_idx] == 0) {
+            // Fade-out completed at the old rect; respawn at the new natural rect.
+            tb_drift_locked[slot_idx] = false;
+            ui_anim_cancel(tb_alpha_handle[slot_idx]);
+            tb_alpha_target[slot_idx] = 255;
+            tb_alpha_handle[slot_idx] = ui_anim_int_to(&tb_alpha[slot_idx], 255,
+                &tb_entrance_profile);
+        } else if (slot_valid && !tb_drift_locked[slot_idx]
+                && tb_alpha_target[slot_idx] != 255) {
             ui_anim_cancel(tb_alpha_handle[slot_idx]);
             tb_alpha_target[slot_idx] = 255;
             tb_alpha_handle[slot_idx] = ui_anim_int_to(&tb_alpha[slot_idx], 255,
                 &tb_fade_in_profile);
         }
+    }
+
+    // CE: while drift-locked, render at the snapshot rect so the bubble
+    // dies in place. Unlock happens in case (a) reverse or case (b) respawn
+    // above, after which natural placement resumes.
+    if (slot_valid && tb_drift_locked[slot_idx]) {
+        rect->x = tb_drift_fade_start_x[slot_idx];
+        rect->y = tb_drift_fade_start_y[slot_idx];
     }
 
     // Text alignment follows the bubble center relative to half the sprite
