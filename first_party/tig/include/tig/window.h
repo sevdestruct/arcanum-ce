@@ -105,6 +105,14 @@ int tig_window_scroll(tig_window_handle_t window_handle, int dx, int dy);
 int tig_window_scroll_rect(tig_window_handle_t window_handle, TigRect* rect, int dx, int dy);
 int tig_window_copy(tig_window_handle_t dst_window_handle, TigRect* dst_rect, tig_window_handle_t src_window_handle, TigRect* src_rect);
 int tig_window_copy_from_vbuffer(tig_window_handle_t dst_window_handle, TigRect* dst_rect, TigVideoBuffer* src_video_buffer, TigRect* src_rect);
+// CE: same as tig_window_copy_from_vbuffer but blends the source with
+// the existing destination pixels using a constant alpha (0..255).
+// alpha=255 is opaque (= identical to the plain copy); alpha=0 is
+// fully transparent (no-op render). Color-key transparent pixels in
+// src still composite as transparent regardless of alpha. Used by
+// tb.c to fade speech bubbles in/out when their NPC drifts off-/
+// on-screen.
+int tig_window_copy_from_vbuffer_alpha(tig_window_handle_t dst_window_handle, TigRect* dst_rect, TigVideoBuffer* src_video_buffer, TigRect* src_rect, uint8_t alpha);
 int tig_window_copy_to_vbuffer(tig_window_handle_t src_window_handle, TigRect* src_rect, TigVideoBuffer* dst_video_buffer, TigRect* dst_rect);
 int tig_window_tint(tig_window_handle_t window_handle, TigRect* rect, int a3, int a4);
 int tig_window_text_write(tig_window_handle_t window_handle, const char* text, TigRect* rect);
@@ -174,6 +182,61 @@ int tig_window_modal_tint_set(bool enabled,
     uint8_t r,
     uint8_t g,
     uint8_t b);
+
+// CE: per-window scale + alpha + anchor for animated entrance / exit
+// transitions. Driven by the ui_anim spring tween system. When set,
+// the compositor blits this window's VB at a scaled dst rect (around
+// the anchor) with const-alpha blending instead of the standard 1:1
+// opaque blit. Anchor is frame-relative (0..1 each axis: 0/0 is
+// top-left, 0.5/0.5 is center, 1/1 is bottom-right). alpha is 0..1
+// (0 = invisible, 1 = fully opaque).
+//
+// _clear restores the natural 1:1 opaque composite path (zero-cost
+// when no animation is active). Both calls invalidate the window's
+// frame so the next composite repaints the affected screen area.
+int tig_window_transform_set(tig_window_handle_t window_handle,
+    float scale_x,
+    float scale_y,
+    float alpha,
+    float anchor_rel_x,
+    float anchor_rel_y);
+int tig_window_transform_clear(tig_window_handle_t window_handle);
+
+// CE: modulate the per-window translucent-black tint amount at
+// composite time. Compositor multiplies the tint r/g/b by `reveal`
+// before applying — 0.0 = no darkening (window appears fully
+// opaque where near-black would normally show the underlay), 1.0
+// = full configured tint strength. Used by ui_anim to fade tint
+// in smoothly after a scale+alpha entrance lands, masking the
+// "snap to tinted" pop when the transform path clears. Default
+// (set at window create) is 1.0.
+int tig_window_tint_reveal_set(tig_window_handle_t window_handle, float reveal);
+
+// CE: cache a pre-tinted snapshot of the window's VB. Used by the
+// ui_anim transform path when the window also has tint_enabled —
+// without a snapshot the compositor falls back to a per-pixel
+// integrated blit (~10× slower than SDL_BlitSurfaceScaled). The
+// snapshot is the window's VB with near-black pixels replaced by
+// the underlay tinted at the window's NATURAL screen position (the
+// "at-rest" tinted look). Compositor uses SDL_BlitSurfaceScaled +
+// alpha mod on the snapshot during the brief anim window.
+//
+// Brief staleness: the snapshot is captured ONCE at anim start;
+// during the ~130ms anim the underlay (iso world) may drift a few
+// pixels — visible only as a very slight smear in the panel's
+// dark-area see-through, almost certainly imperceptible.
+//
+// _release frees the snapshot VB. Safe to call when no snapshot
+// is allocated (no-op).
+int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle);
+void tig_window_tint_snapshot_release(tig_window_handle_t window_handle);
+TigVideoBuffer* tig_window_tint_snapshot_get(tig_window_handle_t window_handle);
+
+// CE: register a callback that fires whenever a tig window is
+// destroyed. Used by ui_anim to cancel any in-flight tween targeting
+// a now-dead handle (avoids stale-handle writes on the next ping).
+// Single-slot registration; passing NULL clears.
+void tig_window_destroy_notify_set(void (*func)(tig_window_handle_t));
 
 #ifdef __cplusplus
 }

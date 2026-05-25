@@ -298,6 +298,252 @@ int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect*
     return TIG_OK;
 }
 
+// CE: blit a window VB to the screen with optional scale + constant
+// alpha. Used by the tig compositor's transform path (driven by the
+// ui_anim spring system). When alpha < 255 the source is alpha-blended
+// over the screen via SDL_BLENDMODE_BLEND; when scale != 1 the dst
+// rect's dimensions differ from src and SDL_BlitSurfaceScaled handles
+// the resampling. NEAREST sampling for performance — the small scale
+// deltas (~5–10%) don't need bilinear.
+int tig_video_blit_scaled_alpha(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    uint8_t alpha)
+{
+    if (!tig_video_initialized) return TIG_ERR_NOT_INITIALIZED;
+    if (src_video_buffer == NULL || src_video_buffer->surface == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    TigRect clamped_dst;
+    int rc = tig_rect_intersection(dst_rect, &stru_610388, &clamped_dst);
+    if (rc != TIG_OK) return rc;
+
+    // Scale-aware clip: derive the proportional src sub-rect that maps
+    // to the clamped dst (in case the original dst extended off-screen
+    // and got cropped). Without this we'd sample the full src into a
+    // smaller dst, producing a mis-scaled image at screen edges.
+    int dx_off = clamped_dst.x - dst_rect->x;
+    int dy_off = clamped_dst.y - dst_rect->y;
+    int dw = dst_rect->width;
+    int dh = dst_rect->height;
+    SDL_Rect native_src;
+    if (dw > 0 && dh > 0) {
+        native_src.x = src_rect->x + (int)((float)src_rect->width  * dx_off / (float)dw);
+        native_src.y = src_rect->y + (int)((float)src_rect->height * dy_off / (float)dh);
+        native_src.w = (int)((float)src_rect->width  * clamped_dst.width  / (float)dw);
+        native_src.h = (int)((float)src_rect->height * clamped_dst.height / (float)dh);
+        if (native_src.w <= 0) native_src.w = 1;
+        if (native_src.h <= 0) native_src.h = 1;
+    } else {
+        native_src.x = src_rect->x;
+        native_src.y = src_rect->y;
+        native_src.w = src_rect->width;
+        native_src.h = src_rect->height;
+    }
+
+    SDL_Rect native_dst = {
+        clamped_dst.x, clamped_dst.y,
+        clamped_dst.width, clamped_dst.height,
+    };
+
+    // Stash + set blend mode + alpha mod on the source surface; restore
+    // afterward so other consumers (e.g. plain tig_video_blit) see the
+    // surface in its original state.
+    SDL_BlendMode prev_blend = SDL_BLENDMODE_NONE;
+    uint8_t prev_alpha = 255;
+    SDL_GetSurfaceBlendMode(src_video_buffer->surface, &prev_blend);
+    SDL_GetSurfaceAlphaMod(src_video_buffer->surface, &prev_alpha);
+    if (alpha < 255) {
+        SDL_SetSurfaceBlendMode(src_video_buffer->surface, SDL_BLENDMODE_BLEND);
+        SDL_SetSurfaceAlphaMod(src_video_buffer->surface, alpha);
+    }
+
+    // Linear sampling — for the small scale deltas the ui_anim spring
+    // produces frame-to-frame (~1% per step), NEAREST jitters: as the
+    // integer dst dimensions stair-step by ±1px, source rows / cols
+    // snap to different pixels, visibly wiggling the content. Linear
+    // interpolates so the transition reads smooth. Marginally slower
+    // per-pixel; the affected windows are small enough that it doesn't
+    // show in frame budget.
+    SDL_BlitSurfaceScaled(src_video_buffer->surface,
+        &native_src,
+        tig_video_state.surface,
+        &native_dst,
+        SDL_SCALEMODE_LINEAR);
+
+    if (alpha < 255) {
+        SDL_SetSurfaceBlendMode(src_video_buffer->surface, prev_blend);
+        SDL_SetSurfaceAlphaMod(src_video_buffer->surface, prev_alpha);
+    }
+    return TIG_OK;
+}
+
+int tig_video_blit_transform_tinted(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    uint8_t threshold,
+    uint8_t tint_r,
+    uint8_t tint_g,
+    uint8_t tint_b,
+    uint8_t alpha)
+{
+    uint64_t perf_t0 = tig_video_tint_blit_perf_enabled
+        ? SDL_GetPerformanceCounter()
+        : 0;
+
+    if (!tig_video_initialized) return TIG_ERR_NOT_INITIALIZED;
+    if (src_video_buffer == NULL || src_video_buffer->surface == NULL
+        || tig_video_state.surface == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    TigRect clamped_dst;
+    int rc = tig_rect_intersection(dst_rect, &stru_610388, &clamped_dst);
+    if (rc != TIG_OK) return rc;
+
+    // Offset within the un-clamped dst (used to keep the proportional
+    // src-pixel mapping correct when clipping at screen edges).
+    int dx_off = clamped_dst.x - dst_rect->x;
+    int dy_off = clamped_dst.y - dst_rect->y;
+    int dw = dst_rect->width;
+    int dh = dst_rect->height;
+    if (dw <= 0 || dh <= 0) return TIG_OK;
+
+    SDL_Surface* src = src_video_buffer->surface;
+    SDL_Surface* dst = tig_video_state.surface;
+    SDL_Surface* under = (underlay_video_buffer != NULL)
+        ? underlay_video_buffer->surface
+        : NULL;
+
+    if (!SDL_LockSurface(src)) return TIG_ERR_GENERIC;
+    if (!SDL_LockSurface(dst)) { SDL_UnlockSurface(src); return TIG_ERR_GENERIC; }
+    if (under != NULL && !SDL_LockSurface(under)) {
+        SDL_UnlockSurface(dst);
+        SDL_UnlockSurface(src);
+        return TIG_ERR_GENERIC;
+    }
+
+    int src_pitch_px = src->pitch / 4;
+    int dst_pitch_px = dst->pitch / 4;
+    int under_pitch_px = (under != NULL) ? (under->pitch / 4) : 0;
+    uint32_t* src_pixels = (uint32_t*)src->pixels;
+    uint32_t* dst_pixels = (uint32_t*)dst->pixels;
+    uint32_t* under_pixels = (under != NULL) ? (uint32_t*)under->pixels : NULL;
+
+    // CE: per-channel multiply factor — same convention as the plain
+    // tint blit (output = underlay * (255 - tint) / 256 per channel,
+    // hue-preserving).
+    int factor_r = 255 - tint_r;
+    int factor_g = 255 - tint_g;
+    int factor_b = 255 - tint_b;
+
+    // Alpha scaled 0..256 to land on /256 instead of /255 (matches
+    // alpha mod math; saves a div per pixel).
+    int a256 = alpha + (alpha >> 7);
+    int inv_a256 = 256 - a256;
+
+    // Inverse-scale ratio: dst pixel (di, dj) maps to src pixel
+    // (src_rect.x + di * sw / dw, src_rect.y + dj * sh / dh). Use
+    // integer math, nearest-neighbor sampling. The scale deltas during
+    // an entrance are small (~5% per step), so the per-frame difference
+    // in src-pixel mapping is gradual; nearest is acceptable here. If
+    // wiggle is visible, switch to a 2-tap horizontal bilinear later.
+    int sw = src_rect->width;
+    int sh = src_rect->height;
+
+    int x_start = clamped_dst.x;
+    int y_start = clamped_dst.y;
+    int x_end = clamped_dst.x + clamped_dst.width;
+    int y_end = clamped_dst.y + clamped_dst.height;
+
+    for (int dy = y_start; dy < y_end; dy++) {
+        int dj = (dy - dst_rect->y);
+        int sy = src_rect->y + (dj * sh) / dh;
+        if (sy < 0) sy = 0;
+        if (sy >= src_rect->y + sh) sy = src_rect->y + sh - 1;
+        uint32_t* sp_row = src_pixels + sy * src_pitch_px;
+        uint32_t* dp_row = dst_pixels + dy * dst_pitch_px;
+        uint32_t* up_row = NULL;
+        if (under_pixels != NULL) {
+            int uy = dy + underlay_offset_y;
+            if (uy >= 0 && uy < under->h) {
+                up_row = under_pixels + uy * under_pitch_px;
+            }
+        }
+        for (int dx = x_start; dx < x_end; dx++) {
+            int di = (dx - dst_rect->x);
+            int sx = src_rect->x + (di * sw) / dw;
+            if (sx < 0) sx = 0;
+            if (sx >= src_rect->x + sw) sx = src_rect->x + sw - 1;
+            uint32_t s = sp_row[sx];
+            uint8_t sr = (uint8_t)(s >> 16);
+            uint8_t sg = (uint8_t)(s >> 8);
+            uint8_t sb = (uint8_t)s;
+
+            uint8_t cr, cg, cb;
+            if (sr <= threshold && sg <= threshold && sb <= threshold
+                && up_row != NULL) {
+                int ux = dx + underlay_offset_x;
+                if (ux >= 0 && ux < under->w) {
+                    uint32_t u = up_row[ux];
+                    int ur = (int)((uint8_t)(u >> 16));
+                    int ug = (int)((uint8_t)(u >> 8));
+                    int ub = (int)((uint8_t)u);
+                    cr = (uint8_t)((ur * factor_r + 128) >> 8);
+                    cg = (uint8_t)((ug * factor_g + 128) >> 8);
+                    cb = (uint8_t)((ub * factor_b + 128) >> 8);
+                } else {
+                    cr = sr; cg = sg; cb = sb;
+                }
+            } else {
+                cr = sr; cg = sg; cb = sb;
+            }
+
+            if (a256 >= 256) {
+                dp_row[dx] = 0xFF000000u
+                    | ((uint32_t)cr << 16)
+                    | ((uint32_t)cg << 8)
+                    | (uint32_t)cb;
+            } else {
+                uint32_t d = dp_row[dx];
+                int dr = (int)((uint8_t)(d >> 16));
+                int dg = (int)((uint8_t)(d >> 8));
+                int db = (int)((uint8_t)d);
+                int rr = ((int)cr * a256 + dr * inv_a256) >> 8;
+                int gg = ((int)cg * a256 + dg * inv_a256) >> 8;
+                int bb = ((int)cb * a256 + db * inv_a256) >> 8;
+                dp_row[dx] = 0xFF000000u
+                    | ((uint32_t)rr << 16)
+                    | ((uint32_t)gg << 8)
+                    | (uint32_t)bb;
+            }
+        }
+    }
+
+    (void)dx_off; (void)dy_off;
+
+    if (under != NULL) SDL_UnlockSurface(under);
+    SDL_UnlockSurface(dst);
+    SDL_UnlockSurface(src);
+
+    if (tig_video_tint_blit_perf_enabled) {
+        uint64_t perf_t1 = SDL_GetPerformanceCounter();
+        uint64_t ns = (uint64_t)((double)(perf_t1 - perf_t0)
+            * 1e9 / (double)SDL_GetPerformanceFrequency());
+        tig_video_tint_blit_perf.total_ns += ns;
+        if (ns > tig_video_tint_blit_perf.max_ns) {
+            tig_video_tint_blit_perf.max_ns = ns;
+        }
+        tig_video_tint_blit_perf.samples++;
+        tig_video_tint_blit_perf.pixels_total +=
+            (uint64_t)clamped_dst.width * (uint64_t)clamped_dst.height;
+    }
+
+    return TIG_OK;
+}
+
 // CE: composite a window's VB to the screen, replacing "near-black"
 // source pixels with subtract-tinted underlay-VB pixels at the same
 // screen position. Other source pixels copy through opaque.
@@ -332,7 +578,8 @@ int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
     uint8_t threshold,
     uint8_t tint_r,
     uint8_t tint_g,
-    uint8_t tint_b)
+    uint8_t tint_b,
+    uint8_t reveal)
 {
     // CE: timing for the tint pathway perf comparison (F9-gated).
     // Wrapping the whole function so the surface lock/unlock cost
@@ -398,6 +645,68 @@ int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
 
     int w = clamped_dst.width;
     int h = clamped_dst.height;
+    // CE: reveal < 255 path — blend each near-black pixel between
+    // (a) the original opaque source and (b) the tinted underlay,
+    // using reveal as the alpha. Scalar-only — reveal != 255 only
+    // happens during the brief tint-fade-in after a window's
+    // entrance settles, so paying the per-pixel cost during ~150ms
+    // is acceptable. reveal=255 uses the original NEON fast path
+    // below.
+    if (reveal < 255) {
+        int rev_n = reveal + (reveal >> 7); // 0..256 like alpha-mod
+        int inv_n = 256 - rev_n;
+        for (int y = 0; y < h; y++) {
+            uint32_t* sp = src_base + y * src_pitch_px;
+            uint32_t* dp = dst_base + y * dst_pitch_px;
+            uint32_t* up = (under_base != NULL) ? (under_base + y * under_pitch_px) : NULL;
+            for (int x = 0; x < w; x++) {
+                uint32_t s = sp[x];
+                uint8_t sr = (uint8_t)(s >> 16);
+                uint8_t sg = (uint8_t)(s >> 8);
+                uint8_t sb = (uint8_t)s;
+                if (sr <= threshold && sg <= threshold && sb <= threshold
+                    && up != NULL) {
+                    uint32_t u = up[x];
+                    uint8_t ur = (uint8_t)(u >> 16);
+                    uint8_t ug = (uint8_t)(u >> 8);
+                    uint8_t ub = (uint8_t)u;
+                    int tr = ((int)ur * (int)factor_r + 128) >> 8;
+                    int tg = ((int)ug * (int)factor_g + 128) >> 8;
+                    int tb = ((int)ub * (int)factor_b + 128) >> 8;
+                    // Blend source (opaque near-black) with tinted
+                    // underlay by reveal. (s * (256-rev) + t * rev) >> 8.
+                    int rr = ((int)sr * inv_n + tr * rev_n) >> 8;
+                    int gg = ((int)sg * inv_n + tg * rev_n) >> 8;
+                    int bb = ((int)sb * inv_n + tb * rev_n) >> 8;
+                    if (rr > 255) rr = 255;
+                    if (gg > 255) gg = 255;
+                    if (bb > 255) bb = 255;
+                    dp[x] = 0xFF000000u
+                        | ((uint32_t)rr << 16)
+                        | ((uint32_t)gg << 8)
+                        | (uint32_t)bb;
+                } else {
+                    dp[x] = s;
+                }
+            }
+        }
+        if (under != NULL) SDL_UnlockSurface(under);
+        SDL_UnlockSurface(dst);
+        SDL_UnlockSurface(src);
+        if (tig_video_tint_blit_perf_enabled) {
+            uint64_t perf_t1 = SDL_GetPerformanceCounter();
+            uint64_t ns = (uint64_t)((double)(perf_t1 - perf_t0)
+                * 1e9 / (double)SDL_GetPerformanceFrequency());
+            tig_video_tint_blit_perf.total_ns += ns;
+            if (ns > tig_video_tint_blit_perf.max_ns) {
+                tig_video_tint_blit_perf.max_ns = ns;
+            }
+            tig_video_tint_blit_perf.samples++;
+            tig_video_tint_blit_perf.pixels_total +=
+                (uint64_t)clamped_dst.width * (uint64_t)clamped_dst.height;
+        }
+        return TIG_OK;
+    }
     for (int y = 0; y < h; y++) {
         uint32_t* sp = src_base + y * src_pitch_px;
         uint32_t* dp = dst_base + y * dst_pitch_px;
@@ -1446,18 +1755,45 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
         return TIG_OK;
     }
 
+    // CE: BLEND_ALPHA_CONST — drive SDL's surface-level alpha blend
+    // mode + alpha mod on the source surface around the blit, then
+    // restore. Used by tig_window_copy_from_vbuffer_alpha (tb.c's
+    // speech bubble fades). alpha[0] is the constant byte applied
+    // to all pixels. Color-keyed sources still mask transparent
+    // pixels correctly because SDL handles the key + alpha
+    // composition in BLEND mode.
+    bool alpha_const = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST) != 0;
+    SDL_BlendMode prev_blend = SDL_BLENDMODE_NONE;
+    uint8_t prev_alpha = 255;
+    if (alpha_const) {
+        SDL_GetSurfaceBlendMode(blit_info->src_video_buffer->surface, &prev_blend);
+        SDL_GetSurfaceAlphaMod(blit_info->src_video_buffer->surface, &prev_alpha);
+        SDL_SetSurfaceBlendMode(blit_info->src_video_buffer->surface, SDL_BLENDMODE_BLEND);
+        SDL_SetSurfaceAlphaMod(blit_info->src_video_buffer->surface, blit_info->alpha[0]);
+    }
+
+    bool ok = true;
     if (stretched) {
         SDL_ScaleMode scale_mode = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_SCALE_LINEAR)
             ? SDL_SCALEMODE_LINEAR
             : SDL_SCALEMODE_NEAREST;
 
         if (!SDL_BlitSurfaceScaled(blit_info->src_video_buffer->surface, &native_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect, scale_mode)) {
-            return TIG_ERR_GENERIC;
+            ok = false;
         }
     } else {
         if (!SDL_BlitSurface(blit_info->src_video_buffer->surface, &native_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect)) {
-            return TIG_ERR_GENERIC;
+            ok = false;
         }
+    }
+
+    if (alpha_const) {
+        SDL_SetSurfaceBlendMode(blit_info->src_video_buffer->surface, prev_blend);
+        SDL_SetSurfaceAlphaMod(blit_info->src_video_buffer->surface, prev_alpha);
+    }
+
+    if (!ok) {
+        return TIG_ERR_GENERIC;
     }
 
     return TIG_OK;

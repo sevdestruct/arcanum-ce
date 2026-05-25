@@ -78,7 +78,45 @@ typedef struct TigWindow {
     uint8_t tint_g;
     uint8_t tint_b;
     tig_window_handle_t tint_underlay;
+    // CE: optional per-window scale + alpha + scale-anchor for the
+    // ui_anim spring-driven entrance/exit animations. When
+    // transform_active, the compositor blits this window's VB to a
+    // scaled dst rect (around the anchor) with const-alpha blending
+    // instead of the standard 1:1 opaque blit. Fast-path when
+    // !transform_active so unanimated windows pay zero cost.
+    bool transform_active;
+    float transform_scale_x;
+    float transform_scale_y;
+    float transform_alpha;       // 0.0..1.0
+    float transform_anchor_x;    // 0.0..1.0, frame-relative
+    float transform_anchor_y;    // 0.0..1.0, frame-relative
+    // CE: optional modulator on the translucent-black tint amount.
+    // Compositor tint pathway multiplies tint_r/g/b by tint_reveal
+    // before writing — 0.0 = no darkening (window appears opaque
+    // where it would normally show the underlay through near-black
+    // areas), 1.0 = full configured tint strength. Used by ui_anim
+    // to fade tint in smoothly after a scale+alpha entrance lands,
+    // masking the "snap to tinted" pop that would otherwise occur
+    // when the transform path clears and tint takes over.
+    float tint_reveal;
+    // CE: pre-baked snapshot of the window's VB with near-black
+    // source pixels replaced by the underlay-at-natural-position
+    // tinted result. Used by the compositor's transform path on
+    // tint-enabled windows: SDL_BlitSurfaceScaled (HW-accelerated)
+    // on this snapshot is ~10× cheaper than the integrated per-
+    // pixel scale+tint+alpha blit. Allocated by
+    // tig_window_tint_snapshot_capture, released by
+    // tig_window_tint_snapshot_release. NULL when no anim is
+    // active.
+    TigVideoBuffer* tint_snapshot_vb;
 } TigWindow;
+
+// CE: optional notification when a window is destroyed. ui_anim
+// registers itself so any in-flight tween targeting the now-dead
+// handle cancels cleanly (no on_complete fires — caller destroyed
+// directly, not via the tween path). Single-slot is enough; if other
+// modules need notifications later, this generalizes to a list.
+static void (*tig_window_destroy_notify_func)(tig_window_handle_t) = NULL;
 
 static int tig_window_free_index(void);
 static int tig_window_handle_to_index(tig_window_handle_t window_handle);
@@ -235,6 +273,19 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->tint_g = 0;
     win->tint_b = 0;
     win->tint_underlay = TIG_WINDOW_HANDLE_INVALID;
+    // CE: ui_anim transform defaults — inactive, identity scale/alpha,
+    // anchor at frame center. Compositor short-circuits the transform
+    // path when transform_active is false so unanimated windows are
+    // zero-cost.
+    win->transform_active = false;
+    win->transform_scale_x = 1.0f;
+    win->transform_scale_y = 1.0f;
+    win->transform_alpha = 1.0f;
+    win->transform_anchor_x = 0.5f;
+    win->transform_anchor_y = 0.5f;
+    // CE: tint at full strength when enabled (no fade modulation).
+    win->tint_reveal = 1.0f;
+    win->tint_snapshot_vb = NULL;
 
     vb_create_info.flags = 0;
 
@@ -305,6 +356,14 @@ int tig_window_destroy(tig_window_handle_t window_handle)
     window_index = tig_window_handle_to_index(window_handle);
     win = &(windows[window_index]);
 
+    // CE: notify any registered observer (ui_anim) before tearing
+    // the window down so it can cancel pending tweens targeting this
+    // handle. Fired before button_destroy in case the observer also
+    // wants to invalidate or cancel UI state tied to the buttons.
+    if (tig_window_destroy_notify_func != NULL) {
+        tig_window_destroy_notify_func(window_handle);
+    }
+
     rc = tig_window_button_destroy(window_handle);
     if (rc != TIG_OK) {
         return rc;
@@ -319,6 +378,14 @@ int tig_window_destroy(tig_window_handle_t window_handle)
     if ((tig_window_ctx_flags & TIG_INITIALIZE_SCRATCH_BUFFER) != 0
         && (win->flags & TIG_WINDOW_TRANSPARENT) != 0) {
         tig_video_buffer_destroy(win->secondary_video_buffer);
+    }
+
+    // CE: clean up ui_anim pre-baked tint snapshot if one was
+    // allocated for an animation that didn't run to completion (e.g.
+    // window destroyed mid-anim).
+    if (win->tint_snapshot_vb != NULL) {
+        tig_video_buffer_destroy(win->tint_snapshot_vb);
+        win->tint_snapshot_vb = NULL;
     }
 
     pop_window_stack(window_handle);
@@ -577,13 +644,105 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 continue;
             }
 
+            // CE: ui_anim transform — if active, the window paints to
+            // a scaled dst rect (around the anchor) instead of its
+            // natural frame. Recompute effective_frame so dirty-rect
+            // intersection and rect-list propagation use the scaled
+            // dst — surrounding area (outside the scaled rect, inside
+            // the frame) falls through to whichever window is beneath.
+            // Skip clip + transform combined (no callers need it; if
+            // a caller hits this, clip wins so the transform inherits
+            // the same scaled-out behavior).
+            bool transform_active = win->transform_active
+                && !win->has_clip;
+            int transform_dst_x = 0, transform_dst_y = 0;
+            int transform_dst_w = 0, transform_dst_h = 0;
+            if (transform_active) {
+                // CE: round-to-nearest (not truncate) for the scaled
+                // dst size, AND match the parity of frame.width/.height.
+                //
+                // The parity match is the important one for visual
+                // smoothness during animation: with center anchor
+                // (0.5) the dst is positioned at
+                // `(frame.dim - dst_dim) / 2` (integer div). When
+                // frame.dim is even and dst_dim is odd, the integer
+                // div drops the .5, so the dst's center lands half
+                // a pixel off from the frame's center. As the
+                // spring advances and dst_dim increments through
+                // odd/even values, the dst center oscillates ±0.5
+                // pixel per frame — under LINEAR filtering this
+                // reads as a sub-pixel "wobble" on high-contrast
+                // content (text, button outlines). Forcing dst_dim
+                // to match frame.dim parity makes the integer div
+                // exact every frame — content stays at the same
+                // sub-pixel position throughout the animation.
+                //
+                // Round-to-nearest is still done first so the spring
+                // approaching 1.0 lands dst == frame; the parity
+                // adjustment is at most ±1 pixel which is well under
+                // the per-frame motion during the animation.
+                int raw_w = (int)((float)win->frame.width
+                    * win->transform_scale_x + 0.5f);
+                int raw_h = (int)((float)win->frame.height
+                    * win->transform_scale_y + 0.5f);
+                // Parity-match by ROUNDING UP (not down) on mismatch.
+                // Both directions achieve sub-pixel center stability,
+                // but rounding up keeps dst_dim >= the raw scaled
+                // value. The mainmenu backdrop is sized with a
+                // 1/0.96 overdraw so that at the receded scale 0.96
+                // the dst rect lands exactly screen-sized (no gap).
+                // Rounding DOWN would shave 1 pixel off → expose a
+                // 1-px black gap at the screen edge whenever
+                // frame.dim parity differed from the raw rounding
+                // result (e.g. 1080 screens: frame.height=1125 odd,
+                // raw_h at scale 0.96 rounds to 1080 even). Rounding
+                // up keeps full coverage; the +1px lands in the
+                // overdraw margin and gets clipped invisibly.
+                if ((raw_w & 1) != (win->frame.width & 1)) raw_w++;
+                if ((raw_h & 1) != (win->frame.height & 1)) raw_h++;
+                transform_dst_w = raw_w;
+                transform_dst_h = raw_h;
+                if (transform_dst_w <= 0 || transform_dst_h <= 0
+                    || win->transform_alpha <= 0.0f) {
+                    // Effectively invisible — skip this window's
+                    // blit. The dirty-rect list isn't clipped here so
+                    // lower windows fully paint the area.
+                    top_window_index--;
+                    continue;
+                }
+                transform_dst_x = win->frame.x
+                    + (int)((float)(win->frame.width - transform_dst_w)
+                            * win->transform_anchor_x);
+                transform_dst_y = win->frame.y
+                    + (int)((float)(win->frame.height - transform_dst_h)
+                            * win->transform_anchor_y);
+                effective_frame.x = transform_dst_x;
+                effective_frame.y = transform_dst_y;
+                effective_frame.width = transform_dst_w;
+                effective_frame.height = transform_dst_h;
+            }
+
             while (curr != NULL) {
                 rc = tig_rect_intersection(&(curr->rect), &effective_frame, &dirty_rect);
                 if (rc == TIG_OK) {
                     // TODO: Not sure how to represent it one to one.
                     bool cont;
                     TigVideoBuffer* src_video_buffer = win->video_buffer;
-                    if ((win->flags & TIG_WINDOW_TRANSPARENT) == 0) {
+                    if (transform_active && v38 < 20) {
+                        // CE: ui_anim transform path needs lower
+                        // windows painted FIRST so the alpha blend has
+                        // valid dst pixels to blend with. Defer to the
+                        // post-pass like the transparent path does;
+                        // unlike transparent we explicitly don't clip
+                        // the dirty against effective_frame either
+                        // (skip via cont=false), so the iso world (or
+                        // whatever is beneath) propagates through and
+                        // paints first.
+                        wins[v38] = win;
+                        rects[v38] = dirty_rect;
+                        v38++;
+                        cont = false;
+                    } else if ((win->flags & TIG_WINDOW_TRANSPARENT) == 0) {
                         cont = true;
                     } else if ((tig_window_ctx_flags & TIG_INITIALIZE_SCRATCH_BUFFER) != 0) {
                         sub_51D050(&dirty_rect,
@@ -650,6 +809,17 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                                     under_off_y = -uw->frame.y;
                                 }
                             }
+                            // CE: tint_reveal controls how much of
+                            // the see-through tinted result is mixed
+                            // in vs the opaque source pixel. 0 = the
+                            // panel reads fully opaque (near-black
+                            // stays solid); 1 = the configured tint
+                            // see-through at full strength. Used by
+                            // ui_anim to fade the see-through IN
+                            // after a window's scale+alpha entrance
+                            // settles.
+                            uint8_t reveal_inline = (uint8_t)(
+                                win->tint_reveal * 255.0f + 0.5f);
                             tig_video_blit_near_black_tinted(src_video_buffer,
                                 &blt_src_rect,
                                 &blt_dst_rect,
@@ -659,7 +829,26 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                                 win->tint_threshold,
                                 win->tint_r,
                                 win->tint_g,
-                                win->tint_b);
+                                win->tint_b,
+                                reveal_inline);
+                        } else if (transform_active) {
+                            // CE: scale + alpha composite path. Re-
+                            // project the dirty-rect-derived src
+                            // (currently window-local based on
+                            // frame) into the transformed dst's
+                            // proportional coords, since dirty_rect
+                            // now lives inside the SCALED dst rect.
+                            float inv_sx = 1.0f / win->transform_scale_x;
+                            float inv_sy = 1.0f / win->transform_scale_y;
+                            blt_src_rect.x = (int)((float)(dirty_rect.x - transform_dst_x) * inv_sx);
+                            blt_src_rect.y = (int)((float)(dirty_rect.y - transform_dst_y) * inv_sy);
+                            blt_src_rect.width = (int)((float)dirty_rect.width * inv_sx);
+                            blt_src_rect.height = (int)((float)dirty_rect.height * inv_sy);
+                            if (blt_src_rect.width <= 0) blt_src_rect.width = 1;
+                            if (blt_src_rect.height <= 0) blt_src_rect.height = 1;
+                            uint8_t a = (uint8_t)(win->transform_alpha * 255.0f + 0.5f);
+                            tig_video_blit_scaled_alpha(src_video_buffer,
+                                &blt_src_rect, &blt_dst_rect, a);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
@@ -713,6 +902,42 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
 
     --v38;
     while (v38 >= 0) {
+        // CE: for ui_anim transformed windows, the queued rect lives
+        // inside the SCALED dst (not the natural frame). Recompute
+        // the transform geometry here so the proportional src/dst
+        // math works — can't reuse the natural-frame src offset.
+        bool defer_transform = wins[v38]->transform_active
+            && !wins[v38]->has_clip;
+        int tx_dx = 0, tx_dy = 0, tx_dw = 0, tx_dh = 0;
+        if (defer_transform) {
+            // CE: same round-to-nearest + parity match as the pre-pass
+            // above. Parity ensures (frame.dim - dst_dim) / 2 is exact
+            // for center anchor — keeps the dst center sub-pixel-stable
+            // across frames so high-contrast content doesn't wobble
+            // during the scale animation.
+            int rw = (int)((float)wins[v38]->frame.width
+                * wins[v38]->transform_scale_x + 0.5f);
+            int rh = (int)((float)wins[v38]->frame.height
+                * wins[v38]->transform_scale_y + 0.5f);
+            // Round UP on parity mismatch — same rationale as the
+            // pre-pass calc: maintains screen coverage at the
+            // receded scale where the backdrop's overdraw lands
+            // exactly screen-sized. Rounding down here was the
+            // cause of the 1-px gap exposed during the menu recede
+            // animation on screens where frame.height parity
+            // differed from raw_h (e.g. 1080).
+            if ((rw & 1) != (wins[v38]->frame.width & 1)) rw++;
+            if ((rh & 1) != (wins[v38]->frame.height & 1)) rh++;
+            tx_dw = rw;
+            tx_dh = rh;
+            tx_dx = wins[v38]->frame.x
+                + (int)((float)(wins[v38]->frame.width - tx_dw)
+                        * wins[v38]->transform_anchor_x);
+            tx_dy = wins[v38]->frame.y
+                + (int)((float)(wins[v38]->frame.height - tx_dh)
+                        * wins[v38]->transform_anchor_y);
+        }
+
         blt_src_rect.x = rects[v38].x - wins[v38]->frame.x;
         blt_src_rect.y = rects[v38].y - wins[v38]->frame.y;
         blt_src_rect.width = rects[v38].width;
@@ -730,6 +955,59 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             vb_blit_info.src_rect = &blt_src_rect;
             vb_blit_info.dst_rect = &blt_dst_rect;
             tig_video_buffer_blit(&vb_blit_info);
+        } else if (defer_transform) {
+            // Re-project queued screen rect into window-local src
+            // (proportional to the scaled dst), keep dst as queued
+            // screen rect.
+            float inv_sx = 1.0f / wins[v38]->transform_scale_x;
+            float inv_sy = 1.0f / wins[v38]->transform_scale_y;
+            if (tx_dw > 0 && tx_dh > 0) {
+                blt_src_rect.x = (int)((float)(rects[v38].x - tx_dx) * inv_sx);
+                blt_src_rect.y = (int)((float)(rects[v38].y - tx_dy) * inv_sy);
+                blt_src_rect.width = (int)((float)rects[v38].width * inv_sx);
+                blt_src_rect.height = (int)((float)rects[v38].height * inv_sy);
+                if (blt_src_rect.width <= 0) blt_src_rect.width = 1;
+                if (blt_src_rect.height <= 0) blt_src_rect.height = 1;
+                uint8_t a = (uint8_t)(wins[v38]->transform_alpha * 255.0f + 0.5f);
+                if (wins[v38]->tint_enabled
+                    && wins[v38]->tint_snapshot_vb != NULL) {
+                    // CE: HW-accelerated path — the snapshot VB
+                    // already has near-black pixels replaced by the
+                    // tinted underlay (captured at anim start). A
+                    // plain scaled+alpha SDL blit on it is ~10×
+                    // cheaper than the per-pixel integrated blit.
+                    tig_video_blit_scaled_alpha(wins[v38]->tint_snapshot_vb,
+                        &blt_src_rect, &blt_dst_rect, a);
+                } else if (wins[v38]->tint_enabled) {
+                    // CE: integrated fallback — scale + tint + alpha
+                    // all in one pass. Used when no snapshot exists
+                    // (anim started without snapshot capture, or the
+                    // capture failed). Slow but correct.
+                    TigVideoBuffer* under_vb = NULL;
+                    int under_off_x = 0;
+                    int under_off_y = 0;
+                    if (wins[v38]->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
+                        int uidx = tig_window_handle_to_index(wins[v38]->tint_underlay);
+                        if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
+                            TigWindow* uw = &(windows[uidx]);
+                            under_vb = uw->video_buffer;
+                            under_off_x = -uw->frame.x;
+                            under_off_y = -uw->frame.y;
+                        }
+                    }
+                    tig_video_blit_transform_tinted(wins[v38]->video_buffer,
+                        &blt_src_rect, &blt_dst_rect,
+                        under_vb, under_off_x, under_off_y,
+                        wins[v38]->tint_threshold,
+                        wins[v38]->tint_r,
+                        wins[v38]->tint_g,
+                        wins[v38]->tint_b,
+                        a);
+                } else {
+                    tig_video_blit_scaled_alpha(wins[v38]->video_buffer,
+                        &blt_src_rect, &blt_dst_rect, a);
+                }
+            }
         } else if (wins[v38]->tint_enabled) {
             TigVideoBuffer* under_vb = NULL;
             int under_off_x = 0;
@@ -743,6 +1021,7 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                     under_off_y = -uw->frame.y;
                 }
             }
+            uint8_t reveal_def = (uint8_t)(wins[v38]->tint_reveal * 255.0f + 0.5f);
             tig_video_blit_near_black_tinted(wins[v38]->video_buffer,
                 &blt_src_rect,
                 &blt_dst_rect,
@@ -752,7 +1031,8 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 wins[v38]->tint_threshold,
                 wins[v38]->tint_r,
                 wins[v38]->tint_g,
-                wins[v38]->tint_b);
+                wins[v38]->tint_b,
+                reveal_def);
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
         }
@@ -1177,6 +1457,54 @@ int tig_window_copy_from_vbuffer(tig_window_handle_t dst_window_handle, TigRect*
     vb_blit_info.flags = 0;
     vb_blit_info.src_video_buffer = src_video_buffer;
     vb_blit_info.src_rect = src_rect;
+    vb_blit_info.dst_video_buffer = windows[dst_window_index].video_buffer;
+    vb_blit_info.dst_rect = dst_rect;
+
+    rc = tig_video_buffer_blit(&vb_blit_info);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+
+    if ((windows[dst_window_index].flags & TIG_WINDOW_HIDDEN) == 0) {
+        dirty_rect.x = dst_rect->x + windows[dst_window_index].frame.x;
+        dirty_rect.y = dst_rect->y + windows[dst_window_index].frame.y;
+        dirty_rect.width = dst_rect->width;
+        dirty_rect.height = dst_rect->height;
+        tig_window_invalidate_rect(&dirty_rect);
+    }
+
+    return TIG_OK;
+}
+
+int tig_window_copy_from_vbuffer_alpha(tig_window_handle_t dst_window_handle, TigRect* dst_rect, TigVideoBuffer* src_video_buffer, TigRect* src_rect, uint8_t alpha)
+{
+    int dst_window_index;
+    TigVideoBufferBlitInfo vb_blit_info;
+    int rc;
+    TigRect dirty_rect;
+
+    if (dst_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        tig_debug_printf("tig_window_copy_from_vbuffer_alpha: ERROR: Attempt to reference Empty WinID!\n");
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    // alpha=0 is a no-op render; skip the blit but still return OK
+    // so callers don't treat it as a failure.
+    if (alpha == 0) {
+        return TIG_OK;
+    }
+
+    dst_window_index = tig_window_handle_to_index(dst_window_handle);
+
+    vb_blit_info.flags = (alpha < 255)
+        ? TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST
+        : 0;
+    vb_blit_info.src_video_buffer = src_video_buffer;
+    vb_blit_info.src_rect = src_rect;
+    vb_blit_info.alpha[0] = alpha;
+    vb_blit_info.alpha[1] = alpha;
+    vb_blit_info.alpha[2] = alpha;
+    vb_blit_info.alpha[3] = alpha;
     vb_blit_info.dst_video_buffer = windows[dst_window_index].video_buffer;
     vb_blit_info.dst_rect = dst_rect;
 
@@ -1826,6 +2154,223 @@ int tig_window_tint_enable(tig_window_handle_t window_handle,
         tig_window_invalidate_rect(&(win->frame));
     }
     return TIG_OK;
+}
+
+int tig_window_transform_set(tig_window_handle_t window_handle,
+    float scale_x,
+    float scale_y,
+    float alpha,
+    float anchor_rel_x,
+    float anchor_rel_y)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return TIG_ERR_INVALID_PARAM;
+    if (!tig_window_initialized) return TIG_ERR_NOT_INITIALIZED;
+
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+
+    if (scale_x < 0.0f) scale_x = 0.0f;
+    if (scale_y < 0.0f) scale_y = 0.0f;
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    if (anchor_rel_x < 0.0f) anchor_rel_x = 0.0f;
+    if (anchor_rel_x > 1.0f) anchor_rel_x = 1.0f;
+    if (anchor_rel_y < 0.0f) anchor_rel_y = 0.0f;
+    if (anchor_rel_y > 1.0f) anchor_rel_y = 1.0f;
+
+    win->transform_active = true;
+    win->transform_scale_x = scale_x;
+    win->transform_scale_y = scale_y;
+    win->transform_alpha = alpha;
+    win->transform_anchor_x = anchor_rel_x;
+    win->transform_anchor_y = anchor_rel_y;
+
+    // Invalidate the window's full frame so the compositor repaints
+    // both the old (pre-transform) and new (scaled) screen areas next
+    // pass. Using frame instead of any computed dst rect because the
+    // dst can be smaller than the frame (scale < 1), and we need the
+    // surrounding area to repaint to "uncover" what was there before.
+    tig_window_invalidate_rect(&(win->frame));
+    return TIG_OK;
+}
+
+int tig_window_transform_clear(tig_window_handle_t window_handle)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return TIG_ERR_INVALID_PARAM;
+    if (!tig_window_initialized) return TIG_ERR_NOT_INITIALIZED;
+
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+
+    if (!win->transform_active) return TIG_OK;
+    win->transform_active = false;
+    win->transform_scale_x = 1.0f;
+    win->transform_scale_y = 1.0f;
+    win->transform_alpha = 1.0f;
+    // Invalidate so the compositor repaints at the natural 1:1 frame.
+    tig_window_invalidate_rect(&(win->frame));
+    return TIG_OK;
+}
+
+int tig_window_tint_reveal_set(tig_window_handle_t window_handle, float reveal)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return TIG_ERR_INVALID_PARAM;
+    if (!tig_window_initialized) return TIG_ERR_NOT_INITIALIZED;
+
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+    if (reveal < 0.0f) reveal = 0.0f;
+    if (reveal > 1.0f) reveal = 1.0f;
+    float prev = win->tint_reveal;
+    win->tint_reveal = reveal;
+    if (prev != reveal && win->tint_enabled) {
+        tig_window_invalidate_rect(&(win->frame));
+    }
+    return TIG_OK;
+}
+
+int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return TIG_ERR_INVALID_PARAM;
+    if (!tig_window_initialized) return TIG_ERR_NOT_INITIALIZED;
+
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+    if (!win->tint_enabled) return TIG_OK;  // nothing to capture
+    if (win->video_buffer == NULL) return TIG_ERR_GENERIC;
+
+    // Allocate snapshot VB if needed, sized to match the window's
+    // natural frame.
+    if (win->tint_snapshot_vb == NULL) {
+        TigVideoBufferCreateInfo vb_create_info;
+        vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        vb_create_info.width = win->frame.width;
+        vb_create_info.height = win->frame.height;
+        vb_create_info.background_color = win->background_color;
+        vb_create_info.color_key = win->color_key;
+        if (tig_video_buffer_create(&vb_create_info, &(win->tint_snapshot_vb)) != TIG_OK) {
+            win->tint_snapshot_vb = NULL;
+            return TIG_ERR_GENERIC;
+        }
+    }
+
+    // Resolve the underlay VB and the offset that maps screen coords
+    // → underlay-VB coords. For a fullscreen iso underlay, the offset
+    // is just -frame.x / -frame.y of the underlay window.
+    TigVideoBuffer* under_vb = NULL;
+    int under_off_x = 0;
+    int under_off_y = 0;
+    if (win->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
+        int uidx = tig_window_handle_to_index(win->tint_underlay);
+        if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
+            TigWindow* uw = &(windows[uidx]);
+            under_vb = uw->video_buffer;
+            under_off_x = -uw->frame.x;
+            under_off_y = -uw->frame.y;
+        }
+    }
+
+    // Copy window VB into snapshot, replacing near-black pixels with
+    // tinted underlay sampled at the window's NATURAL screen position
+    // (since the snapshot represents the at-rest tinted look). Use
+    // the public VB lock/data API so we don't reach into video.c's
+    // opaque struct from here.
+    TigVideoBufferData src_data, dst_data, under_data;
+    if (tig_video_buffer_lock(win->video_buffer) != TIG_OK) {
+        return TIG_ERR_GENERIC;
+    }
+    if (tig_video_buffer_lock(win->tint_snapshot_vb) != TIG_OK) {
+        tig_video_buffer_unlock(win->video_buffer);
+        return TIG_ERR_GENERIC;
+    }
+    bool have_under = false;
+    if (under_vb != NULL) {
+        if (tig_video_buffer_lock(under_vb) == TIG_OK) {
+            have_under = true;
+        }
+    }
+    tig_video_buffer_data(win->video_buffer, &src_data);
+    tig_video_buffer_data(win->tint_snapshot_vb, &dst_data);
+    if (have_under) tig_video_buffer_data(under_vb, &under_data);
+
+    int src_pitch_px = src_data.pitch / 4;
+    int dst_pitch_px = dst_data.pitch / 4;
+    int under_pitch_px = have_under ? (under_data.pitch / 4) : 0;
+    int under_w = have_under ? under_data.width : 0;
+    int under_h = have_under ? under_data.height : 0;
+    int factor_r = 255 - win->tint_r;
+    int factor_g = 255 - win->tint_g;
+    int factor_b = 255 - win->tint_b;
+    uint8_t threshold = win->tint_threshold;
+    int w = win->frame.width;
+    int h = win->frame.height;
+
+    for (int y = 0; y < h; y++) {
+        uint32_t* sp = (uint32_t*)src_data.pixels + y * src_pitch_px;
+        uint32_t* dp = (uint32_t*)dst_data.pixels + y * dst_pitch_px;
+        uint32_t* up = NULL;
+        if (have_under) {
+            int uy = win->frame.y + y + under_off_y;
+            if (uy >= 0 && uy < under_h) {
+                up = (uint32_t*)under_data.pixels + uy * under_pitch_px;
+            }
+        }
+        for (int x = 0; x < w; x++) {
+            uint32_t s = sp[x];
+            uint8_t sr = (uint8_t)(s >> 16);
+            uint8_t sg = (uint8_t)(s >> 8);
+            uint8_t sb = (uint8_t)s;
+            if (sr <= threshold && sg <= threshold && sb <= threshold
+                && up != NULL) {
+                int ux = win->frame.x + x + under_off_x;
+                if (ux >= 0 && ux < under_w) {
+                    uint32_t u = up[ux];
+                    int ur = (int)((uint8_t)(u >> 16));
+                    int ug = (int)((uint8_t)(u >> 8));
+                    int ub = (int)((uint8_t)u);
+                    int tr = (ur * factor_r + 128) >> 8;
+                    int tg = (ug * factor_g + 128) >> 8;
+                    int tb = (ub * factor_b + 128) >> 8;
+                    dp[x] = 0xFF000000u
+                        | ((uint32_t)tr << 16)
+                        | ((uint32_t)tg << 8)
+                        | (uint32_t)tb;
+                    continue;
+                }
+            }
+            dp[x] = s;
+        }
+    }
+
+    if (have_under) tig_video_buffer_unlock(under_vb);
+    tig_video_buffer_unlock(win->tint_snapshot_vb);
+    tig_video_buffer_unlock(win->video_buffer);
+    return TIG_OK;
+}
+
+void tig_window_tint_snapshot_release(tig_window_handle_t window_handle)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return;
+    if (!tig_window_initialized) return;
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+    if (win->tint_snapshot_vb != NULL) {
+        tig_video_buffer_destroy(win->tint_snapshot_vb);
+        win->tint_snapshot_vb = NULL;
+    }
+}
+
+TigVideoBuffer* tig_window_tint_snapshot_get(tig_window_handle_t window_handle)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return NULL;
+    if (!tig_window_initialized) return NULL;
+    int window_index = tig_window_handle_to_index(window_handle);
+    return windows[window_index].tint_snapshot_vb;
+}
+
+void tig_window_destroy_notify_set(void (*func)(tig_window_handle_t))
+{
+    tig_window_destroy_notify_func = func;
 }
 
 // 0x51EA10

@@ -112,6 +112,43 @@ int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 
+// CE: blit a window VB to the screen with optional scale (dst.w/h
+// differ from src.w/h triggers SDL_BlitSurfaceScaled at nearest-
+// neighbor) AND optional constant alpha (alpha < 255 enables
+// SDL_BLENDMODE_BLEND with alpha-mod). Used by the tig compositor's
+// per-window transform path that the ui_anim spring tween drives for
+// entrance/exit animations. Pass alpha=255 + src.w/h == dst.w/h for
+// equivalent of plain tig_video_blit (still cheap to call).
+int tig_video_blit_scaled_alpha(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    uint8_t alpha);
+
+// CE: integrated scale + near-black-tint + alpha blit. Used by the
+// tig compositor when a transformed window also has the translucent-
+// black tint enabled (e.g. inventory mid-entrance). Doing all three
+// operations in one pass gives the entrance the same "see-through
+// tinted" look the panel has at rest — without this integrated path,
+// the entrance would render the near-black panel areas as solid
+// (because the scaled+alpha SDL path can't read the underlay) and
+// only snap to the tinted appearance when the transform clears.
+//
+// Per-pixel scalar — heavier than the plain scaled+alpha (no NEON
+// in this path yet, the dst pixel count is bounded by typical UI
+// window sizes, and the path only runs during the ~200ms entrance/
+// exit windows). See F9 perf log's tint-blit line for measured cost.
+int tig_video_blit_transform_tinted(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    uint8_t threshold,
+    uint8_t tint_r,
+    uint8_t tint_g,
+    uint8_t tint_b,
+    uint8_t alpha);
+
 // CE: composite blit that replaces near-black source pixels with
 // MUL-darkened underlay pixels at the same screen position. Used by
 // the HUD bar's translucent-black pathway: the bar's panel art has
@@ -128,6 +165,14 @@ int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect*
 // the underlay's hue. A saturating-subtract version was tried first
 // but visibly burned colors (channels clipped to 0 independently,
 // shifting hue toward whichever channel was strongest).
+//
+// `reveal` (0..255) blends the result between the original source
+// pixel (reveal=0 — near-black areas stay opaque, the tint pathway
+// does nothing) and the fully-tinted underlay (reveal=255 — original
+// behavior). Used by ui_anim to fade the see-through effect IN after
+// a window's scale+alpha entrance settles, so the panel doesn't snap
+// from "opaque" to "tinted see-through" — the see-through reveals
+// gradually. reveal=255 is the runtime default for static UIs.
 int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
     TigRect* src_rect,
     TigRect* dst_rect,
@@ -137,7 +182,8 @@ int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
     uint8_t threshold,
     uint8_t tint_r,
     uint8_t tint_g,
-    uint8_t tint_b);
+    uint8_t tint_b,
+    uint8_t reveal);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 // Hint the next tig_video_flip to upload only `rect` of the surface to the GPU
