@@ -1,5 +1,7 @@
 #include "ui/sleep_ui.h"
 
+#include <limits.h>
+
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/gfade.h"
@@ -15,6 +17,7 @@
 #include "game/ui.h"
 #include "ui/anim_ui.h"
 #include "ui/intgame.h"
+#include "ui/ui_anim.h"
 
 typedef enum SleepUiOption {
     SLEEP_UI_OPTION_ONE_HOUR,
@@ -162,6 +165,22 @@ static bool sleep_ui_active;
 static IsoInvalidateRectFunc* sleep_ui_invalidate_rect;
 static IsoRedrawFunc* sleep_ui_draw;
 
+// CE: spring-tweened vertical slide offset (design-coord pixels).
+// 0 = panel at its rest position just below the top HUD bar.
+// Negative shifts up; at -window_height the panel is fully off the
+// top of the screen. Driven by ui_anim_int_to. Read each frame by
+// sleep_ui_ping which moves the tig window to rest_y + slide_offset.
+static int sleep_ui_slide_offset = 0;
+
+// CE: cached window-art height for the slide-up dismiss target.
+static int sleep_ui_window_height = 0;
+
+// CE: true between sleep_ui_close and the slide-up tween's settle
+// callback. Suppresses input on the still-alive panel during dismiss
+// and tells the finalize-close callback to actually destroy when the
+// tween settles.
+static bool sleep_ui_dismiss_pending;
+
 /**
  * Called when the game is initialized.
  *
@@ -216,7 +235,18 @@ void sleep_ui_exit(void)
 void sleep_ui_reset(void)
 {
     if (sleep_ui_active) {
-        sleep_ui_close();
+        // CE: bypass the slide-out animation — game is resetting,
+        // ui_anim may not get pinged again. Synchronous destroy +
+        // state cleanup. Any in-flight slide tween targeting
+        // sleep_ui_slide_offset continues to settle quietly; its
+        // on_complete returns early because sleep_ui_dismiss_pending
+        // is cleared here.
+        sleep_ui_dismiss_pending = false;
+        sleep_ui_destroy();
+        sleep_ui_obj = OBJ_HANDLE_NULL;
+        sleep_ui_using_bed = false;
+        sleep_ui_wait_mode = false;
+        sleep_ui_slide_offset = 0;
     }
 }
 
@@ -250,6 +280,28 @@ void sleep_ui_toggle(int64_t bed_obj)
 
     // Close sleep UI if it's currently visible.
     if (sleep_ui_active) {
+        if (sleep_ui_dismiss_pending) {
+            // CE: mid-dismiss reversal — user re-pressed before
+            // the slide-up tween settled. Clear dismiss flag and
+            // retarget the spring back to 0. The retarget fires
+            // the previous on_complete (sleep_ui_finalize_close)
+            // before swapping in NULL — finalize_close is guarded
+            // on dismiss_pending and no-ops because we just
+            // cleared it. The sleep state (obj/using_bed/wait_mode)
+            // is preserved because sleep_ui_close defers its
+            // cleanup to finalize_close.
+            sleep_ui_dismiss_pending = false;
+            int slide_ms = (int)((float)sleep_ui_window_height / 0.85f + 0.5f);
+            if (slide_ms < 140) slide_ms = 140;
+            if (slide_ms > 350) slide_ms = 350;
+            ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+            ui_anim_int_to(&sleep_ui_slide_offset, 0, &slide_profile);
+            // Re-enter SLEEP mode — sleep_ui_close had switched
+            // to MAIN; the reversal needs the matching push so
+            // the next sleep_ui_close pops back cleanly.
+            intgame_mode_set(INTGAME_MODE_SLEEP);
+            return;
+        }
         sleep_ui_close();
         return;
     }
@@ -375,6 +427,42 @@ void sleep_ui_toggle(int64_t bed_obj)
     }
 }
 
+// CE: ui_anim on_complete callback — fires when the slide-up dismiss
+// tween settles at -sleep_ui_window_height. Performs the deferred
+// state cleanup (bed exit + obj/wait_mode reset) AND destroys the
+// now-fully-offscreen panel. Guarded against being called for a
+// non-dismiss settle (e.g. reversal-retarget): only proceeds when
+// sleep_ui_dismiss_pending is still set.
+static void sleep_ui_finalize_close(void* ctx_v)
+{
+    (void)ctx_v;
+    int64_t bed_obj;
+
+    if (!sleep_ui_dismiss_pending) {
+        return;
+    }
+    sleep_ui_dismiss_pending = false;
+
+    // CE: bed-exit + state reset deferred from sleep_ui_close. By
+    // delaying these to here, a mid-dismiss reversal (user re-
+    // presses S while the panel is sliding up) leaves the sleep
+    // state intact — sleep_ui_obj stays valid, bed link stays —
+    // so the panel sliding back down is fully functional.
+    if (sleep_ui_using_bed) {
+        if (sub_443F80(&bed_obj, &sleep_ui_bed_obj_safe)
+            && bed_obj != OBJ_HANDLE_NULL) {
+            critter_leave_bed(sleep_ui_obj, bed_obj);
+        }
+    }
+    sleep_ui_using_bed = false;
+    sleep_ui_obj = OBJ_HANDLE_NULL;
+    sleep_ui_wait_mode = false;
+
+    if (sleep_ui_active) {
+        sleep_ui_destroy();
+    }
+}
+
 /**
  * Closes the sleep UI.
  *
@@ -382,28 +470,59 @@ void sleep_ui_toggle(int64_t bed_obj)
  */
 void sleep_ui_close(void)
 {
-    int64_t bed_obj;
-
     if (!sleep_ui_active) {
         return;
     }
+    if (sleep_ui_dismiss_pending) {
+        // Already animating out — let the in-flight tween finish.
+        return;
+    }
+
+    // CE: set dismiss_pending BEFORE intgame_mode_set. That call
+    // dispatches into the prev_mode handler which itself calls
+    // sleep_ui_close recursively for prev_mode == INTGAME_MODE_SLEEP
+    // (see intgame.c:5266). Without this guard the recursive
+    // sleep_ui_close re-enters past the !sleep_ui_active /
+    // !dismiss_pending checks and starts the slide-up tween a
+    // SECOND time — and that second start retargets the first
+    // tween, firing the first on_complete (sleep_ui_finalize_close)
+    // which destroys the window IMMEDIATELY. The visible result
+    // was "sleep window just disappears, no slide animation".
+    sleep_ui_dismiss_pending = true;
 
     if (intgame_mode_set(INTGAME_MODE_MAIN)) {
         timeevent_clear_all_typed(TIMEEVENT_TYPE_SLEEPING);
         sleep_ui_wake_up();
-        sleep_ui_destroy();
 
-        if (sleep_ui_using_bed) {
-            if (sub_443F80(&bed_obj, &sleep_ui_bed_obj_safe)
-                && bed_obj != OBJ_HANDLE_NULL) {
-                critter_leave_bed(sleep_ui_obj, bed_obj);
-            }
-        }
+        // CE: start the slide-up tween instead of destroying the
+        // window synchronously. tig_window_move runs each frame via
+        // sleep_ui_ping using the tweened slide_offset value; once
+        // the spring settles at -window_height the on_complete
+        // callback (sleep_ui_finalize_close) fires and destroys.
+        //
+        // CE: pixel-velocity-based settle (~0.85 px/ms) so the
+        // slide reads at the same visual speed as the (taller)
+        // fate panel; equal settle_ms would make sleep look
+        // proportionally slower since it has less distance to
+        // travel.
+        int slide_ms = (int)((float)sleep_ui_window_height / 0.85f + 0.5f);
+        if (slide_ms < 140) slide_ms = 140;
+        if (slide_ms > 350) slide_ms = 350;
+        ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+        ui_anim_int_to_with_complete(&sleep_ui_slide_offset,
+            -sleep_ui_window_height, &slide_profile,
+            sleep_ui_finalize_close, NULL);
 
-        // Reset sleep UI state.
-        sleep_ui_using_bed = false;
-        sleep_ui_obj = OBJ_HANDLE_NULL;
-        sleep_ui_wait_mode = false;
+        // CE: bed-exit + obj/using_bed/wait_mode reset are
+        // deferred to sleep_ui_finalize_close. Until the slide-up
+        // tween settles (or a mid-dismiss reversal aborts it),
+        // sleep_ui_obj and friends stay valid — so a quick re-
+        // press of S during the slide cleanly reverses without
+        // leaving null-state in the message filter.
+    } else {
+        // intgame_mode_set refused the transition — undo the
+        // dismiss flag so the next close attempt actually runs.
+        sleep_ui_dismiss_pending = false;
     }
 }
 
@@ -421,6 +540,11 @@ bool sleep_ui_is_active(void)
 // Called by the TAB HUD-crop toggle so the panel sits flush against
 // screen-top when the bar is hidden, or back below it when shown.
 // No-op when the panel isn't currently open.
+//
+// Honors sleep_ui_slide_offset so a TAB toggle mid-slide doesn't
+// snap the panel back to its slide_offset=0 rest position — the
+// per-frame sleep_ui_ping repositions with the offset re-applied
+// next tick.
 void sleep_ui_reposition(void)
 {
     tig_art_id_t art_id;
@@ -442,7 +566,48 @@ void sleep_ui_reposition(void)
     rect.width = art_frame_data.width;
     rect.height = art_frame_data.height;
     hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
-    tig_window_move(sleep_ui_window, rect.x, rect.y);
+    tig_window_move(sleep_ui_window, rect.x, rect.y + sleep_ui_slide_offset);
+}
+
+// CE: per-frame integrator hook — pumps the spring-tweened slide
+// offset into a tig_window_move so the panel slides down on appear /
+// slides up on dismiss. Cheap fast-path when no slide motion is
+// active (early return on rect-unchanged-since-last-frame).
+void sleep_ui_ping(void)
+{
+    static int s_last_applied_offset = INT_MIN;
+    static int s_last_applied_top = INT_MIN;
+
+    if (!sleep_ui_active || sleep_ui_window == TIG_WINDOW_HANDLE_INVALID) {
+        // Reset so a fresh open re-applies the move on first ping.
+        s_last_applied_offset = INT_MIN;
+        s_last_applied_top = INT_MIN;
+        return;
+    }
+
+    int top = intgame_hud_top_offset();
+    if (sleep_ui_slide_offset == s_last_applied_offset
+        && top == s_last_applied_top) {
+        return;
+    }
+    s_last_applied_offset = sleep_ui_slide_offset;
+    s_last_applied_top = top;
+
+    tig_art_id_t art_id;
+    TigArtFrameData art_frame_data;
+    TigRect rect;
+    if (tig_art_interface_id_create(565, 0, 0, 0, &art_id) != TIG_OK) {
+        return;
+    }
+    if (tig_art_frame_data(art_id, &art_frame_data) != TIG_OK) {
+        return;
+    }
+    rect.x = 573;
+    rect.y = top;
+    rect.width = art_frame_data.width;
+    rect.height = art_frame_data.height;
+    hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
+    tig_window_move(sleep_ui_window, rect.x, rect.y + sleep_ui_slide_offset);
 }
 
 /**
@@ -493,6 +658,12 @@ bool sleep_ui_create(void)
         exit(EXIT_FAILURE); // FIX: Proper exit code.
     }
 
+    // CE: tig stacks newer windows above older in the same z-class, so
+    // the freshly-created sleep panel lands ABOVE the top HUD bar by
+    // default. Re-promote the top bar to put it back on top so the
+    // slide-down animation emerges from BEHIND the bar.
+    intgame_hud_promote_top_strip();
+
     // Draw background.
     rect.x = 0;
     rect.y = 0;
@@ -530,6 +701,35 @@ bool sleep_ui_create(void)
     }
 
     sleep_ui_active = true;
+
+    // CE: cache window height for the slide-up dismiss target.
+    sleep_ui_window_height = art_frame_data.height;
+
+    // CE: spring-driven slide-in entrance. Start the panel at
+    // -window_height (fully above the top edge of the screen),
+    // immediately shift it there with tig_window_move, then spring
+    // the offset back to 0. sleep_ui_ping pumps the per-frame
+    // tig_window_move using the tweened value.
+    sleep_ui_slide_offset = -sleep_ui_window_height;
+    sleep_ui_dismiss_pending = false;
+    {
+        TigRect rest;
+        rest.x = 573;
+        rest.y = intgame_hud_top_offset();
+        rest.width = art_frame_data.width;
+        rest.height = art_frame_data.height;
+        hrp_apply(&rest, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
+        tig_window_move(sleep_ui_window, rest.x, rest.y + sleep_ui_slide_offset);
+    }
+    // CE: pixel-velocity-based settle — symmetric with the
+    // sleep_ui_close slide-up and matched to fate_ui's slide rate
+    // so both panels visually move at the same speed despite their
+    // height difference.
+    int slide_ms = (int)((float)sleep_ui_window_height / 0.85f + 0.5f);
+    if (slide_ms < 140) slide_ms = 140;
+    if (slide_ms > 350) slide_ms = 350;
+    ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+    ui_anim_int_to(&sleep_ui_slide_offset, 0, &slide_profile);
 
     return true;
 }

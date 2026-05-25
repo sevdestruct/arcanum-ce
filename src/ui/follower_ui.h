@@ -19,4 +19,12 @@ void follower_ui_hide(void);
 void follower_ui_show(void);
 int follower_ui_panel_bottom(void);
 
+// CE: per-frame hook — animates the toggle + scroller buttons to ride
+// the bottom HUD's visible top edge as a child. When the TAB stage
+// crops the bar (MEDIUM/MINI/HIDDEN), these widgets slide down into
+// the freed space, mirroring how fate/sleep_ui ride the top bar.
+// No-op for compact-mode layout (the widgets are already at the
+// bottom of the screen, clear of the HUD).
+void follower_ui_ping(void);
+
 #endif /* ARCANUM_UI_FOLLOWER_UI_H_ */

@@ -11,6 +11,11 @@
 #include "game/iso_zoom.h"
 #include "game/location.h"
 #include "game/tile.h"
+#include "ui/fate_ui.h"
+#include "ui/follower_ui.h"
+#include "ui/intgame.h"
+#include "ui/sleep_ui.h"
+#include "ui/ui_anim.h"
 
 #include "game/ai.h"
 #include "game/anim.h"
@@ -426,6 +431,11 @@ bool gamelib_init(GameInitInfo* init_info)
     // to color-key transparency, per-tick subtract-tint the iso pixels
     // under the bar, plain hardware color-key blit in compositor.
     settings_register(&settings, TRANSLUCENT_BLACK_UI_KEY, "1", NULL);
+
+    // CE: master toggle for the ui_anim spring-driven UI animation
+    // system. Defaults on. Disable for instant-snap UIs (accessibility,
+    // screenshots, personal preference).
+    settings_register(&settings, UI_ANIMATIONS_KEY, "1", NULL);
 
     // CE: Opt-in for vanilla "snap camera to PC on overlay open". Default
     // off — opening Inventory / Logbook / Schematic / Written / Options
@@ -1177,6 +1187,10 @@ void gamelib_zoom_perf_toggle(void)
     // translucent-black tint composite blit, so the perf-log dump
     // can report tint cost alongside the existing flip breakdown.
     tig_video_tint_blit_perf_set_enabled(gamelib_zoom_perf_enabled);
+    // CE: + ui_anim spring-integrator timing (per-frame + per-apply +
+    // active slot count) so motion-system cost is observable in the
+    // same dump.
+    ui_anim_perf_set_enabled(gamelib_zoom_perf_enabled);
     gamelib_zoom_perf_frames = 0;
     gamelib_zoom_perf_full_frames = 0;
     gamelib_zoom_perf_total_render_ns = 0;
@@ -1326,6 +1340,29 @@ bool gamelib_draw(void)
         return false;
     }
 
+    // CE: UI animation spring integrator. Must run BEFORE the
+    // gamelib_dirty early-return below — ui_anim drives window
+    // transforms via tig's invalidate path (separate dirty list
+    // from gamelib's), so when nothing in iso world is moving
+    // (e.g. pre-game mainmenu, fully-paused game) the gamelib
+    // dirty flag stays false but ui_anim still needs to advance
+    // springs for entrance/exit/slide animations. tig_window_display
+    // (called from each main loop AFTER iso_redraw → gamelib_draw)
+    // picks up tig's own invalidations from transform_set and
+    // composites the new frame.
+    ui_anim_ping();
+
+    // CE: HUD bar slide must run BEFORE the gamelib_dirty early-
+    // return — ui_anim_ping just integrated the slide offsets, but
+    // they're not applied to the bar's tig position until
+    // intgame_hud_ping calls tig_window_move. When the game is
+    // paused or we're at the mainmenu (gamelib_dirty=false), this
+    // function returned early without ever moving the bars, leaving
+    // them visible at whatever position the previous band-mode /
+    // hide path put them. Run hud_ping first so slide_hide / slide_
+    // show actually animate during the mainmenu navigation too.
+    intgame_hud_ping();
+
     if (!gamelib_dirty) {
         return false;
     }
@@ -1337,6 +1374,28 @@ bool gamelib_draw(void)
     camera_tween_ping();
     dialog_camera_ping();
     camera_follow_ping();
+    // CE: dialog-options backdrop position update. Runs AFTER
+    // ui_anim_ping so it sees the just-integrated tweened
+    // tc_bottom_gap_offset; recomputes the backdrop rect y and
+    // issues the necessary invalidations on shift. Cheap when not
+    // mid-tween (early return on rect-unchanged).
+    tc_ping();
+    // CE: fate / sleep window slide-position update. Same pattern
+    // as tc_ping — reads the spring-tweened slide offset that
+    // ui_anim_ping just integrated and calls tig_window_move so the
+    // panels slide down on appear / slide up on dismiss. Cheap
+    // no-op when the panel isn't open and the slide isn't moving.
+    fate_ui_ping();
+    sleep_ui_ping();
+    // CE: follower toggle/scroller chrome rides the bottom HUD's
+    // TAB-stage top crop — same shared-anchor pattern as fate/
+    // sleep above. Cheap no-op when offset hasn't changed.
+    follower_ui_ping();
+    // Note: intgame_hud_ping is called earlier (before the
+    // gamelib_dirty early-return) so the slide can animate at the
+    // mainmenu where gamelib_dirty stays false. fate/sleep panels
+    // read intgame_hud_top_offset() each frame in their own pings
+    // and pick up the just-integrated value the same way.
     z = iso_zoom_current();
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
@@ -1790,6 +1849,32 @@ bool gamelib_draw(void)
                                 (double)tint_perf.pixels_total / 1e6);
                             tig_debug_printf("%s", tint_line);
                             gamelib_zoom_perf_log(tint_line);
+                        }
+
+                        // CE: ui_anim spring-integrator cost. Active
+                        // slots = concurrent tweens (typical session:
+                        // 0–4; opens / closes spike briefly). ping =
+                        // full integrator including per-slot apply.
+                        // apply = subset spent inside the per-kind
+                        // writer (transform_set, int_var write, etc).
+                        TigUiAnimPerf ui_perf;
+                        ui_anim_perf_get(&ui_perf);
+                        ui_anim_perf_reset();
+                        if (ui_perf.ping_samples > 0) {
+                            float avg_ping_us = (float)((double)ui_perf.ping_total_ns
+                                / (double)ui_perf.ping_samples / 1e3);
+                            float max_ping_us = (float)((double)ui_perf.ping_max_ns / 1e3);
+                            float avg_apply_us = (float)((double)ui_perf.apply_total_ns
+                                / (double)ui_perf.ping_samples / 1e3);
+                            float avg_active = (float)((double)ui_perf.active_slots_total
+                                / (double)ui_perf.ping_samples);
+                            char ui_line[256];
+                            snprintf(ui_line, sizeof(ui_line),
+                                "[zoom-perf]   ui_anim: ping avg %.1fus max %.1fus (apply avg %.1fus) | active avg %.1f max %d\n",
+                                avg_ping_us, max_ping_us, avg_apply_us,
+                                avg_active, ui_perf.active_slots_max);
+                            tig_debug_printf("%s", ui_line);
+                            gamelib_zoom_perf_log(ui_line);
                         }
 
                         // Fourth line: remaining main-loop buckets that
@@ -2876,6 +2961,86 @@ void gamelib_logo(void)
     gmovie_play_path("movies\\TroikaLogo.bik", 0, 0);
 }
 
+// CE: see gamelib.h. Shared post-process used by gamelib_splash,
+// mainmenu_ui (legacy chrome), and slide_ui (credits slides).
+void gamelib_apply_legacy_vignette_to_vb(TigVideoBuffer* vb)
+{
+    TigVideoBufferData vbd;
+    if (vb == NULL) return;
+
+    int gw = hrp_iso_window_width_get();
+    int gh = hrp_iso_window_height_get();
+    bool game_is_hires = (gw > 800 || gh > 600);
+    bool side_gradient_only = false;
+
+    if (!game_is_hires) {
+        SDL_Rect display_bounds = { 0, 0, 0, 0 };
+        if (!SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(), &display_bounds)
+            || display_bounds.w <= 0 || display_bounds.h <= 0) {
+            return;
+        }
+        float display_aspect = (float)display_bounds.w / (float)display_bounds.h;
+        if (display_aspect >= 1.32f && display_aspect <= 1.35f) {
+            return;
+        }
+        side_gradient_only = true;
+    }
+
+    if (tig_video_buffer_lock(vb) != TIG_OK) return;
+    if (tig_video_buffer_data(vb, &vbd) != TIG_OK) {
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+    if (vbd.pixels == NULL || vbd.width <= 0 || vbd.height <= 0) {
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+
+    const float cx = (float)vbd.width * 0.5f;
+    const float cy = (float)vbd.height * 0.5f;
+    const float rx = (float)vbd.width * 0.5f;
+    const float ry = (float)vbd.height * 0.5f;
+    const float inner = side_gradient_only ? 0.50f : 0.55f;
+    const float outer = side_gradient_only ? 1.00f : 1.10f;
+    const float span = outer - inner;
+
+    uint8_t* base = (uint8_t*)vbd.pixels;
+    for (int y = 0; y < vbd.height; y++) {
+        uint32_t* row = (uint32_t*)(base + (size_t)y * (size_t)vbd.pitch);
+        float dy = side_gradient_only ? 0.0f : ((float)y - cy) / ry;
+        float dy2 = dy * dy;
+        for (int x = 0; x < vbd.width; x++) {
+            float dx = ((float)x - cx) / rx;
+            float dist;
+            if (side_gradient_only) {
+                dist = dx < 0.0f ? -dx : dx;
+            } else {
+                dist = sqrtf(dx * dx + dy2);
+            }
+            float fade;
+            if (dist <= inner) {
+                continue;
+            } else if (dist >= outer) {
+                fade = 1.0f;
+            } else {
+                float t = (dist - inner) / span;
+                fade = t * t * (3.0f - 2.0f * t);
+            }
+            float keep = 1.0f - fade;
+            uint32_t pix = row[x];
+            int r = tig_color_get_red(pix);
+            int g = tig_color_get_green(pix);
+            int b = tig_color_get_blue(pix);
+            r = (int)((float)r * keep);
+            g = (int)((float)g * keep);
+            b = (int)((float)b * keep);
+            row[x] = tig_color_make(r, g, b);
+        }
+    }
+
+    tig_video_buffer_unlock(vb);
+}
+
 // 0x404830
 void gamelib_splash(tig_window_handle_t window_handle)
 {
@@ -2893,6 +3058,12 @@ void gamelib_splash(tig_window_handle_t window_handle)
     settings_register(&settings, SPLASH_KEY, "0", NULL);
     splash = settings_get_value(&settings, SPLASH_KEY);
 
+    // CE: ensure the vignette cfg key is registered here (in case
+    // gamelib_splash runs before mainmenu_ui_init, which also
+    // registers it). settings_register is idempotent — second
+    // registration is a no-op besides callback re-assignment.
+    settings_register(&settings, LEGACY_MENU_VIGNETTE_KEY, "0", NULL);
+
     tig_file_list_create(&file_list, "art\\splash\\*.bmp");
 
     if (file_list.count != 0) {
@@ -2907,6 +3078,14 @@ void gamelib_splash(tig_window_handle_t window_handle)
         if (video_buffer != NULL
             && tig_window_data(window_handle, &window_data) == TIG_OK
             && tig_video_buffer_data(video_buffer, &vb_data) == TIG_OK) {
+            // Apply opt-in vignette to the splash BMP before
+            // copying it to the window. One-shot effect on the
+            // freshly-loaded VB — no per-frame cost (the VB is
+            // destroyed shortly after the copy).
+            if (settings_get_value(&settings, LEGACY_MENU_VIGNETTE_KEY)) {
+                gamelib_apply_legacy_vignette_to_vb(video_buffer);
+            }
+
             src_rect.x = 0;
             src_rect.y = 0;
             src_rect.width = vb_data.width;

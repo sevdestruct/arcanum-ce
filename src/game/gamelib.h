@@ -36,6 +36,24 @@
 // panel regions so the world peeks through. Defaults to 1 (enabled).
 #define TRANSLUCENT_BLACK_UI_KEY "translucent black ui"
 
+// CE: master toggle for the ui_anim spring-driven tween system.
+// Defaults to 1 (enabled). When 0, ui_anim_* start functions skip the
+// spring entirely and apply the end state immediately (and fire any
+// on_complete callback synchronously) — useful for accessibility,
+// screenshot/debugging, or anyone who prefers snap-instant UIs.
+#define UI_ANIMATIONS_KEY "ui animations"
+
+// CE: opt-in elliptical-vignette fade-to-black on legacy mainmenu
+// panel art (mainmenu / pause / single-player / sub-windows when
+// custom-UI bg art isn't loaded). Darkens the corners + edges of
+// the 800x600 chrome with a smoothstep ellipse falloff, giving the
+// vanilla art a more "cinematic" framed look without modifying the
+// underlying BMPs. Defaults to 0 (off) — vanilla appearance
+// preserved unless the user opts in via config. No effect when
+// custom-UI bg art is loaded (the custom art is already designed
+// for the full screen and doesn't need a vignette).
+#define LEGACY_MENU_VIGNETTE_KEY "legacy menu vignette"
+
 // When enabled, opening an overlay screen (Logbook, Inventory, Schematic,
 // Written, Options-while-in-play, Charedit) snaps the camera back to the
 // PC's location before showing the panel. Defaulted off — many players
@@ -126,6 +144,18 @@ typedef struct GameSaveInfo {
 extern unsigned int gamelib_ping_time;
 extern Settings settings;
 extern TigVideoBuffer* gamelib_scratch_video_buffer;
+
+// CE: opt-in fade-to-black post-process. Apply the same vignette /
+// side-gradient logic used for the mainmenu legacy chrome to an
+// arbitrary video buffer (splash BMP, credits slide, etc.). Gating:
+//   - Game render > 800x600: full elliptical vignette.
+//   - Vanilla 800x600 + 4:3 physical display: no fade.
+//   - Vanilla 800x600 + widescreen display: horizontal-only side
+//     gradient (left + right edges fade).
+// Caller is responsible for checking LEGACY_MENU_VIGNETTE_KEY and
+// whether the user has custom UI art (in which case skip the call).
+// One-shot, in-place pixel mutation.
+void gamelib_apply_legacy_vignette_to_vb(TigVideoBuffer* vb);
 
 bool gamelib_init(GameInitInfo* init_info);
 void gamelib_reset(void);

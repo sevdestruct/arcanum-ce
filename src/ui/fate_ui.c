@@ -1,5 +1,7 @@
 #include "ui/fate_ui.h"
 
+#include <limits.h>
+
 #include "game/critter.h"
 #include "game/fate.h"
 #include "game/hrp.h"
@@ -7,6 +9,7 @@
 #include "ui/charedit_ui.h"
 #include "ui/intgame.h"
 #include "ui/types.h"
+#include "ui/ui_anim.h"
 
 static void fate_ui_create(void);
 static void fate_ui_destroy(void);
@@ -73,6 +76,23 @@ static bool fate_ui_initialized;
  */
 static bool fate_ui_created;
 
+// CE: spring-tweened vertical slide offset (design-coord pixels). 0
+// means the panel sits at its rest position (just below the top
+// HUD bar); negative means it's shifted up — at -window_height the
+// panel is fully off the top of the screen. Driven by ui_anim_int_to.
+// Read each frame by fate_ui_ping which moves the tig window to
+// rest_y + fate_ui_slide_offset.
+static int fate_ui_slide_offset = 0;
+
+// CE: cached window-art height so fate_ui_close can compute the
+// "fully off-screen" target without re-querying art metadata.
+static int fate_ui_window_height = 0;
+
+// CE: true between fate_ui_close and the slide-up tween's settle
+// callback. Suppresses input on the still-alive panel during dismiss
+// and tells fate_ui_finalize_close to destroy when the tween settles.
+static bool fate_ui_dismiss_pending;
+
 /**
  * Called when the game is initialized.
  *
@@ -112,7 +132,16 @@ bool fate_ui_init(GameInitInfo* init_info)
 void fate_ui_reset(void)
 {
     if (fate_ui_created) {
-        fate_ui_close();
+        // CE: bypass the slide-out animation — game is resetting,
+        // ui_anim may not get pinged again before the panel needs
+        // to be gone. Synchronous destroy + state cleanup. Any
+        // in-flight slide tween targeting fate_ui_slide_offset
+        // continues to settle quietly; its on_complete returns
+        // early because fate_ui_dismiss_pending is cleared here.
+        fate_ui_dismiss_pending = false;
+        fate_ui_destroy();
+        fate_ui_obj = OBJ_HANDLE_NULL;
+        fate_ui_slide_offset = 0;
     }
 }
 
@@ -140,8 +169,25 @@ void fate_ui_exit(void)
  */
 void fate_ui_toggle(int64_t obj)
 {
-    // Close fate UI if it's currently visible.
     if (fate_ui_created) {
+        if (fate_ui_dismiss_pending) {
+            // CE: mid-dismiss reversal — user re-pressed the
+            // toggle before the slide-up tween settled. Clear the
+            // dismiss flag and retarget the spring back to 0 from
+            // wherever it currently is. The retarget fires the
+            // previous on_complete (fate_ui_finalize_close) before
+            // swapping in the new (NULL) callback — finalize_close
+            // is guarded on dismiss_pending and no-ops because we
+            // just cleared it. Result: smooth slide-back from
+            // current position, no completion-then-reopen pop.
+            fate_ui_dismiss_pending = false;
+            int slide_ms = (int)((float)fate_ui_window_height / 0.85f + 0.5f);
+            if (slide_ms < 140) slide_ms = 140;
+            if (slide_ms > 350) slide_ms = 350;
+            ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+            ui_anim_int_to(&fate_ui_slide_offset, 0, &slide_profile);
+            return;
+        }
         fate_ui_close();
         return;
     }
@@ -158,6 +204,24 @@ void fate_ui_toggle(int64_t obj)
     fate_ui_create();
 }
 
+// CE: ui_anim on_complete — fires when the slide-up dismiss tween
+// settles at -fate_ui_window_height. Destroys the now-fully-offscreen
+// panel and clears the dismiss-pending flag. Guarded against being
+// called for a non-dismiss settle (e.g. reposition retarget): only
+// destroys when fate_ui_dismiss_pending is still set.
+static void fate_ui_finalize_close(void* ctx_v)
+{
+    (void)ctx_v;
+    if (!fate_ui_dismiss_pending) {
+        return;
+    }
+    fate_ui_dismiss_pending = false;
+    if (fate_ui_created) {
+        fate_ui_destroy();
+        fate_ui_obj = OBJ_HANDLE_NULL;
+    }
+}
+
 /**
  * Closes the fate UI.
  *
@@ -165,16 +229,42 @@ void fate_ui_toggle(int64_t obj)
  */
 void fate_ui_close(void)
 {
-    if (fate_ui_created) {
-        fate_ui_destroy();
-        fate_ui_obj = OBJ_HANDLE_NULL;
+    if (!fate_ui_created) {
+        return;
     }
+    if (fate_ui_dismiss_pending) {
+        // Already animating out — let the in-flight tween finish.
+        return;
+    }
+    fate_ui_dismiss_pending = true;
+    // Slide up by the panel's height so the entire window goes off
+    // the top of the screen, then destroy from the on_complete
+    // callback. tig_window_move runs each frame from fate_ui_ping
+    // using the tweened slide_offset value.
+    //
+    // CE: pixel-velocity-based settle (~0.85 px/ms) so the slide
+    // looks the same speed regardless of panel height. Equal
+    // settle_ms would make the taller fate panel slide visibly
+    // faster than the shorter sleep panel; computing ms from
+    // height keeps the px/ms rate constant. Clamp [140, 350] so
+    // edge-case heights still feel intentional.
+    int slide_ms = (int)((float)fate_ui_window_height / 0.85f + 0.5f);
+    if (slide_ms < 140) slide_ms = 140;
+    if (slide_ms > 350) slide_ms = 350;
+    ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+    ui_anim_int_to_with_complete(&fate_ui_slide_offset,
+        -fate_ui_window_height, &slide_profile,
+        fate_ui_finalize_close, NULL);
 }
 
 // CE: Re-snap the fate window to its docked-below-top-bar position.
 // Called by the TAB HUD-crop toggle so the panel sits flush against
 // screen-top when the bar is hidden, or back below it when shown.
 // No-op when the panel isn't currently open.
+//
+// Honors fate_ui_slide_offset so a TAB toggle mid-slide doesn't snap
+// the panel back to its slide_offset=0 rest position — the per-frame
+// fate_ui_ping repositions with the offset re-applied next tick.
 void fate_ui_reposition(void)
 {
     tig_art_id_t art_id;
@@ -196,7 +286,48 @@ void fate_ui_reposition(void)
     rect.width = art_frame_data.width;
     rect.height = art_frame_data.height;
     hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
-    tig_window_move(fate_ui_window, rect.x, rect.y);
+    tig_window_move(fate_ui_window, rect.x, rect.y + fate_ui_slide_offset);
+}
+
+// CE: per-frame integrator hook — pumps the spring-tweened slide
+// offset into a tig_window_move so the panel slides down on appear /
+// slides up on dismiss. Cheap fast-path when no slide motion is
+// active (early return on rect-unchanged-since-last-frame).
+void fate_ui_ping(void)
+{
+    static int s_last_applied_offset = 0;
+    static int s_last_applied_top = 0;
+
+    if (!fate_ui_created || fate_ui_window == TIG_WINDOW_HANDLE_INVALID) {
+        // Reset so a fresh open re-applies the move on first ping.
+        s_last_applied_offset = INT_MIN;
+        s_last_applied_top = INT_MIN;
+        return;
+    }
+
+    int top = intgame_hud_top_offset();
+    if (fate_ui_slide_offset == s_last_applied_offset
+        && top == s_last_applied_top) {
+        return;
+    }
+    s_last_applied_offset = fate_ui_slide_offset;
+    s_last_applied_top = top;
+
+    tig_art_id_t art_id;
+    TigArtFrameData art_frame_data;
+    TigRect rect;
+    if (tig_art_interface_id_create(292, 0, 0, 0, &art_id) != TIG_OK) {
+        return;
+    }
+    if (tig_art_frame_data(art_id, &art_frame_data) != TIG_OK) {
+        return;
+    }
+    rect.x = 0;
+    rect.y = top;
+    rect.width = art_frame_data.width;
+    rect.height = art_frame_data.height;
+    hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
+    tig_window_move(fate_ui_window, rect.x, rect.y + fate_ui_slide_offset);
 }
 
 /**
@@ -246,6 +377,13 @@ void fate_ui_create(void)
         exit(EXIT_FAILURE); // FIX: Proper exit code.
     }
 
+    // CE: tig stacks newer windows above older in the same z-class, so
+    // the freshly-created fate panel lands ABOVE the top HUD bar by
+    // default. Re-promote the top bar to put it back on top so the
+    // slide-down animation emerges from BEHIND the bar (rather than
+    // being visible above it from frame 1, defeating the slide effect).
+    intgame_hud_promote_top_strip();
+
     // Draw background.
     window_rect.x = 0;
     window_rect.y = 0;
@@ -285,6 +423,37 @@ void fate_ui_create(void)
     }
 
     fate_ui_created = true;
+
+    // CE: cache height for the slide-up dismiss target.
+    fate_ui_window_height = art_frame_data.height;
+
+    // CE: spring-driven slide-in entrance. Start the panel at
+    // -window_height (fully above the top edge of the screen) so it
+    // visibly descends from off-screen to its rest position. The
+    // window has already been created at its rest screen rect by
+    // tig_window_create; we shift it up immediately via
+    // tig_window_move, then ui_anim_int_to springs the offset back
+    // to 0. fate_ui_ping pumps the per-frame tig_window_move.
+    fate_ui_slide_offset = -fate_ui_window_height;
+    fate_ui_dismiss_pending = false;
+    {
+        TigRect rest;
+        rest.x = 0;
+        rest.y = intgame_hud_top_offset();
+        rest.width = art_frame_data.width;
+        rest.height = art_frame_data.height;
+        hrp_apply(&rest, GRAVITY_CENTER_HORIZONTAL | GRAVITY_TOP);
+        tig_window_move(fate_ui_window, rest.x, rest.y + fate_ui_slide_offset);
+    }
+    // CE: pixel-velocity-based settle — same rate as the dismiss
+    // slide-up in fate_ui_close, so entrance and exit feel
+    // symmetric and the fate panel matches the visual speed of the
+    // (shorter) sleep panel.
+    int slide_ms = (int)((float)fate_ui_window_height / 0.85f + 0.5f);
+    if (slide_ms < 140) slide_ms = 140;
+    if (slide_ms > 350) slide_ms = 350;
+    ui_anim_profile_t slide_profile = { slide_ms, 1.2f };
+    ui_anim_int_to(&fate_ui_slide_offset, 0, &slide_profile);
 }
 
 /**

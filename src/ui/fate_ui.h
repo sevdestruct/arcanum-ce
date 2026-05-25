@@ -13,4 +13,11 @@ void fate_ui_close(void);
 // No-op when the panel isn't currently open.
 void fate_ui_reposition(void);
 
+// CE: per-frame integrator — reads the spring-tweened slide offset
+// and calls tig_window_move so the panel slides down on appear / up
+// on dismiss. Also tracks the dismiss-when-settled state and fires
+// the actual tig_window_destroy when the slide-up tween finishes.
+// Cheap no-op when the panel isn't open and not pending dismiss.
+void fate_ui_ping(void);
+
 #endif /* ARCANUM_UI_FATE_UI_H_ */

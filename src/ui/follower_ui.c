@@ -17,6 +17,8 @@
 #include "ui/intgame.h"
 #include "ui/inven_ui.h"
 #include "ui/tb_ui.h"
+#include "ui/ui_anim.h"
+#include <limits.h>
 
 /**
  * Commands available in the follower drop-down context menu.
@@ -1349,6 +1351,75 @@ void follower_ui_show(void)
 {
     if (follower_ui_initialized) {
         follower_ui_refresh();
+    }
+}
+
+// CE: spring-tweened y offset for the toggle + scroll buttons. Tracks
+// the bottom HUD's TAB-stage top crop so the buttons ride the bar
+// like a child. ui_anim_int_to in follower_ui_ping retargets this
+// whenever the stage changes; intgame's apply_clips drives stage
+// transitions (TAB key + auto-pop), so we don't need to subscribe
+// — just poll the target every frame.
+static int follower_ui_slide_offset = 0;
+static int follower_ui_slide_target = 0;
+
+/**
+ * CE: per-frame hook called from gamelib_draw. Computes the design-y
+ * offset the toggle / scroll button windows need to ride the bar's
+ * visible top edge, animates `follower_ui_slide_offset` toward that
+ * target via ui_anim_int_to, and re-applies the offset (with
+ * hrp_apply) to each special-button window via tig_window_move.
+ *
+ * The normal-mode rect places the toggle at design y=428 (13 above
+ * the FULL bar's top at 441). When the bar crops down it moves to
+ * 428 + top_crop, ending at 587 in HIDDEN — same as the compact-
+ * mode rect. So in steady state the same offset works for both
+ * modes; we just skip the slide-target retarget when compact mode
+ * is active because that layout is below the bar already.
+ */
+void follower_ui_ping(void)
+{
+    static int s_last_applied = INT_MIN;
+
+    if (!follower_ui_initialized) {
+        s_last_applied = INT_MIN;
+        follower_ui_slide_offset = 0;
+        follower_ui_slide_target = 0;
+        return;
+    }
+
+    // Compact layout (toggle sits at the bottom of the screen, below
+    // the HUD) doesn't need TAB-stage tracking — the chrome is clear
+    // of the bar already.
+    bool compact = (follower_ui_button_rects[FOLLOWER_UI_BUTTON_TOGGLE].y
+        == follower_ui_special_button_rects_compact_mode[
+            FOLLOWER_UI_BUTTON_TOGGLE - FOLLOWER_UI_SLOTS].y);
+
+    int target = compact ? 0 : intgame_hud_bottom_top_crop();
+    if (target != follower_ui_slide_target) {
+        follower_ui_slide_target = target;
+        ui_anim_int_to(&follower_ui_slide_offset, target,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+    }
+
+    if (follower_ui_slide_offset == s_last_applied) {
+        return;
+    }
+    s_last_applied = follower_ui_slide_offset;
+
+    // Re-apply the offset to all three special buttons. The base
+    // rect (in design coords) sits at button_rects[i]; we add the
+    // current offset and re-run hrp_apply to land at the right
+    // screen position for the active resolution.
+    int idx;
+    for (idx = FOLLOWER_UI_SLOTS; idx < FOLLOWER_UI_BUTTON_COUNT; idx++) {
+        if (follower_ui_windows[idx] == TIG_WINDOW_HANDLE_INVALID) {
+            continue;
+        }
+        TigRect r = follower_ui_button_rects[idx];
+        r.y += follower_ui_slide_offset;
+        hrp_apply(&r, GRAVITY_LEFT | GRAVITY_BOTTOM);
+        tig_window_move(follower_ui_windows[idx], r.x, r.y);
     }
 }
 

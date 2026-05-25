@@ -1,5 +1,6 @@
 #include "ui/intgame.h"
 
+#include <limits.h>
 #include <stdio.h>
 
 #include "game/dialog_camera.h"
@@ -65,6 +66,7 @@
 #include "ui/spell_ui.h"
 #include "ui/tb_ui.h"
 #include "ui/textedit_ui.h"
+#include "ui/ui_anim.h"
 #include "ui/wmap_ui.h"
 #include "ui/written_ui.h"
 
@@ -941,6 +943,14 @@ static bool dword_64C6B0;
 // 0x64C6B4
 static bool intgame_iso_interface_created;
 
+// CE: forward-declared early because intgame_iso_strips_show_as_band
+// (which sets band_mode) and sub_54B5D0 (which reads shell_hidden)
+// live above the slide module's main static block. The defining
+// declarations with initializers are further down alongside the
+// other slide state.
+static bool intgame_hud_band_mode;
+static bool intgame_hud_shell_hidden;
+
 // CE: translucent-black tint pathway opt-in flag. Set true when the
 // bar is created with TRANSLUCENT_BLACK_UI_KEY on. Read by:
 //   - intgame_hud_tick_invalidate_alpha_strips (per-tick: marks iso
@@ -1453,6 +1463,14 @@ void iso_interface_create(tig_window_handle_t window_handle)
         tig_button_hide(intgame_maintain_fs_buttons[index].button_handle);
     }
 
+    // CE: bars were just created at rest. Snap them off-screen now
+    // so the level-load entrance (when mainmenu closes and the iso
+    // world becomes visible) slides them in from below / above
+    // instead of revealing them already at rest. intgame_hide below
+    // becomes a no-op for the bars — they're already where
+    // slide_hide would put them.
+    intgame_hud_slide_prepare_offscreen();
+
     intgame_hide();
 }
 
@@ -1925,6 +1943,20 @@ bool sub_54B5D0(TigMessage* msg)
     tig_art_id_t art_id;
     char time_str_buffer[80];
     char buffer[80];
+
+    // CE: when a shell menu has slid the bars off-screen, the bar
+    // windows stay tig-shown (so the slide animation can render) —
+    // which means this filter still gets keyboard / mouse messages
+    // routed to it. Originally intgame_hide tig_window_hide'd the
+    // bars, so the filter never fired during shell menus and game
+    // hotkeys (I=inventory, M=wmap, etc) were de-facto blocked.
+    // Restore that behavior by short-circuiting here whenever the
+    // bars are in shell-hidden state. Band mode (chargen / vanilla
+    // shells repurposing the bar as panel chrome) explicitly wants
+    // input — it falls through.
+    if (intgame_hud_shell_hidden) {
+        return false;
+    }
 
     if (scrollbar_ui_process_event(msg)
         || handle_button_unhover(msg)
@@ -8654,23 +8686,13 @@ void intgame_iso_strips_promote(void)
     }
 }
 
-// Fully hide both iso-interface HUD strips.  Unlike intgame_hide(), which
-// leaves the bottom strip visible (moved up to align with main-menu chrome
-// covers and reused as the menu's rotwin / info-bar band), this hides
-// both strips outright.  Used by chrome-less menus (Save / Load) where the
-// would-be band would otherwise float visibly below the panel as "HUD
-// showing through" the menu.
+// CE: chrome-less shell menus (Save / Load, hi-res Options) hide
+// the bars via slide. Idempotent with intgame_hud_slide_hide — if
+// the path already ran intgame_hide (which slides), this just
+// re-asserts the same slide.
 void intgame_iso_strips_hide_full(void)
 {
-    int i;
-    if (!intgame_iso_interface_created) {
-        return;
-    }
-    for (i = 0; i < 2; i++) {
-        if (dword_64C4F8[i] != TIG_WINDOW_HANDLE_INVALID) {
-            tig_window_hide(dword_64C4F8[i]);
-        }
-    }
+    intgame_hud_slide_hide();
 }
 
 // Force the iso (game-world) window visible.  intgame_hide() hides the
@@ -8688,16 +8710,20 @@ void intgame_iso_world_show(void)
     }
 }
 
-// Re-apply the moved-and-shown state of intgame_hide() for the bottom iso
-// strip, so chrome-bearing menus (pause menu, etc.) get their band back
-// after a transition through a chrome-less menu hid both strips.  The top
-// strip stays hidden (matches intgame_hide()).
+// Re-apply the moved-and-shown state for the bottom iso strip, so
+// chrome-bearing vanilla menus (pause menu, etc.) get their band
+// back. The top strip stays hidden.
+//
+// CE: cancels any in-flight slide so the vanilla band positioning
+// owns the bar's screen y without the slide system re-driving it.
 void intgame_iso_strips_show_as_band(void)
 {
     TigRect rect;
     if (!intgame_iso_interface_created) {
         return;
     }
+    intgame_hud_slide_reset_to_rest();
+    intgame_hud_band_mode = true;
     if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
         tig_window_hide(dword_64C4F8[0]);
     }
@@ -8705,6 +8731,16 @@ void intgame_iso_strips_show_as_band(void)
         rect = intgame_interface_window_frames[1];
         hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
         tig_window_move(dword_64C4F8[1], rect.x, rect.y);
+        // CE: re-evaluate the translucent-black underlay BEFORE
+        // the bar becomes visible as a band. Otherwise the bar
+        // composites for one frame with whatever underlay was set
+        // last (iso world, from iso_interface_create), which the
+        // user sees as the bar punching through to the pregame
+        // world for a moment before snapping to the menu backdrop.
+        // Doing it here means the very first frame the bar shows
+        // already samples the correct underlay (mainmenu backdrop
+        // when one is up, none otherwise).
+        intgame_refresh_hud_bar_tint();
         if (!intgame_is_compact_interface()) {
             tig_window_show(dword_64C4F8[1]);
         }
@@ -9209,7 +9245,6 @@ int sub_557CF0(void)
 void intgame_hide(void)
 {
     int index;
-    TigRect rect;
 
     if (!intgame_iso_interface_created) {
         return;
@@ -9217,9 +9252,11 @@ void intgame_hide(void)
 
     tig_window_hide(dword_64C52C);
 
-    for (index = 0; index < 2; index++) {
-        tig_window_hide(dword_64C4F8[index]);
-    }
+    // CE: slide bars off-screen instead of tig_window_hide + move
+    // to mid-screen "band" position. Shell-menu callers that want
+    // the band (vanilla chrome-bearing menus) cancel this via
+    // intgame_iso_strips_show_as_band → intgame_hud_slide_reset_to_rest.
+    intgame_hud_slide_hide();
 
     if (intgame_fs_hotkey_window != TIG_WINDOW_HANDLE_INVALID) {
         tig_window_hide(intgame_fs_hotkey_window);
@@ -9230,15 +9267,6 @@ void intgame_hide(void)
     }
 
     follower_ui_hide();
-
-    // Move bottom bar window up so its aligned with mainmenu covers.
-    rect = intgame_interface_window_frames[1];
-    hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_CENTER_VERTICAL);
-    tig_window_move(dword_64C4F8[1], rect.x, rect.y);
-
-    if (!intgame_is_compact_interface()) {
-        tig_window_show(dword_64C4F8[1]);
-    }
 }
 
 // CE: TAB-cycle HUD-crop state. Bound to the TAB key in main.c.
@@ -9296,6 +9324,88 @@ static bool intgame_hud_peek_from_mini = false;
 // consumers (camera-follow margin math, fate/sleep top-bar dock).
 static bool intgame_hud_user_hidden;
 
+// CE: spring-tweened vertical slide offset (design-coord pixels) for
+// the top HUD bar. 0 = bar at its rest screen position (y=0); -41 =
+// bar slid fully off the top of the screen. Animated by ui_anim_int_to
+// on TAB-HUD stage transitions between visible-top (FULL) and hidden-
+// top (MEDIUM, MINI, HIDDEN) stages. Read by intgame_hud_top_offset
+// every frame, so fate / sleep panels that dock under the bar "ride
+// along" without any explicit parent-child wiring.
+static int intgame_hud_top_slide_offset = 0;
+
+// CE: bottom HUD bar slide-from-bottom offset (design coords).
+// Positive = bar moved DOWN below its natural rest y (off-screen
+// when slide_offset >= INTGAME_HUD_BOTTOM_H). 0 = at rest.
+//
+// Used for the return-from-HIDDEN transition only: instead of the
+// scale-down/fade-out's inverse scale-up/fade-in, the bar slides
+// up from below the screen back into its rest position. Snapped
+// to INTGAME_HUD_BOTTOM_H when the transition fires, then
+// ui_anim_int_to springs it back to 0 over the slide profile.
+// intgame_hud_ping applies it via tig_window_move every frame.
+static int intgame_hud_bottom_slide_offset = 0;
+
+// CE: returns the screen-coord y of the bottom bar at rest. Computed
+// on-demand from the design-coord frame + the same gravity used at
+// create-time (BOTTOM, see iso_interface_create). Tracks screen
+// resizes via hrp_apply.
+//
+// Previously this was captured from wd.rect.y when offset==0, but
+// the vanilla band-mode path moves the bar mid-screen with offset
+// still 0, which would corrupt the capture and break later slides.
+static int intgame_hud_bottom_rest_y_compute(void)
+{
+    TigRect rest = intgame_interface_window_frames[1];
+    hrp_apply(&rest, GRAVITY_CENTER_HORIZONTAL | GRAVITY_BOTTOM);
+    return rest.y;
+}
+
+// CE: the last visible stage the bar was in before going HIDDEN.
+// During HIDDEN, the bar still renders this stage's band so the
+// slide-down carries the band off-screen as a unit rather than
+// flashing empty. Switches to FULL on initial cold start so the
+// very first show-after-HIDDEN (if it somehow happens) doesn't
+// render garbage.
+static IntgameHudStage intgame_hud_last_visible_stage = INTGAME_HUD_STAGE_FULL;
+
+// CE: shared tween handles for the top + bottom bar slide offsets.
+// File-scope so the apply_clips TAB-driven path AND the public
+// slide_hide / slide_show shell-menu paths can cancel each other's
+// in-flight tween before retargeting — without this, two callers
+// fighting over the same offset variable would produce visible
+// jitter.
+static ui_anim_handle_t intgame_hud_top_slide_handle = UI_ANIM_HANDLE_INVALID;
+static ui_anim_handle_t intgame_hud_bottom_slide_handle = UI_ANIM_HANDLE_INVALID;
+
+// CE: ping's "last value applied to tig_window_move" memo, file-scope
+// so reset_to_rest (band mode handoff) can sync them against the new
+// offset — otherwise ping fires on the next frame and snaps the bar
+// back to rest_y, fighting whatever band-mode positioning the caller
+// just installed via tig_window_move.
+static int intgame_hud_top_last_applied = INT_MIN;
+static int intgame_hud_bottom_last_applied = INT_MIN;
+
+// CE: set true while a shell menu (Options / Save / Load / ESC
+// pause) is currently slide-hiding the bars. apply_clips skips its
+// usual TAB-driven slide retargets while this is set so the menu's
+// off-screen state isn't fought by a stray rotwin-driven reapply.
+// Cleared by intgame_hud_slide_show.
+// (Forward-declared at file top — defining decl is up there.)
+
+// CE: set true while vanilla band mode is active (chargen windows
+// repurpose the bottom bar as their chrome band via
+// intgame_iso_strips_show_as_band). The bar is parked mid-screen
+// via tig_window_move with offset==0; if we then transition to a
+// chrome-less menu, a normal slide-hide would jump the bar to its
+// natural BOTTOM rest before sliding off — visible as a flash.
+// slide_hide snaps to off-screen instead when this is set so the
+// chargen panel's own exit animation owns the visual.
+// (Forward-declared at file top — defining decl is up there.)
+
+// CE: top HUD bar height (design coords). Hardcoded — matches the
+// chrome art (top_bar.art = 800x41).
+#define INTGAME_HUD_TOP_HEIGHT 41
+
 // Stage-band design coords inside the bottom strip's 800x159 VB.
 #define INTGAME_HUD_BOTTOM_W 800
 #define INTGAME_HUD_BOTTOM_H 159
@@ -9311,7 +9421,6 @@ static bool intgame_hud_user_hidden;
 void intgame_show(void)
 {
     int index;
-    TigRect rect;
 
     if (!intgame_iso_interface_created) {
         return;
@@ -9319,10 +9428,38 @@ void intgame_show(void)
 
     tig_window_show(dword_64C52C);
 
-    if (!intgame_is_compact_interface()) {
-        for (index = 0; index < 2; index++) {
-            tig_window_show(dword_64C4F8[index]);
+    // CE: slide bars back to TAB-stage rest.
+    //   - shell_hidden (slide-hide path used): animate from
+    //     off-screen.
+    //   - band_mode (chargen / vanilla Options/Save/Load was
+    //     using the bar as panel chrome at mid-screen): snap to
+    //     off-screen first, then animate in. The chargen exit is
+    //     a level-load entrance from the player's POV — slide-in
+    //     is the right entrance.
+    //   - neither (last seen at TAB rest, no menu): legacy
+    //     tig_window_show + snap to BOTTOM rest.
+    if (intgame_hud_shell_hidden || intgame_hud_band_mode) {
+        if (intgame_hud_band_mode) {
+            intgame_hud_slide_prepare_offscreen();
         }
+        // Make sure the bar windows are tig-shown — band mode
+        // tig_window_hide'd the top, and slide-show animates the
+        // position only.
+        if (!intgame_is_compact_interface()) {
+            for (index = 0; index < 2; index++) {
+                tig_window_show(dword_64C4F8[index]);
+            }
+        }
+        intgame_hud_slide_show();
+    } else {
+        if (!intgame_is_compact_interface()) {
+            for (index = 0; index < 2; index++) {
+                tig_window_show(dword_64C4F8[index]);
+            }
+        }
+        TigRect rect = intgame_interface_window_frames[1];
+        hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_BOTTOM);
+        tig_window_move(dword_64C4F8[1], rect.x, rect.y);
     }
 
     if (intgame_fs_hotkey_window != TIG_WINDOW_HANDLE_INVALID) {
@@ -9335,11 +9472,6 @@ void intgame_show(void)
         }
     }
 
-    // Restore bottom bar position.
-    rect = intgame_interface_window_frames[1];
-    hrp_apply(&rect, GRAVITY_CENTER_HORIZONTAL | GRAVITY_BOTTOM);
-    tig_window_move(dword_64C4F8[1], rect.x, rect.y);
-
     follower_ui_show();
 
     // CE: Re-apply the current TAB stage's clip after a modal menu
@@ -9347,6 +9479,57 @@ void intgame_show(void)
     // called on close and would otherwise leave the strips fully
     // visible regardless of the user's TAB stage.
     intgame_hud_apply_clips();
+}
+
+// CE: Set the bottom bar's clip rect to the band for `render_stage`,
+// positioned in screen coords relative to (bar_x, bar_y) — the bar
+// window's current frame origin. Both apply_clips (on stage change)
+// and intgame_hud_ping (every frame during a slide) call this so
+// the crop tracks the bar's y as it animates between rest and off-
+// screen. chrome_strip_y is recomputed inside so it picks up the
+// active rotwin's per-type anchor offset.
+static void intgame_hud_bottom_set_clip(int bar_x,
+    int bar_y,
+    IntgameHudStage render_stage)
+{
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    int chrome_strip_y = INTGAME_HUD_MEDIUM_BAND_Y;
+    if (intgame_iso_window_type >= 0
+        && intgame_iso_window_type < ROTWIN_TYPE_COUNT) {
+        int btn_y = intgame_rotwin_button_info[intgame_iso_window_type].y;
+        if (btn_y > intgame_interface_window_frames[1].y) {
+            chrome_strip_y = btn_y - intgame_interface_window_frames[1].y;
+        }
+    }
+    TigRect band;
+    switch (render_stage) {
+    case INTGAME_HUD_STAGE_FULL:
+        tig_window_clip_rect_set(dword_64C4F8[1], NULL);
+        break;
+    case INTGAME_HUD_STAGE_MEDIUM:
+        band.x = bar_x + INTGAME_HUD_MEDIUM_BAND_X;
+        band.y = bar_y + chrome_strip_y;
+        band.width = INTGAME_HUD_MEDIUM_BAND_W;
+        band.height = INTGAME_HUD_MEDIUM_BAND_H;
+        tig_window_clip_rect_set(dword_64C4F8[1], &band);
+        break;
+    case INTGAME_HUD_STAGE_MINI:
+        band.x = bar_x + INTGAME_HUD_MINI_BAND_X;
+        band.y = bar_y + chrome_strip_y
+            + (INTGAME_HUD_MINI_BAND_Y - INTGAME_HUD_MEDIUM_BAND_Y);
+        band.width = INTGAME_HUD_MINI_BAND_W;
+        band.height = INTGAME_HUD_MINI_BAND_H;
+        tig_window_clip_rect_set(dword_64C4F8[1], &band);
+        break;
+    case INTGAME_HUD_STAGE_HIDDEN:
+    default: {
+        TigRect empty = { 0, 0, 0, 0 };
+        tig_window_clip_rect_set(dword_64C4F8[1], &empty);
+        break;
+    }
+    }
 }
 
 // Compute and install the per-strip clip rects for the current
@@ -9373,19 +9556,39 @@ static void intgame_hud_apply_clips(void)
         }
         TigWindowData strip_wd;
         if (tig_window_data(dword_64C4F8[strip_idx], &strip_wd) == TIG_OK) {
-            iso_invalidate_rect(&strip_wd.rect);
+            // CE: for the top strip, the slide tween may have left
+            // the window's current frame offscreen (y=-41). Iso
+            // needs to repaint the bar's REST screen area (y=0..41)
+            // so the slide-in animation reveals fresh pixels. We
+            // compose a rect at y=0 using the strip's width/x but
+            // ignoring its current y.
+            TigRect inv = strip_wd.rect;
+            if (strip_idx == 0) {
+                inv.y = 0;
+                inv.height = INTGAME_HUD_TOP_HEIGHT;
+            }
+            iso_invalidate_rect(&inv);
         }
     }
 
-    // Top strip: only visible in FULL stage.
-    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
-        if (intgame_hud_stage == INTGAME_HUD_STAGE_FULL) {
-            tig_window_clip_rect_set(dword_64C4F8[0], NULL);
-        } else {
-            // Zero-size clip → window composites nothing.
-            TigRect empty = { 0, 0, 0, 0 };
-            tig_window_clip_rect_set(dword_64C4F8[0], &empty);
-        }
+    // Top strip: visibility is now driven by a tweened slide rather
+    // than a clip-rect on/off. The strip's window y position is
+    // springed toward 0 (visible) when FULL, -INTGAME_HUD_TOP_HEIGHT
+    // (off the top edge) for any cropped stage. intgame_hud_ping
+    // pumps tig_window_move every frame from the integrated offset.
+    // We always leave the clip-rect cleared so the moving frame
+    // composites normally at whatever screen position the tween has
+    // it at this instant.
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID
+        && !intgame_hud_shell_hidden) {
+        tig_window_clip_rect_set(dword_64C4F8[0], NULL);
+        int target = (intgame_hud_stage == INTGAME_HUD_STAGE_FULL)
+            ? 0
+            : -INTGAME_HUD_TOP_HEIGHT;
+        ui_anim_cancel(intgame_hud_top_slide_handle);
+        intgame_hud_top_slide_handle = ui_anim_int_to(
+            &intgame_hud_top_slide_offset, target,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
     }
 
     // Bottom strip: stage-specific band.
@@ -9394,53 +9597,70 @@ static void intgame_hud_apply_clips(void)
         if (tig_window_data(dword_64C4F8[1], &wd) != TIG_OK) {
             return;
         }
-        // wd.rect is the strip's screen-coord frame after hrp_apply.
-        // Bands below are strip-local (design coords); add the
-        // frame origin to get screen coords for the clip rect.
-        int sx = wd.rect.x;
-        int sy = wd.rect.y;
-        TigRect band;
-        // CE: anchor the band's Y to the active rotwin's chrome top so
-        // a per-type anchor offset (e.g. SKILLS/SPELLS shifted 1px up
-        // vs MSG/dialogue) doesn't leave a sliver of bar background
-        // above/below the chrome. Width and X stay constant — the band
-        // is always 410px wide centered on the chrome anchor.
-        int chrome_strip_y = INTGAME_HUD_MEDIUM_BAND_Y;
-        if (intgame_iso_window_type >= 0
-            && intgame_iso_window_type < ROTWIN_TYPE_COUNT) {
-            int btn_y = intgame_rotwin_button_info[intgame_iso_window_type].y;
-            // Skip the zero-sized stub entries (QUANTITY / MP_KICKBAN).
-            if (btn_y > intgame_interface_window_frames[1].y) {
-                chrome_strip_y = btn_y - intgame_interface_window_frames[1].y;
+        // CE: keep "last visible stage" current so the slide-down
+        // into HIDDEN can keep rendering whatever band the user
+        // last saw — the whole band moves off-screen as a unit
+        // along with the bar.
+        if (intgame_hud_stage != INTGAME_HUD_STAGE_HIDDEN) {
+            intgame_hud_last_visible_stage = intgame_hud_stage;
+        }
+        IntgameHudStage render_stage =
+            (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN)
+            ? intgame_hud_last_visible_stage
+            : intgame_hud_stage;
+
+        // Install the band clip at the bar's current screen y.
+        // intgame_hud_ping re-installs it every frame the slide
+        // changes position so the crop follows the bar.
+        intgame_hud_bottom_set_clip(wd.rect.x, wd.rect.y, render_stage);
+
+        // CE: HIDDEN ↔ visible transition for the bottom bar.
+        //   - Entering HIDDEN: slide the bar DOWN with its current
+        //     band clip in tow (render_stage above is the previous
+        //     visible stage) — the whole band moves off-screen as
+        //     a unit.
+        //   - Leaving HIDDEN: snap to below-screen (in case ping
+        //     hasn't run yet), then slide UP to rest in sync with
+        //     the top bar's slide-down. render_stage is the new
+        //     stage, so the slide reveals the destination band.
+        // MEDIUM/MINI cycling (no HIDDEN involved) skips this —
+        // those are just clip-rect swaps, no slide.
+        static IntgameHudStage s_prev_stage = INTGAME_HUD_STAGE_FULL;
+        bool was_hidden = (s_prev_stage == INTGAME_HUD_STAGE_HIDDEN);
+        bool now_hidden = (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN);
+
+        if (was_hidden != now_hidden
+            && !intgame_hud_shell_hidden) {
+            int rest_y = intgame_hud_bottom_rest_y_compute();
+            // Stop any in-flight slide so the previous direction's
+            // motion doesn't fight us.
+            ui_anim_cancel(intgame_hud_bottom_slide_handle);
+            intgame_hud_bottom_slide_handle = UI_ANIM_HANDLE_INVALID;
+
+            if (now_hidden) {
+                // Slide DOWN from rest to off-screen below. Ping
+                // moves the band clip along with the bar each
+                // frame so the whole band rides off-screen.
+                intgame_hud_bottom_slide_offset = 0;
+                intgame_hud_bottom_slide_handle = ui_anim_int_to(
+                    &intgame_hud_bottom_slide_offset,
+                    INTGAME_HUD_BOTTOM_H,
+                    &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+            } else {
+                // Snap below-screen first (in case ping hadn't
+                // moved it yet), then slide UP to rest.
+                intgame_hud_bottom_slide_offset = INTGAME_HUD_BOTTOM_H;
+                tig_window_move(dword_64C4F8[1], wd.rect.x,
+                    rest_y + INTGAME_HUD_BOTTOM_H);
+                intgame_hud_bottom_set_clip(wd.rect.x,
+                    rest_y + INTGAME_HUD_BOTTOM_H,
+                    render_stage);
+                intgame_hud_bottom_slide_handle = ui_anim_int_to(
+                    &intgame_hud_bottom_slide_offset, 0,
+                    &UI_ANIM_PROFILE_DEFAULT_SLIDE);
             }
         }
-        switch (intgame_hud_stage) {
-        case INTGAME_HUD_STAGE_FULL:
-            tig_window_clip_rect_set(dword_64C4F8[1], NULL);
-            break;
-        case INTGAME_HUD_STAGE_MEDIUM:
-            band.x = sx + INTGAME_HUD_MEDIUM_BAND_X;
-            band.y = sy + chrome_strip_y;
-            band.width = INTGAME_HUD_MEDIUM_BAND_W;
-            band.height = INTGAME_HUD_MEDIUM_BAND_H;
-            tig_window_clip_rect_set(dword_64C4F8[1], &band);
-            break;
-        case INTGAME_HUD_STAGE_MINI:
-            // MINI shows just the inner text-row band of the chrome art
-            // (art-local row at +71). Slides with the chrome anchor.
-            band.x = sx + INTGAME_HUD_MINI_BAND_X;
-            band.y = sy + chrome_strip_y + (INTGAME_HUD_MINI_BAND_Y - INTGAME_HUD_MEDIUM_BAND_Y);
-            band.width = INTGAME_HUD_MINI_BAND_W;
-            band.height = INTGAME_HUD_MINI_BAND_H;
-            tig_window_clip_rect_set(dword_64C4F8[1], &band);
-            break;
-        case INTGAME_HUD_STAGE_HIDDEN:
-        default: {
-            TigRect empty = { 0, 0, 0, 0 };
-            tig_window_clip_rect_set(dword_64C4F8[1], &empty);
-            break;
-        }
-        }
+        s_prev_stage = intgame_hud_stage;
     }
 
     // Reposition top-bar-docked panels so they sit flush against the
@@ -9637,11 +9857,296 @@ bool intgame_hud_is_user_hidden(void)
     return intgame_hud_user_hidden;
 }
 
+void intgame_hud_promote_top_strip(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[0] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    tig_window_move_on_top(dword_64C4F8[0]);
+}
+
+tig_window_handle_t intgame_get_band_bar_handle(void)
+{
+    if (!intgame_iso_interface_created) {
+        return TIG_WINDOW_HANDLE_INVALID;
+    }
+    return dword_64C4F8[1];
+}
+
+bool intgame_hud_is_band_mode(void)
+{
+    return intgame_hud_band_mode;
+}
+
+// CE: slide both HUD bars off-screen, ignoring TAB stage. Used by
+// shell menus (Options / Save / Load / ESC pause) that previously
+// hid the bars instantly via tig_window_hide — sliding looks more
+// "physical" and matches the bg's own entrance/exit timing.
+//
+// The bars stay tig-shown (not tig_window_hide) so the slide is
+// actually visible. The captured rest_y + bottom_slide_offset
+// mechanism in intgame_hud_ping handles the per-frame move; setting
+// the shell_hidden flag pauses the TAB-driven slide retargets that
+// would otherwise fight us.
+//
+// Idempotent — safe to call from multiple paths converging on the
+// same menu open. Also resets the bottom bar's render_stage anchor
+// to "last visible" so the band crop slides off with the bar.
+void intgame_hud_slide_hide(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+
+    // CE: if we're coming out of band mode (bar parked mid-screen
+    // as chargen panel chrome), a slide would JUMP from mid-screen
+    // to bottom rest before animating off — visible flash. Snap
+    // to off-screen instead and let the chargen window's own exit
+    // animation handle the visual transition.
+    bool was_band = intgame_hud_band_mode;
+    intgame_hud_band_mode = false;
+    intgame_hud_shell_hidden = true;
+
+    ui_anim_cancel(intgame_hud_top_slide_handle);
+    ui_anim_cancel(intgame_hud_bottom_slide_handle);
+    intgame_hud_top_slide_handle = UI_ANIM_HANDLE_INVALID;
+    intgame_hud_bottom_slide_handle = UI_ANIM_HANDLE_INVALID;
+
+    if (was_band) {
+        // Snap straight to off-screen, no animation. Sync
+        // last_applied so ping doesn't re-fire on the next frame.
+        intgame_hud_top_slide_offset = -INTGAME_HUD_TOP_HEIGHT;
+        intgame_hud_bottom_slide_offset = INTGAME_HUD_BOTTOM_H;
+        intgame_hud_top_last_applied = intgame_hud_top_slide_offset;
+        intgame_hud_bottom_last_applied = intgame_hud_bottom_slide_offset;
+        if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+            TigWindowData wd;
+            if (tig_window_data(dword_64C4F8[0], &wd) == TIG_OK) {
+                tig_window_move(dword_64C4F8[0], wd.rect.x,
+                    -INTGAME_HUD_TOP_HEIGHT);
+            }
+            // band mode tig_window_hide'd the top earlier; keep
+            // it consistent — re-show so the slide-show later
+            // doesn't reveal an invisible window at rest_y.
+            tig_window_show(dword_64C4F8[0]);
+        }
+        if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+            TigWindowData wd;
+            if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
+                tig_window_move(dword_64C4F8[1], wd.rect.x,
+                    intgame_hud_bottom_rest_y_compute()
+                        + INTGAME_HUD_BOTTOM_H);
+            }
+        }
+        return;
+    }
+
+    // Normal slide path — bar was at TAB-rest or already mid-slide.
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        intgame_hud_top_slide_handle = ui_anim_int_to(
+            &intgame_hud_top_slide_offset,
+            -INTGAME_HUD_TOP_HEIGHT,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+    }
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        intgame_hud_bottom_slide_handle = ui_anim_int_to(
+            &intgame_hud_bottom_slide_offset,
+            INTGAME_HUD_BOTTOM_H,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+    }
+}
+
+// CE: complementary slide-show — animates both bars from wherever
+// they currently are (typically off-screen after slide_hide) back
+// to their TAB-stage rest positions. The TAB stage may itself have
+// the bars partially hidden (MEDIUM/MINI/HIDDEN) — we honor that
+// so the menu dismiss restores exactly what the user had before.
+void intgame_hud_slide_show(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    intgame_hud_shell_hidden = false;
+    intgame_hud_band_mode = false;
+
+    // Top bar → slide back to TAB target (0 for FULL, -41 for any
+    // cropped stage).
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        int top_target = (intgame_hud_stage == INTGAME_HUD_STAGE_FULL)
+            ? 0
+            : -INTGAME_HUD_TOP_HEIGHT;
+        ui_anim_cancel(intgame_hud_top_slide_handle);
+        intgame_hud_top_slide_handle = ui_anim_int_to(
+            &intgame_hud_top_slide_offset, top_target,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+    }
+
+    // Bottom bar → 0 (rest) when visible, BOTTOM_H (off-screen
+    // below) when the TAB stage is HIDDEN. Re-apply clips so the
+    // render_stage clip rect is current.
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        int bottom_target =
+            (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN)
+            ? INTGAME_HUD_BOTTOM_H
+            : 0;
+        ui_anim_cancel(intgame_hud_bottom_slide_handle);
+        intgame_hud_bottom_slide_handle = ui_anim_int_to(
+            &intgame_hud_bottom_slide_offset, bottom_target,
+            &UI_ANIM_PROFILE_DEFAULT_SLIDE);
+    }
+}
+
+// CE: snap-mode reset for both bar slide offsets. Used by the
+// vanilla band-mode path (intgame_iso_strips_show_as_band) and by
+// callers that need to know the bars are at rest immediately
+// (level-load setup, save). Cancels any in-flight tween.
+void intgame_hud_slide_reset_to_rest(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    ui_anim_cancel(intgame_hud_top_slide_handle);
+    ui_anim_cancel(intgame_hud_bottom_slide_handle);
+    intgame_hud_top_slide_handle = UI_ANIM_HANDLE_INVALID;
+    intgame_hud_bottom_slide_handle = UI_ANIM_HANDLE_INVALID;
+    intgame_hud_top_slide_offset =
+        (intgame_hud_stage == INTGAME_HUD_STAGE_FULL)
+        ? 0
+        : -INTGAME_HUD_TOP_HEIGHT;
+    intgame_hud_bottom_slide_offset =
+        (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN)
+        ? INTGAME_HUD_BOTTOM_H
+        : 0;
+    intgame_hud_shell_hidden = false;
+    // Sync last_applied to the new offsets so ping doesn't fire on
+    // the next frame and snap the bar back to rest_y, overriding
+    // whatever band-mode positioning the caller is about to install
+    // via tig_window_move.
+    intgame_hud_top_last_applied = intgame_hud_top_slide_offset;
+    intgame_hud_bottom_last_applied = intgame_hud_bottom_slide_offset;
+}
+
+// CE: seed both bar slide offsets to off-screen WITHOUT animating
+// — used for level-load entrance, where the bars should already
+// be off-screen when the iso world first renders. A subsequent
+// intgame_hud_slide_show animates them in from there.
+//
+// Actively moves the bar windows to off-screen via tig_window_move
+// (in addition to seeding the offset slots) so there's no one-
+// frame flash of bars-at-rest before the next ping cycle picks
+// up the new offset. rest_y is captured from the current bottom
+// bar y if not already known.
+void intgame_hud_slide_prepare_offscreen(void)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    ui_anim_cancel(intgame_hud_top_slide_handle);
+    ui_anim_cancel(intgame_hud_bottom_slide_handle);
+    intgame_hud_top_slide_handle = UI_ANIM_HANDLE_INVALID;
+    intgame_hud_bottom_slide_handle = UI_ANIM_HANDLE_INVALID;
+    intgame_hud_top_slide_offset = -INTGAME_HUD_TOP_HEIGHT;
+    intgame_hud_bottom_slide_offset = INTGAME_HUD_BOTTOM_H;
+    intgame_hud_shell_hidden = true;
+    intgame_hud_band_mode = false;
+
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID) {
+        // Cancel any in-flight ui_anim tween targeting this window
+        // (e.g. the band-mode exit hide that mainmenu_ui's
+        // sub_546DD0 fires alongside the panel hide) AND clear
+        // the transform tig left behind. Without this, the slide
+        // animates into place but the band-exit tween either
+        // re-asserts scale 0.92 / alpha 0 on the next ui_anim_ping
+        // (rendering the bar invisible) or leaves a stale
+        // transform in tig's compositor (same outcome).
+        ui_anim_cancel_for_window(dword_64C4F8[0]);
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[0], &wd) == TIG_OK) {
+            tig_window_move(dword_64C4F8[0], wd.rect.x,
+                -INTGAME_HUD_TOP_HEIGHT);
+        }
+    }
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID) {
+        ui_anim_cancel_for_window(dword_64C4F8[1]);
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
+            tig_window_move(dword_64C4F8[1], wd.rect.x,
+                intgame_hud_bottom_rest_y_compute() + INTGAME_HUD_BOTTOM_H);
+        }
+    }
+}
+
+// CE: per-frame integrator — applies the spring-tweened top-bar
+// slide offset to the top HUD strip's tig window via tig_window_move.
+// Cheap fast-path when the offset hasn't changed since the last
+// invocation (early return on identity). Called from gamelib_draw
+// after ui_anim_ping so it sees the just-integrated offset.
+void intgame_hud_ping(void)
+{
+    if (!intgame_iso_interface_created) {
+        // Iso interface gone — reset so a fresh open re-applies on
+        // first ping.
+        intgame_hud_top_last_applied = INT_MIN;
+        intgame_hud_bottom_last_applied = INT_MIN;
+        return;
+    }
+
+    // Top bar slide.
+    if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID
+        && intgame_hud_top_slide_offset != intgame_hud_top_last_applied) {
+        intgame_hud_top_last_applied = intgame_hud_top_slide_offset;
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[0], &wd) == TIG_OK) {
+            // The bar's canonical rest y is 0 (top of screen), so
+            // we move directly to slide_offset (range -41..0).
+            tig_window_move(dword_64C4F8[0], wd.rect.x,
+                intgame_hud_top_slide_offset);
+        }
+    }
+
+    // Bottom bar slide (used both for entering HIDDEN — slide
+    // DOWN — and leaving HIDDEN — slide UP). rest_y is computed
+    // on-demand from the design frame + GRAVITY_BOTTOM, the same
+    // gravity used at create-time — so band-mode tig_window_move
+    // calls don't corrupt our baseline.
+    //
+    // Re-install the band clip at the new screen y so the crop
+    // tracks the bar — without this, the clip stays at the old
+    // screen rect and the bar's content slides INSIDE a static
+    // crop instead of moving as a unit with its band.
+    if (dword_64C4F8[1] != TIG_WINDOW_HANDLE_INVALID
+        && intgame_hud_bottom_slide_offset != intgame_hud_bottom_last_applied) {
+        intgame_hud_bottom_last_applied = intgame_hud_bottom_slide_offset;
+        TigWindowData wd;
+        if (tig_window_data(dword_64C4F8[1], &wd) == TIG_OK) {
+            int new_y = intgame_hud_bottom_rest_y_compute()
+                + intgame_hud_bottom_slide_offset;
+            tig_window_move(dword_64C4F8[1], wd.rect.x, new_y);
+            IntgameHudStage render_stage =
+                (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN)
+                ? intgame_hud_last_visible_stage
+                : intgame_hud_stage;
+            intgame_hud_bottom_set_clip(wd.rect.x, new_y, render_stage);
+        }
+    }
+}
+
 int intgame_hud_top_offset(void)
 {
-    // 41 = top HUD strip design height. Fate/sleep panels dock at
-    // y=41 when the top bar is visible (FULL), y=0 otherwise.
-    return intgame_hud_user_hidden ? 0 : 41;
+    // CE: instead of the binary 0-or-41 snap based on stage, return
+    // the smoothly-animated bar y. Fate / sleep panels read this
+    // every frame via their own pings and "ride" the bar's slide as
+    // it tweens between rest (offset=0 → returns 41) and fully-off
+    // (offset=-41 → returns 0). Mid-tween values produce the
+    // intermediate dock positions that compose with each panel's
+    // own slide animation.
+    int top = INTGAME_HUD_TOP_HEIGHT + intgame_hud_top_slide_offset;
+    if (top < 0) top = 0;
+    if (top > INTGAME_HUD_TOP_HEIGHT) top = INTGAME_HUD_TOP_HEIGHT;
+    return top;
 }
 
 // Half of the bottom strip's currently hidden height (in design coords).
@@ -9666,6 +10171,53 @@ int intgame_hud_bottom_gap_offset(void)
     default:
         return 0;
     }
+}
+
+int intgame_hud_bottom_top_crop(void)
+{
+    switch (intgame_hud_stage) {
+    case INTGAME_HUD_STAGE_FULL:
+        return 0;
+    case INTGAME_HUD_STAGE_MEDIUM:
+        // Visible band starts at strip-local MEDIUM_BAND_Y (51).
+        return INTGAME_HUD_MEDIUM_BAND_Y;
+    case INTGAME_HUD_STAGE_MINI:
+        // Visible band starts at strip-local MINI_BAND_Y (122).
+        return INTGAME_HUD_MINI_BAND_Y;
+    case INTGAME_HUD_STAGE_HIDDEN:
+        // No visible bar — top edge has fallen all the way to
+        // INTGAME_HUD_BOTTOM_H (= bottom of the strip rect).
+        return INTGAME_HUD_BOTTOM_H;
+    default:
+        return 0;
+    }
+}
+
+void intgame_hud_bottom_band_design_x(int* out_x, int* out_w)
+{
+    int x = 0;
+    int w = 0;
+    switch (intgame_hud_stage) {
+    case INTGAME_HUD_STAGE_FULL:
+        x = 0;
+        w = INTGAME_HUD_BOTTOM_W;
+        break;
+    case INTGAME_HUD_STAGE_MEDIUM:
+        x = INTGAME_HUD_MEDIUM_BAND_X;
+        w = INTGAME_HUD_MEDIUM_BAND_W;
+        break;
+    case INTGAME_HUD_STAGE_MINI:
+        x = INTGAME_HUD_MINI_BAND_X;
+        w = INTGAME_HUD_MINI_BAND_W;
+        break;
+    case INTGAME_HUD_STAGE_HIDDEN:
+    default:
+        x = 0;
+        w = 0;
+        break;
+    }
+    if (out_x != NULL) *out_x = x;
+    if (out_w != NULL) *out_w = w;
 }
 
 // CE: per-tick iso-invalidate hook. In the current direct-paint
@@ -9744,16 +10296,36 @@ static IntgameTintParams intgame_translucent_black_pick(void)
         .threshold = 8,
         .r = 0, .g = 0, .b = 0,
     };
+    // CE: backdrop check first, regardless of mainmenu_ui_active.
+    // When the strip-mgmt block fires show_as_band (which triggers
+    // a tint refresh) inside mainmenu_ui_create_window_func, the
+    // backdrop is already created but mainmenu_ui_active hasn't
+    // been set to true yet — that happens later in the same
+    // function. Checking the backdrop window directly catches that
+    // window of time and prevents the bar from picking up the iso
+    // world (pregame "world") as its tint underlay for a frame.
+    tig_window_handle_t backdrop = mainmenu_ui_get_backdrop_handle();
+    if (backdrop != TIG_WINDOW_HANDLE_INVALID
+        && mainmenu_ui_has_custom_backdrop_art()) {
+        params.underlay = backdrop;
+        // ~80% darken
+        params.r = 204;
+        params.g = 204;
+        params.b = 204;
+        return params;
+    }
     if (mainmenu_ui_is_active()) {
-        tig_window_handle_t backdrop = mainmenu_ui_get_backdrop_handle();
-        if (backdrop != TIG_WINDOW_HANDLE_INVALID) {
-            params.underlay = backdrop;
-            // ~80% darken
-            params.r = 204;
-            params.g = 204;
-            params.b = 204;
-            return params;
-        }
+        // Legacy / no-custom-bg mainmenu: don't use the panel as
+        // the underlay (panel-as-its-own-underlay creates feedback:
+        // a panel near-black pixel reading from its same near-black
+        // pixel produces an even darker result, blacking out the
+        // panel chrome). And don't fall through to iso (in-game
+        // pause case) — the user explicitly didn't want modals
+        // punching through to the live game world, and pre-game
+        // there is no game world anyway. Disable the tint so
+        // near-black panel pixels render as their native near-
+        // black color, matching vanilla appearance.
+        return params;
     }
     if (intgame_iso_interface_is_created()) {
         params.underlay = intgame_iso_window;

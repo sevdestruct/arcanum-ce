@@ -178,6 +178,38 @@ int sub_557CF0(void);
 void intgame_hide(void);
 void intgame_show(void);
 
+// CE: handle of the bottom HUD strip window (the one chargen /
+// vanilla shell menus repurpose as their chrome band via
+// intgame_iso_strips_show_as_band). Callers use this to animate
+// the band in/out alongside their own panel chrome so the whole
+// composite enters / exits as one. Returns INVALID before the iso
+// interface has been created.
+tig_window_handle_t intgame_get_band_bar_handle(void);
+
+// CE: true while the bottom strip is currently parked at mid-screen
+// as panel chrome (band mode). Used by callers (mainmenu sub_546DD0)
+// to decide whether their exit animation should also fade the band
+// out as part of the composite.
+bool intgame_hud_is_band_mode(void);
+
+// CE: Slide the top + bottom HUD bars off-screen. Used by shell
+// menus (Options / Save / Load / ESC pause) that previously hid
+// the bars instantly. The bars stay tig-shown; only their position
+// is animated. Pair with intgame_hud_slide_show on dismiss.
+void intgame_hud_slide_hide(void);
+// CE: Slide the bars back to their TAB-stage rest. TAB-cropped
+// states (MEDIUM / MINI / HIDDEN) are honored — the bars end up
+// where the user left them before the menu opened.
+void intgame_hud_slide_show(void);
+// CE: cancel any in-flight slide and snap both bars to their
+// TAB-rest position. For callers (vanilla band mode, etc.) that
+// take over the bar's position directly.
+void intgame_hud_slide_reset_to_rest(void);
+// CE: seed offsets to off-screen without animating. For level
+// load: bars start hidden, then intgame_hud_slide_show animates
+// them in.
+void intgame_hud_slide_prepare_offscreen(void);
+
 // CE: User-toggleable HUD visibility (TAB key). Hides both iso HUD
 // strips (top and bottom bars) by moving them off-screen so their
 // message filters keep receiving keyboard / dialog input even while
@@ -194,10 +226,27 @@ void intgame_hud_auto_pop_for_rotwin(void);
 // last fired (called from iso_interface_window_set when the rotwin
 // returns to MSG). No-op when no snapshot is stashed.
 void intgame_hud_restore_after_rotwin(void);
-// CE: Y-offset of the top HUD strip in design coords (41 when the
-// top bar is visible, 0 otherwise). Used by fate_ui / sleep_ui to
-// dock their panels flush at screen-top when the bar is cropped.
+// CE: Y-offset of the top HUD strip in design coords. With the
+// Phase 1.5 slide tween wired up this returns the smoothly-animated
+// position — 41 when the bar is fully at rest (FULL stage), 0 when
+// fully hidden (MEDIUM/MINI/HIDDEN), and any value in between
+// during a stage transition. fate_ui / sleep_ui ride this value
+// every frame via their own pings so they slide with the bar.
 int intgame_hud_top_offset(void);
+
+// CE: per-frame integrator hook — applies the spring-tweened bar
+// slide offset to the top HUD strip via tig_window_move. Driven by
+// the ui_anim tween started in intgame_hud_apply_clips on stage
+// changes. Cheap no-op when the offset hasn't moved since last
+// invocation, or when the iso interface isn't currently created.
+void intgame_hud_ping(void);
+
+// CE: re-promote the top HUD strip to the top of its z-class.
+// Called by fate_ui / sleep_ui right after creating their windows
+// so their slide-down emerges from BEHIND the top bar (which would
+// otherwise sit below the newly-created panel in z-order, leaving
+// the panel visible above the bar from frame 1).
+void intgame_hud_promote_top_strip(void);
 // CE: per-tick hook called BEFORE iso_redraw. Marks the iso VB
 // under any HUD strip using the translucent-black tint pathway as
 // dirty, so iso_redraw repaints fresh world pixels there. The
@@ -216,6 +265,28 @@ void intgame_hud_tick_apply_tint(void);
 // is cropped, taking half the visual real-estate that the cropped
 // portion of the bar would have occupied.
 int intgame_hud_bottom_gap_offset(void);
+
+// CE: design pixels the visible bar's TOP edge has moved DOWN from
+// its FULL-stage position (= design y=441 in 600-tall reference
+// space). Used by follower_ui (to ride the bar like a child) and
+// tb.c (speech bubbles get more room as the bar crops down).
+//   FULL    -> 0    (visible top at design y=441)
+//   MEDIUM  -> 51   (visible top at design y=492)
+//   MINI    -> 122  (visible top at design y=563)
+//   HIDDEN  -> 159  (no visible bar)
+int intgame_hud_bottom_top_crop(void);
+
+// CE: design-space horizontal extent of the bottom HUD's currently
+// visible band, in 800-wide reference coords. Used by tb.c (speech
+// bubbles) so bubbles in the freed side areas (e.g. MEDIUM crops
+// down to a 410px-wide center band, leaving ~195px on each side
+// flush with the iso-world bottom edge) can drop into the bottom
+// rows instead of being reserved against a phantom full-width bar.
+//   FULL    -> x=0,   w=800
+//   MEDIUM  -> x=196, w=410
+//   MINI    -> x=205, w=394
+//   HIDDEN  -> x=0,   w=0
+void intgame_hud_bottom_band_design_x(int* out_x, int* out_w);
 // CE: enable/disable the optional near-black see-through alpha on the
 // given window. Gated by the TranslucentBlackUI cfg flag — when off
 // (or enable=false), this clears any prior alpha state on the window.
