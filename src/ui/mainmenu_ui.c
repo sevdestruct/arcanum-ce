@@ -44,6 +44,7 @@
 #include "ui/iso.h"
 #include "ui/logbook_ui.h"
 #include "ui/options_ui.h"
+#include "ui/video_convert_ui.h"
 #include "ui/schematic_ui.h"
 #include "ui/scrollbar_ui.h"
 #include "ui/sleep_ui.h"
@@ -1578,6 +1579,13 @@ bool mainmenu_ui_init(GameInitInfo* init_info)
     sub_549A80();
     dword_64C37C = NULL;
 
+    /* NOTE: the video-conversion prompt fires from mainmenu_ui_handle,
+     * not from here. mainmenu_ui_init runs before the Arcanum game
+     * module finishes mounting (modules/Arcanum.dat + the loose
+     * modules/Arcanum/ directory), so a scan triggered here only sees
+     * 2 of the ~10 cutscene .bik files. Deferring to handle() ensures
+     * the scan picks up the whole set. */
+
     return true;
 }
 
@@ -1863,6 +1871,14 @@ bool mainmenu_ui_handle(void)
     }
 
     broadcast_ui_close();
+
+    /* CE: The Arcanum game module (which carries 8 of the 10
+     * cutscene .bik files inside modules/Arcanum.dat + the loose
+     * modules/Arcanum/ directory) finishes mounting AFTER
+     * mainmenu_ui_init returns. Trigger the video-conversion modal
+     * here on first entry to mainmenu_ui_handle, by which time
+     * everything is visible to the scan. */
+    video_convert_ui_show_if_needed();
 
     while (mainmenu_ui_active) {
         tig_ping();
@@ -4933,8 +4949,9 @@ static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* pat
         "art/",
     };
     static const char* extensions[] = {
-        ".mp4",
-        ".bik",
+        ".avi",   /* MJPEG-in-AVI is the cross-platform default; preferred */
+        ".mp4",   /* legacy: old custom backgrounds shipped as .mp4 */
+        ".bik",   /* legacy: original .bik before .avi sidecar exists  */
     };
     /* Suffixes to try in order: _native first (no scale-to-fit), then bare. */
     static const char* suffixes[] = {
@@ -5451,6 +5468,14 @@ static void mainmenu_ui_bg_video_start(void)
         && mainmenu_ui_bg_video_buffer != NULL
         && strcmp(mainmenu_ui_bg_video_path, requested_path) == 0) {
         mainmenu_ui_has_custom_bg = false;
+        /* Re-enable audio (the prewarm path muted it during the intro
+         * so the bg-video soundtrack didn't bleed into the cutscene)
+         * and clear any stale frame-due timestamp so the first tick
+         * fires one frame_ms from now -- NOT a wall-clock catch-up
+         * that would skip the bg video forward by the intro's length. */
+        bink_compat_set_audio_enabled(mainmenu_ui_bg_video, true);
+        mainmenu_ui_bg_video_next_frame_due_ms = 0;
+        mainmenu_ui_bg_video_last_tick_ms = 0;
         mainmenu_ui_bg_video_present_current_frame();
         mainmenu_ui_bg_video_schedule_tick();
         mainmenu_ui_bg_video_preserve_on_close = false;
@@ -5532,6 +5557,83 @@ static bool mainmenu_ui_bg_video_is_supported_window_type(MainMenuWindowType typ
     char path[TIG_MAX_PATH];
 
     return mainmenu_ui_extract_bg_video_path(type, path);
+}
+
+/* Pre-open the main-menu background video and decode its first frame
+ * during init, BEFORE the intro cutscene runs. The decoder, video
+ * buffer, and "frame 0 painted" state all persist across the intro;
+ * when mainmenu_ui_handle() later opens the MAINMENU window, the
+ * bg_video_start fast path finds everything already loaded and the
+ * intro->menu handoff is a single composite away from being instant
+ * (no disk read, no decode latency in the critical path).
+ *
+ * Audio is muted (BINKSND OnOff=0) while the intro plays so the bg
+ * video's soundtrack doesn't bleed into the cutscene's mix. The fast
+ * path in bg_video_start re-enables audio at the moment the menu
+ * actually takes over. */
+void mainmenu_ui_prewarm_bg_video_file(void)
+{
+    char path[TIG_MAX_PATH];
+    TigVideoBufferCreateInfo vb_info;
+
+    if (mainmenu_ui_bg_video != NULL) {
+        /* Already prewarmed (e.g. main() called us twice) -- nothing
+         * more to do. */
+        return;
+    }
+    if (!mainmenu_ui_extract_bg_video_path(MM_WINDOW_MAINMENU, path)) {
+        return;
+    }
+
+    mainmenu_ui_bg_video = BinkOpen(path, BINKSNDTRACK);
+    if (mainmenu_ui_bg_video == NULL) {
+        return;
+    }
+
+    /* Suppress the bg video's audio until the menu actually takes over.
+     * BinkDoFrame below decodes frame 0 (and reads frame 0's audio
+     * chunks); without this mute the BINKSND callback would push that
+     * audio straight into the mixer alongside the intro. */
+    bink_compat_set_audio_enabled(mainmenu_ui_bg_video, false);
+
+    strncpy(mainmenu_ui_bg_video_path, path, sizeof(mainmenu_ui_bg_video_path) - 1);
+    mainmenu_ui_bg_video_path[sizeof(mainmenu_ui_bg_video_path) - 1] = '\0';
+
+    vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+    vb_info.background_color = 0;
+    vb_info.color_key = 0;
+    vb_info.width = (int)mainmenu_ui_bg_video->Width;
+    vb_info.height = (int)mainmenu_ui_bg_video->Height;
+    if (tig_video_buffer_create(&vb_info, &mainmenu_ui_bg_video_buffer) != TIG_OK) {
+        BinkClose(mainmenu_ui_bg_video);
+        mainmenu_ui_bg_video = NULL;
+        mainmenu_ui_bg_video_path[0] = '\0';
+        return;
+    }
+
+    /* Decode frame 0 into the bg video buffer. The buffer now holds the
+     * exact pixels that should appear the moment the intro's last
+     * frame is replaced by the menu composite. */
+    if (BinkDoFrame(mainmenu_ui_bg_video) == 0) {
+        TigVideoBufferData vbd;
+        if (tig_video_buffer_lock(mainmenu_ui_bg_video_buffer) == TIG_OK) {
+            if (tig_video_buffer_data(mainmenu_ui_bg_video_buffer, &vbd) == TIG_OK) {
+                BinkCopyToBuffer(mainmenu_ui_bg_video,
+                    vbd.pixels, vbd.pitch,
+                    (unsigned)vbd.height, 0, 0, 3);
+            }
+            tig_video_buffer_unlock(mainmenu_ui_bg_video_buffer);
+        }
+        BinkNextFrame(mainmenu_ui_bg_video);
+    }
+
+    /* Critically: DO NOT call mainmenu_ui_bg_video_schedule_tick() here.
+     * The intro is about to run for ~11 seconds and the tick scheduler
+     * would either drive playback into the intro (audio still muted, so
+     * silent, but visually ticking off-screen) or queue up a "catch
+     * up" that frame-skips by hundreds of frames the moment the menu
+     * opens. Leave next_frame_due_ms at 0 -- bg_video_start's fast path
+     * resets timing when the menu actually takes over. */
 }
 
 static bool mainmenu_ui_bg_video_matches_window_type(MainMenuWindowType type)

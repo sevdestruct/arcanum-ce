@@ -125,6 +125,14 @@ void tig_movie_exit(void)
 {
     // COMPAT: Free binkw32.dll
     bink_compat_exit();
+
+    // Tear down the long-lived movie mixer (kept alive across cutscene
+    // boundaries since 2026-05; see unref_mixer for the rationale).
+    if (mixer != NULL) {
+        MIX_DestroyMixer(mixer);
+        mixer = NULL;
+        mixer_refcount = 0;
+    }
 }
 
 // 0x531530
@@ -738,8 +746,14 @@ int ref_mixer(void)
 
 void unref_mixer(void)
 {
-    if (--mixer_refcount == 0) {
-        MIX_DestroyMixer(mixer);
+    /* Don't destroy the mixer when the refcount drops to 0 -- on macOS
+     * MIX_CreateMixerDevice reopens the audio device which can take
+     * 50-200 ms, and that delay shows up as a visible stall every time
+     * the engine switches between cutscenes (intro chain logos -> 50000
+     * -> menu background). Keep the mixer pinned across the whole
+     * session and tear it down once in tig_movie_exit at app shutdown. */
+    if (mixer_refcount > 0) {
+        --mixer_refcount;
     }
 }
 

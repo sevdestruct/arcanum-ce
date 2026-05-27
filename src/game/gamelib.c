@@ -22,6 +22,7 @@
 #include "game/gfade.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
+#include "game/video_convert.h"
 #include "game/highres_config.h"
 #include "game/hrp.h"
 #include "game/invensource.h"
@@ -178,6 +179,7 @@ static GameLibModule gamelib_modules[] = {
     { "Newspaper", newspaper_init, newspaper_reset, NULL, NULL, newspaper_exit, NULL, NULL, newspaper_save, newspaper_load, NULL },
     { "TownMap", NULL, townmap_reset, townmap_mod_load, townmap_mod_unload, NULL, NULL, NULL, NULL, NULL, NULL },
     { "GMovie", NULL, NULL, gmovie_mod_load, gmovie_mod_unload, NULL, NULL, NULL, NULL, NULL, NULL },
+    { "VideoConvert", video_convert_init, NULL, NULL, NULL, video_convert_exit, NULL, NULL, NULL, NULL, NULL },
     { "Brightness", brightness_init, NULL, NULL, NULL, brightness_exit, NULL, NULL, NULL, NULL, NULL },
     { "GFade", gfade_init, NULL, NULL, NULL, gfade_exit, NULL, NULL, NULL, NULL, gfade_resize },
     { "Anti-Teleport", antiteleport_init, NULL, antiteleport_mod_load, antiteleport_mod_unload, antiteleport_exit, NULL, NULL, NULL, NULL, NULL },

@@ -400,6 +400,15 @@ int main(int argc, char** argv)
         return EXIT_SUCCESS; // FIXME: Should be `EXIT_FAILURE`.
     }
 
+    /* CE: warm the OS page cache for the main-menu background video
+     * BEFORE the intro plays. The intro typically runs 10+ seconds,
+     * which is plenty of time to flush a 20-100 MB AVI into the
+     * kernel's page cache. By the time gmovie_play(8) returns and
+     * mainmenu_ui_handle() asks BinkOpen for the bg-video file, the
+     * read is satisfied from RAM rather than a cold-disk seek, and
+     * the intro->menu handoff lands within one frame. */
+    mainmenu_ui_prewarm_bg_video_file();
+
     if (highres_config->intro) {
         gmovie_play(8, GAME_MOVIE_NO_FINAL_FLIP, 0);
     }

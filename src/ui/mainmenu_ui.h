@@ -107,4 +107,11 @@ void sub_549A70(void);
 bool mainmenu_ui_has_bg_video_frame(void);
 bool mainmenu_ui_capture_bg_video_bmp_for_window(tig_window_handle_t window_handle, TigBmp* bmp);
 
+/* Warm the OS page cache for the MAINMENU window's background video
+ * (data/art/ui/mainmenu_bg.{avi,mp4,bik}). Read it cold during init so
+ * the actual BinkOpen at intro->menu transition time hits the cache
+ * and the handoff stays sub-frame. Safe no-op if no video bg exists.
+ */
+void mainmenu_ui_prewarm_bg_video_file(void);
+
 #endif /* ARCANUM_UI_MAINMENU_UI_H_ */
