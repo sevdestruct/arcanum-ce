@@ -5,6 +5,8 @@ add_library(bink_compat STATIC
     "src/avi_reader.h"
     "src/mjpeg_decoder.c"
     "src/mjpeg_decoder.h"
+    "src/bink1_decoder.c"
+    "src/bink1_decoder.h"
 )
 
 target_include_directories(bink_compat PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
