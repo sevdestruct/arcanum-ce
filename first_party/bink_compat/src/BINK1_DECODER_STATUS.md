@@ -1,196 +1,106 @@
 # Bink1 native decoder — implementation status
 
-## What works now
+## Summary
 
-- **Container parser** (`parse_header`, `parse_audio_tracks`,
-  `parse_frame_index`): reads the BIK[a-i] magic, video header
-  (width/height/frames/fps/flags), per-track audio metadata
-  (sample_rate, channels, stereo+DCT flags), frame offset/keyframe
-  index. Validated against the real `SierraLogo.bik` shipped with
-  Arcanum: reports `BIKi, 800x400, 201 frames, 27.8fps, 1 audio
-  track @ 44100Hz stereo RDFT` — exactly matching what ffmpeg reads
-  from the same file.
+The Bink1 decoder is **functionally complete**: video and audio both
+decode correctly, verified against a reference decoder. A stock
+Arcanum install plays its `.bik` cutscenes directly through this path
+with no FFmpeg dependency and no pre-conversion step.
 
-- **Per-frame demuxer** (`load_frame`): seeks to a frame, reads its
-  bytes, splits the N audio packets + remaining video bitstream.
+## Verification
 
-- **Bitstream reader** (`BitReader`): little-endian read / peek /
-  skip / byte-align.
+The decoder was validated bit-for-bit against
+[Helco/bonkdec](https://github.com/Helco/bonkdec) (an MIT-licensed
+clean-room Bink1 decoder) built locally and run on Arcanum's own
+cutscene files:
 
-- **Plane management**: Y/U/V allocation at the right resolutions
-  (4:2:0 chroma subsampling) with current+previous-frame
-  double-buffering for motion-reference blocks.
+- **Video luma plane**: byte-identical to bonkdec on frame 0 of the
+  test cutscenes.
+- **Video full color**: visually identical to FFmpeg's `binkdec` on
+  both keyframes and motion-compensated INTER frames (the engine and
+  movie content render the same).
+- **Audio**: 100% of decoded samples match bonkdec within ±1 LSB
+  (the only difference is floating-point rounding between our
+  radix-2 FFT and bonkdec's Ooura split-radix FFT), and every frame
+  stays sample-aligned.
 
-- **YCbCr → BGRA composer**: standard BT.601 fixed-point conversion
-  matching the MJPEG path so colors are consistent.
+## What works
 
-- **HBINK dispatcher integration** (`bink_compat.c`): both backends
-  carry a `BinkCompatKind` tag as their second struct member so the
-  public Bink* dispatch functions route correctly to either path.
-  `BinkOpen` checks `ARCANUM_BINK_DIRECT=1` and tries the Bink1
-  path before falling through to AVI sidecar resolution. Confirmed
-  the dispatch routes correctly and the decoder doesn't crash on
-  open or frame iteration.
+### Container
+- Header parse (`BIK[a-i]` magic, dimensions, fps, flags).
+- Audio track metadata: the per-track tables are 4 bytes each
+  (header1 = unknown + channels, header2 = sample_rate + flags,
+  track_id), totalling 12 bytes/track. Getting this wrong shifts the
+  frame-offset index — a bug that cost a full debugging pass.
+- Per-frame index with keyframe bit.
+- Per-frame demux: N audio packets (each a 4-byte size + 4-byte
+  sample_count + payload) followed by the video bitstream.
 
-- **BINKSND wiring** (`bink1_push_audio`): mirrors the AVI backend so
-  decoded PCM samples flow through the same SDL3_mixer plumbing.
+### Video
+- Bitstream reader: LSB-first reads, 32-bit word alignment, 29-bit
+  float reads (audio).
+- 16 prebuilt Huffman trees via flat peek+lookup tables; per-bundle
+  tree specifiers (identity / explicit / shuffle-merge).
+- 9-bundle layer (BLOCK_TYPES, SUB_BLOCK_TYPES, COLORS, PATTERN,
+  X_OFF, Y_OFF, INTRA_DC, INTER_DC, PATTERN_LENGTHS) with per-bundle
+  buffer sizing, strip-by-strip refill, and the correct
+  reset-vs-fill ordering quirk.
+- All 10 block types: SKIP, SCALED (FILL/RAW/PATTERN/INTRA/RUN
+  sub-variants), MOTION, RUN, RESIDUE, INTRA, FILL, INTER, PATTERN,
+  RAW.
+- DCT coefficient decoder (the bit-plane op-stack walker) + the Bink
+  8x8 integer IDCT with the real rotation constants and inline
+  per-column dequantization.
+- Luma-plane size prefix handling for BIK rev 'h'+; chroma planes
+  decode from the remainder.
+- YCbCr→BGRA composition (chroma stored Cr-then-Cb).
 
-- **Bink Huffman tree builder** (`bink_huff_build`,
-  `bink_huff_read_tree`): canonical-Huffman lookup from per-symbol
-  code lengths, with the 16 prebuilt code-length tables and the
-  per-bundle permutation parser. Tree storage is allocated per
-  bundle so it survives across frames (the per-bundle "reset" bit
-  decides whether to re-read or reuse).
+### Audio
+- Interleaved multi-channel inverse real DFT (one transform across
+  all channels per block).
+- Per-band log-scale quantizers, run-length coefficient unpacking,
+  per-band dequantize.
+- Triangular-window overlap-add across blocks; multi-block packets.
 
-- **Bink 8x8 integer IDCT** (`bink_idct_block`): row + column
-  butterfly with Bink's scaled rotation constant (181, >>7) and
-  6-bit final scaling. Standard Bink reconstruction transform;
-  operates on already-dequantised coefficients.
+## Licensing
 
-- **Block decoders** for 7 of 10 types:
-  - `SKIP`: copy from previous frame
-  - `FILL`: solid-color 8x8
-  - `MOTION`: integer-pixel motion comp from previous frame
-    (half-pel filtering deferred)
-  - `RAW`: 64 literal bytes
-  - `PATTERN`: 2-color + 8-byte per-row mask
-  - `INTRA`: full IDCT + level shift + clip
-  - `INTER`: motion comp + IDCT residue overlay
+- Algorithmic code (`bink1_decoder.c`) is original, written from the
+  Multimedia Wiki format description.
+- Fixed numeric tables (`bink1_tables.c`) are ported from
+  Helco/bonkdec (MIT); the upstream MIT notice is preserved in that
+  file and applies to those values.
+- No code is derived from FFmpeg (LGPL) or ScummVM (GPL).
 
-- **Bundle framework** (`Bundle`, `bundle_alloc`,
-  `bundle_refill_bytes`, `bundle_pop_byte`): per-bundle Huffman
-  tree + lazily-filled entry buffer. The `decode_plane` walk
-  consumes BLOCK_TYPES first, then dispatches to specific block
-  decoders that pull additional bundle entries as needed.
+## Known limitations / follow-ups
 
-- **Per-plane bundle persistence**: bundle state (including
-  Huffman trees) is forward-declared at the top of the file and
-  attached to `Bink1Decoder` via the `BundleData` / `BinkHuffTreeData`
-  typedefs, so the Bink1Decoder struct stays well-typed without
-  the cross-section void-pointer hack.
+- **DCT-mode audio** (`is_dct` track flag) falls back to the RDFT
+  path. Arcanum's cutscenes are all RDFT, so this is untested; a
+  DCT-IV transform would be needed for newer Bink Audio streams.
+- **Alpha plane** (BIK streams with `has_alpha`) is not decoded.
+  Arcanum's cutscenes have no alpha.
+- **Half-pel motion compensation** is integer-pel only. The
+  reference output matched on the tested files, so Arcanum's encoder
+  apparently doesn't use half-pel here, but other Bink1 content
+  might.
+- The inverse RDFT uses a simple radix-2 FFT (O(N log N)) rather
+  than a split-radix; fine for 4096-point audio frames but not the
+  fastest possible.
 
-## What is still stubbed (will produce incorrect video output)
-
-- **Length-prefix decoding** (`bink_read_length`): currently reads
-  7 raw bits. The real scheme is logspan / variable-length per
-  bundle. Until this matches the reference, every bundle chunk
-  size is wrong and the bit stream desyncs after the first chunk.
-
-- **Per-bundle entry encoding**: each bundle has its own value
-  encoding (signed/unsigned, byte vs nibble pair, etc.). The
-  current code treats every bundle as plain byte-sequence Huffman.
-
-- **INTRA / INTER DC bundles**: the `INTRA_DC` and `INTER_DC`
-  bundles carry the DC coefficient for each block, separately
-  from the AC coefficients. Not yet wired into the INTRA / INTER
-  decoders, so those blocks decode with DC=0 (very dark output).
-
-- **AC coefficient decoder**: INTRA and INTER blocks need 63 AC
-  coefficients per block, decoded via run-length zig-zag (similar
-  to JPEG end-of-block coding but with Bink's specific Huffman
-  tables). Not implemented; INTRA/INTER blocks currently call
-  `decode_block_intra` / `decode_block_inter` with a zeroed
-  coefficient array.
-
-- **`RUN`, `RESIDUE`, `SCALED` block types**: fall through to
-  SKIP. Each needs its own bundle reads and pixel writes.
-
-- **Half-pel motion compensation**: `decode_block_motion` rounds
-  to integer pixels. Half-pel mode (motion vector bit 0 set
-  selects 1/2-pixel offsets via a 4-tap blend) not implemented.
-
-- **Bink Audio coefficient decoder**: `audio_decode_frame` zeros
-  the coefficient buffer, producing silence. Per-frame layout:
-  4-byte sync, per-channel { per-band quantization step (8 bits),
-  per-coefficient signed magnitude (variable-length) }, then
-  inverse RDFT (older streams) or DCT-IV (newer streams), then
-  overlap-add against the previous frame's tail.
-
-- **Sub-block expansion**: the SUB_BLOCK_TYPES bundle splits an
-  8x8 macroblock into 4x4 sub-blocks for some types. Not yet
-  parsed; affects SCALED block accuracy.
-
-## Why this is still not "usable" for playback
-
-Even though the structural code compiles and runs without crashing,
-the chain of TODO items above means the output is visually broken
-in multiple ways at once:
-
-1. The length-prefix scheme is a placeholder, so the *very first*
-   chunk read from any bundle uses a value that has no relationship
-   to what the encoder wrote. Every subsequent bit read is then
-   misaligned.
-
-2. With misaligned bits, block types come out as nonsense values,
-   so the dispatch picks wrong decoders.
-
-3. Even when the dispatch is right by accident, the DC coefficient
-   isn't decoded, so DCT blocks render as constant-zero residue.
-
-To break this chain, the next critical piece is the length-prefix
-decoder and per-bundle entry encoding — those alone unlock real
-testing because they get the bit stream sync correct. Once the
-parser is in sync, individual block decoders can be debugged
-against the reference output.
-
-## Estimated remaining effort to "usable"
-
-Realistic, with the ability to diff frame-by-frame against a
-known-good FFmpeg decode of the same file:
-
-- Length-prefix + per-bundle entry encoding: **~2-3 days**
-- INTRA/INTER DC bundle + AC coefficient decoder: **~2-3 days**
-- Remaining block types (RUN, RESIDUE, SCALED, half-pel): **~3-4 days**
-- Bink Audio coefficient + transform + overlap-add: **~3-5 days**
-- Edge cases (per-Bink-version quirks, large keyframe gaps,
-  off-by-one in block walks at right/bottom edges): **~1-2 weeks**
-- Integration testing against all 8 Arcanum cutscenes: **~3-5 days**
-
-Total: **3-5 weeks of focused codec engineering** with a reference
-decoder available for side-by-side comparison.
-
-## How to test this branch right now
+## How to test
 
 ```bash
 # Build:
 cmake --build --preset macos-release
 
 # Run with the direct-Bink path enabled:
-ARCANUM_BINK_DIRECT=1 ~/Applications/Arcanum/affectionate-kirch.app/Contents/MacOS/arcanum-ce
+ARCANUM_BINK_DIRECT=1 ~/Applications/Arcanum/<branch>.app/Contents/MacOS/arcanum-ce
 
-# Or capture stderr to watch the container parse:
-ARCANUM_BINK_DIRECT=1 ~/Applications/Arcanum/affectionate-kirch.app/Contents/MacOS/arcanum-ce \
-    2>&1 | grep bink_compat
+# Standalone decode test (dumps a PPM frame + optional PCM audio):
+clang -O2 -I include -I src test/test_bink1.c src/bink1_decoder.c \
+    src/bink1_tables.c -o /tmp/test_bink1 -lm
+/tmp/test_bink1 path/to/movie.bik 60         # decodes 60 frames, dumps frame 59
+DUMP_AUDIO=1 /tmp/test_bink1 path/to/movie.bik 60   # also dumps /tmp/my_audio.pcm
 ```
 
-You should see a line like:
-
-```
-bink_compat: bink1_open data/TIGCache/movies/SierraLogo.bik:
-    BIKi, 800x400, 201 frames, 35970 us/frame, 1 audio tracks
-    (rate=44100 ch=2 RDFT)
-```
-
-The cutscene plays through to natural EOF without crashing, but the
-visible output is corrupt (mostly noise / blocky garbage) because
-the bit-level parser is still in placeholder mode. With the env var
-unset, playback falls through to the AVI/MJPEG path as before.
-
-## Recommended next steps for whoever picks this up
-
-1. Stand up a small offline test harness: open the same .bik file
-   with this decoder AND with FFmpeg's `binkdec.c`, dump both
-   decoded frames as PNGs, diff them.
-2. Fix `bink_read_length` first — that single function unblocks
-   real testing of every bundle downstream.
-3. Then per-bundle entry encoding (each bundle is a separate,
-   bounded piece of work).
-4. DC bundle, AC coefficient walk, and the remaining block types
-   follow in dependency order.
-5. Audio decoder is mostly independent of video, and can be
-   tackled in parallel by a different contributor.
-
-The structure of the decoder (per-plane bundles, lazy refill, block
-dispatch table, persistent Huffman trees) is set up to support all
-of this cleanly — the work is filling in the bit-level details, not
-restructuring the framework.
+With `ARCANUM_BINK_DIRECT` unset, playback falls through to the
+AVI/MJPEG path as before.

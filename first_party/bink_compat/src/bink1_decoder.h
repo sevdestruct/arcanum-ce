@@ -21,11 +21,15 @@
  *
  * The format is RAD Game Tools' proprietary container. Layout
  * documentation comes from the publicly available Multimedia Wiki
- * reverse-engineering writeup; this implementation is clean-room
- * (no code derived from FFmpeg's LGPL libavcodec/binkdec.c or
- * ScummVM's GPL video/bink_decoder.cpp). The intent is interop with
- * legitimate .bik content the user already owns, in the same spirit
- * as the project's existing binkw32.dll runtime-load on Windows x86.
+ * reverse-engineering writeup. This implementation derives no code
+ * from FFmpeg's LGPL libavcodec/binkdec.c or ScummVM's GPL
+ * video/bink_decoder.cpp. The fixed lookup tables (Huffman trees,
+ * quantization matrices, scan/pattern tables, audio band edges) live
+ * in bink1_tables.c and were ported from Helco/bonkdec, an MIT-
+ * licensed clean-room decoder; that file carries the upstream MIT
+ * notice. The intent is interop with legitimate .bik content the
+ * user already owns, in the same spirit as the project's existing
+ * binkw32.dll runtime-load on Windows x86.
  *
  * Public API contract: the bink_compat shim layer dispatches the
  * legacy HBINK calls (BinkOpen / BinkDoFrame / BinkCopyToBuffer /
