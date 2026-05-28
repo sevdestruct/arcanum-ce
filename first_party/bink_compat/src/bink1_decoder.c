@@ -34,6 +34,37 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
+/* Diagnostic instrumentation                                         */
+/* ------------------------------------------------------------------ */
+/* All tracing is opt-in via ARCANUM_BINK_TRACE=1 (env var read once
+ * at module init). When off the macros compile to no-ops so there's
+ * zero overhead in production. */
+
+static int g_bink_trace_enabled = -1;
+static int g_bink_trace_frame = 0;
+
+static int bink_trace_check(void)
+{
+    if (g_bink_trace_enabled < 0) {
+        const char* v = getenv("ARCANUM_BINK_TRACE");
+        g_bink_trace_enabled = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y'))
+            ? 1 : 0;
+    }
+    return g_bink_trace_enabled;
+}
+
+#define BINK_TRACE(...) do { if (bink_trace_check()) { \
+        fprintf(stderr, "bink1: " __VA_ARGS__); fflush(stderr); \
+    } } while (0)
+
+/* Detailed trace: only first N frames to keep log readable. */
+#define BINK_TRACE_FRAME_LIMIT 3
+#define BINK_TRACE_DETAIL(...) do { \
+    if (bink_trace_check() && g_bink_trace_frame < BINK_TRACE_FRAME_LIMIT) { \
+        fprintf(stderr, "bink1: " __VA_ARGS__); fflush(stderr); \
+    } } while (0)
+
+/* ------------------------------------------------------------------ */
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -224,7 +255,11 @@ typedef struct {
     size_t   write_pos;
     size_t   read_pos;
     int      remaining;          /* run quota left for this plane */
+    int      runsize;            /* bit-width of chunk-length prefix */
     int16_t* values;
+    /* For BLOCK_TYPES / SUB_BLOCK_TYPES: last emitted symbol so the
+     * 4-bit RLE expansion (codes 12..15 -> repeat last) can fire. */
+    int      last_value;
 } BundleData;
 
 struct Bink1Decoder {
@@ -431,6 +466,14 @@ static bool parse_frame_index(Bink1Decoder* d)
         d->frames[i].size = (uint32_t)(next - cur);
     }
     d->frame_count = d->info.frame_count;
+
+    BINK_TRACE("frame index: %u frames, first 4 offsets/sizes/kf: "
+        "(%llu,%u,%d) (%llu,%u,%d) (%llu,%u,%d) (%llu,%u,%d)\n",
+        d->frame_count,
+        (unsigned long long)d->frames[0].offset, d->frames[0].size, d->frames[0].keyframe,
+        (unsigned long long)d->frames[1].offset, d->frames[1].size, d->frames[1].keyframe,
+        (unsigned long long)d->frames[2].offset, d->frames[2].size, d->frames[2].keyframe,
+        (unsigned long long)d->frames[3].offset, d->frames[3].size, d->frames[3].keyframe);
     return true;
 }
 
@@ -452,18 +495,32 @@ static bool load_frame(Bink1Decoder* d, uint32_t index)
     if (!read_exact(d->fp, d->frame_buf, fe->size)) return false;
     d->frame_buf_size = fe->size;
 
-    /* Demux the frame: each audio track contributes a 4-byte size
-     * followed by `size` bytes of audio bitstream. After all audio
-     * packets, the remainder is the video bitstream. */
+    /* Demux the frame. Per the Bink container spec, the per-track
+     * audio packet is structured as:
+     *   4 bytes: stored_length = (audio_data_bytes + 4); 0 = silence
+     *   4 bytes: sample_count (only present if stored_length != 0)
+     *   N bytes: audio bitstream (N = stored_length - 4)
+     * After all audio tracks, the remainder is the video bitstream. */
     size_t pos = 0;
     for (int t = 0; t < d->track_count; ++t) {
         if (pos + 4 > d->frame_buf_size) return false;
-        uint32_t aud_size = rd_u32le(d->frame_buf + pos);
+        uint32_t stored_len = rd_u32le(d->frame_buf + pos);
         pos += 4;
-        if (pos + aud_size > d->frame_buf_size) return false;
-        d->audio_packets[t].data = d->frame_buf + pos;
-        d->audio_packets[t].size = aud_size;
-        pos += aud_size;
+        if (stored_len == 0) {
+            /* Silence packet -- no sample_count word follows. */
+            d->audio_packets[t].data = NULL;
+            d->audio_packets[t].size = 0;
+            continue;
+        }
+        /* stored_len includes the 4-byte sample_count word + the
+         * raw audio bytes. Skip the sample count and point the
+         * packet at the audio data proper. */
+        if (pos + stored_len > d->frame_buf_size) return false;
+        if (stored_len < 4) return false;
+        /* d->frame_buf[pos..pos+3] is the sample_count -- skip. */
+        d->audio_packets[t].data = d->frame_buf + pos + 4;
+        d->audio_packets[t].size = stored_len - 4;
+        pos += stored_len;
     }
     d->video_data = d->frame_buf + pos;
     d->video_size = d->frame_buf_size - pos;
@@ -565,12 +622,51 @@ static int bink_huff_read_sym(BitReader* br, const BinkHuffTree* t)
     return t->permutation[raw];
 }
 
+/* Bink Huffman tree permutation merge step (recursive). Given a
+ * working array of size 2^depth, repeatedly merge adjacent runs by
+ * interleaving them via swap pairs read from the stream until the
+ * tree's full 16-symbol permutation is reconstructed. This matches
+ * the "shuffle" branch of the Bink tree specifier. */
+static void bink_huff_merge_perm(BitReader* br, uint8_t* a, int run_len)
+{
+    if (run_len >= 16) return;
+    uint8_t merged[16];
+    for (int i = 0; i < 16; i += run_len * 2) {
+        int p = 0;
+        int q = run_len;
+        while (p < run_len && q < run_len * 2) {
+            /* 1-bit: 0 = take from left run, 1 = take from right. */
+            if (br_read(br, 1)) {
+                merged[i + p + q - run_len] = a[i + q];
+                ++q;
+            } else {
+                merged[i + p + q - run_len] = a[i + p];
+                ++p;
+            }
+        }
+        while (p < run_len) {
+            merged[i + p + q - run_len] = a[i + p];
+            ++p;
+        }
+        while (q < run_len * 2) {
+            merged[i + p + q - run_len] = a[i + q];
+            ++q;
+        }
+    }
+    memcpy(a, merged, 16);
+    bink_huff_merge_perm(br, a, run_len * 2);
+}
+
 /* Decode a per-bundle Huffman tree specifier from the bitstream:
- *   - 4 bits: tree index (0..15) selecting one of the prebuilt
- *     code-length tables in kBinkHuffLengths.
- *   - If index > 0 and the bitstream has more data, read the symbol
- *     permutation (16 entries × 4 bits each).
- *   - If index == 0, no permutation: identity 0..15.
+ *   - 4 bits: tree index (0..15) selecting a prebuilt code-length
+ *     table from kBinkHuffLengths.
+ *   - If index == 0: identity permutation (raw 4-bit nibbles).
+ *   - Otherwise: 1-bit mode selector:
+ *       1 = "explicit": read 3 bits for count, then `count` 4-bit
+ *           symbols listing which value goes where, remaining
+ *           symbols fall through in natural order.
+ *       0 = "shuffle": read 2 bits for depth, swap adjacent pairs
+ *           at that depth, then merge() the pair runs upward.
  * Returns true on success. */
 static bool bink_huff_read_tree(BitReader* br, BinkHuffTree* t)
 {
@@ -579,15 +675,48 @@ static bool bink_huff_read_tree(BitReader* br, BinkHuffTree* t)
     if (!bink_huff_build(t, kBinkHuffLengths[idx])) return false;
     if (idx == 0) {
         for (int i = 0; i < 16; ++i) t->permutation[i] = (uint8_t)i;
-    } else {
-        /* The permutation is delivered via a small "swap" sequence
-         * encoded in the stream. The simple variant (used in the
-         * Bink1 video bundle headers) is a per-position 4-bit
-         * value: 16 nibbles giving the value mapped to each
-         * canonical-order slot. */
-        for (int i = 0; i < 16; ++i) {
-            t->permutation[i] = (uint8_t)br_read(br, 4);
+        t->built = 1;
+        return true;
+    }
+
+    int mode = (int)br_read(br, 1);
+    if (mode == 1) {
+        /* Explicit selection. */
+        int count = (int)br_read(br, 3);
+        if (count > 16) count = 16;
+        uint8_t taken[16] = { 0 };
+        uint8_t perm[16];
+        memset(perm, 0xFF, sizeof(perm));
+        for (int i = 0; i < count; ++i) {
+            int v = (int)br_read(br, 4);
+            if (v >= 16) v = 15;
+            perm[i] = (uint8_t)v;
+            taken[v] = 1;
         }
+        /* Fill remaining slots in natural order with unused values. */
+        int slot = count;
+        for (int v = 0; v < 16 && slot < 16; ++v) {
+            if (!taken[v]) perm[slot++] = (uint8_t)v;
+        }
+        memcpy(t->permutation, perm, 16);
+    } else {
+        /* Shuffle mode. Initial layout is identity. Pair-swap at
+         * the specified depth, then merge upward. */
+        int depth = (int)br_read(br, 2);
+        uint8_t perm[16];
+        for (int i = 0; i < 16; ++i) perm[i] = (uint8_t)i;
+        /* Apply per-pair swap bits at the base depth. */
+        int base_run = 1 << depth;
+        for (int i = 0; i < 16; i += base_run * 2) {
+            if (br_read(br, 1)) {
+                uint8_t tmp[8];
+                memcpy(tmp, perm + i, base_run);
+                memcpy(perm + i, perm + i + base_run, base_run);
+                memcpy(perm + i + base_run, tmp, base_run);
+            }
+        }
+        bink_huff_merge_perm(br, perm, base_run * 2);
+        memcpy(t->permutation, perm, 16);
     }
     t->built = 1;
     return true;
@@ -983,73 +1112,139 @@ static int bink_ceil_log2(int x)
     return n;
 }
 
-/* Read a Bink bundle chunk length. Length-prefix size is determined
- * by the bundle's remaining-block count: the encoder uses
- * ceil(log2(remaining + 1)) bits so a chunk can address any subset
- * of the remaining blocks. This matches the standard pattern in
- * Bink Video's bundle layer where each bundle is a run-encoded
- * stream stopped exactly at the plane's block count.
- *
- * `remaining` is the number of un-read entries left in this
- * bundle's plane allotment. Returns 0 (no more chunks) when
- * remaining hits 0. */
-static int bink_read_length(BitReader* br, int remaining)
+/* Grow the bundle's entries buffer to at least `need` bytes. */
+static bool bundle_ensure_capacity(Bundle* b, size_t need)
 {
-    if (remaining <= 0) return 0;
-    int bits = bink_ceil_log2(remaining + 1);
-    if (bits <= 0) return remaining;
-    if (bits > 16) bits = 16;
-    int len = (int)br_read(br, bits);
-    if (len <= 0) return 0;
-    if (len > remaining) len = remaining;
-    return len;
+    if (need <= b->capacity) return true;
+    size_t cap = b->capacity ? b->capacity : 256;
+    while (cap < need) cap *= 2;
+    uint8_t* nb = (uint8_t*)realloc(b->entries, cap);
+    if (!nb) return false;
+    b->entries = nb;
+    b->capacity = cap;
+    return true;
 }
 
-/* Refill `b` with at least one chunk worth of entries. `remaining`
- * is the bundle's run quota for this plane. Returns the number of
- * entries currently available for popping (may be zero at end-of-
- * bundle). Allocates b->entries lazily on first chunk if needed.  */
-static int bundle_refill_bytes(Bundle* b, BitReader* br, int remaining)
+static void bundle_push_byte(Bundle* b, int value)
+{
+    if (!bundle_ensure_capacity(b, b->write_pos + 1)) return;
+    b->entries[b->write_pos++] = (uint8_t)value;
+    b->last_value = value;
+}
+
+/* Read one chunk of a 4-bit nibble bundle (BLOCK_TYPES,
+ * SUB_BLOCK_TYPES, RUN). After the runsize-bit chunk length there's
+ * a 1-bit "constant" flag: if set, emit t copies of the same 4-bit
+ * value. Otherwise read t Huffman-decoded values; for BLOCK_TYPES /
+ * SUB_BLOCK_TYPES the values 12..15 expand to runs of the last
+ * emitted symbol via { 4, 8, 12, 32 } repetition counts. */
+static int bundle_refill_4bit_rle(Bundle* b, BitReader* br, int do_rle_expansion)
 {
     if (b->read_pos < b->write_pos) {
         return (int)(b->write_pos - b->read_pos);
     }
-    int len = bink_read_length(br, remaining);
-    if (len <= 0) return 0;
+    if (b->remaining <= 0) return 0;
+    int runsize = b->runsize > 0 ? b->runsize : 4;
+    int t = (int)br_read(br, runsize);
+    if (t <= 0) return 0;
+    if (t > b->remaining) t = b->remaining;
 
-    /* Lazy allocation: bundles attached to stack-local BinkPlane
-     * objects never see bundle_alloc -- size the entries buffer to
-     * one chunk's worth here on first use. Growable on subsequent
-     * chunks if a single chunk exceeds the initial capacity. */
-    size_t need = b->write_pos + (size_t)len;
-    if (need > b->capacity) {
-        size_t cap = b->capacity ? b->capacity : 256;
-        while (cap < need) cap *= 2;
-        uint8_t* nb = (uint8_t*)realloc(b->entries, cap);
-        if (!nb) return 0;
-        b->entries = nb;
-        b->capacity = cap;
-    }
-    for (int i = 0; i < len; ++i) {
-        int sym = bink_huff_read_sym(br, &b->tree);
-        b->entries[b->write_pos++] = (uint8_t)sym;
+    int constant_flag = (int)br_read(br, 1);
+    if (constant_flag) {
+        int v = (int)br_read(br, 4);
+        if (!bundle_ensure_capacity(b, b->write_pos + (size_t)t)) return 0;
+        for (int i = 0; i < t; ++i) {
+            b->entries[b->write_pos++] = (uint8_t)v;
+        }
+        b->last_value = v;
+        b->remaining -= t;
+    } else {
+        static const int kRleRunCounts[4] = { 4, 8, 12, 32 };
+        int emitted = 0;
+        while (emitted < t) {
+            int v = bink_huff_read_sym(br, &b->tree);
+            if (do_rle_expansion && v >= 12 && v <= 15) {
+                int run = kRleRunCounts[v - 12];
+                if (run > t - emitted) run = t - emitted;
+                int last = b->last_value;
+                for (int i = 0; i < run; ++i) bundle_push_byte(b, last);
+                emitted += run;
+            } else {
+                bundle_push_byte(b, v);
+                ++emitted;
+            }
+        }
+        b->remaining -= emitted;
     }
     return (int)(b->write_pos - b->read_pos);
 }
 
-/* Pop one byte-valued entry from the bundle, refilling from the
- * bitstream as needed. `remaining` is updated to reflect entries
- * consumed (write side) so the next chunk size is computed against
- * the live quota. Returns 0 if the bundle has no entries to pop
- * (end-of-bundle), which is a fail-safe for desynced streams. */
-static int bundle_pop_byte(Bundle* b, BitReader* br)
+/* Read one chunk of an 8-bit value bundle (COLORS). Per-byte the
+ * encoder may emit a "constant" shortcut too. Within non-constant
+ * chunks each byte comes from a context-sensitive pair of Huffman
+ * trees (high nibble selected by previous high nibble); we
+ * approximate using one tree until contextual trees are wired up
+ * -- this keeps the decoder synced even if colors are wrong. */
+static int bundle_refill_colors(Bundle* b, BitReader* br)
+{
+    if (b->read_pos < b->write_pos) {
+        return (int)(b->write_pos - b->read_pos);
+    }
+    if (b->remaining <= 0) return 0;
+    int runsize = b->runsize > 0 ? b->runsize : 4;
+    int t = (int)br_read(br, runsize);
+    if (t <= 0) return 0;
+    if (t > b->remaining) t = b->remaining;
+    int constant_flag = (int)br_read(br, 1);
+    if (constant_flag) {
+        int v = (int)br_read(br, 8);
+        if (!bundle_ensure_capacity(b, b->write_pos + (size_t)t)) return 0;
+        for (int i = 0; i < t; ++i) b->entries[b->write_pos++] = (uint8_t)v;
+        b->last_value = v;
+    } else {
+        for (int i = 0; i < t; ++i) {
+            int lo = bink_huff_read_sym(br, &b->tree);
+            int hi = bink_huff_read_sym(br, &b->tree);
+            bundle_push_byte(b, (hi << 4) | (lo & 0xF));
+        }
+    }
+    b->remaining -= t;
+    return (int)(b->write_pos - b->read_pos);
+}
+
+/* Generic byte refill -- placeholder for bundles we haven't yet
+ * tailored. Mirrors the structural pattern (length + constant flag +
+ * data) so bit positions stay sane. */
+static int bundle_refill_generic(Bundle* b, BitReader* br)
+{
+    return bundle_refill_4bit_rle(b, br, 0);
+}
+
+/* Pop one byte-valued entry from `b`, choosing the correct refill
+ * strategy based on the bundle's id. `do_rle` is true for the two
+ * bundles that use 4-bit-RLE expansion (BLOCK_TYPES, SUB_BLOCK_TYPES).
+ * Returns 0 if the bundle has no entries to pop (end-of-bundle). */
+static int bundle_pop(Bundle* b, BitReader* br, int bundle_id)
 {
     if (b->read_pos >= b->write_pos) {
-        int n = bundle_refill_bytes(b, br, b->remaining);
+        int n;
+        if (bundle_id == BINK_SRC_BLOCK_TYPES
+            || bundle_id == BINK_SRC_SUB_BLOCK_TYPES) {
+            n = bundle_refill_4bit_rle(b, br, 1);
+        } else if (bundle_id == BINK_SRC_COLORS) {
+            n = bundle_refill_colors(b, br);
+        } else {
+            n = bundle_refill_generic(b, br);
+        }
         if (n <= 0) return 0;
-        b->remaining -= n;
     }
     return b->entries[b->read_pos++];
+}
+
+/* Legacy alias for transitions. */
+static int bundle_pop_byte(Bundle* b, BitReader* br)
+{
+    return bundle_pop(b, br, BINK_SRC_BLOCK_TYPES);
 }
 
 /* Top-level plane decoder. Consumes the plane's portion of the
@@ -1072,67 +1267,119 @@ static int bundle_pop_byte(Bundle* b, BitReader* br)
 static bool decode_plane(BinkPlane* plane, BitReader* br)
 {
     /* Phase 1: read tree-reset bits + tree specifiers for each
-     * bundle. Bink stores them as a packed prefix. */
+     * bundle, and compute each bundle's chunk-length-prefix bit
+     * width (runsize). Per the spec, runsize = log2_size of the
+     * bundle buffer; for most bundles the buffer holds one entry
+     * per block in the plane, so runsize = ceil(log2(plane_blocks)).
+     * COLORS / PATTERN / INTRA_DC / INTER_DC have larger per-plane
+     * quotas because they're consulted multiple times per block. */
     int plane_blocks = plane->width_blocks * plane->height_blocks;
+    int pb_log2 = bink_ceil_log2(plane_blocks > 1 ? plane_blocks : 2);
+    BINK_TRACE_DETAIL("  plane: %dx%d (%d blocks, pb_log2=%d)\n",
+        plane->width_blocks, plane->height_blocks, plane_blocks, pb_log2);
     for (int i = 0; i < BINK_SRC_COUNT; ++i) {
         Bundle* b = &plane->bundles[i];
         bundle_reset_cursors(b);
-        /* BLOCK_TYPES is always one entry per block. Other bundles
-         * have variable demand depending on block-type mix; we
-         * conservatively start them at plane_blocks too so the
-         * first chunk's length-prefix has enough bits. */
         b->remaining = plane_blocks;
+        b->last_value = 0;
+
+        switch (i) {
+        case BINK_SRC_BLOCK_TYPES:
+        case BINK_SRC_SUB_BLOCK_TYPES:
+        case BINK_SRC_X_OFF:
+        case BINK_SRC_Y_OFF:
+        case BINK_SRC_RUN:
+            b->runsize = pb_log2;
+            break;
+        case BINK_SRC_COLORS:
+        case BINK_SRC_PATTERN:
+        case BINK_SRC_INTRA_DC:
+        case BINK_SRC_INTER_DC:
+            /* COLORS bundle can have up to ~64 entries per block
+             * (RAW block) so its run quota is much larger. Bump
+             * the runsize so chunk prefixes can address it. */
+            b->runsize = pb_log2 + 3;
+            break;
+        default:
+            b->runsize = pb_log2;
+            break;
+        }
+        if (b->runsize > 16) b->runsize = 16;
+
+        size_t bit_pos_before = br->pos_bits;
         int reset = (int)br_read(br, 1);
         if (reset || !b->tree.built) {
-            if (!bink_huff_read_tree(br, &b->tree)) return false;
+            if (!bink_huff_read_tree(br, &b->tree)) {
+                BINK_TRACE_DETAIL("  bundle %d tree read FAILED at bit %zu\n",
+                    i, bit_pos_before);
+                return false;
+            }
         }
+        BINK_TRACE_DETAIL("  bundle %d: reset=%d runsize=%d perm[0..3]=%d,%d,%d,%d "
+            "(after bit %zu)\n",
+            i, reset, b->runsize, b->tree.permutation[0], b->tree.permutation[1],
+            b->tree.permutation[2], b->tree.permutation[3], br->pos_bits);
     }
 
     /* Phase 2: block-by-block decode. */
+    int block_type_histogram[16] = { 0 };
     for (int by = 0; by < plane->height_blocks; ++by) {
         for (int bx = 0; bx < plane->width_blocks; ++bx) {
-            int block_type = bundle_pop_byte(
-                &plane->bundles[BINK_SRC_BLOCK_TYPES], br);
+            int block_type = bundle_pop(
+                &plane->bundles[BINK_SRC_BLOCK_TYPES], br,
+                BINK_SRC_BLOCK_TYPES);
+            if (block_type >= 0 && block_type < 16) {
+                block_type_histogram[block_type]++;
+            }
             switch (block_type) {
             case BINK_BLOCK_SKIP:
                 decode_block_skip(plane, bx, by);
                 break;
             case BINK_BLOCK_FILL: {
-                int color = bundle_pop_byte(
-                    &plane->bundles[BINK_SRC_COLORS], br);
+                int color = bundle_pop(
+                    &plane->bundles[BINK_SRC_COLORS], br,
+                    BINK_SRC_COLORS);
                 decode_block_fill(plane, bx, by, (uint8_t)color);
                 break;
             }
             case BINK_BLOCK_MOTION: {
-                int mx = bundle_pop_byte(
-                    &plane->bundles[BINK_SRC_X_OFF], br);
-                int my = bundle_pop_byte(
-                    &plane->bundles[BINK_SRC_Y_OFF], br);
-                /* Bundle values are unsigned bytes; interpret as
-                 * signed (range -128..127). */
-                if (mx >= 128) mx -= 256;
-                if (my >= 128) my -= 256;
+                int mx = bundle_pop(
+                    &plane->bundles[BINK_SRC_X_OFF], br,
+                    BINK_SRC_X_OFF);
+                int my = bundle_pop(
+                    &plane->bundles[BINK_SRC_Y_OFF], br,
+                    BINK_SRC_Y_OFF);
+                /* X_OFF / Y_OFF values are 4-bit signed magnitude
+                 * (the spec describes an extra sign bit per value
+                 * which we don't yet decode -- conservatively
+                 * interpret the byte as signed range -8..7). */
+                if (mx >= 8) mx -= 16;
+                if (my >= 8) my -= 16;
                 decode_block_motion(plane, bx, by, mx, my);
                 break;
             }
             case BINK_BLOCK_RAW: {
                 uint8_t raw[64];
                 for (int i = 0; i < 64; ++i) {
-                    raw[i] = (uint8_t)bundle_pop_byte(
-                        &plane->bundles[BINK_SRC_COLORS], br);
+                    raw[i] = (uint8_t)bundle_pop(
+                        &plane->bundles[BINK_SRC_COLORS], br,
+                        BINK_SRC_COLORS);
                 }
                 decode_block_raw(plane, bx, by, raw);
                 break;
             }
             case BINK_BLOCK_PATTERN: {
-                uint8_t c0 = (uint8_t)bundle_pop_byte(
-                    &plane->bundles[BINK_SRC_COLORS], br);
-                uint8_t c1 = (uint8_t)bundle_pop_byte(
-                    &plane->bundles[BINK_SRC_COLORS], br);
+                uint8_t c0 = (uint8_t)bundle_pop(
+                    &plane->bundles[BINK_SRC_COLORS], br,
+                    BINK_SRC_COLORS);
+                uint8_t c1 = (uint8_t)bundle_pop(
+                    &plane->bundles[BINK_SRC_COLORS], br,
+                    BINK_SRC_COLORS);
                 uint8_t pat[8];
                 for (int i = 0; i < 8; ++i) {
-                    pat[i] = (uint8_t)bundle_pop_byte(
-                        &plane->bundles[BINK_SRC_PATTERN], br);
+                    pat[i] = (uint8_t)bundle_pop(
+                        &plane->bundles[BINK_SRC_PATTERN], br,
+                        BINK_SRC_PATTERN);
                 }
                 decode_block_pattern(plane, bx, by, c0, c1, pat);
                 break;
@@ -1153,6 +1400,21 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
             }
         }
     }
+    BINK_TRACE_DETAIL("  block types: SKIP=%d SCALED=%d MOTION=%d RUN=%d "
+        "RESIDUE=%d INTRA=%d FILL=%d INTER=%d PATTERN=%d RAW=%d (oob=%d)\n",
+        block_type_histogram[BINK_BLOCK_SKIP],
+        block_type_histogram[BINK_BLOCK_SCALED],
+        block_type_histogram[BINK_BLOCK_MOTION],
+        block_type_histogram[BINK_BLOCK_RUN],
+        block_type_histogram[BINK_BLOCK_RESIDUE],
+        block_type_histogram[BINK_BLOCK_INTRA],
+        block_type_histogram[BINK_BLOCK_FILL],
+        block_type_histogram[BINK_BLOCK_INTER],
+        block_type_histogram[BINK_BLOCK_PATTERN],
+        block_type_histogram[BINK_BLOCK_RAW],
+        block_type_histogram[10] + block_type_histogram[11]
+        + block_type_histogram[12] + block_type_histogram[13]
+        + block_type_histogram[14] + block_type_histogram[15]);
     return true;
 }
 
@@ -1328,10 +1590,35 @@ bool bink1_decoder_decode_video(Bink1Decoder* d,
     BitReader br;
     br_init(&br, d->video_data, d->video_size);
 
+    BINK_TRACE_DETAIL("frame %u: %zu video bytes, audio packets=%d (size[0]=%zu), "
+        "first 32 bits=%08x\n",
+        d->current_frame, d->video_size, d->track_count,
+        d->track_count > 0 ? d->audio_packets[0].size : 0,
+        d->video_size >= 4 ?
+            (unsigned)(d->video_data[0]
+                | (d->video_data[1] << 8)
+                | (d->video_data[2] << 16)
+                | (d->video_data[3] << 24)) : 0);
+
     /* Decode each plane into the "current" frame buffer set. */
     int set = d->cur_plane_set;
     int prev = 1 - set;
+
+    /* For Bink revisions >= 'i', alpha (when present) and luma planes
+     * are each prefixed by a 32-bit plane-size byte count. We don't
+     * use the size for length validation but must skip past it so the
+     * Huffman/bundle reader starts at the right bit offset. */
+    bool has_plane_size_prefix = (d->info.video_version >= 'i');
+
     for (int p = 0; p < BINK1_MAX_PLANES; ++p) {
+        if (has_plane_size_prefix && p == 0) {
+            /* Skip the 32-bit luma plane size. (Alpha plane has the
+             * same prefix when present; we don't yet decode alpha,
+             * which has has_alpha=true streams.) */
+            br_byte_align(&br);
+            uint32_t plane_size_bytes = br_read(&br, 32);
+            (void)plane_size_bytes;
+        }
         BinkPlane plane;
         memset(&plane, 0, sizeof(plane));
         plane.width = d->plane_widths[p];
@@ -1355,6 +1642,21 @@ bool bink1_decoder_decode_video(Bink1Decoder* d,
         }
         if (!ok) return false;
     }
+
+    /* Sanity histogram of output plane pixels for the first few frames
+     * -- if everything decoded to constant black, all bytes are zero. */
+    if (bink_trace_check() && g_bink_trace_frame < BINK_TRACE_FRAME_LIMIT) {
+        int nonzero = 0;
+        const uint8_t* y = d->planes[0][set];
+        size_t total = (size_t)d->plane_strides[0]
+            * (size_t)d->plane_heights[0];
+        for (size_t i = 0; i < total && i < 65536; ++i) {
+            if (y[i] != 0) ++nonzero;
+        }
+        BINK_TRACE_DETAIL("  Y plane: %d nonzero bytes in first 64KB\n",
+            nonzero);
+    }
+    g_bink_trace_frame++;
 
     compose_bgra(d, set, dst, dst_pitch, dst_w, dst_h);
     d->have_decoded_frame = 1;
