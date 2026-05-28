@@ -2041,18 +2041,25 @@ static void compose_bgra(Bink1Decoder* d, int set,
     int vs = d->plane_strides[1];
     int us = d->plane_strides[2];
 
+    /* Bink stores luma/chroma in limited (studio) range: black is
+     * Y=16, white Y=235, chroma centred on 128 spanning 16..240. Use
+     * the standard BT.601 limited-range -> full-range RGB conversion
+     * (integer form, 298/256 = 1.164 luma gain) so Y=16 maps to true
+     * black and Y=235 to white -- matching what ffmpeg produces. The
+     * earlier full-range matrix passed Y straight through, lifting
+     * blacks to a grey 16. */
     for (int y = 0; y < h; ++y) {
         const uint8_t* py = yp + y * ys;
         const uint8_t* pu = up + (y / 2) * us;
         const uint8_t* pv = vp + (y / 2) * vs;
         uint8_t* dr = dst + y * dst_pitch;
         for (int x = 0; x < w; ++x) {
-            int Y = py[x];
-            int U = pu[x / 2] - 128;
-            int V = pv[x / 2] - 128;
-            int R = Y + ((91881 * V) >> 16);
-            int G = Y - ((22554 * U + 46802 * V) >> 16);
-            int B = Y + ((116130 * U) >> 16);
+            int C = py[x] - 16;
+            int D = pu[x / 2] - 128;   /* Cb */
+            int E = pv[x / 2] - 128;   /* Cr */
+            int R = (298 * C + 409 * E + 128) >> 8;
+            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+            int B = (298 * C + 516 * D + 128) >> 8;
             dr[4 * x + 0] = clip_u8(B);
             dr[4 * x + 1] = clip_u8(G);
             dr[4 * x + 2] = clip_u8(R);
