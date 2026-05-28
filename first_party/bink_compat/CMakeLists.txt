@@ -22,3 +22,14 @@ endif()
 
 set(BINK_COMPAT_LIBRARY "bink_compat" PARENT_SCOPE)
 set(BINK_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include" PARENT_SCOPE)
+
+# Standalone Bink1 decode verification tool. EXCLUDE_FROM_ALL keeps it
+# out of the normal app/release build; build it explicitly with:
+#   cmake --build --preset <preset> --target bink1_verify
+# then run e.g.  ./bink1_verify movie.bik 60
+add_executable(bink1_verify EXCLUDE_FROM_ALL "test/bink1_verify.c")
+target_link_libraries(bink1_verify PRIVATE bink_compat)
+target_include_directories(bink1_verify PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(UNIX AND NOT APPLE)
+    target_link_libraries(bink1_verify PRIVATE m)
+endif()
