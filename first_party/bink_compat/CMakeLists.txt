@@ -7,6 +7,8 @@ add_library(bink_compat STATIC
     "src/mjpeg_decoder.h"
     "src/bink1_decoder.c"
     "src/bink1_decoder.h"
+    "src/bink1_tables.c"
+    "src/bink1_tables.h"
 )
 
 target_include_directories(bink_compat PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
