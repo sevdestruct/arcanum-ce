@@ -4,10 +4,9 @@
 
 The Bink1 decoder is the **default** video path: a stock Arcanum
 install plays its `.bik` cutscenes (and custom `.bik` replacements)
-directly, with no FFmpeg dependency and no pre-conversion step. Video
-and RDFT-mode audio are complete and verified against reference
-decoders; DCT-mode audio (newer RAD encodes) is the one remaining
-piece, in progress.
+directly, with no FFmpeg dependency and no pre-conversion step. Video,
+RDFT-mode audio, and DCT-mode audio (newer RAD encodes) are all
+complete and verified against reference decoders.
 
 Set `ARCANUM_BINK_DIRECT=0` to force the legacy MJPEG/AVI sidecar
 path instead (A/B comparison, or to dodge a decoder bug on a
@@ -27,8 +26,13 @@ own cutscene files plus fresh RAD Video Tools encodes (1080p):
 - **RDFT audio**: 100% of decoded samples match bonkdec within ±1 LSB
   (float rounding between our radix-2 FFT and bonkdec's Ooura
   split-radix FFT), and every frame stays sample-aligned.
-- **DCT audio**: in progress; being verified against FFmpeg's
-  decoded PCM as the oracle.
+- **DCT audio**: verified against FFmpeg's decoded PCM (the only
+  available reference — bonkdec is RDFT-only). Both channels correlate
+  ~0.99 with FFmpeg's output, sample-aligned at offset 0 with no drift
+  across the whole file. The residual (~13% RMS, same order as the
+  RDFT path's spread vs FFmpeg) is float-pipeline rounding: our naive
+  double-precision DCT vs FFmpeg's float32 fast DCT. Perceptually it
+  is the same audio.
 
 ### Colour range
 
@@ -71,11 +75,20 @@ grey 16.)
 - YCbCr→BGRA composition (chroma stored Cr-then-Cb).
 
 ### Audio
-- Interleaved multi-channel inverse real DFT (one transform across
-  all channels per block).
-- Per-band log-scale quantizers, run-length coefficient unpacking,
-  per-band dequantize.
+- **RDFT mode**: interleaved multi-channel inverse real DFT (one
+  transform across all channels per block); 2 leading float29
+  coefficients biased -22.
+- **DCT mode**: per-channel inverse DCT. Each block is word-aligned,
+  begins with a 2-bit field, then per channel: 2 float29 coefficients
+  (exponent biased -23) + 25 quantizer bands + run-length AC. Bands
+  span the full per-channel transform size (0..base, mapped at the
+  single-channel Nyquist), one coefficient per band step.
+- Per-band log-scale quantizers (10^(exp*0.0664)), run-length
+  coefficient unpacking, per-band dequantize.
 - Triangular-window overlap-add across blocks; multi-block packets.
+- Audio output buffer is sized to the largest packet (the priming
+  first frame can be ~19 blocks vs 1 for normal frames), scanned at
+  open time, so the preroll is never truncated.
 
 ## Licensing
 
@@ -88,11 +101,10 @@ grey 16.)
 
 ## Known limitations / follow-ups
 
-- **DCT-mode audio** (`is_dct` track flag, `binkaudio_dct`): in
-  progress. Arcanum's original cutscenes are all RDFT, but the modern
-  RAD Video Tools encoder emits DCT-mode audio, so custom RAD-encoded
-  cutscenes need this. Video plays regardless; only that audio track
-  is affected until the DCT path lands.
+- **DCT-mode audio** (`is_dct` track flag, `binkaudio_dct`): done.
+  Arcanum's original cutscenes are all RDFT, but the modern RAD Video
+  Tools encoder emits DCT-mode audio, so custom RAD-encoded cutscenes
+  use this path.
 - **Alpha plane** (BIK streams with `has_alpha`) is not decoded.
   Arcanum's cutscenes have no alpha.
 - **Half-pel motion compensation** is integer-pel only. The

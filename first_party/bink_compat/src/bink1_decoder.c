@@ -214,16 +214,24 @@ static void br_word_align(BitReader* br)
     if (br->pos_bits > br->total_bits) br->pos_bits = br->total_bits;
 }
 
-/* Read a 29-bit signed float: 5-bit signed exponent (offset -22),
- * 23-bit unsigned mantissa, 1 sign bit. Used by the Bink Audio
- * decoder for the first two coefficients of every frame. */
-static float br_read_float29(BitReader* br)
+/* Read a 29-bit signed float: 5-bit unsigned exponent biased by
+ * `exp_bias`, 23-bit unsigned mantissa, 1 sign bit. Used by the Bink
+ * Audio decoder for the first two coefficients of every block. The two
+ * transform modes bias the exponent differently: RDFT uses -22
+ * (verified bit-exact against bonkdec), DCT uses -23. */
+static float br_read_float_bias(BitReader* br, int exp_bias)
 {
-    int exp = (int)br_read(br, 5) - 22;
+    int exp = (int)br_read(br, 5) + exp_bias;
     uint32_t mant = br_read(br, 23);
     int sign = (int)br_read(br, 1);
     float v = ldexpf((float)mant, exp);
     return sign ? -v : v;
+}
+
+/* RDFT-mode float coefficient (exponent bias -22). */
+static float br_read_float29(BitReader* br)
+{
+    return br_read_float_bias(br, -22);
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,6 +268,13 @@ typedef struct {
     int   quantizer_bands[27];  /* coefficient index at each band edge */
     int   band_count;           /* number of band edges - 1 */
     float quantizers[26];       /* per-band dequantization multiplier */
+
+    /* DCT-mode geometry (per channel). RDFT mode runs one interleaved
+     * transform of samples_per_frame; DCT mode runs one transform of
+     * dct_base PER channel and interleaves the results. */
+    int   dct_base;             /* per-channel transform size */
+    int   dct_window;           /* per-channel overlap = dct_base/16 */
+    int   dct_block;            /* per-channel emit = dct_base - dct_window */
 
     float* coeffs;              /* samples_per_frame floats (interleaved) */
     int16_t* quant_coeffs;      /* samples_per_frame shorts (reused for samples) */
@@ -810,21 +825,37 @@ static bool audio_init_track(Bink1AudioState* a, const Bink1AudioTrackInfo* info
     a->samples_per_frame = spf;
     a->samples_per_window = spf / 16;
     a->samples_per_block = spf - a->samples_per_window;
-    a->dct_scale = (float)(2.0 / sqrt((double)spf));
+    a->dct_base = base;
+    a->dct_window = base / 16;
+    a->dct_block = base - a->dct_window;
 
-    /* Quantizer band edges: walk the critical-band table while the
-     * band edge is below the (interleaved) half sample rate, mapping
-     * each edge to a coefficient index, then close with spf/2. */
-    int sample_rate = channels * (int)info->sample_rate;
+    /* Quantizer band edges, expressed as coefficient indices.
+     *
+     * RDFT mode runs ONE transform over the channel-interleaved frame
+     * (spf real values = spf/2 complex bins) at the doubled
+     * channels*rate; the critical bands map onto the half-spectrum
+     * spf/2, and dequant walks two coefficients (re,im) per band step.
+     *
+     * DCT mode runs a transform PER channel over `base` real
+     * coefficients spanning 0..Nyquist at the true single-channel
+     * rate. A size-N real DCT has N coefficients across 0..Nyquist, so
+     * the bands map onto the FULL transform size (top = base, not
+     * base/2) and dequant walks one coefficient per band step.
+     *
+     * The output scale is 2/sqrt(N) for the size-N transform. */
+    int transform_n = info->is_dct ? base : spf;
+    a->dct_scale = (float)(2.0 / sqrt((double)transform_n));
+    int top = info->is_dct ? transform_n : (transform_n / 2);
+    int sample_rate = (info->is_dct ? 1 : channels) * (int)info->sample_rate;
     int half_rate = (sample_rate + 1) / 2;
     int nb = 0;
     for (int i = 0; i < BINK_AUDIO_BAND_COUNT; ++i) {
         if (bink_audio_critical_freq[i] >= half_rate) break;
-        int idx = (spf / 2) * bink_audio_critical_freq[i] / half_rate;
+        int idx = top * bink_audio_critical_freq[i] / half_rate;
         if (idx < 1) idx = 1;
         a->quantizer_bands[nb++] = idx;
     }
-    a->quantizer_bands[nb++] = spf / 2;
+    a->quantizer_bands[nb++] = top;
     a->band_count = nb - 1;     /* number of bands = edges - 1 */
 
     a->coeffs = (float*)calloc((size_t)spf, sizeof(float));
@@ -846,11 +877,12 @@ static void audio_read_quantizers(Bink1AudioState* a, BitReader* br)
 }
 
 /* Unpack the run-length-coded quantized coefficients into
- * a->quant_coeffs[2 .. spf). */
-static void audio_unpack_coeffs(Bink1AudioState* a, BitReader* br)
+ * a->quant_coeffs[2 .. n). n is the transform size (samples_per_frame
+ * for interleaved RDFT, dct_base per channel for DCT). */
+static void audio_unpack_coeffs(Bink1AudioState* a, BitReader* br, int start, int n)
 {
-    int spf = a->samples_per_frame;
-    int i = 2;
+    int spf = n;
+    int i = start;
     while (i < spf) {
         int end;
         if (br_read(br, 1) == 0) {
@@ -909,6 +941,115 @@ static void audio_apply_window(Bink1AudioState* a, int16_t* out)
     memcpy(a->window, a->quant_coeffs + spb, (size_t)spw * sizeof(int16_t));
 }
 
+/* Inverse DCT of n real coefficients (the inverse of the encoder's
+ * forward DCT), in place:
+ *   x[m] = sum_{k=0}^{n-1} c[k] * cos(pi/n * (m+0.5) * k)
+ * Note the DC term c[0] is NOT halved here -- matching the reference
+ * decoder's amplitude was closest with the full DC weight. Naive
+ * O(n^2); n <= 2048 so the cost is acceptable. Output scaling is
+ * applied by the caller (a->dct_scale). */
+static void audio_inverse_dct(float* data, int n)
+{
+    if (n <= 0) return;
+    float* tmp = (float*)calloc((size_t)n, sizeof(float));
+    if (!tmp) return;
+    const double PI = 3.14159265358979323846;
+    double dc = (double)data[0];
+    for (int m = 0; m < n; ++m) {
+        double acc = dc;
+        double ang = PI / (double)n * ((double)m + 0.5);
+        for (int k = 1; k < n; ++k) {
+            acc += (double)data[k] * cos(ang * (double)k);
+        }
+        tmp[m] = (float)acc;
+    }
+    memcpy(data, tmp, (size_t)n * sizeof(float));
+    free(tmp);
+}
+
+/* Per-channel overlap-add for DCT mode. Each channel keeps its own
+ * overlap tail in a->window[c * dct_window .. ). `tdom` holds this
+ * block's dct_base time-domain samples for channel c; writes
+ * dct_block interleaved samples to out (stride = channels). */
+static void audio_apply_window_dct(Bink1AudioState* a, int c, int channels,
+    const int16_t* tdom, int16_t* out, int first)
+{
+    int win = a->dct_window;
+    int blk = a->dct_block;
+    int16_t* tail = a->window + c * win;
+    if (first) {
+        for (int i = 0; i < blk; ++i) out[i * channels] = tdom[i];
+    } else {
+        for (int i = 0; i < win; ++i) {
+            out[i * channels] =
+                (int16_t)((tdom[i] * i + tail[i] * (win - i)) / win);
+        }
+        for (int i = win; i < blk; ++i) out[i * channels] = tdom[i];
+    }
+    for (int i = 0; i < win; ++i) tail[i] = tdom[blk + i];
+}
+
+/* DCT-mode packet decode: per channel, decode dct_base coefficients
+ * (2 leading floats + per-band quantizers + run-length AC), inverse
+ * DCT, scale/clip, then triangular-window overlap-add interleaved
+ * into the output. */
+static int audio_decode_packet_dct(Bink1AudioState* a, BitReader* br,
+    uint32_t sample_count, int16_t* out, int out_capacity)
+{
+    int ch = a->info.is_stereo ? 2 : 1;
+    int base = a->dct_base;
+    int blk = a->dct_block;
+    int interleaved_block = blk * ch;
+    int samples_left = (int)sample_count;
+    if (samples_left > out_capacity) samples_left = out_capacity;
+    int written = 0;
+    int16_t tdom[2048];
+    float scale = a->dct_scale;     /* 2 / sqrt(base) */
+
+    while (samples_left >= interleaved_block) {
+        if (written + interleaved_block > out_capacity) break;
+        /* Each block is word-aligned and begins with a 2-bit field
+         * (skipped) before the per-channel coefficient data. */
+        br_word_align(br);
+        if (br_remaining(br) < 64) break;
+        br_read(br, 2);
+
+        for (int c = 0; c < ch; ++c) {
+            memset(a->coeffs, 0, (size_t)base * sizeof(float));
+            /* Two leading 29-bit float coefficients (the DC pair),
+             * then the run-length-coded AC coefficients. DCT mode
+             * biases the float exponent by -23. */
+            a->coeffs[0] = br_read_float_bias(br, -23);
+            a->coeffs[1] = br_read_float_bias(br, -23);
+            audio_read_quantizers(a, br);
+            audio_unpack_coeffs(a, br, 2, base);
+            /* Dequantize each real coefficient by its band's
+             * quantizer. Band edges span the full transform size, so
+             * every coefficient up to `base` is covered. */
+            int ci = 2;
+            for (int b = 0; b < a->band_count; ++b) {
+                int hi = a->quantizer_bands[b + 1];
+                if (hi > base) hi = base;
+                float q = a->quantizers[b];
+                while (ci < hi) {
+                    a->coeffs[ci] = q * (float)a->quant_coeffs[ci];
+                    ++ci;
+                }
+            }
+            audio_inverse_dct(a->coeffs, base);
+            for (int i = 0; i < base; ++i) {
+                tdom[i] = audio_clip16(scale * a->coeffs[i]);
+            }
+            audio_apply_window_dct(a, c, ch, tdom, out + written + c,
+                a->is_first_decode);
+        }
+        a->is_first_decode = 0;
+        written += interleaved_block;
+        samples_left -= interleaved_block;
+    }
+    return written;
+}
+
 /* Decode an entire audio packet (which may contain several blocks)
  * into interleaved s16 samples. `sample_count` is the packet's
  * declared output sample count (across all channels). Returns the
@@ -917,11 +1058,9 @@ static int audio_decode_packet(Bink1AudioState* a, BitReader* br,
     uint32_t sample_count, int16_t* out, int out_capacity)
 {
     if (!a->initialized) return 0;
-    /* DCT-mode Bink Audio (binkaudio_dct, newer RAD encodes) is not
-     * implemented yet. Emit clean silence rather than running the RDFT
-     * transform on DCT-coded data, which would decode to noise. Video
-     * is unaffected. */
-    if (a->info.is_dct) return 0;
+    if (a->info.is_dct) {
+        return audio_decode_packet_dct(a, br, sample_count, out, out_capacity);
+    }
     int spf = a->samples_per_frame;
     int spb = a->samples_per_block;
     int samples_left = (int)sample_count;
@@ -937,7 +1076,7 @@ static int audio_decode_packet(Bink1AudioState* a, BitReader* br,
         a->coeffs[1] = br_read_float29(br);
 
         audio_read_quantizers(a, br);
-        audio_unpack_coeffs(a, br);
+        audio_unpack_coeffs(a, br, 2, spf);
         audio_dequantize(a);
 
         audio_inverse_rdft(a->coeffs, spf);
@@ -2104,15 +2243,31 @@ Bink1Decoder* bink1_decoder_open(const char* path)
                 return NULL;
             }
         }
-        /* An audio packet can hold several blocks; size the worst-case
-         * output generously at a handful of blocks' worth of samples
-         * per channel-frame so callers can pass a fixed buffer. */
-        int max_bytes = 0;
+        /* An audio packet can hold many blocks -- the priming first
+         * frame in particular decodes far more than a normal frame (a
+         * ~19-block preroll vs 1 block). Callers pass a single fixed
+         * buffer sized from audio_bytes_per_frame, so it must cover the
+         * LARGEST packet or the preroll gets truncated and every later
+         * frame is shifted (desync). Scan each frame's track-0 audio
+         * header: the 4-byte sample_count field is the exact output
+         * byte count for that packet. */
+        size_t max_bytes = 0;
+        for (uint32_t i = 0; i < d->info.frame_count; ++i) {
+            uint64_t foff = d->frames[i].offset & ~1ull;
+            uint8_t hdr[8];
+            if (fseeko(d->fp, (off_t)foff, SEEK_SET) != 0) continue;
+            if (fread(hdr, 1, sizeof(hdr), d->fp) != sizeof(hdr)) continue;
+            uint32_t stored_len = rd_u32le(hdr);
+            if (stored_len < 4) continue;            /* silence / none */
+            uint32_t scount = rd_u32le(hdr + 4);      /* = output bytes */
+            if ((size_t)scount > max_bytes) max_bytes = scount;
+        }
+        /* Floor at several blocks' worth in case the scan under-reads. */
         for (int t = 0; t < d->track_count; ++t) {
-            int per = d->audio_state[t].samples_per_frame * 16 * 2;
+            size_t per = (size_t)d->audio_state[t].samples_per_frame * 16 * 2;
             if (per > max_bytes) max_bytes = per;
         }
-        d->audio_bytes_per_frame = (size_t)max_bytes;
+        d->audio_bytes_per_frame = max_bytes;
     } else {
         d->audio_bytes_per_frame = 0;
     }
