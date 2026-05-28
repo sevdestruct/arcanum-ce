@@ -14,6 +14,8 @@
 #include "game/gsound.h"
 #include "game/mes.h"
 
+#include "bink_compat.h"
+
 /**
  * "movies.mes"
  *
@@ -482,12 +484,22 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
 
     found = false;
     {
-        static const char* const video_exts[] = { ".avi", ".mp4", ".bik" };
+        // Extension priority depends on the active backend: with the
+        // native Bink decoder enabled (ARCANUM_BINK_DIRECT=1) a .bik is
+        // the directly-playable asset and must win over a leftover
+        // .avi/.mp4 of the same base name; otherwise .avi (converted
+        // MJPEG) is preferred.
+        static const char* const exts_avi_first[] = { ".avi", ".mp4", ".bik" };
+        static const char* const exts_bik_first[] = { ".bik", ".avi", ".mp4" };
+        const char* const* video_exts = bink_compat_native_bink_enabled()
+            ? exts_bik_first
+            : exts_avi_first;
+        const int video_ext_count = 3;
         int i;
         char candidate[TIG_MAX_PATH];
         // Check for a `_native` suffixed file first. If found, native
         // resolution is used (no scale-to-fit).
-        for (i = 0; i < (int)(sizeof(video_exts) / sizeof(video_exts[0])); i++) {
+        for (i = 0; i < video_ext_count; i++) {
             snprintf(candidate, sizeof(candidate), "data/videos/%s_native%s", base_noext, video_exts[i]);
             if (tig_file_extract(candidate, temp_path)) {
                 flags |= GAME_MOVIE_NO_SCALE;
@@ -496,7 +508,7 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
             }
         }
         if (!found) {
-            for (i = 0; i < (int)(sizeof(video_exts) / sizeof(video_exts[0])); i++) {
+            for (i = 0; i < video_ext_count; i++) {
                 snprintf(candidate, sizeof(candidate), "data/videos/%s%s", base_noext, video_exts[i]);
                 if (tig_file_extract(candidate, temp_path)) {
                     found = true;
@@ -506,9 +518,15 @@ void gmovie_play_path(const char* path, GameMovieFlags flags, int sound_track)
         }
     }
 
-    // Fall back to the original DAT path, trying .avi sidecar first so
-    // cross-platform builds use the converted asset before the
-    // (Windows-only) native .bik path.
+    // Fall back to the original DAT path. With the native Bink decoder
+    // enabled, prefer the original .bik directly (it plays natively, no
+    // conversion); otherwise try the .avi sidecar first so cross-platform
+    // builds use the converted MJPEG asset before the .bik.
+    if (!found && bink_compat_native_bink_enabled()) {
+        if (tig_file_extract(path, temp_path)) {
+            found = true;
+        }
+    }
     if (!found) {
         char alt_path[TIG_MAX_PATH];
         build_avi_sidecar(path, alt_path, sizeof(alt_path));

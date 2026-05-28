@@ -93,6 +93,13 @@ void bink_compat_set_audio_enabled(HBINK bnk, bool enabled);
 bool bink_compat_init(void);
 void bink_compat_exit(void);
 
+/* True when the from-scratch native Bink1 decoder is the active path
+ * (ARCANUM_BINK_DIRECT=1). Callers that resolve a video asset across
+ * several container formats should prefer a .bik candidate when this
+ * is set, so a native .bik isn't shadowed by a leftover .avi/.mp4 of
+ * the same base name. */
+bool bink_compat_native_bink_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif

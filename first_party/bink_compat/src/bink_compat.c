@@ -683,6 +683,11 @@ static bool bink1_path_enabled(void)
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
 }
 
+bool bink_compat_native_bink_enabled(void)
+{
+    return bink1_path_enabled();
+}
+
 /* -------------------------------------------------------------------------
  * Public dispatch
  * -------------------------------------------------------------------------

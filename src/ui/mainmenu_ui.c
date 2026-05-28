@@ -4948,11 +4948,17 @@ static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* pat
         "art/ui/",
         "art/",
     };
-    static const char* extensions[] = {
-        ".avi",   /* MJPEG-in-AVI is the cross-platform default; preferred */
-        ".mp4",   /* legacy: old custom backgrounds shipped as .mp4 */
-        ".bik",   /* legacy: original .bik before .avi sidecar exists  */
-    };
+    /* Extension priority depends on the active video backend. With the
+     * native Bink decoder enabled (ARCANUM_BINK_DIRECT=1) a .bik is the
+     * real, directly-playable asset, so it must win over a leftover
+     * .avi/.mp4 of the same base name; otherwise the AVI/MJPEG path is
+     * primary and .avi is preferred. */
+    static const char* extensions_avi_first[] = { ".avi", ".mp4", ".bik" };
+    static const char* extensions_bik_first[] = { ".bik", ".avi", ".mp4" };
+    const char** extensions = bink_compat_native_bink_enabled()
+        ? extensions_bik_first
+        : extensions_avi_first;
+    const int extension_count = 3;
     /* Suffixes to try in order: _native first (no scale-to-fit), then bare. */
     static const char* suffixes[] = {
         "_native",
@@ -4977,7 +4983,7 @@ static bool mainmenu_ui_extract_bg_video_path(MainMenuWindowType type, char* pat
 
         for (prefix_index = 0; prefix_index < SDL_arraysize(prefixes); prefix_index++) {
             for (suffix_index = 0; suffix_index < SDL_arraysize(suffixes); suffix_index++) {
-                for (extension_index = 0; extension_index < SDL_arraysize(extensions); extension_index++) {
+                for (extension_index = 0; extension_index < extension_count; extension_index++) {
                     snprintf(candidate,
                         sizeof(candidate),
                         "%s%s%s%s",
