@@ -27,6 +27,7 @@
  */
 
 #include "bink1_decoder.h"
+#include "bink1_tables.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -200,6 +201,29 @@ static void br_byte_align(BitReader* br)
     if (r) br->pos_bits += 8 - r;
 }
 
+/* Advance to the next 32-bit word boundary. Bink frames are written as
+ * sequences of 32-bit little-endian words, and many decode-time
+ * sub-streams (notably the per-band audio coefficients) are zero-
+ * padded up to the next word boundary. */
+static void br_word_align(BitReader* br)
+{
+    size_t r = br->pos_bits & 31;
+    if (r) br->pos_bits += 32 - r;
+    if (br->pos_bits > br->total_bits) br->pos_bits = br->total_bits;
+}
+
+/* Read a 29-bit signed float: 5-bit signed exponent (offset -22),
+ * 23-bit unsigned mantissa, 1 sign bit. Used by the Bink Audio
+ * decoder for the first two coefficients of every frame. */
+static float br_read_float29(BitReader* br)
+{
+    int exp = (int)br_read(br, 5) - 22;
+    uint32_t mant = br_read(br, 23);
+    int sign = (int)br_read(br, 1);
+    float v = ldexpf((float)mant, exp);
+    return sign ? -v : v;
+}
+
 /* ------------------------------------------------------------------ */
 /* 2. Container parser                                                */
 /* ------------------------------------------------------------------ */
@@ -235,13 +259,13 @@ typedef struct {
     int    initialized;
 } Bink1AudioState;
 
-/* Bink Huffman tree state -- mirrored in the full definition further
- * down the file. Declared here so Bink1Decoder can hold one. */
+/* Bink Huffman tree state. Each per-bundle tree binds a 4-bit tree
+ * index (selecting one of the 16 prebuilt lookup tables in
+ * bink1_tables.c) to a 16-symbol permutation. Decoding is a peek
+ * over max_bits bits followed by a table lookup.
+ */
 typedef struct {
-    uint8_t  symbols[16];
-    uint8_t  code_lengths[16];
-    uint32_t code_min[17];
-    int16_t  code_offset[17];
+    int      tree_id;            /* 0..15 */
     uint8_t  permutation[16];
     int      built;
 } BinkHuffTreeData;
@@ -531,192 +555,89 @@ static bool load_frame(Bink1Decoder* d, uint32_t index)
 /* 4. Huffman tree builder (shared by audio + video)                  */
 /* ------------------------------------------------------------------ */
 
-/* Bink uses a small fixed Huffman alphabet (16 symbols) plus a per-
- * bundle symbol permutation. The 16 prebuilt code-length tables are
- * documented on the Multimedia Wiki -- here they are stored as code
- * lengths in bits, indexed by symbol. Codes are LSB-first (matches
- * our BitReader). */
-static const uint8_t kBinkHuffLengths[16][16] = {
-    /*  0: 4-bit fixed -- identity tree (used when length 0)
-     *     Encoded as 16 codes of length 4 in the prebuilt table. */
-    {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4},
-    {1, 3, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6},
-    {1, 2, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
-    {2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6},
-    {2, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6},
-    {1, 2, 4, 4, 4, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6},
-    {1, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6},
-    {3, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6},
-    {2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6},
-    {2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6},
-    {3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6},
-    {2, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6},
-    {1, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
-    {2, 2, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6},
-    {2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6},
-    {1, 3, 4, 4, 4, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6},
-};
-
-/* Alias for the forward-declared BinkHuffTreeData up top so the
- * implementation code reads naturally as "BinkHuffTree". */
 typedef BinkHuffTreeData BinkHuffTree;
 
-/* Build the canonical Huffman lookup tables from the per-symbol code
- * lengths in `lengths`. Symbols are placed in code-order so a given
- * (length, code) pair maps to symbols[code_offset[length]+(code-min)]. */
-static bool bink_huff_build(BinkHuffTree* t, const uint8_t* lengths)
-{
-    /* Count codes of each length. */
-    int count[17] = { 0 };
-    for (int i = 0; i < 16; ++i) {
-        if (lengths[i] < 1 || lengths[i] > 16) return false;
-        count[lengths[i]]++;
-    }
-
-    /* First canonical code value at each length. */
-    uint32_t code = 0;
-    int symbol_idx = 0;
-    for (int len = 1; len <= 16; ++len) {
-        t->code_min[len] = code;
-        t->code_offset[len] = (int16_t)(symbol_idx - (int)code);
-        code = (code + count[len]) << 1;
-    }
-
-    /* Place symbols in canonical code order. */
-    int placed[17] = { 0 };
-    for (int sym = 0; sym < 16; ++sym) {
-        int len = lengths[sym];
-        int slot = 0;
-        for (int l = 1; l < len; ++l) slot += count[l];
-        slot += placed[len]++;
-        t->symbols[slot] = (uint8_t)sym;
-        t->code_lengths[slot] = (uint8_t)len;
-    }
-    return true;
-}
-
-/* Read a Huffman-coded symbol from the bitstream. Returns the index
- * into the tree's symbols[] array; callers then map through the
- * permutation if they care about the user-visible value. */
-static int bink_huff_read_raw(BitReader* br, const BinkHuffTree* t)
-{
-    uint32_t acc = 0;
-    for (int len = 1; len <= 16; ++len) {
-        acc = (acc << 1) | br_read(br, 1);
-        if (acc < t->code_min[len] + 0u) continue;
-        /* Check if this code falls within length `len`'s range. */
-        int next_min = (len < 16) ? (int)t->code_min[len + 1] >> 1 : -1;
-        if (next_min < 0 || acc < (uint32_t)next_min) {
-            int slot = (int)acc + t->code_offset[len];
-            if (slot < 0 || slot >= 16) return 0;
-            return (int)t->symbols[slot];
-        }
-    }
-    return 0;
-}
-
-/* Read a permutation-mapped symbol value (0..15). */
+/* Read one symbol from the bitstream using one of the prebuilt Bink
+ * Huffman trees plus a per-bundle symbol permutation. Each prebuilt
+ * tree is a flat lookup of 2^max_bits entries: the high nibble is the
+ * code length (number of bits actually consumed), the low nibble is
+ * the symbol index into the permutation. */
 static int bink_huff_read_sym(BitReader* br, const BinkHuffTree* t)
 {
-    int raw = bink_huff_read_raw(br, t);
-    return t->permutation[raw];
-}
-
-/* Bink Huffman tree permutation merge step (recursive). Given a
- * working array of size 2^depth, repeatedly merge adjacent runs by
- * interleaving them via swap pairs read from the stream until the
- * tree's full 16-symbol permutation is reconstructed. This matches
- * the "shuffle" branch of the Bink tree specifier. */
-static void bink_huff_merge_perm(BitReader* br, uint8_t* a, int run_len)
-{
-    if (run_len >= 16) return;
-    uint8_t merged[16];
-    for (int i = 0; i < 16; i += run_len * 2) {
-        int p = 0;
-        int q = run_len;
-        while (p < run_len && q < run_len * 2) {
-            /* 1-bit: 0 = take from left run, 1 = take from right. */
-            if (br_read(br, 1)) {
-                merged[i + p + q - run_len] = a[i + q];
-                ++q;
-            } else {
-                merged[i + p + q - run_len] = a[i + p];
-                ++p;
-            }
-        }
-        while (p < run_len) {
-            merged[i + p + q - run_len] = a[i + p];
-            ++p;
-        }
-        while (q < run_len * 2) {
-            merged[i + p + q - run_len] = a[i + q];
-            ++q;
-        }
-    }
-    memcpy(a, merged, 16);
-    bink_huff_merge_perm(br, a, run_len * 2);
+    int max_bits = (int)bink_huff_max_bits[t->tree_id];
+    uint32_t bits = br_peek(br, max_bits);
+    uint8_t entry = bink_huff_tree[t->tree_id][bits];
+    br_skip(br, entry >> 4);
+    return t->permutation[entry & 0xF];
 }
 
 /* Decode a per-bundle Huffman tree specifier from the bitstream:
- *   - 4 bits: tree index (0..15) selecting a prebuilt code-length
- *     table from kBinkHuffLengths.
- *   - If index == 0: identity permutation (raw 4-bit nibbles).
+ *   - 4 bits: tree_id (0..15)
+ *   - If tree_id == 0: identity permutation (raw 4-bit nibbles).
  *   - Otherwise: 1-bit mode selector:
- *       1 = "explicit": read 3 bits for count, then `count` 4-bit
- *           symbols listing which value goes where, remaining
- *           symbols fall through in natural order.
- *       0 = "shuffle": read 2 bits for depth, swap adjacent pairs
- *           at that depth, then merge() the pair runs upward.
- * Returns true on success. */
+ *       1 = "explicit": read 3-bit count, then count+1 4-bit symbols
+ *           in order; the remaining unused symbols fall through in
+ *           natural order.
+ *       0 = "shuffle": read 2-bit depth N; merge "from"/"to" buffers
+ *           N+1 times, doubling the merge size each iteration; each
+ *           merge step reads 1 bit per output slot to decide whether
+ *           the next value comes from the left or right run.
+ * Matches Helco/bonkdec's Huffman.ReadTree exactly. */
 static bool bink_huff_read_tree(BitReader* br, BinkHuffTree* t)
 {
-    int idx = (int)br_read(br, 4);
-    if (idx >= 16) return false;
-    if (!bink_huff_build(t, kBinkHuffLengths[idx])) return false;
-    if (idx == 0) {
-        for (int i = 0; i < 16; ++i) t->permutation[i] = (uint8_t)i;
+    int tree_id = (int)br_read(br, 4);
+    if (tree_id >= BINK_HUFF_TREE_COUNT) return false;
+    t->tree_id = tree_id;
+    /* Initial symbol permutation = identity. */
+    for (int i = 0; i < 16; ++i) t->permutation[i] = (uint8_t)i;
+
+    if (tree_id == 0) {
         t->built = 1;
         return true;
     }
 
-    int mode = (int)br_read(br, 1);
-    if (mode == 1) {
-        /* Explicit selection. */
-        int count = (int)br_read(br, 3);
-        if (count > 16) count = 16;
-        uint8_t taken[16] = { 0 };
+    if (br_read(br, 1) == 1) {
+        /* Explicit branch. */
+        int first_count = (int)br_read(br, 3);
         uint8_t perm[16];
-        memset(perm, 0xFF, sizeof(perm));
-        for (int i = 0; i < count; ++i) {
+        int taken_mask = 0;
+        int i = 0;
+        for (; i <= first_count; ++i) {
             int v = (int)br_read(br, 4);
-            if (v >= 16) v = 15;
             perm[i] = (uint8_t)v;
-            taken[v] = 1;
+            taken_mask |= 1 << v;
         }
-        /* Fill remaining slots in natural order with unused values. */
-        int slot = count;
-        for (int v = 0; v < 16 && slot < 16; ++v) {
-            if (!taken[v]) perm[slot++] = (uint8_t)v;
+        for (int j = 0; j < 16; ++j) {
+            if (!(taken_mask & (1 << j))) perm[i++] = (uint8_t)j;
         }
         memcpy(t->permutation, perm, 16);
     } else {
-        /* Shuffle mode. Initial layout is identity. Pair-swap at
-         * the specified depth, then merge upward. */
-        int depth = (int)br_read(br, 2);
-        uint8_t perm[16];
-        for (int i = 0; i < 16; ++i) perm[i] = (uint8_t)i;
-        /* Apply per-pair swap bits at the base depth. */
-        int base_run = 1 << depth;
-        for (int i = 0; i < 16; i += base_run * 2) {
-            if (br_read(br, 1)) {
-                uint8_t tmp[8];
-                memcpy(tmp, perm + i, base_run);
-                memcpy(perm + i, perm + i + base_run, base_run);
-                memcpy(perm + i + base_run, tmp, base_run);
+        /* Shuffle branch. */
+        int shuffle_depth = (int)br_read(br, 2);
+        uint8_t buf_a[16], buf_b[16];
+        memcpy(buf_a, t->permutation, 16); /* identity */
+        uint8_t* to = buf_a;
+        uint8_t* from = buf_b;
+        for (int i = 0; i <= shuffle_depth; ++i) {
+            uint8_t* tmp = from; from = to; to = tmp;
+            int merge_size = 1 << i;
+            for (int j = 0; j < 16; j += merge_size * 2) {
+                /* Merge two adjacent runs of merge_size from `from`
+                 * into `to`, choosing per-output-slot via 1 bit. */
+                int p = 0, q = 0;
+                int out = 0;
+                while (p < merge_size && q < merge_size) {
+                    if (br_read(br, 1) == 0) {
+                        to[j + out++] = from[j + p++];
+                    } else {
+                        to[j + out++] = from[j + merge_size + q++];
+                    }
+                }
+                while (p < merge_size) to[j + out++] = from[j + p++];
+                while (q < merge_size) to[j + out++] = from[j + merge_size + q++];
             }
         }
-        bink_huff_merge_perm(br, perm, base_run * 2);
-        memcpy(t->permutation, perm, 16);
+        memcpy(t->permutation, to, 16);
     }
     t->built = 1;
     return true;
