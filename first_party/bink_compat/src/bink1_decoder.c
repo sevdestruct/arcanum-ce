@@ -204,6 +204,28 @@ typedef struct {
     int    initialized;
 } Bink1AudioState;
 
+/* Bink Huffman tree state -- mirrored in the full definition further
+ * down the file. Declared here so Bink1Decoder can hold one. */
+typedef struct {
+    uint8_t  symbols[16];
+    uint8_t  code_lengths[16];
+    uint32_t code_min[17];
+    int16_t  code_offset[17];
+    uint8_t  permutation[16];
+    int      built;
+} BinkHuffTreeData;
+
+/* Bundle decode state (fully defined below). Forward-declare the
+ * minimal shape needed by the decoder struct. */
+typedef struct {
+    BinkHuffTreeData tree;
+    uint8_t* entries;
+    size_t   capacity;
+    size_t   write_pos;
+    size_t   read_pos;
+    int16_t* values;
+} BundleData;
+
 struct Bink1Decoder {
     FILE* fp;
     Bink1Info info;
@@ -242,6 +264,7 @@ struct Bink1Decoder {
     int      plane_heights[BINK1_MAX_PLANES];
     int      plane_strides[BINK1_MAX_PLANES];
     int      cur_plane_set;     /* 0 or 1: which set holds the current frame */
+
 
     /* Decoded BGRA output for the most recent decode_video call. */
     int      have_decoded_frame;
@@ -476,18 +499,9 @@ static const uint8_t kBinkHuffLengths[16][16] = {
     {1, 3, 4, 4, 4, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6},
 };
 
-/* Per-tree decoding state. The tree consists of a code-length per
- * symbol and a remapped symbol order (the permutation read from the
- * stream). We decode by accumulating bits and stepping through a
- * canonical Huffman lookup table built from the lengths. */
-typedef struct {
-    uint8_t  symbols[16];        /* symbol values in code-order */
-    uint8_t  code_lengths[16];   /* length per code-order slot   */
-    uint32_t code_min[17];       /* first canonical code at this length */
-    int16_t  code_offset[17];    /* symbols[offset+(code-min)] = sym  */
-    uint8_t  permutation[16];    /* maps decoded symbol -> output value */
-    int      built;
-} BinkHuffTree;
+/* Alias for the forward-declared BinkHuffTreeData up top so the
+ * implementation code reads naturally as "BinkHuffTree". */
+typedef BinkHuffTreeData BinkHuffTree;
 
 /* Build the canonical Huffman lookup tables from the per-symbol code
  * lengths in `lengths`. Symbols are placed in code-order so a given
@@ -688,11 +702,9 @@ static int audio_decode_frame(Bink1AudioState* a, BitReader* br,
  * data for each plane is read up-front for that plane's pass, then
  * block-by-block decoding consumes bundle entries as needed. */
 
-typedef struct {
-    uint8_t* data;
-    size_t   size;
-    size_t   pos;
-} Bundle;
+/* Bundle: alias for the forward-declared BundleData up top. The
+ * full doc comment lives next to the typedef above. */
+typedef BundleData Bundle;
 
 typedef struct {
     /* Per-bundle state. */
@@ -710,6 +722,42 @@ typedef struct {
     /* Previous frame's plane for MOTION / RESIDUE reference. */
     uint8_t* prev;
 } BinkPlane;
+
+/* Initialise a bundle's buffers. Called once per (plane, bundle) on
+ * the first frame; subsequent frames just reset the read/write
+ * cursors. */
+static bool bundle_alloc(Bundle* b, int width_blocks, int height_blocks, int has_values)
+{
+    size_t blocks = (size_t)width_blocks * (size_t)height_blocks;
+    /* A bundle entry can occupy up to 64 elements per block in the
+     * worst case (RAW), so size to that bound. */
+    b->capacity = blocks * 64;
+    b->entries = (uint8_t*)calloc(b->capacity, 1);
+    if (!b->entries) return false;
+    if (has_values) {
+        b->values = (int16_t*)calloc(b->capacity, sizeof(int16_t));
+        if (!b->values) return false;
+    }
+    b->write_pos = 0;
+    b->read_pos = 0;
+    return true;
+}
+
+static void bundle_reset_cursors(Bundle* b)
+{
+    b->write_pos = 0;
+    b->read_pos = 0;
+}
+
+static void bundle_free(Bundle* b)
+{
+    free(b->entries);
+    free(b->values);
+    b->entries = NULL;
+    b->values = NULL;
+    b->capacity = 0;
+    b->write_pos = b->read_pos = 0;
+}
 
 /* Decode one 8x8 block. The block-type for this block was already
  * extracted from BINK_SRC_BLOCK_TYPES. */
@@ -905,24 +953,159 @@ static void decode_block_passthrough(BinkPlane* plane, int bx, int by)
     decode_block_skip(plane, bx, by);
 }
 
+/* --- Bundle chunk decoder ---------------------------------------- *
+ *
+ * Each bundle in a Bink frame is delivered as a sequence of chunks:
+ *
+ *     while ((have_more_chunks)) {
+ *         length = read_length();    // Huffman-coded, variable
+ *         for (i = 0; i < length; i++)
+ *             value = read_value();  // Huffman-coded (per bundle)
+ *     }
+ *
+ * Chunks are refilled on demand: when a block decoder asks for the
+ * next entry from a bundle whose buffer is exhausted, the parser
+ * reads the next chunk.
+ *
+ * The "have more chunks" signal is implicit -- when the total
+ * blocks-per-plane is consumed, the bundle stream is implicitly
+ * done. We track this by counting consumed entries per bundle.
+ */
+
+/* Read a Bink-style length prefix: small values use a short prefix,
+ * larger values escape into wider bit fields. The exact bit layout
+ * for length specifiers in Bink1 varies by bundle, but the most
+ * common form is a unary prefix capped at 7 bits with one tail
+ * extension. This is documented as "logspan" coding on the wiki. */
+static int bink_read_length(BitReader* br)
+{
+    /* TODO: replace with the exact per-bundle length scheme. For
+     * now use a 7-bit raw read so the parser remains in sync with
+     * the bitstream structure even if values are mis-scaled. */
+    int v = (int)br_read(br, 7);
+    return v;
+}
+
+/* Refill `b` with at least one chunk worth of entries. Returns the
+ * number of entries available (may be zero at end-of-bundle). */
+static int bundle_refill_bytes(Bundle* b, BitReader* br)
+{
+    if (b->read_pos < b->write_pos) {
+        return (int)(b->write_pos - b->read_pos);
+    }
+    int len = bink_read_length(br);
+    if (len <= 0) return 0;
+    if (b->write_pos + (size_t)len > b->capacity) {
+        len = (int)(b->capacity - b->write_pos);
+    }
+    for (int i = 0; i < len; ++i) {
+        int sym = bink_huff_read_sym(br, &b->tree);
+        b->entries[b->write_pos++] = (uint8_t)sym;
+    }
+    return (int)(b->write_pos - b->read_pos);
+}
+
+static int bundle_pop_byte(Bundle* b, BitReader* br)
+{
+    if (b->read_pos >= b->write_pos) {
+        if (bundle_refill_bytes(b, br) <= 0) return 0;
+    }
+    return b->entries[b->read_pos++];
+}
+
 /* Top-level plane decoder. Consumes the plane's portion of the
- * video bitstream and writes to plane->dst. */
+ * video bitstream and writes to plane->dst.
+ *
+ * Per-plane structure documented on the wiki:
+ *   - For each of the 9 bundles: 1 bit "reset Huffman tree" + if
+ *     set, the per-bundle Huffman tree specifier (4 bits index +
+ *     16 nibbles permutation when index != 0)
+ *   - Block-by-block walk consuming bundles
+ *
+ * NOTE: this implementation is structurally correct (it walks
+ * blocks, dispatches by type, consumes bundle entries) but the
+ * bit-level details of length-prefix coding and per-bundle entry
+ * encoding need verification against a known-good Bink reference
+ * stream. Until then, .bik playback via this path will likely
+ * produce noisy or distorted output. The MJPEG path remains the
+ * recommended production option.
+ */
 static bool decode_plane(BinkPlane* plane, BitReader* br)
 {
-    /* TODO: For each bundle, the encoder writes:
-     *   - 1 bit: empty marker
-     *   - if not empty: { length-prefix bundle data } repeated
-     *
-     * We're not parsing those bundle headers yet; instead, we
-     * default every block to SKIP (passthrough) and copy the
-     * previous frame's plane. This is correct for the very first
-     * frame ONLY if `prev` is zeroed, in which case the output is
-     * a black frame -- acceptable as a "decoder is alive" baseline
-     * until the bundle layer is wired in.  */
-    (void)br;
+    /* Phase 1: read tree-reset bits + tree specifiers for each
+     * bundle. Bink stores them as a packed prefix. */
+    for (int i = 0; i < BINK_SRC_COUNT; ++i) {
+        Bundle* b = &plane->bundles[i];
+        bundle_reset_cursors(b);
+        int reset = (int)br_read(br, 1);
+        if (reset || !b->tree.built) {
+            if (!bink_huff_read_tree(br, &b->tree)) return false;
+        }
+    }
+
+    /* Phase 2: block-by-block decode. */
     for (int by = 0; by < plane->height_blocks; ++by) {
         for (int bx = 0; bx < plane->width_blocks; ++bx) {
-            decode_block_passthrough(plane, bx, by);
+            int block_type = bundle_pop_byte(
+                &plane->bundles[BINK_SRC_BLOCK_TYPES], br);
+            switch (block_type) {
+            case BINK_BLOCK_SKIP:
+                decode_block_skip(plane, bx, by);
+                break;
+            case BINK_BLOCK_FILL: {
+                int color = bundle_pop_byte(
+                    &plane->bundles[BINK_SRC_COLORS], br);
+                decode_block_fill(plane, bx, by, (uint8_t)color);
+                break;
+            }
+            case BINK_BLOCK_MOTION: {
+                int mx = bundle_pop_byte(
+                    &plane->bundles[BINK_SRC_X_OFF], br);
+                int my = bundle_pop_byte(
+                    &plane->bundles[BINK_SRC_Y_OFF], br);
+                /* Bundle values are unsigned bytes; interpret as
+                 * signed (range -128..127). */
+                if (mx >= 128) mx -= 256;
+                if (my >= 128) my -= 256;
+                decode_block_motion(plane, bx, by, mx, my);
+                break;
+            }
+            case BINK_BLOCK_RAW: {
+                uint8_t raw[64];
+                for (int i = 0; i < 64; ++i) {
+                    raw[i] = (uint8_t)bundle_pop_byte(
+                        &plane->bundles[BINK_SRC_COLORS], br);
+                }
+                decode_block_raw(plane, bx, by, raw);
+                break;
+            }
+            case BINK_BLOCK_PATTERN: {
+                uint8_t c0 = (uint8_t)bundle_pop_byte(
+                    &plane->bundles[BINK_SRC_COLORS], br);
+                uint8_t c1 = (uint8_t)bundle_pop_byte(
+                    &plane->bundles[BINK_SRC_COLORS], br);
+                uint8_t pat[8];
+                for (int i = 0; i < 8; ++i) {
+                    pat[i] = (uint8_t)bundle_pop_byte(
+                        &plane->bundles[BINK_SRC_PATTERN], br);
+                }
+                decode_block_pattern(plane, bx, by, c0, c1, pat);
+                break;
+            }
+            /* INTRA / INTER / RUN / RESIDUE / SCALED still require
+             * the DCT coefficient bundle wiring (INTRA_DC + INTER_DC
+             * + AC zig-zag bundle) which isn't decoded yet. Default
+             * to SKIP so the block-walk stays in sync with the
+             * bundle reads. */
+            case BINK_BLOCK_INTRA:
+            case BINK_BLOCK_INTER:
+            case BINK_BLOCK_RUN:
+            case BINK_BLOCK_RESIDUE:
+            case BINK_BLOCK_SCALED:
+            default:
+                decode_block_passthrough(plane, bx, by);
+                break;
+            }
         }
     }
     return true;
