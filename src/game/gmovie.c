@@ -281,6 +281,18 @@ static void scan_data_subtree_for_videos(const char* dir_path, int depth)
         FILE* fp = fopen(sibling, "rb");
         if (fp) { fclose(fp); continue; }
 
+        /* When native Bink is active, a sibling .bik is itself a
+         * playable asset (preferred by the resolver), so a loose
+         * .mp4/.mov/... next to it is redundant and shouldn't be
+         * offered for conversion. */
+        if (bink_compat_native_bink_enabled()) {
+            char bik_sibling[TIG_MAX_PATH];
+            memcpy(bik_sibling, full, n);
+            memcpy(bik_sibling + n, ".bik", 5);
+            FILE* fb = fopen(bik_sibling, "rb");
+            if (fb) { fclose(fb); continue; }
+        }
+
         /* Basename without extension, for the modal display. */
         const char* leaf = strrchr(full, '/');
         leaf = leaf ? leaf + 1 : full;
@@ -303,33 +315,42 @@ void gmovie_scan_video_assets(void)
 
     /* Pass 1 -- canonical cutscene .bik files via the engine's file
      * enumeration. This sees both loose-disk and DAT-internal .bik
-     * entries that match "movies\*.bik". */
-    TigFileList list;
-    tig_file_list_create(&list, "movies\\*.bik");
-    unsigned int total_bik = list.count;
-    for (unsigned int i = 0; i < list.count; ++i) {
-        const char* leaf = list.entries[i].path;
+     * entries that match "movies\*.bik".
+     *
+     * Skipped entirely when the native Bink decoder is the active
+     * path: .bik cutscenes play directly with no conversion, so they
+     * must not drive the "convert your videos" prompt. (If a specific
+     * .bik ever fails to decode natively, ARCANUM_BINK_DIRECT=0
+     * re-enables this pass and the MJPEG sidecar workflow.) */
+    unsigned int total_bik = 0;
+    if (!bink_compat_native_bink_enabled()) {
+        TigFileList list;
+        tig_file_list_create(&list, "movies\\*.bik");
+        total_bik = list.count;
+        for (unsigned int i = 0; i < list.count; ++i) {
+            const char* leaf = list.entries[i].path;
 
-        char basename[64];
-        if (!strip_ext(leaf, basename, sizeof(basename))) {
-            continue;
-        }
-        if (avi_already_exists(basename)) {
-            continue;
-        }
+            char basename[64];
+            if (!strip_ext(leaf, basename, sizeof(basename))) {
+                continue;
+            }
+            if (avi_already_exists(basename)) {
+                continue;
+            }
 
-        char source[TIG_MAX_PATH];
-        snprintf(source, sizeof(source), "movies\\%s", leaf);
-        /* All .bik sources -- DAT-internal or loose -- get their .avi
-         * written to the canonical override directory. This is the
-         * first path gmovie_play_path probes at runtime, so the
-         * converted file wins regardless of which form the original
-         * .bik took. */
-        char dest[TIG_MAX_PATH];
-        snprintf(dest, sizeof(dest), "data/videos/%s.avi", basename);
-        gmovie_unconverted_push(source, dest, basename);
+            char source[TIG_MAX_PATH];
+            snprintf(source, sizeof(source), "movies\\%s", leaf);
+            /* All .bik sources -- DAT-internal or loose -- get their
+             * .avi written to the canonical override directory. This
+             * is the first path gmovie_play_path probes at runtime, so
+             * the converted file wins regardless of which form the
+             * original .bik took. */
+            char dest[TIG_MAX_PATH];
+            snprintf(dest, sizeof(dest), "data/videos/%s.avi", basename);
+            gmovie_unconverted_push(source, dest, basename);
+        }
+        tig_file_list_destroy(&list);
     }
-    tig_file_list_destroy(&list);
     unsigned int after_bik = unconverted_count;
 
     /* Pass 2 -- recursively walk loose files under data/ and art/ for
