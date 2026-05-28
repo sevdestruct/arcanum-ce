@@ -777,6 +777,112 @@ static bool audio_init_track(Bink1AudioState* a, const Bink1AudioTrackInfo* info
     return true;
 }
 
+/* In-place iterative radix-2 decimation-in-time FFT. Input is N
+ * complex samples laid out as { re[0], im[0], re[1], im[1], ... }.
+ * `inverse` selects the direction (1 = inverse, 0 = forward). N
+ * must be a power of two. */
+static void audio_fft_complex(float* data, int n, int inverse)
+{
+    /* Bit-reversal permutation. */
+    int j = 0;
+    for (int i = 1; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float tr = data[2*i];     data[2*i]     = data[2*j];     data[2*j]     = tr;
+            float ti = data[2*i + 1]; data[2*i + 1] = data[2*j + 1]; data[2*j + 1] = ti;
+        }
+    }
+    /* Butterflies. */
+    const double PI = 3.14159265358979323846;
+    for (int len = 2; len <= n; len <<= 1) {
+        double ang = (inverse ? 1.0 : -1.0) * 2.0 * PI / (double)len;
+        float wlen_re = (float)cos(ang);
+        float wlen_im = (float)sin(ang);
+        for (int i = 0; i < n; i += len) {
+            float w_re = 1.0f, w_im = 0.0f;
+            for (int k = 0; k < len / 2; ++k) {
+                int a = 2 * (i + k);
+                int b = 2 * (i + k + len / 2);
+                float u_re = data[a], u_im = data[a + 1];
+                float v_re = data[b] * w_re - data[b + 1] * w_im;
+                float v_im = data[b] * w_im + data[b + 1] * w_re;
+                data[a]     = u_re + v_re;
+                data[a + 1] = u_im + v_im;
+                data[b]     = u_re - v_re;
+                data[b + 1] = u_im - v_im;
+                float nw_re = w_re * wlen_re - w_im * wlen_im;
+                float nw_im = w_re * wlen_im + w_im * wlen_re;
+                w_re = nw_re; w_im = nw_im;
+            }
+        }
+    }
+    if (inverse) {
+        float inv_n = 1.0f / (float)n;
+        for (int i = 0; i < 2 * n; ++i) data[i] *= inv_n;
+    }
+}
+
+/* Inverse Real DFT (length n, n even). The Bink coefficient layout
+ * stores the spectrum as n real values where:
+ *   coeffs[0] = DC bin (real)
+ *   coeffs[1] = Nyquist bin (real) -- libavcodec packs it here
+ *   coeffs[2k], coeffs[2k+1] for k = 1..n/2-1 form (real, imag)
+ *     pairs of the kth complex bin
+ * After the inverse transform, coeffs[] holds n real time-domain
+ * samples in-place. */
+static void audio_inverse_rdft(float* coeffs, int n)
+{
+    if (n <= 0 || (n & (n - 1)) != 0) return;  /* require power of 2 */
+    /* Expand the packed real spectrum into a length-n complex
+     * spectrum suitable for a complex inverse FFT. The complex
+     * layout enforces Hermitian symmetry (X[N-k] = conj(X[k])) so
+     * the output is purely real. */
+    float* tmp = (float*)calloc((size_t)n * 2, sizeof(float));
+    if (!tmp) return;
+    tmp[0] = coeffs[0];                         /* DC */
+    tmp[1] = 0.0f;
+    tmp[2 * (n / 2)] = coeffs[1];               /* Nyquist (real) */
+    tmp[2 * (n / 2) + 1] = 0.0f;
+    for (int k = 1; k < n / 2; ++k) {
+        float re = coeffs[2 * k];
+        float im = coeffs[2 * k + 1];
+        tmp[2 * k]     = re;
+        tmp[2 * k + 1] = im;
+        tmp[2 * (n - k)]     = re;
+        tmp[2 * (n - k) + 1] = -im;
+    }
+    audio_fft_complex(tmp, n, 1);
+    /* Take real parts. */
+    for (int i = 0; i < n; ++i) coeffs[i] = tmp[2 * i];
+    free(tmp);
+}
+
+/* Inverse DCT-IV of length n. The DCT-IV is its own inverse up to
+ * a scale, and Bink Audio v2 uses it instead of RDFT for newer
+ * streams. We implement it via a DCT-IV -> DCT-IV self-inverse:
+ *   y[k] = sum_{n=0..N-1} x[n] * cos((pi/N) * (n + 1/2) * (k + 1/2))
+ * Naive O(N^2) implementation; audio frames are <= 8192 samples so
+ * the cost is acceptable for the rare DCT-mode tracks. */
+static void audio_inverse_dct_iv(float* coeffs, int n)
+{
+    if (n <= 0) return;
+    const double PI = 3.14159265358979323846;
+    float* tmp = (float*)calloc((size_t)n, sizeof(float));
+    if (!tmp) return;
+    for (int k = 0; k < n; ++k) {
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) {
+            sum += coeffs[i] * cos(PI / (double)n
+                * ((double)i + 0.5) * ((double)k + 0.5));
+        }
+        tmp[k] = (float)(sum * 2.0 / (double)n);
+    }
+    memcpy(coeffs, tmp, (size_t)n * sizeof(float));
+    free(tmp);
+}
+
 /* Read a 29-bit "Bink float" from the bitstream: 5-bit exponent +
  * 23-bit mantissa + 1-bit sign (read in that order, per the wiki).
  * Used for the two leading audio coefficients per channel per
@@ -878,19 +984,20 @@ static int audio_decode_frame(Bink1AudioState* a, BitReader* br,
         channel_done: ;
     }
 
-    /* Inverse transform: the spec calls for RDFT or DCT-IV. We
-     * don't yet implement either -- without the transform the
-     * coefficients we just decoded are frequency-domain samples
-     * that should be inverse-transformed before time-domain
-     * overlap-add. For now, treat the coefficient buffer as if it
-     * were already time-domain and apply overlap-add directly; this
-     * will produce noise rather than music but keeps the audio
-     * scheduler progressing at the right rate.
-     *
-     * TODO: implement inverse RDFT (length n, for older streams)
-     * and inverse DCT-IV (length n, for newer streams selected by
-     * audio_flags bit 12). Then overlap-add against prev_tail.
-     */
+    /* Inverse transform: RDFT for older streams, DCT-IV for newer
+     * streams (selected by audio_flags bit 12). Both convert the
+     * decoded coefficient buffer from frequency domain to time
+     * domain in place. The RDFT path uses a standard radix-2 DIT
+     * iterative FFT with conjugate twiddles. */
+    int is_dct = a->info.is_dct;
+    for (int c = 0; c < channels; ++c) {
+        if (!is_dct) {
+            audio_inverse_rdft(a->coeffs[c], n);
+        } else {
+            audio_inverse_dct_iv(a->coeffs[c], n);
+        }
+    }
+
     for (int c = 0; c < channels; ++c) {
         float* prev = a->prev_tail[c];
         float* cur  = a->coeffs[c];
