@@ -223,6 +223,7 @@ typedef struct {
     size_t   capacity;
     size_t   write_pos;
     size_t   read_pos;
+    int      remaining;          /* run quota left for this plane */
     int16_t* values;
 } BundleData;
 
@@ -972,31 +973,62 @@ static void decode_block_passthrough(BinkPlane* plane, int bx, int by)
  * done. We track this by counting consumed entries per bundle.
  */
 
-/* Read a Bink-style length prefix: small values use a short prefix,
- * larger values escape into wider bit fields. The exact bit layout
- * for length specifiers in Bink1 varies by bundle, but the most
- * common form is a unary prefix capped at 7 bits with one tail
- * extension. This is documented as "logspan" coding on the wiki. */
-static int bink_read_length(BitReader* br)
+/* ceil(log2(x)) for small positive x, 0 for x <= 1. */
+static int bink_ceil_log2(int x)
 {
-    /* TODO: replace with the exact per-bundle length scheme. For
-     * now use a 7-bit raw read so the parser remains in sync with
-     * the bitstream structure even if values are mis-scaled. */
-    int v = (int)br_read(br, 7);
-    return v;
+    if (x <= 1) return 0;
+    int n = 0;
+    --x;
+    while (x) { ++n; x >>= 1; }
+    return n;
 }
 
-/* Refill `b` with at least one chunk worth of entries. Returns the
- * number of entries available (may be zero at end-of-bundle). */
-static int bundle_refill_bytes(Bundle* b, BitReader* br)
+/* Read a Bink bundle chunk length. Length-prefix size is determined
+ * by the bundle's remaining-block count: the encoder uses
+ * ceil(log2(remaining + 1)) bits so a chunk can address any subset
+ * of the remaining blocks. This matches the standard pattern in
+ * Bink Video's bundle layer where each bundle is a run-encoded
+ * stream stopped exactly at the plane's block count.
+ *
+ * `remaining` is the number of un-read entries left in this
+ * bundle's plane allotment. Returns 0 (no more chunks) when
+ * remaining hits 0. */
+static int bink_read_length(BitReader* br, int remaining)
+{
+    if (remaining <= 0) return 0;
+    int bits = bink_ceil_log2(remaining + 1);
+    if (bits <= 0) return remaining;
+    if (bits > 16) bits = 16;
+    int len = (int)br_read(br, bits);
+    if (len <= 0) return 0;
+    if (len > remaining) len = remaining;
+    return len;
+}
+
+/* Refill `b` with at least one chunk worth of entries. `remaining`
+ * is the bundle's run quota for this plane. Returns the number of
+ * entries currently available for popping (may be zero at end-of-
+ * bundle). Allocates b->entries lazily on first chunk if needed.  */
+static int bundle_refill_bytes(Bundle* b, BitReader* br, int remaining)
 {
     if (b->read_pos < b->write_pos) {
         return (int)(b->write_pos - b->read_pos);
     }
-    int len = bink_read_length(br);
+    int len = bink_read_length(br, remaining);
     if (len <= 0) return 0;
-    if (b->write_pos + (size_t)len > b->capacity) {
-        len = (int)(b->capacity - b->write_pos);
+
+    /* Lazy allocation: bundles attached to stack-local BinkPlane
+     * objects never see bundle_alloc -- size the entries buffer to
+     * one chunk's worth here on first use. Growable on subsequent
+     * chunks if a single chunk exceeds the initial capacity. */
+    size_t need = b->write_pos + (size_t)len;
+    if (need > b->capacity) {
+        size_t cap = b->capacity ? b->capacity : 256;
+        while (cap < need) cap *= 2;
+        uint8_t* nb = (uint8_t*)realloc(b->entries, cap);
+        if (!nb) return 0;
+        b->entries = nb;
+        b->capacity = cap;
     }
     for (int i = 0; i < len; ++i) {
         int sym = bink_huff_read_sym(br, &b->tree);
@@ -1005,10 +1037,17 @@ static int bundle_refill_bytes(Bundle* b, BitReader* br)
     return (int)(b->write_pos - b->read_pos);
 }
 
+/* Pop one byte-valued entry from the bundle, refilling from the
+ * bitstream as needed. `remaining` is updated to reflect entries
+ * consumed (write side) so the next chunk size is computed against
+ * the live quota. Returns 0 if the bundle has no entries to pop
+ * (end-of-bundle), which is a fail-safe for desynced streams. */
 static int bundle_pop_byte(Bundle* b, BitReader* br)
 {
     if (b->read_pos >= b->write_pos) {
-        if (bundle_refill_bytes(b, br) <= 0) return 0;
+        int n = bundle_refill_bytes(b, br, b->remaining);
+        if (n <= 0) return 0;
+        b->remaining -= n;
     }
     return b->entries[b->read_pos++];
 }
@@ -1034,9 +1073,15 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
 {
     /* Phase 1: read tree-reset bits + tree specifiers for each
      * bundle. Bink stores them as a packed prefix. */
+    int plane_blocks = plane->width_blocks * plane->height_blocks;
     for (int i = 0; i < BINK_SRC_COUNT; ++i) {
         Bundle* b = &plane->bundles[i];
         bundle_reset_cursors(b);
+        /* BLOCK_TYPES is always one entry per block. Other bundles
+         * have variable demand depending on block-type mix; we
+         * conservatively start them at plane_blocks too so the
+         * first chunk's length-prefix has enough bits. */
+        b->remaining = plane_blocks;
         int reset = (int)br_read(br, 1);
         if (reset || !b->tree.built) {
             if (!bink_huff_read_tree(br, &b->tree)) return false;
@@ -1296,7 +1341,19 @@ bool bink1_decoder_decode_video(Bink1Decoder* d,
         plane.stride = d->plane_strides[p];
         plane.dst = d->planes[p][set];
         plane.prev = d->planes[p][prev];
-        if (!decode_plane(&plane, &br)) return false;
+
+        bool ok = decode_plane(&plane, &br);
+
+        /* Bundle entries are lazily-allocated heap buffers held by
+         * the stack-local plane.bundles. Release them before the
+         * plane goes out of scope so we don't leak each frame.
+         * The Huffman tree itself is plain inline storage and
+         * needs no separate free. */
+        for (int i = 0; i < BINK_SRC_COUNT; ++i) {
+            free(plane.bundles[i].entries);
+            free(plane.bundles[i].values);
+        }
+        if (!ok) return false;
     }
 
     compose_bgra(d, set, dst, dst_pitch, dst_w, dst_h);
