@@ -245,19 +245,26 @@ typedef struct {
     int      keyframe;
 } Bink1FrameEntry;
 
-/* Internal audio decoder state for one track. */
+/* Internal audio decoder state for one track. Follows bonkdec's
+ * AudioDecoder model: the transform operates on a single interleaved
+ * buffer covering all channels, so samples_per_frame already includes
+ * the channel multiplier. */
 typedef struct {
     Bink1AudioTrackInfo info;
 
-    /* Band layout for the FFT/DCT coder. Set on first frame. */
-    int frame_len;              /* samples per coded frame (power of 2) */
-    int overlap_len;            /* half-window samples carried to next frame */
-    int band_count;
-    int band_bounds[26];        /* up to 25 critical bands + sentinel */
+    int samples_per_frame;      /* FFT length = channels * (512..2048) */
+    int samples_per_window;     /* overlap region = samples_per_frame/16 */
+    int samples_per_block;      /* samples emitted per block = spf - spw */
+    float dct_scale;            /* 2 / sqrt(samples_per_frame) */
 
-    /* Working buffers: one float frame's worth per channel. */
-    float* coeffs[2];           /* coefficient buffer */
-    float* prev_tail[2];        /* overlap-add tail from previous frame */
+    int   quantizer_bands[27];  /* coefficient index at each band edge */
+    int   band_count;           /* number of band edges - 1 */
+    float quantizers[26];       /* per-band dequantization multiplier */
+
+    float* coeffs;              /* samples_per_frame floats (interleaved) */
+    int16_t* quant_coeffs;      /* samples_per_frame shorts (reused for samples) */
+    int16_t* window;            /* overlap tail from previous block */
+    int    is_first_decode;
     int    initialized;
 } Bink1AudioState;
 
@@ -339,6 +346,7 @@ struct Bink1Decoder {
     struct {
         const uint8_t* data;
         size_t size;
+        uint32_t sample_count;   /* output sample count from packet header */
     } audio_packets[BINK1_MAX_AUDIO_TRACKS];
 
     /* Decoded plane buffers: planes[0..2][0..1] = current and previous
@@ -565,14 +573,15 @@ static bool load_frame(Bink1Decoder* d, uint32_t index)
             /* Silence packet -- no sample_count word follows. */
             d->audio_packets[t].data = NULL;
             d->audio_packets[t].size = 0;
+            d->audio_packets[t].sample_count = 0;
             continue;
         }
         /* stored_len includes the 4-byte sample_count word + the
-         * raw audio bytes. Skip the sample count and point the
-         * packet at the audio data proper. */
+         * raw audio bytes. The sample_count is the number of decoded
+         * output samples (across all channels) this packet yields. */
         if (pos + stored_len > d->frame_buf_size) return false;
         if (stored_len < 4) return false;
-        /* d->frame_buf[pos..pos+3] is the sample_count -- skip. */
+        d->audio_packets[t].sample_count = rd_u32le(d->frame_buf + pos);
         d->audio_packets[t].data = d->frame_buf + pos + 4;
         d->audio_packets[t].size = stored_len - 4;
         pos += stored_len;
@@ -677,65 +686,31 @@ static bool bink_huff_read_tree(BitReader* br, BinkHuffTree* t)
 /* ------------------------------------------------------------------ */
 /* 5. Bink Audio decoder                                              */
 /* ------------------------------------------------------------------ */
+/*
+ * Follows Helco/bonkdec's AudioDecoder. The transform spans all
+ * channels in a single interleaved buffer: samples_per_frame already
+ * includes the channel count, so a stereo 44.1 kHz track uses a
+ * 4096-point inverse real DFT covering L/R interleaved.
+ *
+ * Per coded block:
+ *   - align bit reader to the next 32-bit word
+ *   - 2 leading 29-bit floats (the DC and Nyquist-ish coefficients)
+ *   - per-band 8-bit quantizer exponents -> 10^(exp * 0.0664)
+ *   - run-length-coded quantized coefficients
+ *   - dequantize per band
+ *   - inverse real DFT, scale by 2/sqrt(N), clamp to int16
+ *   - triangular-window overlap-add against the previous block's tail
+ *
+ * A single audio packet may hold several blocks; we loop until the
+ * packet's declared sample count is produced.
+ */
 
-/* Critical-band edges (Hz) shared by all Bink Audio sample rates.
- * Each frame's coefficient buffer is partitioned at the band positions
- * corresponding to the sample rate -- the decoder builds band_bounds
- * lazily on first frame using these reference edges. */
-static const float kBinkAudioBandHz[25] = {
-        0.0f,   100.0f,  200.0f,  300.0f,  400.0f,
-      510.0f,   630.0f,  770.0f,  920.0f, 1080.0f,
-     1270.0f,  1480.0f, 1720.0f, 2000.0f, 2320.0f,
-     2700.0f,  3150.0f, 3700.0f, 4400.0f, 5300.0f,
-     6400.0f,  7700.0f, 9500.0f, 12000.0f, 15500.0f
-};
-
-static int audio_frame_len_for_rate(uint32_t rate)
-{
-    /* Bink picks the FFT size from sample rate, rounded to a power
-     * of two. For 44100 the frame is 2048 samples (overlap 1024). */
-    if (rate < 22050) return 1024;
-    if (rate < 44100) return 1024;
-    return 2048;
-}
-
-static bool audio_init_track(Bink1AudioState* a, const Bink1AudioTrackInfo* info)
-{
-    a->info = *info;
-    int n = audio_frame_len_for_rate(info->sample_rate);
-    a->frame_len = n;
-    a->overlap_len = n / 2;
-
-    /* Compute band layout from the reference edges. */
-    a->band_count = 0;
-    float hz_per_bin = (float)info->sample_rate / (float)n;
-    for (int i = 0; i < 25 && a->band_count < 25; ++i) {
-        int bin = (int)(kBinkAudioBandHz[i] / hz_per_bin + 0.5f);
-        if (bin > n / 2) bin = n / 2;
-        a->band_bounds[a->band_count++] = bin;
-    }
-    a->band_bounds[a->band_count] = n / 2;
-    if (a->band_bounds[a->band_count] != a->band_bounds[a->band_count - 1]) {
-        ++a->band_count;
-    }
-
-    int channels = info->is_stereo ? 2 : 1;
-    for (int c = 0; c < channels; ++c) {
-        a->coeffs[c] = (float*)calloc((size_t)n, sizeof(float));
-        a->prev_tail[c] = (float*)calloc((size_t)a->overlap_len, sizeof(float));
-        if (!a->coeffs[c] || !a->prev_tail[c]) return false;
-    }
-    a->initialized = 1;
-    return true;
-}
-
-/* In-place iterative radix-2 decimation-in-time FFT. Input is N
- * complex samples laid out as { re[0], im[0], re[1], im[1], ... }.
- * `inverse` selects the direction (1 = inverse, 0 = forward). N
- * must be a power of two. */
+/* In-place iterative radix-2 decimation-in-time complex FFT. `data`
+ * is interleaved { re0, im0, re1, im1, ... } of length 2*n; `inverse`
+ * picks the sign and applies the 1/n normalisation. n must be a power
+ * of two. */
 static void audio_fft_complex(float* data, int n, int inverse)
 {
-    /* Bit-reversal permutation. */
     int j = 0;
     for (int i = 1; i < n; ++i) {
         int bit = n >> 1;
@@ -746,7 +721,6 @@ static void audio_fft_complex(float* data, int n, int inverse)
             float ti = data[2*i + 1]; data[2*i + 1] = data[2*j + 1]; data[2*j + 1] = ti;
         }
     }
-    /* Butterflies. */
     const double PI = 3.14159265358979323846;
     for (int len = 2; len <= n; len <<= 1) {
         double ang = (inverse ? 1.0 : -1.0) * 2.0 * PI / (double)len;
@@ -776,197 +750,209 @@ static void audio_fft_complex(float* data, int n, int inverse)
     }
 }
 
-/* Inverse Real DFT (length n, n even). The Bink coefficient layout
- * stores the spectrum as n real values where:
- *   coeffs[0] = DC bin (real)
- *   coeffs[1] = Nyquist bin (real) -- libavcodec packs it here
- *   coeffs[2k], coeffs[2k+1] for k = 1..n/2-1 form (real, imag)
- *     pairs of the kth complex bin
- * After the inverse transform, coeffs[] holds n real time-domain
- * samples in-place. */
+/* Inverse real DFT, in place, length n (n a power of two). On input,
+ * coeffs holds the packed half-spectrum in the layout used by Bink /
+ * Ooura's rdft: coeffs[0] = R[0] (DC), coeffs[1] = R[n/2] (Nyquist),
+ * coeffs[2k], coeffs[2k+1] = (R[k], I[k]) for 1 <= k < n/2. On output
+ * coeffs[0..n-1] holds the n real time-domain samples (the IRDFT as
+ * defined by Ooura, i.e. *without* the trailing 2/n scale -- the
+ * caller folds the audio's 2/sqrt(n) factor in afterward). */
 static void audio_inverse_rdft(float* coeffs, int n)
 {
-    if (n <= 0 || (n & (n - 1)) != 0) return;  /* require power of 2 */
-    /* Expand the packed real spectrum into a length-n complex
-     * spectrum suitable for a complex inverse FFT. The complex
-     * layout enforces Hermitian symmetry (X[N-k] = conj(X[k])) so
-     * the output is purely real. */
+    if (n <= 0 || (n & (n - 1)) != 0) return;
     float* tmp = (float*)calloc((size_t)n * 2, sizeof(float));
     if (!tmp) return;
-    tmp[0] = coeffs[0];                         /* DC */
+    tmp[0] = coeffs[0];               /* DC, imag 0 */
     tmp[1] = 0.0f;
-    tmp[2 * (n / 2)] = coeffs[1];               /* Nyquist (real) */
+    tmp[2 * (n / 2)] = coeffs[1];     /* Nyquist, imag 0 */
     tmp[2 * (n / 2) + 1] = 0.0f;
     for (int k = 1; k < n / 2; ++k) {
         float re = coeffs[2 * k];
         float im = coeffs[2 * k + 1];
-        tmp[2 * k]     = re;
+        tmp[2 * k] = re;
         tmp[2 * k + 1] = im;
-        tmp[2 * (n - k)]     = re;
+        tmp[2 * (n - k)] = re;         /* Hermitian mirror */
         tmp[2 * (n - k) + 1] = -im;
     }
-    audio_fft_complex(tmp, n, 1);
-    /* Take real parts. */
-    for (int i = 0; i < n; ++i) coeffs[i] = tmp[2 * i];
+    /* Use the *forward* complex transform (exp(-i...)) on the
+     * Hermitian spectrum: expanding the conjugate-symmetric pairs
+     * gives a[k] = R0 + R_{n/2}(-1)^k + 2*sum(R[j]cos + I[j]sin),
+     * which is exactly 2x Ooura's IRDFT (case 2, excluding scale).
+     * So take real parts and halve to match the reference, leaving
+     * the audio's own 2/sqrt(n) factor to the caller. */
+    audio_fft_complex(tmp, n, 0);
+    for (int i = 0; i < n; ++i) coeffs[i] = tmp[2 * i] * 0.5f;
     free(tmp);
 }
 
-/* Inverse DCT-IV of length n. The DCT-IV is its own inverse up to
- * a scale, and Bink Audio v2 uses it instead of RDFT for newer
- * streams. We implement it via a DCT-IV -> DCT-IV self-inverse:
- *   y[k] = sum_{n=0..N-1} x[n] * cos((pi/N) * (n + 1/2) * (k + 1/2))
- * Naive O(N^2) implementation; audio frames are <= 8192 samples so
- * the cost is acceptable for the rare DCT-mode tracks. */
-static void audio_inverse_dct_iv(float* coeffs, int n)
+static int16_t audio_clip16(float v)
 {
-    if (n <= 0) return;
-    const double PI = 3.14159265358979323846;
-    float* tmp = (float*)calloc((size_t)n, sizeof(float));
-    if (!tmp) return;
-    for (int k = 0; k < n; ++k) {
-        double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            sum += coeffs[i] * cos(PI / (double)n
-                * ((double)i + 0.5) * ((double)k + 0.5));
-        }
-        tmp[k] = (float)(sum * 2.0 / (double)n);
-    }
-    memcpy(coeffs, tmp, (size_t)n * sizeof(float));
-    free(tmp);
+    int s = (int)lrintf(v);
+    if (s < -32768) s = -32768;
+    if (s > 32767) s = 32767;
+    return (int16_t)s;
 }
 
-/* Read a 29-bit "Bink float" from the bitstream: 5-bit exponent +
- * 23-bit mantissa + 1-bit sign (read in that order, per the wiki).
- * Used for the two leading audio coefficients per channel per
- * frame. */
-static float audio_read_float(BitReader* br)
-{
-    int power = (int)br_read(br, 5);
-    uint32_t mant = br_read(br, 23);
-    int sign = (int)br_read(br, 1);
-    /* Reconstruct as mantissa * 2^(power - 23) with sign. */
-    double v = (double)mant * ldexp(1.0, power - 23);
-    if (sign) v = -v;
-    return (float)v;
-}
-
-/* Bink Audio variable-length coefficient length table (16 entries),
- * straight from the wiki. The selector chooses how many bits the
- * next batch of coefficient values uses. */
-static const int kBinkAudioRleLengths[16] = {
+/* Bink Audio run-length code table: the 4-bit selector maps to a run
+ * multiplier (the unpacker advances 8 * RunLengths[idx] coefficients). */
+static const int kBinkAudioRunLengths[16] = {
     2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64
 };
 
-/* Decode one audio frame. Reads coefficients per the documented
- * Bink Audio (v1) layout:
- *   - 2 floats per channel (leading DC-ish samples)
- *   - per critical band: 8-bit quantization step
- *   - per coefficient (band-by-band): variable-length signed magnitude
- *   - inverse RDFT / DCT-IV (selected by track flag bit 12)
- *   - linear-ramp overlap-add against the previous frame's half-window
- *
- * Without the inverse transform implementation the decoded samples
- * are wrong, but the bitstream cursor advances correctly so other
- * codepaths stay in sync. */
-static int audio_decode_frame(Bink1AudioState* a, BitReader* br,
-    int16_t* out, int out_capacity)
+static bool audio_init_track(Bink1AudioState* a, const Bink1AudioTrackInfo* info)
+{
+    a->info = *info;
+    int channels = info->is_stereo ? 2 : 1;
+    int base = (info->sample_rate >= 44100) ? 2048
+             : (info->sample_rate >= 22050) ? 1024
+             : 512;
+    int spf = channels * base;
+    a->samples_per_frame = spf;
+    a->samples_per_window = spf / 16;
+    a->samples_per_block = spf - a->samples_per_window;
+    a->dct_scale = (float)(2.0 / sqrt((double)spf));
+
+    /* Quantizer band edges: walk the critical-band table while the
+     * band edge is below the (interleaved) half sample rate, mapping
+     * each edge to a coefficient index, then close with spf/2. */
+    int sample_rate = channels * (int)info->sample_rate;
+    int half_rate = (sample_rate + 1) / 2;
+    int nb = 0;
+    for (int i = 0; i < BINK_AUDIO_BAND_COUNT; ++i) {
+        if (bink_audio_critical_freq[i] >= half_rate) break;
+        int idx = (spf / 2) * bink_audio_critical_freq[i] / half_rate;
+        if (idx < 1) idx = 1;
+        a->quantizer_bands[nb++] = idx;
+    }
+    a->quantizer_bands[nb++] = spf / 2;
+    a->band_count = nb - 1;     /* number of bands = edges - 1 */
+
+    a->coeffs = (float*)calloc((size_t)spf, sizeof(float));
+    a->quant_coeffs = (int16_t*)calloc((size_t)spf, sizeof(int16_t));
+    a->window = (int16_t*)calloc((size_t)a->samples_per_window, sizeof(int16_t));
+    if (!a->coeffs || !a->quant_coeffs || !a->window) return false;
+    a->is_first_decode = 1;
+    a->initialized = 1;
+    return true;
+}
+
+/* Decode the per-band 8-bit quantizer exponents for one block. */
+static void audio_read_quantizers(Bink1AudioState* a, BitReader* br)
+{
+    for (int i = 0; i < a->band_count; ++i) {
+        int exp = (int)br_read(br, 8);
+        a->quantizers[i] = (float)pow(10.0, exp * 0.066399999);
+    }
+}
+
+/* Unpack the run-length-coded quantized coefficients into
+ * a->quant_coeffs[2 .. spf). */
+static void audio_unpack_coeffs(Bink1AudioState* a, BitReader* br)
+{
+    int spf = a->samples_per_frame;
+    int i = 2;
+    while (i < spf) {
+        int end;
+        if (br_read(br, 1) == 0) {
+            end = i + 8;
+        } else {
+            end = i + 8 * kBinkAudioRunLengths[br_read(br, 4)];
+        }
+        if (end > spf) end = spf;
+
+        int bits = (int)br_read(br, 4);
+        if (bits == 0) {
+            for (; i < end; ++i) a->quant_coeffs[i] = 0;
+            continue;
+        }
+        for (; i < end; ++i) {
+            int v = (int)br_read(br, bits);
+            if (v != 0 && br_read(br, 1) != 0) v = -v;
+            a->quant_coeffs[i] = (int16_t)v;
+        }
+    }
+}
+
+/* Multiply the quantized coefficients by their band's quantizer. The
+ * two leading float coefficients (indices 0,1) are left untouched. */
+static void audio_dequantize(Bink1AudioState* a)
+{
+    int ci = 2;
+    for (int b = 0; b < a->band_count; ++b) {
+        int band_size = a->quantizer_bands[b + 1] - a->quantizer_bands[b];
+        float q = a->quantizers[b];
+        for (int i = 0; i < band_size; ++i) {
+            a->coeffs[ci] = q * a->quant_coeffs[ci]; ++ci;
+            a->coeffs[ci] = q * a->quant_coeffs[ci]; ++ci;
+        }
+    }
+}
+
+/* Triangular-window overlap-add of the freshly transformed block
+ * (now sitting in a->quant_coeffs as int16) against the previous
+ * block's saved tail, writing samples_per_block samples to out. */
+static void audio_apply_window(Bink1AudioState* a, int16_t* out)
+{
+    int spw = a->samples_per_window;
+    int spb = a->samples_per_block;
+    if (a->is_first_decode) {
+        a->is_first_decode = 0;
+        memcpy(out, a->quant_coeffs, (size_t)spb * sizeof(int16_t));
+    } else {
+        for (int i = 0; i < spw; ++i) {
+            out[i] = (int16_t)((a->quant_coeffs[i] * i
+                + a->window[i] * (spw - i)) / spw);
+        }
+        memcpy(out + spw, a->quant_coeffs + spw,
+            (size_t)(spb - spw) * sizeof(int16_t));
+    }
+    memcpy(a->window, a->quant_coeffs + spb, (size_t)spw * sizeof(int16_t));
+}
+
+/* Decode an entire audio packet (which may contain several blocks)
+ * into interleaved s16 samples. `sample_count` is the packet's
+ * declared output sample count (across all channels). Returns the
+ * number of int16 samples written. */
+static int audio_decode_packet(Bink1AudioState* a, BitReader* br,
+    uint32_t sample_count, int16_t* out, int out_capacity)
 {
     if (!a->initialized) return 0;
-    int n = a->frame_len;
-    int half = a->overlap_len;
-    int channels = a->info.is_stereo ? 2 : 1;
+    int spf = a->samples_per_frame;
+    int spb = a->samples_per_block;
+    int samples_left = (int)sample_count;
+    if (samples_left > out_capacity) samples_left = out_capacity;
+    int written = 0;
 
-    if (out_capacity < half * channels) return 0;
-
-    for (int c = 0; c < channels; ++c) {
-        memset(a->coeffs[c], 0, (size_t)n * sizeof(float));
-    }
-
-    /* Per-channel coefficient decode. */
-    for (int c = 0; c < channels; ++c) {
+    while (samples_left > 0) {
+        br_word_align(br);
         if (br_remaining(br) < 64) break;
 
-        /* Two leading 29-bit floats. */
-        a->coeffs[c][0] = audio_read_float(br);
-        a->coeffs[c][1] = audio_read_float(br);
+        memset(a->coeffs, 0, (size_t)spf * sizeof(float));
+        a->coeffs[0] = br_read_float29(br);
+        a->coeffs[1] = br_read_float29(br);
 
-        /* Per critical band: 8-bit log-scale quantizer index. */
-        float quantizers[26];
-        for (int band = 0; band < a->band_count && band < 26; ++band) {
-            int qi = (int)br_read(br, 8);
-            if (qi > 95) qi = 95;
-            /* quant = 10 ^ (qi * 0.0664) per spec. */
-            quantizers[band] = (float)pow(10.0, qi * 0.0664);
-        }
+        audio_read_quantizers(a, br);
+        audio_unpack_coeffs(a, br);
+        audio_dequantize(a);
 
-        /* Per-coefficient decode, band-by-band. Each band processes
-         * its range of FFT bins with a shared variable-length scheme:
-         *   width_idx = read 4 bits
-         *   width_bits = kBinkAudioRleLengths[width_idx]
-         *   for each bin in this batch:
-         *     magnitude = read width_bits bits
-         *     if magnitude: sign = read 1 bit
-         *     value = (sign ? -magnitude : magnitude) * quant[band]
-         *
-         * Batch sizes are not fully documented; the libavcodec
-         * implementation re-reads width_idx at band boundaries and
-         * after every batch fills. We approximate by reading one
-         * value per bin -- correctness depends on the exact wiki-
-         * unspecified batch boundary rule. */
-        int bin = 2;  /* first two bins were the leading floats */
-        for (int band = 0; band < a->band_count && bin < n / 2; ++band) {
-            int band_end = a->band_bounds[band + 1];
-            if (band_end > n / 2) band_end = n / 2;
-            float q = quantizers[band];
-            while (bin < band_end) {
-                if (br_remaining(br) < 5) goto channel_done;
-                int width_idx = (int)br_read(br, 4);
-                int width_bits = kBinkAudioRleLengths[width_idx];
-                int batch_count = 8;  /* spec-unspecified; libav uses small batches */
-                if (bin + batch_count > band_end) batch_count = band_end - bin;
-                for (int i = 0; i < batch_count; ++i) {
-                    if (br_remaining(br) < width_bits + 1) goto channel_done;
-                    uint32_t mag = br_read(br, width_bits);
-                    float v = (float)mag * q;
-                    if (mag != 0 && br_read(br, 1)) v = -v;
-                    a->coeffs[c][bin++] = v;
-                }
-            }
-        }
-        channel_done: ;
-    }
-
-    /* Inverse transform: RDFT for older streams, DCT-IV for newer
-     * streams (selected by audio_flags bit 12). Both convert the
-     * decoded coefficient buffer from frequency domain to time
-     * domain in place. The RDFT path uses a standard radix-2 DIT
-     * iterative FFT with conjugate twiddles. */
-    int is_dct = a->info.is_dct;
-    for (int c = 0; c < channels; ++c) {
-        if (!is_dct) {
-            audio_inverse_rdft(a->coeffs[c], n);
+        if (!a->info.is_dct) {
+            audio_inverse_rdft(a->coeffs, spf);
         } else {
-            audio_inverse_dct_iv(a->coeffs[c], n);
+            /* DCT-mode streams are not used by Arcanum; treat as RDFT
+             * for now so the cursor still advances correctly. */
+            audio_inverse_rdft(a->coeffs, spf);
         }
-    }
+        for (int i = 0; i < spf; ++i) {
+            a->quant_coeffs[i] = audio_clip16(a->dct_scale * a->coeffs[i]);
+        }
 
-    for (int c = 0; c < channels; ++c) {
-        float* prev = a->prev_tail[c];
-        float* cur  = a->coeffs[c];
-        for (int i = 0; i < half; ++i) {
-            /* Linear-ramp overlap-add per spec. */
-            float ramp_new = (float)i / (float)half;
-            float ramp_old = 1.0f - ramp_new;
-            float v = prev[i] * ramp_old + cur[i] * ramp_new;
-            int s = (int)v;
-            if (s < -32768) s = -32768;
-            if (s > 32767) s = 32767;
-            out[i * channels + c] = (int16_t)s;
-        }
-        /* Save current frame's tail for next overlap-add. */
-        memcpy(prev, cur + half, (size_t)half * sizeof(float));
+        int use = samples_left < spb ? samples_left : spb;
+        if (written + spb > out_capacity) break;
+        audio_apply_window(a, out + written);
+        written += use;
+        samples_left -= use;
     }
-    return half;
+    return written;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2112,15 +2098,15 @@ Bink1Decoder* bink1_decoder_open(const char* path)
                 return NULL;
             }
         }
-        /* Worst case s16le stereo per frame is the largest overlap_len
-         * any track uses, times 2 channels times 2 bytes. */
-        int max_overlap = 0;
+        /* An audio packet can hold several blocks; size the worst-case
+         * output generously at a handful of blocks' worth of samples
+         * per channel-frame so callers can pass a fixed buffer. */
+        int max_bytes = 0;
         for (int t = 0; t < d->track_count; ++t) {
-            if (d->audio_state[t].overlap_len > max_overlap) {
-                max_overlap = d->audio_state[t].overlap_len;
-            }
+            int per = d->audio_state[t].samples_per_frame * 16 * 2;
+            if (per > max_bytes) max_bytes = per;
         }
-        d->audio_bytes_per_frame = (size_t)max_overlap * 2 * 2;
+        d->audio_bytes_per_frame = (size_t)max_bytes;
     } else {
         d->audio_bytes_per_frame = 0;
     }
@@ -2138,11 +2124,9 @@ void bink1_decoder_close(Bink1Decoder* d)
     if (d->audio_state) {
         for (int t = 0; t < d->track_count; ++t) {
             Bink1AudioState* a = &d->audio_state[t];
-            int channels = a->info.is_stereo ? 2 : 1;
-            for (int c = 0; c < channels; ++c) {
-                free(a->coeffs[c]);
-                free(a->prev_tail[c]);
-            }
+            free(a->coeffs);
+            free(a->quant_coeffs);
+            free(a->window);
         }
         free(d->audio_state);
     }
@@ -2276,20 +2260,21 @@ bool bink1_decoder_decode_audio(Bink1Decoder* d,
         }
     }
 
-    /* Decode primary track only. */
+    /* Decode primary track only. A silent packet yields no samples. */
+    if (!d->audio_packets[0].data || d->audio_packets[0].size == 0) {
+        *out_bytes = 0;
+        return true;
+    }
+
     BitReader br;
     br_init(&br, d->audio_packets[0].data, d->audio_packets[0].size);
 
     Bink1AudioState* a = &d->audio_state[0];
-    int channels = a->info.is_stereo ? 2 : 1;
-    size_t needed = (size_t)a->overlap_len * (size_t)channels * sizeof(int16_t);
-    if (dst_capacity < needed) {
-        *out_bytes = 0;
-        return false;
-    }
-
-    int samples = audio_decode_frame(a, &br, (int16_t*)dst, (int)(dst_capacity / sizeof(int16_t)));
-    *out_bytes = (size_t)samples * (size_t)channels * sizeof(int16_t);
+    int cap_samples = (int)(dst_capacity / sizeof(int16_t));
+    int samples = audio_decode_packet(a, &br,
+        d->audio_packets[0].sample_count, (int16_t*)dst, cap_samples);
+    /* `samples` is already the interleaved (all-channel) count. */
+    *out_bytes = (size_t)samples * sizeof(int16_t);
     return true;
 }
 
@@ -2326,15 +2311,13 @@ bool bink1_decoder_rewind(Bink1Decoder* d)
         }
     }
     d->cur_plane_set = 0;
-    /* Reset audio overlap tails to silence. */
+    /* Reset audio overlap state to silence. */
     for (int t = 0; t < d->track_count; ++t) {
         Bink1AudioState* a = &d->audio_state[t];
-        int channels = a->info.is_stereo ? 2 : 1;
-        for (int c = 0; c < channels; ++c) {
-            if (a->prev_tail[c]) {
-                memset(a->prev_tail[c], 0,
-                    (size_t)a->overlap_len * sizeof(float));
-            }
+        a->is_first_decode = 1;
+        if (a->window) {
+            memset(a->window, 0,
+                (size_t)a->samples_per_window * sizeof(int16_t));
         }
     }
     return true;

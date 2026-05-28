@@ -54,6 +54,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* Audio dump mode: decode audio for `want_frames` frames into
+     * /tmp/my_audio.pcm (interleaved s16). */
+    FILE* apcm = getenv("DUMP_AUDIO") ? fopen("/tmp/my_audio.pcm", "wb") : NULL;
+    size_t max_audio = bink1_decoder_max_audio_bytes(d);
+    uint8_t* abuf = max_audio ? (uint8_t*)malloc(max_audio) : NULL;
+
     int decoded = 0;
     int max = want_frames > (int)info.frame_count ? (int)info.frame_count
                                                   : want_frames;
@@ -82,9 +88,17 @@ int main(int argc, char** argv)
                 printf("dumped frame %d to /tmp/bink1_frame.ppm\n", i);
             }
         }
+        if (apcm && abuf) {
+            size_t ab = 0;
+            if (bink1_decoder_decode_audio(d, abuf, max_audio, &ab) && ab) {
+                fwrite(abuf, 1, ab, apcm);
+            }
+        }
         if (!bink1_decoder_next_frame(d)) break;
     }
     printf("decoded %d frames cleanly\n", decoded);
+    if (apcm) { fclose(apcm); printf("dumped audio to /tmp/my_audio.pcm\n"); }
+    free(abuf);
 
     /* Sample a few pixels of the last frame to see what's in there. */
     size_t total = (size_t)dst_pitch * info.height;
