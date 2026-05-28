@@ -676,11 +676,16 @@ static void bink1_rewind(Bink1Backend* b)
  * Off by default until the video bundle layer + DCT are fully wired
  * up; until then, even files that decode-open successfully will play
  * back as black frames. */
+/* The from-scratch native Bink1 decoder is the default video path.
+ * Set ARCANUM_BINK_DIRECT=0 (or n/f) to force the legacy MJPEG/AVI
+ * sidecar path instead -- useful for A/B comparison or if a specific
+ * .bik exposes a decoder bug. */
 static bool bink1_path_enabled(void)
 {
     const char* v = getenv("ARCANUM_BINK_DIRECT");
-    if (!v || !*v) return false;
-    return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
+    if (!v || !*v) return true;
+    return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N'
+        || v[0] == 'f' || v[0] == 'F');
 }
 
 bool bink_compat_native_bink_enabled(void)
@@ -764,12 +769,10 @@ HBINK BINKCALL BinkOpen(const char* name, unsigned flags)
     }
     if (!name) return NULL;
 
-    /* Opt-in v2 path: ARCANUM_BINK_DIRECT=1 enables the from-scratch
-     * Bink1 decoder for .bik files. Off by default while the video
-     * bundle decoder is still WIP -- when enabled it will currently
-     * play .bik streams as black-frame placeholders with audio
-     * silence (container/demux works, but block reconstruction is
-     * not wired up yet). The AVI/MJPEG path remains primary.  */
+    /* Default path: the from-scratch native Bink1 decoder handles .bik
+     * files directly (video + RDFT audio). If it can't open the file
+     * (e.g. a Bink2 stream, or ARCANUM_BINK_DIRECT=0), we fall through
+     * to the AVI/MJPEG sidecar below. */
     if (bink1_path_enabled()) {
         size_t nlen = strlen(name);
         bool looks_bik = nlen >= 4
