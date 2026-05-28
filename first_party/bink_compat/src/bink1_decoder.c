@@ -917,6 +917,11 @@ static int audio_decode_packet(Bink1AudioState* a, BitReader* br,
     uint32_t sample_count, int16_t* out, int out_capacity)
 {
     if (!a->initialized) return 0;
+    /* DCT-mode Bink Audio (binkaudio_dct, newer RAD encodes) is not
+     * implemented yet. Emit clean silence rather than running the RDFT
+     * transform on DCT-coded data, which would decode to noise. Video
+     * is unaffected. */
+    if (a->info.is_dct) return 0;
     int spf = a->samples_per_frame;
     int spb = a->samples_per_block;
     int samples_left = (int)sample_count;
@@ -935,13 +940,7 @@ static int audio_decode_packet(Bink1AudioState* a, BitReader* br,
         audio_unpack_coeffs(a, br);
         audio_dequantize(a);
 
-        if (!a->info.is_dct) {
-            audio_inverse_rdft(a->coeffs, spf);
-        } else {
-            /* DCT-mode streams are not used by Arcanum; treat as RDFT
-             * for now so the cursor still advances correctly. */
-            audio_inverse_rdft(a->coeffs, spf);
-        }
+        audio_inverse_rdft(a->coeffs, spf);
         for (int i = 0; i < spf; ++i) {
             a->quant_coeffs[i] = audio_clip16(a->dct_scale * a->coeffs[i]);
         }
