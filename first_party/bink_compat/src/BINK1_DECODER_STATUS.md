@@ -2,27 +2,42 @@
 
 ## Summary
 
-The Bink1 decoder is **functionally complete**: video and audio both
-decode correctly, verified against a reference decoder. A stock
-Arcanum install plays its `.bik` cutscenes directly through this path
-with no FFmpeg dependency and no pre-conversion step.
+The Bink1 decoder is the **default** video path: a stock Arcanum
+install plays its `.bik` cutscenes (and custom `.bik` replacements)
+directly, with no FFmpeg dependency and no pre-conversion step. Video
+and RDFT-mode audio are complete and verified against reference
+decoders; DCT-mode audio (newer RAD encodes) is the one remaining
+piece, in progress.
+
+Set `ARCANUM_BINK_DIRECT=0` to force the legacy MJPEG/AVI sidecar
+path instead (A/B comparison, or to dodge a decoder bug on a
+specific file).
 
 ## Verification
 
-The decoder was validated bit-for-bit against
+The decoder was validated against
 [Helco/bonkdec](https://github.com/Helco/bonkdec) (an MIT-licensed
-clean-room Bink1 decoder) built locally and run on Arcanum's own
-cutscene files:
+clean-room Bink1 decoder) and FFmpeg, both run locally on Arcanum's
+own cutscene files plus fresh RAD Video Tools encodes (1080p):
 
-- **Video luma plane**: byte-identical to bonkdec on frame 0 of the
-  test cutscenes.
-- **Video full color**: visually identical to FFmpeg's `binkdec` on
-  both keyframes and motion-compensated INTER frames (the engine and
-  movie content render the same).
-- **Audio**: 100% of decoded samples match bonkdec within ±1 LSB
-  (the only difference is floating-point rounding between our
-  radix-2 FFT and bonkdec's Ooura split-radix FFT), and every frame
-  stays sample-aligned.
+- **Video luma plane**: byte-identical to bonkdec.
+- **Video full color (RGB)**: matches FFmpeg within ±1 LSB across the
+  frame (mean abs diff ~0.04), including correct true-black letterbox
+  bars — see the colour-range note below.
+- **RDFT audio**: 100% of decoded samples match bonkdec within ±1 LSB
+  (float rounding between our radix-2 FFT and bonkdec's Ooura
+  split-radix FFT), and every frame stays sample-aligned.
+- **DCT audio**: in progress; being verified against FFmpeg's
+  decoded PCM as the oracle.
+
+### Colour range
+
+Bink stores luma/chroma in limited (studio) range — black is Y=16,
+white Y=235. The composer applies the standard integer BT.601
+limited→full-range conversion (298/256 luma gain with the -16 luma
+and -128 chroma offsets), so blacks land at RGB 0 and the output
+matches FFmpeg. (An earlier full-range matrix lifted blacks to a
+grey 16.)
 
 ## What works
 
@@ -73,9 +88,11 @@ cutscene files:
 
 ## Known limitations / follow-ups
 
-- **DCT-mode audio** (`is_dct` track flag) falls back to the RDFT
-  path. Arcanum's cutscenes are all RDFT, so this is untested; a
-  DCT-IV transform would be needed for newer Bink Audio streams.
+- **DCT-mode audio** (`is_dct` track flag, `binkaudio_dct`): in
+  progress. Arcanum's original cutscenes are all RDFT, but the modern
+  RAD Video Tools encoder emits DCT-mode audio, so custom RAD-encoded
+  cutscenes need this. Video plays regardless; only that audio track
+  is affected until the DCT path lands.
 - **Alpha plane** (BIK streams with `has_alpha`) is not decoded.
   Arcanum's cutscenes have no alpha.
 - **Half-pel motion compensation** is integer-pel only. The
@@ -89,18 +106,16 @@ cutscene files:
 ## How to test
 
 ```bash
-# Build:
+# Build the game (native Bink is the default video path):
 cmake --build --preset macos-release
+~/Applications/Arcanum/<branch>.app/Contents/MacOS/arcanum-ce
+# (set ARCANUM_BINK_DIRECT=0 to force the legacy MJPEG/AVI path)
 
-# Run with the direct-Bink path enabled:
-ARCANUM_BINK_DIRECT=1 ~/Applications/Arcanum/<branch>.app/Contents/MacOS/arcanum-ce
-
-# Standalone decode test (dumps a PPM frame + optional PCM audio):
-clang -O2 -I include -I src test/test_bink1.c src/bink1_decoder.c \
-    src/bink1_tables.c -o /tmp/test_bink1 -lm
-/tmp/test_bink1 path/to/movie.bik 60         # decodes 60 frames, dumps frame 59
-DUMP_AUDIO=1 /tmp/test_bink1 path/to/movie.bik 60   # also dumps /tmp/my_audio.pcm
+# Standalone decode verification tool (EXCLUDE_FROM_ALL CMake target):
+cmake --build --preset macos-release --target bink1_verify
+BV=out/build/macos/first_party/bink_compat/Release/bink1_verify
+"$BV" path/to/movie.bik 60                       # PASS/PARTIAL verdict
+BINK_VERIFY_PPM=/tmp/f.ppm "$BV" movie.bik 60     # dump last frame (PPM)
+BINK_VERIFY_PCM=/tmp/a.pcm "$BV" movie.bik 60     # dump audio (s16 PCM)
+# It also detects Bink2 (KB2) files and tells you to re-encode as Bink 1.
 ```
-
-With `ARCANUM_BINK_DIRECT` unset, playback falls through to the
-AVI/MJPEG path as before.
