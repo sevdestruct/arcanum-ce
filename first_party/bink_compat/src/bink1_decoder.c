@@ -1220,25 +1220,187 @@ static int bundle_refill_generic(Bundle* b, BitReader* br)
     return bundle_refill_4bit_rle(b, br, 0);
 }
 
+/* Read one 4-bit signed motion vector value with an optional sign
+ * bit (only present when the magnitude nibble is non-zero). Used
+ * by X_OFF / Y_OFF bundles. Returns the signed value (-15..15). */
+static int bundle_refill_motion(Bundle* b, BitReader* br)
+{
+    if (b->read_pos < b->write_pos) {
+        return (int)(b->write_pos - b->read_pos);
+    }
+    if (b->remaining <= 0) return 0;
+    int runsize = b->runsize > 0 ? b->runsize : 4;
+    int t = (int)br_read(br, runsize);
+    if (t <= 0) return 0;
+    if (t > b->remaining) t = b->remaining;
+    int constant_flag = (int)br_read(br, 1);
+    if (constant_flag) {
+        int magnitude = (int)br_read(br, 4);
+        int sign = 0;
+        if (magnitude != 0) sign = (int)br_read(br, 1);
+        int signed_value = sign ? -magnitude : magnitude;
+        /* Store as 8-bit two's complement so the byte buffer reads
+         * pop the right value. */
+        uint8_t v = (uint8_t)(signed_value & 0xFF);
+        if (!bundle_ensure_capacity(b, b->write_pos + (size_t)t)) return 0;
+        for (int i = 0; i < t; ++i) b->entries[b->write_pos++] = v;
+    } else {
+        for (int i = 0; i < t; ++i) {
+            int magnitude = bink_huff_read_sym(br, &b->tree);
+            int sign = 0;
+            if (magnitude != 0) sign = (int)br_read(br, 1);
+            int signed_value = sign ? -magnitude : magnitude;
+            bundle_push_byte(b, (uint8_t)(signed_value & 0xFF));
+        }
+    }
+    b->remaining -= t;
+    return (int)(b->write_pos - b->read_pos);
+}
+
+/* Decode an INTRA_DC or INTER_DC bundle chunk. These are NOT
+ * Huffman-coded; the wiki gives the exact bit layout:
+ *
+ *   t = getbits(runsize)                  // entries in this chunk
+ *   if !t: bundle has no more entries
+ *   start = getbits(startsize)            // 11 for INTRA, 10 for INTER
+ *   start = sign-magnitude (LSB sign)
+ *   emit(start)
+ *   for chunks of <= 8 deltas:
+ *       t2 = getbits(4)                   // delta bit-width 0..15
+ *       if t2:
+ *           for j in min(t, 8):
+ *               v = getbits(t2)
+ *               if v && getbit(): v = -v
+ *               start += v
+ *               emit(start)
+ *
+ * Values are written into b->values[] (int16_t). The byte mirror
+ * b->entries[] receives clamped 8-bit copies so existing byte-pop
+ * paths still work for non-INTRA / non-INTER block dispatch. */
+static int bundle_refill_dc(Bundle* b, BitReader* br, int startsize)
+{
+    if (b->read_pos < b->write_pos) {
+        return (int)(b->write_pos - b->read_pos);
+    }
+    if (b->remaining <= 0) return 0;
+    int runsize = b->runsize > 0 ? b->runsize : 8;
+    int t = (int)br_read(br, runsize);
+    if (t <= 0) return 0;
+    if (t > b->remaining) t = b->remaining;
+
+    /* Start value: sign-magnitude in LSB. */
+    int start_raw = (int)br_read(br, startsize);
+    int start = (start_raw & 1) ? -(start_raw >> 1) : (start_raw >> 1);
+
+    /* Lazy-allocate the int16 mirror. */
+    if (!b->values) {
+        b->values = (int16_t*)calloc(b->capacity ? b->capacity : 256,
+            sizeof(int16_t));
+        if (!b->values) return 0;
+    }
+
+    /* Emit the start value (always 1 entry). */
+    if (!bundle_ensure_capacity(b, b->write_pos + 1)) return 0;
+    b->values[b->write_pos] = (int16_t)start;
+    int clamped = start < -128 ? -128 : (start > 127 ? 127 : start);
+    b->entries[b->write_pos++] = (uint8_t)(clamped & 0xFF);
+
+    int produced = 1;
+    while (produced < t) {
+        int t2 = (int)br_read(br, 4);
+        if (t2 == 0) {
+            /* Zero-delta run: emit `min(t-produced, 8)` copies of
+             * the current `start` (the wiki shows `*dst++=t` but
+             * that's widely believed to be a wiki typo for start). */
+            int run = t - produced;
+            if (run > 8) run = 8;
+            if (!bundle_ensure_capacity(b, b->write_pos + (size_t)run))
+                break;
+            for (int j = 0; j < run; ++j) {
+                b->values[b->write_pos] = (int16_t)start;
+                int c = start < -128 ? -128 : (start > 127 ? 127 : start);
+                b->entries[b->write_pos++] = (uint8_t)(c & 0xFF);
+            }
+            produced += run;
+        } else {
+            int chunk_size = t - produced;
+            if (chunk_size > 8) chunk_size = 8;
+            for (int j = 0; j < chunk_size; ++j) {
+                int v = (int)br_read(br, t2);
+                if (v != 0 && br_read(br, 1)) v = -v;
+                start += v;
+                if (!bundle_ensure_capacity(b, b->write_pos + 1)) break;
+                b->values[b->write_pos] = (int16_t)start;
+                int c = start < -128 ? -128 : (start > 127 ? 127 : start);
+                b->entries[b->write_pos++] = (uint8_t)(c & 0xFF);
+            }
+            produced += chunk_size;
+        }
+    }
+    b->remaining -= produced;
+    return (int)(b->write_pos - b->read_pos);
+}
+
 /* Pop one byte-valued entry from `b`, choosing the correct refill
- * strategy based on the bundle's id. `do_rle` is true for the two
- * bundles that use 4-bit-RLE expansion (BLOCK_TYPES, SUB_BLOCK_TYPES).
- * Returns 0 if the bundle has no entries to pop (end-of-bundle). */
+ * strategy based on the bundle's id. Returns 0 (== BINK_BLOCK_SKIP)
+ * if the bundle has no entries to pop (end-of-bundle), which is a
+ * fail-safe for desynced streams. */
 static int bundle_pop(Bundle* b, BitReader* br, int bundle_id)
 {
     if (b->read_pos >= b->write_pos) {
         int n;
-        if (bundle_id == BINK_SRC_BLOCK_TYPES
-            || bundle_id == BINK_SRC_SUB_BLOCK_TYPES) {
+        switch (bundle_id) {
+        case BINK_SRC_BLOCK_TYPES:
+        case BINK_SRC_SUB_BLOCK_TYPES:
             n = bundle_refill_4bit_rle(b, br, 1);
-        } else if (bundle_id == BINK_SRC_COLORS) {
+            break;
+        case BINK_SRC_COLORS:
             n = bundle_refill_colors(b, br);
-        } else {
+            break;
+        case BINK_SRC_X_OFF:
+        case BINK_SRC_Y_OFF:
+            n = bundle_refill_motion(b, br);
+            break;
+        case BINK_SRC_INTRA_DC:
+            n = bundle_refill_dc(b, br, 11);
+            break;
+        case BINK_SRC_INTER_DC:
+            n = bundle_refill_dc(b, br, 10);
+            break;
+        default:
             n = bundle_refill_generic(b, br);
+            break;
         }
         if (n <= 0) return 0;
     }
     return b->entries[b->read_pos++];
+}
+
+/* Pop one signed int16 value (for DC bundles). Returns 0 on
+ * end-of-bundle. */
+static int bundle_pop_signed(Bundle* b, BitReader* br, int bundle_id)
+{
+    if (b->read_pos >= b->write_pos) {
+        int n;
+        if (bundle_id == BINK_SRC_INTRA_DC) {
+            n = bundle_refill_dc(b, br, 11);
+        } else if (bundle_id == BINK_SRC_INTER_DC) {
+            n = bundle_refill_dc(b, br, 10);
+        } else {
+            n = bundle_refill_motion(b, br);
+        }
+        if (n <= 0) return 0;
+    }
+    int v;
+    if (b->values) {
+        v = b->values[b->read_pos];
+    } else {
+        /* Sign-extend byte. */
+        int8_t bv = (int8_t)b->entries[b->read_pos];
+        v = bv;
+    }
+    b->read_pos++;
+    return v;
 }
 
 /* Legacy alias for transitions. */
@@ -1343,18 +1505,15 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
                 break;
             }
             case BINK_BLOCK_MOTION: {
-                int mx = bundle_pop(
+                /* X_OFF / Y_OFF deliver signed values directly via
+                 * bundle_pop_signed (the per-value sign bit is
+                 * already applied during refill). */
+                int mx = bundle_pop_signed(
                     &plane->bundles[BINK_SRC_X_OFF], br,
                     BINK_SRC_X_OFF);
-                int my = bundle_pop(
+                int my = bundle_pop_signed(
                     &plane->bundles[BINK_SRC_Y_OFF], br,
                     BINK_SRC_Y_OFF);
-                /* X_OFF / Y_OFF values are 4-bit signed magnitude
-                 * (the spec describes an extra sign bit per value
-                 * which we don't yet decode -- conservatively
-                 * interpret the byte as signed range -8..7). */
-                if (mx >= 8) mx -= 16;
-                if (my >= 8) my -= 16;
                 decode_block_motion(plane, bx, by, mx, my);
                 break;
             }
