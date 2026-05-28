@@ -1835,8 +1835,12 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
         memset(plane->dst + y * plane->stride, 0xFF, W);
     }
 
+    int block_hist[16] = { 0 };
+    long block_bits[16] = { 0 };
+
     /* Phase 2: per 8-row strip, fill all bundles then walk blocks. */
     for (int y = 0; y < H; y += 8) {
+        size_t pos_pre = br->pos_bits;
         bundle_fill_4bit_rle(&plane->bundles[BINK_SRC_BLOCK_TYPES], br);
         bundle_fill_4bit_rle(&plane->bundles[BINK_SRC_SUB_BLOCK_TYPES], br);
         bundle_fill_8bit(&plane->bundles[BINK_SRC_COLORS], br);
@@ -1845,12 +1849,30 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
         bundle_fill_4bit_signed(&plane->bundles[BINK_SRC_Y_OFF], br);
         bundle_fill_16bit(&plane->bundles[BINK_SRC_INTRA_DC], br);
         bundle_fill_16bit(&plane->bundles[BINK_SRC_INTER_DC], br);
+        size_t pos_post = br->pos_bits;
+        if (bink_trace_check() && g_bink_trace_frame < BINK_TRACE_FRAME_LIMIT
+                && (pos_post - pos_pre) > 0) {
+            BINK_TRACE_DETAIL("    strip y=%d: fill consumed %zu bits, "
+                "lens: BT=%d SB=%d C=%d P=%d X=%d Y=%d IDC=%d INC=%d PL=%d\n",
+                y, pos_post - pos_pre,
+                plane->bundles[BINK_SRC_BLOCK_TYPES].length,
+                plane->bundles[BINK_SRC_SUB_BLOCK_TYPES].length,
+                plane->bundles[BINK_SRC_COLORS].length,
+                plane->bundles[BINK_SRC_PATTERN].length,
+                plane->bundles[BINK_SRC_X_OFF].length,
+                plane->bundles[BINK_SRC_Y_OFF].length,
+                plane->bundles[BINK_SRC_INTRA_DC].length,
+                plane->bundles[BINK_SRC_INTER_DC].length,
+                plane->bundles[BINK_SRC_PATTERN_LENGTHS].length);
+        }
         bundle_fill_4bit_unsigned(&plane->bundles[BINK_SRC_PATTERN_LENGTHS], br);
 
         int by = y / 8;
         for (int x = 0; x < W; x += 8) {
             int bx = x / 8;
+            size_t block_pre = br->pos_bits;
             int btype = bundle_next(&plane->bundles[BINK_SRC_BLOCK_TYPES]);
+            if (btype >= 0 && btype < 16) block_hist[btype]++;
             switch (btype) {
             case BINK_BLOCK_SKIP:
                 decode_block_skip_at(plane, bx, by);
@@ -1913,10 +1935,52 @@ static bool decode_plane(BinkPlane* plane, BitReader* br)
                 decode_block_skip_at(plane, bx, by);
                 break;
             }
+            if (btype >= 0 && btype < 16) {
+                block_bits[btype] += (long)(br->pos_bits - block_pre);
+            }
         }
     }
 
     br_word_align(br);
+
+    if (bink_trace_check() && g_bink_trace_frame < BINK_TRACE_FRAME_LIMIT) {
+        /* Tally plane non-default content + a tiny histogram of values. */
+        int nonffff = 0;
+        long sum = 0;
+        int n = W * H;
+        for (int y = 0; y < H; ++y) {
+            const uint8_t* row = plane->dst + y * plane->stride;
+            for (int x = 0; x < W; ++x) {
+                if (row[x] != 0xFF) ++nonffff;
+                sum += row[x];
+            }
+        }
+        BINK_TRACE_DETAIL("  plane %dx%d: %d non-0xFF bytes, avg=%ld, br bits left=%zu\n",
+            W, H, nonffff, n ? sum / n : 0,
+            br->total_bits > br->pos_bits ? br->total_bits - br->pos_bits : 0);
+        BINK_TRACE_DETAIL("    blocks: SKIP=%d SCALED=%d MOTION=%d RUN=%d "
+            "RESIDUE=%d INTRA=%d FILL=%d INTER=%d PATTERN=%d RAW=%d "
+            "(invalid=%d)\n",
+            block_hist[BINK_BLOCK_SKIP], block_hist[BINK_BLOCK_SCALED],
+            block_hist[BINK_BLOCK_MOTION], block_hist[BINK_BLOCK_RUN],
+            block_hist[BINK_BLOCK_RESIDUE], block_hist[BINK_BLOCK_INTRA],
+            block_hist[BINK_BLOCK_FILL], block_hist[BINK_BLOCK_INTER],
+            block_hist[BINK_BLOCK_PATTERN], block_hist[BINK_BLOCK_RAW],
+            block_hist[10] + block_hist[11] + block_hist[12]
+            + block_hist[13] + block_hist[14] + block_hist[15]);
+        BINK_TRACE_DETAIL("    bits/block: SCALED=%ld RUN=%ld RES=%ld INTRA=%ld "
+            "INTER=%ld\n",
+            block_hist[BINK_BLOCK_SCALED] ? block_bits[BINK_BLOCK_SCALED]
+                / block_hist[BINK_BLOCK_SCALED] : 0,
+            block_hist[BINK_BLOCK_RUN] ? block_bits[BINK_BLOCK_RUN]
+                / block_hist[BINK_BLOCK_RUN] : 0,
+            block_hist[BINK_BLOCK_RESIDUE] ? block_bits[BINK_BLOCK_RESIDUE]
+                / block_hist[BINK_BLOCK_RESIDUE] : 0,
+            block_hist[BINK_BLOCK_INTRA] ? block_bits[BINK_BLOCK_INTRA]
+                / block_hist[BINK_BLOCK_INTRA] : 0,
+            block_hist[BINK_BLOCK_INTER] ? block_bits[BINK_BLOCK_INTER]
+                / block_hist[BINK_BLOCK_INTER] : 0);
+    }
     return true;
 }
 
@@ -2119,14 +2183,18 @@ bool bink1_decoder_decode_video(Bink1Decoder* d,
      * Huffman/bundle reader starts at the right bit offset. */
     bool has_plane_size_prefix = (d->info.video_version >= 'i');
 
+    size_t luma_end_bit = 0;
     for (int p = 0; p < BINK1_MAX_PLANES; ++p) {
         if (has_plane_size_prefix && p == 0) {
-            /* Skip the 32-bit luma plane size. (Alpha plane has the
-             * same prefix when present; we don't yet decode alpha,
-             * which has has_alpha=true streams.) */
+            /* Read the 32-bit luma plane size and use it to bound the
+             * Y plane decode -- the chroma planes start exactly that
+             * many bytes after the prefix, regardless of how many bits
+             * our block walk consumes. */
             br_byte_align(&br);
             uint32_t plane_size_bytes = br_read(&br, 32);
-            (void)plane_size_bytes;
+            luma_end_bit = br.pos_bits + (size_t)plane_size_bytes * 8;
+            BINK_TRACE_DETAIL("  luma plane size prefix: %u bytes, "
+                "ends at bit %zu\n", plane_size_bytes, luma_end_bit);
         }
         BinkPlane plane;
         memset(&plane, 0, sizeof(plane));
@@ -2141,6 +2209,19 @@ bool bink1_decoder_decode_video(Bink1Decoder* d,
 
         bool ok = decode_plane(&plane, &br);
         if (!ok) return false;
+        /* After the luma plane, force-seek to the byte-aligned end of
+         * the luma plane as given by the prefix. This guarantees the
+         * chroma planes start at the right bit offset even if the
+         * luma walker over- or under-read. */
+        if (has_plane_size_prefix && p == 0 && luma_end_bit > 0) {
+            if (br.pos_bits != luma_end_bit) {
+                BINK_TRACE_DETAIL("  luma over/under-read by %ld bits, "
+                    "seeking to %zu\n",
+                    (long)br.pos_bits - (long)luma_end_bit, luma_end_bit);
+            }
+            br.pos_bits = luma_end_bit;
+            if (br.pos_bits > br.total_bits) br.pos_bits = br.total_bits;
+        }
     }
 
     /* Sanity histogram of output plane pixels for the first few frames
