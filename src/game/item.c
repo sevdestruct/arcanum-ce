@@ -755,8 +755,8 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     }
     gv_art_fliph("i_gold100fH", gold_aid);
 
-    // i_gold250: SPEC 32x64 = i_coins00 slice (0,4) 46x27 flip_h off(-5,-3)
-    // + i_gold100 off(5,0). NOTE: 32-wide canvas clips the wider parts (flag).
+    // i_gold250: 64x32 = i_coins00 slice (0,4) 46x27 flip_h off(-5,-3)
+    // + i_gold100 off(5,0).
     if (!item_gold_define_override("i_gold250")) {
         memset(l, 0, sizeof(l));
         if (have_coins) {
@@ -765,10 +765,10 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
             l[0].flip_x = true; l[0].off_x = -5; l[0].off_y = -3;
             l[1].src_sprite = "i_gold100";
             l[1].off_x = 5; l[1].off_y = 0;
-            ce_sprite_define("i_gold250", 32, 64, l, 2);
+            ce_sprite_define("i_gold250", 64, 32, l, 2);
         } else {
             l[0].src_sprite = "i_gold100";
-            ce_sprite_define("i_gold250", 32, 64, l, 1);
+            ce_sprite_define("i_gold250", 64, 32, l, 1);
         }
     }
     gv_fliph("i_gold250fH", "i_gold250");
