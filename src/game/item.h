@@ -59,6 +59,9 @@ int item_adjust_magic(int64_t item_obj, int64_t owner_obj, int value);
 int sub_461620(int64_t item_obj, int64_t owner_obj, int64_t a3);
 int item_aptitude_crit_failure_chance(int64_t item_obj, int64_t owner_obj);
 void item_inv_icon_size(int64_t item_id, int* width, int* height);
+// CE: quantity-based gold variant sprite name (NULL if not gold / not built);
+// optionally returns its inventory cell footprint.
+const char* item_gold_inv_variant(int64_t item_id, int* cells_w, int* cells_h);
 bool item_transfer(int64_t item_obj, int64_t critter_obj);
 bool item_transfer_ex(int64_t item_obj, int64_t critter_obj, int inventory_location);
 bool item_drop(int64_t item_obj);

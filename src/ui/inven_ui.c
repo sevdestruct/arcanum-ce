@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "game/ai.h"
+#include "game/ce_sprite.h"
 #include "game/critter.h"
 #include "game/dialog.h"
 #include "game/gamelib.h"
@@ -2963,6 +2964,28 @@ bool redraw_inven_fix_bad_inven(int64_t a1, int64_t a2)
     return false;
 }
 
+// CE: if `item_obj` is a gold pile with a quantity-based variant sprite, draw it
+// centered in its cell footprint (footprint_w/h = cells*32) and return true so
+// the caller skips the normal icon blit. Gives 1 / 2 / 4-slot coin piles that
+// match the slot count item_inv_icon_size now reports for gold.
+static bool inven_ui_draw_gold_variant(int64_t item_obj, int cell_x, int cell_y,
+    int footprint_w, int footprint_h)
+{
+    const char* name;
+    int sw;
+    int sh;
+
+    name = item_gold_inv_variant(item_obj, NULL, NULL);
+    if (name == NULL) {
+        return false;
+    }
+    ce_sprite_size(name, &sw, &sh);
+    ce_sprite_draw(inven_ui_window_handle, name,
+        cell_x + (footprint_w - sw) / 2,
+        cell_y + (footprint_h - sh) / 2, 255);
+    return true;
+}
+
 // 0x576520
 void redraw_inven(bool a1)
 {
@@ -3528,6 +3551,11 @@ void redraw_inven(bool a1)
                     0);
             }
 
+            // CE: gold draws as a quantity-variant sprite (sized to its slots).
+            if (inven_ui_draw_gold_variant(item_obj, x, y, width, height)) {
+                continue;
+            }
+
             art_blit_info.art_id = obj_field_int32_get(item_obj, OBJ_F_ITEM_INV_AID);
             if (tig_art_item_id_destroyed_get(obj_field_int32_get(item_obj, OBJ_F_CURRENT_AID)) != 0) {
                 art_blit_info.art_id = tig_art_item_id_destroyed_set(art_blit_info.art_id, 0);
@@ -3766,6 +3794,21 @@ void redraw_inven(bool a1)
                 y = v102 + 32 * (inventory_location / 10 - dword_681508);
 
                 if (y < v109 + v102) {
+                    // CE: gold draws as its quantity-variant sprite (sized to
+                    // its slots) when the whole footprint fits the visible band;
+                    // otherwise fall through to the normal (clipped) blit.
+                    {
+                        int gcw;
+                        int gch;
+                        if (obj_field_int32_get(item_obj, OBJ_F_TYPE) == OBJ_TYPE_GOLD
+                            && item_gold_inv_variant(item_obj, &gcw, &gch) != NULL
+                            && y >= v102 && y + gch * 32 <= v102 + v109) {
+                            inven_ui_draw_gold_variant(item_obj, x, y,
+                                gcw * 32, gch * 32);
+                            continue;
+                        }
+                    }
+
                     art_blit_info.art_id = obj_field_int32_get(item_obj, OBJ_F_ITEM_INV_AID);
                     if (tig_art_item_id_destroyed_get(obj_field_int32_get(item_obj, OBJ_F_CURRENT_AID))) {
                         art_blit_info.art_id = tig_art_item_id_destroyed_set(art_blit_info.art_id, 0);

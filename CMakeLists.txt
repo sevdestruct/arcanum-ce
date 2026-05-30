@@ -50,6 +50,8 @@ set(SRCS
     "src/game/camera_follow.h"
     "src/game/camera_tween.c"
     "src/game/camera_tween.h"
+    "src/game/ce_sprite.c"
+    "src/game/ce_sprite.h"
     "src/game/ci.c"
     "src/game/ci.h"
     "src/game/combat.c"

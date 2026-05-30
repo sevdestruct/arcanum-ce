@@ -2,6 +2,7 @@
 
 #include "game/anim.h"
 #include "game/background.h"
+#include "game/ce_sprite.h"
 #include "game/critter.h"
 #include "game/description.h"
 #include "game/descriptions.h"
@@ -574,10 +575,121 @@ int item_aptitude_crit_failure_chance(int64_t item_obj, int64_t owner_obj)
 }
 
 // 0x461780
+// CE: quantity-based gold inventory variants. Slot footprint follows the icon's
+// pixel size (see item_inv_icon_size below), so picking a variant sprite of the
+// right size yields 1 / 2 / 4-slot coin piles by amount. The variants are built
+// once from the live `i_gold` art (sliced / recomposed) via the ce_sprite
+// registry — no derived art is shipped. (i_gold250 / i_gold500 are placeholders
+// at the correct footprint until the i_coins00 composite source is wired.)
+static bool item_gold_variants_built;
+
+static void item_gold_build_variants(tig_art_id_t gold_aid)
+{
+    TigArtFrameData afd;
+    CeSpriteLayer l[3];
+
+    if (item_gold_variants_built) {
+        return;
+    }
+    if (tig_art_frame_data(gold_aid, &afd) != TIG_OK) {
+        return; // art not ready yet — retry on a later call
+    }
+
+    // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (0,0) 15x21.
+    memset(l, 0, sizeof(l));
+    l[0].src_art = gold_aid;
+    l[0].sw = 15;
+    l[0].sh = 21;
+    ce_sprite_define("i_gold1", 15, 21, l, 1);
+
+    // i_gold50 = i_gold slice (0,0) 30x32 (1 slot).
+    memset(l, 0, sizeof(l));
+    l[0].src_art = gold_aid;
+    l[0].sw = 30;
+    l[0].sh = 32;
+    ce_sprite_define("i_gold50", 30, 32, l, 1);
+
+    // i_gold100 = the original gold pile, as-is (2 slots, 2x1).
+    memset(l, 0, sizeof(l));
+    l[0].src_art = gold_aid;
+    ce_sprite_define("i_gold100", afd.width, afd.height, l, 1);
+
+    // i_gold250: 64x32 (2 slots). TODO: prepend i_coins00 slice (0,4) 46x27,
+    // flipped_h, off (-8,-3). Placeholder = the gold pile centered.
+    memset(l, 0, sizeof(l));
+    l[0].src_sprite = "i_gold100";
+    ce_sprite_define("i_gold250", 64, 32, l, 1);
+
+    // i_gold500: 64x64 (4 slots). TODO: prepend i_coins00 slice (0,4) 46x31,
+    // flipped_h, off (-2,-14), then i_gold250 + i_gold100. Placeholder for now.
+    memset(l, 0, sizeof(l));
+    l[0].src_sprite = "i_gold100";
+    ce_sprite_define("i_gold500", 64, 64, l, 1);
+
+    item_gold_variants_built = true;
+}
+
+// For a gold pile, return the variant sprite name for its amount (building the
+// variants on first use), and optionally its cell footprint. NULL if `item_id`
+// isn't gold or the variants aren't built yet (caller falls back to vanilla art).
+const char* item_gold_inv_variant(int64_t item_id, int* cells_w, int* cells_h)
+{
+    int amount;
+    const char* name;
+    int pw;
+    int ph;
+
+    if (obj_field_int32_get(item_id, OBJ_F_TYPE) != OBJ_TYPE_GOLD) {
+        return NULL;
+    }
+    item_gold_build_variants(obj_field_int32_get(item_id, OBJ_F_ITEM_INV_AID));
+
+    amount = obj_field_int32_get(item_id, OBJ_F_GOLD_QUANTITY);
+    if (amount >= 500) {
+        name = "i_gold500";
+    } else if (amount >= 251) {
+        name = "i_gold250";
+    } else if (amount >= 100) {
+        name = "i_gold100";
+    } else if (amount >= 50) {
+        name = "i_gold50";
+    } else {
+        name = "i_gold1";
+    }
+
+    if (!ce_sprite_exists(name)) {
+        return NULL;
+    }
+    ce_sprite_size(name, &pw, &ph);
+    if (cells_w != NULL) {
+        *cells_w = (pw - 1) / 32 + 1;
+    }
+    if (cells_h != NULL) {
+        *cells_h = (ph - 1) / 32 + 1;
+    }
+    return name;
+}
+
 void item_inv_icon_size(int64_t item_id, int* width, int* height)
 {
     tig_art_id_t aid;
     TigArtFrameData art_frame_data;
+
+    // CE: gold uses quantity-based variant sprites whose footprint determines
+    // its slot count (1 / 2 / 4). Resolve that here so every caller agrees.
+    if (obj_field_int32_get(item_id, OBJ_F_TYPE) == OBJ_TYPE_GOLD) {
+        int cw;
+        int ch;
+        if (item_gold_inv_variant(item_id, &cw, &ch) != NULL) {
+            if (width != NULL) {
+                *width = cw;
+            }
+            if (height != NULL) {
+                *height = ch;
+            }
+            return;
+        }
+    }
 
     aid = obj_field_int32_get(item_id, OBJ_F_ITEM_INV_AID);
 
