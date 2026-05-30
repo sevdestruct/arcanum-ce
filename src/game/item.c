@@ -611,10 +611,73 @@ static bool item_gold_define_override(const char* name)
     return true;
 }
 
+// A named-sprite composite layer (offset from canvas center). Used by gv_compose.
+typedef struct GvPart {
+    const char* name;
+    int ox;
+    int oy;
+} GvPart;
+
+// 1-layer slice of an art id (canvas = slice size). Override file wins.
+static void gv_slice(const char* name, tig_art_id_t art,
+    int sx, int sy, int sw, int sh)
+{
+    CeSpriteLayer l[1];
+    if (item_gold_define_override(name)) return;
+    memset(l, 0, sizeof(l));
+    l[0].src_art = art;
+    l[0].sx = sx; l[0].sy = sy; l[0].sw = sw; l[0].sh = sh;
+    ce_sprite_define(name, sw, sh, l, 1);
+}
+
+// 1-layer horizontal flip of a full art id (canvas = art frame size).
+static void gv_art_fliph(const char* name, tig_art_id_t art)
+{
+    CeSpriteLayer l[1];
+    TigArtFrameData afd;
+    if (item_gold_define_override(name)) return;
+    if (tig_art_frame_data(art, &afd) != TIG_OK) return;
+    memset(l, 0, sizeof(l));
+    l[0].src_art = art;
+    l[0].flip_x = true;
+    ce_sprite_define(name, afd.width, afd.height, l, 1);
+}
+
+// 1-layer horizontal flip of an existing named sprite (canvas = source size).
+static void gv_fliph(const char* name, const char* src)
+{
+    CeSpriteLayer l[1];
+    int w = 0, h = 0;
+    if (item_gold_define_override(name)) return;
+    ce_sprite_size(src, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    memset(l, 0, sizeof(l));
+    l[0].src_sprite = src;
+    l[0].flip_x = true;
+    ce_sprite_define(name, w, h, l, 1);
+}
+
+// Composite of named sprites at center-relative offsets, back-to-front.
+static void gv_compose(const char* name, int w, int h,
+    const GvPart* parts, int n)
+{
+    CeSpriteLayer l[12];
+    int i;
+    if (item_gold_define_override(name)) return;
+    if (n > 12) n = 12;
+    memset(l, 0, sizeof(l));
+    for (i = 0; i < n; i++) {
+        l[i].src_sprite = parts[i].name;
+        l[i].off_x = parts[i].ox;
+        l[i].off_y = parts[i].oy;
+    }
+    ce_sprite_define(name, w, h, l, n);
+}
+
 static void item_gold_build_variants(tig_art_id_t gold_aid)
 {
     TigArtFrameData afd;
-    CeSpriteLayer l[3];
+    CeSpriteLayer l[2];
     tig_art_id_t coins_aid;
     bool have_coins;
 
@@ -640,41 +703,60 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         }
     }
 
-    // Each variant: a user/mod override file wins; else the built-in build.
-    // (Overriding i_gold100 also flows into the i_gold250/500 composites, which
-    // reference it by name.)
-
-    // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (15,11) 15x21.
-    if (!item_gold_define_override("i_gold1")) {
-        memset(l, 0, sizeof(l));
-        l[0].src_art = gold_aid;
-        l[0].sx = 15;
-        l[0].sy = 11;
-        l[0].sw = 15;
-        l[0].sh = 21;
-        ce_sprite_define("i_gold1", 15, 21, l, 1);
+    // ---- coin-cluster components sliced from i_coins00 (need coins art) ----
+    if (have_coins) {
+        gv_art_fliph("i_coins00fH", coins_aid);
+        gv_slice("i_coins24", coins_aid, 33, 7, 17, 23);
+        gv_fliph("i_coins24fH", "i_coins24");
+        gv_slice("i_coins49", coins_aid, 4, 0, 24, 31);
+        gv_fliph("i_coins49fH", "i_coins49");
+        // SPEC: i_gold2000 references "i_coins29fH" which is never defined.
+        // Substituting i_coins24fH so the name resolves — TODO confirm slice.
+        gv_compose("i_coins29fH", 17, 23,
+            (GvPart[]){ { "i_coins24fH", 0, 0 } }, 1);
     }
 
-    // i_gold50 = i_gold slice (0,0) 30x32 (1 slot).
-    if (!item_gold_define_override("i_gold50")) {
-        memset(l, 0, sizeof(l));
-        l[0].src_art = gold_aid;
-        l[0].sw = 30;
-        l[0].sh = 32;
-        ce_sprite_define("i_gold50", 30, 32, l, 1);
-    }
+    // ---- small-pile components sliced from i_gold ----
+    gv_slice("i_gold1", gold_aid, 39, 16, 9, 4);
+    gv_fliph("i_gold1fH", "i_gold1");
+    gv_compose("i_gold2", 16, 8,
+        (GvPart[]){ { "i_gold1fH", 3, -2 }, { "i_gold1fH", -3, 2 } }, 2);
+    gv_compose("i_gold3", 16, 10,
+        (GvPart[]){ { "i_gold2", 0, 1 }, { "i_gold1fH", 3, -3 } }, 2);
+    gv_compose("i_gold4", 16, 12,
+        (GvPart[]){ { "i_gold3", 0, 1 }, { "i_gold1fH", 3, -4 } }, 2);
 
-    // i_gold100 = the original gold pile, as-is (2 slots, 2x1).
+    gv_slice("i_goldC", gold_aid, 20, 22, 10, 10);
+    gv_fliph("i_goldCfH", "i_goldC");
+    gv_slice("i_gold4ish", gold_aid, 39, 16, 10, 12);
+    gv_fliph("i_gold4ishfH", "i_gold4ish");
+    // SPEC gave no canvas for i_gold5 — using 16x16 (fits both centered parts).
+    gv_compose("i_gold5", 16, 16,
+        (GvPart[]){ { "i_gold4ish", -3, 0 }, { "i_goldC", 3, 3 } }, 2);
+    gv_fliph("i_gold5fH", "i_gold5");
+
+    gv_slice("i_gold10", gold_aid, 0, 0, 30, 32);
+    gv_fliph("i_gold10fH", "i_gold10");
+    gv_slice("i_gold24", gold_aid, 31, 6, 18, 22);
+    gv_fliph("i_gold24fH", "i_gold24");
+    gv_compose("i_gold25", 24, 24,
+        (GvPart[]){ { "i_gold24", 1, -3 }, { "i_goldC", 6, 7 } }, 2);
+    // SPEC said "i_gold flip_h" — interpreting as i_gold25 flip_h (24x24).
+    gv_fliph("i_gold25fH", "i_gold25");
+
+    gv_slice("i_gold50", gold_aid, 0, 0, 30, 32);
+    gv_fliph("i_gold50fH", "i_gold50");
+
+    // i_gold100 = the original gold pile, as-is.
     if (!item_gold_define_override("i_gold100")) {
-        TigArtFrameData gfd;
-        tig_art_frame_data(gold_aid, &gfd);
         memset(l, 0, sizeof(l));
         l[0].src_art = gold_aid;
-        ce_sprite_define("i_gold100", gfd.width, gfd.height, l, 1);
+        ce_sprite_define("i_gold100", afd.width, afd.height, l, 1);
     }
+    gv_art_fliph("i_gold100fH", gold_aid);
 
-    // i_gold250: 64x32 (2 slots) = i_coins00 slice (0,4) 46x27, flipped_h,
-    // off (-8,-3) UNDER i_gold100. Falls back to the gold pile if no i_coins00.
+    // i_gold250: SPEC 32x64 = i_coins00 slice (0,4) 46x27 flip_h off(-5,-3)
+    // + i_gold100 off(5,0). NOTE: 32-wide canvas clips the wider parts (flag).
     if (!item_gold_define_override("i_gold250")) {
         memset(l, 0, sizeof(l));
         if (have_coins) {
@@ -682,30 +764,56 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
             l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 27;
             l[0].flip_x = true; l[0].off_x = -5; l[0].off_y = -3;
             l[1].src_sprite = "i_gold100";
-            l[1].off_x = 4; l[1].off_y = 0;
-            ce_sprite_define("i_gold250", 64, 32, l, 2);
+            l[1].off_x = 5; l[1].off_y = 0;
+            ce_sprite_define("i_gold250", 32, 64, l, 2);
         } else {
             l[0].src_sprite = "i_gold100";
-            ce_sprite_define("i_gold250", 64, 32, l, 1);
+            ce_sprite_define("i_gold250", 32, 64, l, 1);
         }
     }
+    gv_fliph("i_gold250fH", "i_gold250");
 
-    // i_gold500: 64x64 (4 slots) = i_coins00 slice (0,4) 46x31, flipped_h,
-    // off (-2,-6) UNDER i_gold250 off (0,9) (back-to-front).
+    // i_gold500: 58x52 = i_coins00 slice (0,4) 46x31 (no flip) off(-2,-6)
+    // UNDER i_gold250 off(0,10).
     if (!item_gold_define_override("i_gold500")) {
         memset(l, 0, sizeof(l));
         if (have_coins) {
             l[0].src_art = coins_aid;
             l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 31;
-            l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -6;
+            l[0].off_x = -2; l[0].off_y = -6;
             l[1].src_sprite = "i_gold250";
-            l[1].off_x = 0; l[1].off_y = 9;
-            ce_sprite_define("i_gold500", 64, 64, l, 2);
+            l[1].off_x = 0; l[1].off_y = 10;
+            ce_sprite_define("i_gold500", 58, 52, l, 2);
         } else {
-            l[0].src_sprite = "i_gold100";
-            ce_sprite_define("i_gold500", 64, 64, l, 1);
+            l[0].src_sprite = "i_gold250";
+            ce_sprite_define("i_gold500", 58, 52, l, 1);
         }
     }
+    gv_fliph("i_gold500fH", "i_gold500");
+
+    // i_gold1000: 58x62.
+    gv_compose("i_gold1000", 58, 62,
+        (GvPart[]){
+            { "i_coins49fH", 15, 0 },
+            { "i_coins49fH", 0, -14 },
+            { "i_coins49fH", -1, 5 },
+            { "i_gold500", 0, 5 },
+            { "i_goldCfH", -16, 3 },
+        }, 5);
+
+    // i_gold2000: 64x64.
+    gv_compose("i_gold2000", 64, 64,
+        (GvPart[]){
+            { "i_gold1000", 1, -2 },
+            { "i_coins49fH", -17, -6 },
+            { "i_coins49fH", -19, 6 },
+            { "i_coins29fH", -15, -9 },
+            { "i_coins29fH", 13, -21 },
+            { "i_coins29fH", 26, 6 },
+            { "i_gold1000", 1, 1 },
+            { "i_goldCfH", 12, -13 },
+            { "i_goldCfH", -17, 8 },
+        }, 9);
 
     item_gold_variants_built = true;
 }
@@ -726,16 +834,32 @@ const char* item_gold_inv_variant(int64_t item_id, int* cells_w, int* cells_h)
     item_gold_build_variants(obj_field_int32_get(item_id, OBJ_F_ITEM_INV_AID));
 
     amount = obj_field_int32_get(item_id, OBJ_F_GOLD_QUANTITY);
-    if (amount >= 500) {
+    if (amount >= 2000) {
+        name = "i_gold2000";
+    } else if (amount >= 1000) {
+        name = "i_gold1000";
+    } else if (amount >= 500) {
         name = "i_gold500";
-    } else if (amount >= 251) {
+    } else if (amount >= 250) {
         name = "i_gold250";
     } else if (amount >= 100) {
         name = "i_gold100";
     } else if (amount >= 50) {
-        name = "i_gold50";
+        name = "i_gold50fH";
+    } else if (amount >= 25) {
+        name = "i_gold25fH";
+    } else if (amount >= 10) {
+        name = "i_gold10fH";
+    } else if (amount >= 5) {
+        name = "i_gold5fH";
+    } else if (amount == 4) {
+        name = "i_gold4";
+    } else if (amount == 3) {
+        name = "i_gold3";
+    } else if (amount == 2) {
+        name = "i_gold2";
     } else {
-        name = "i_gold1";
+        name = "i_gold1fH";
     }
 
     if (!ce_sprite_exists(name)) {
