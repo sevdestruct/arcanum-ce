@@ -63,6 +63,18 @@ TigVideoBuffer* ce_sprite_vbuffer(const char* name);
 // Free every registered sprite (call at engine shutdown).
 void ce_sprite_shutdown(void);
 
+// Reserve a stable art id backed by a raw .dat art PATH (e.g.
+// "art\\item\\i_coins00.art"). Lets us address art that has no entry in the
+// item/critter name tables — superseded assets that still live in the .dat —
+// by loading the .ART directly via the path. Idempotent per path. Returns
+// TIG_ART_ID_INVALID if the registry is full. The art is loaded lazily by the
+// engine on first use (guard call sites with tig_file_exists for the path).
+tig_art_id_t ce_named_art(const char* art_path);
+
+// Path resolver hook: if `aid` is one of our reserved ids, fill `path` and
+// return true. Wired into the game's art file-path resolver (name_resolve_path).
+bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen);
+
 #ifdef __cplusplus
 }
 #endif

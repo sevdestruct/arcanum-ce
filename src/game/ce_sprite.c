@@ -218,3 +218,48 @@ void ce_sprite_shutdown(void)
     }
     ce_sprite_count = 0;
 }
+
+// --- Reserved art ids backed by raw .dat paths ----------------------------
+// A free art type (the TigArtType enum uses 0..14; the 4-bit type field leaves
+// 15) tags ids whose path we resolve ourselves. The low bits are an index into
+// the path table. tig_art_build_path routes non-MISC types to the game's
+// resolver, which calls ce_named_art_resolve first (see name_resolve_path).
+#define CE_ART_TYPE_NAMED 15
+#define CE_NAMED_ART_CAP 64
+
+static char ce_named_art_paths[CE_NAMED_ART_CAP][TIG_MAX_PATH];
+static int ce_named_art_count;
+
+tig_art_id_t ce_named_art(const char* art_path)
+{
+    int i;
+    if (art_path == NULL) {
+        return TIG_ART_ID_INVALID;
+    }
+    for (i = 0; i < ce_named_art_count; i++) {
+        if (strcmp(ce_named_art_paths[i], art_path) == 0) {
+            return ((tig_art_id_t)CE_ART_TYPE_NAMED << 28) | (tig_art_id_t)i;
+        }
+    }
+    if (ce_named_art_count >= CE_NAMED_ART_CAP) {
+        return TIG_ART_ID_INVALID;
+    }
+    strncpy(ce_named_art_paths[ce_named_art_count], art_path, TIG_MAX_PATH - 1);
+    ce_named_art_paths[ce_named_art_count][TIG_MAX_PATH - 1] = '\0';
+    i = ce_named_art_count++;
+    return ((tig_art_id_t)CE_ART_TYPE_NAMED << 28) | (tig_art_id_t)i;
+}
+
+bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen)
+{
+    int index;
+    if ((aid >> 28) != CE_ART_TYPE_NAMED) {
+        return false;
+    }
+    index = (int)(aid & 0x0FFFFFFF);
+    if (index < 0 || index >= ce_named_art_count) {
+        return false;
+    }
+    snprintf(path, maxlen, "%s", ce_named_art_paths[index]);
+    return true;
+}

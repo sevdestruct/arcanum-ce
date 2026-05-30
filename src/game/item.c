@@ -598,11 +598,20 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         return; // art not ready yet — retry on a later call
     }
 
-    // The superseded "i_coins00" pile (still in the .dat) is the composing
-    // source for the big stacks; fall back to plain gold if it can't be found.
-    coins_aid = a_name_item_inven_aid_by_name("i_coins00");
-    have_coins = (coins_aid != TIG_ART_ID_INVALID
-        && tig_art_frame_data(coins_aid, &afd) == TIG_OK);
+    // The superseded "i_coins00" pile still lives in the .dat but has no entry
+    // in the item name tables, so address it by raw path via a reserved art id.
+    // Guard on the file actually existing so we don't composite the badart
+    // fallback; fall back to plain gold if it's not there.
+    coins_aid = TIG_ART_ID_INVALID;
+    have_coins = false;
+    {
+        TigFileInfo coins_fi;
+        if (tig_file_exists("art\\item\\i_coins00.art", &coins_fi)) {
+            coins_aid = ce_named_art("art\\item\\i_coins00.art");
+            have_coins = (coins_aid != TIG_ART_ID_INVALID
+                && tig_art_frame_data(coins_aid, &afd) == TIG_OK);
+        }
+    }
 
     // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (0,0) 15x21.
     memset(l, 0, sizeof(l));

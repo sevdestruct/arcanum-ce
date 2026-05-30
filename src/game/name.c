@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "game/a_name.h"
+#include "game/ce_sprite.h"
 #include "game/mes.h"
 
 static void name_missing_art_init(void);
@@ -869,6 +870,12 @@ int name_resolve_path(tig_art_id_t aid, char* path, size_t maxlen)
 
     if (!name_initialized) {
         return TIG_ERR_IO;
+    }
+
+    // CE: reserved ids backed by a raw .dat path (e.g. superseded art reached
+    // by name for the sprite compositor) resolve before the normal tables.
+    if (ce_named_art_resolve(aid, path, maxlen)) {
+        return TIG_OK;
     }
 
     aid = name_normalize_aid(aid);
