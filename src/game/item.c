@@ -710,10 +710,6 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         gv_fliph("i_coins24fH", "i_coins24");
         gv_slice("i_coins49", coins_aid, 4, 0, 24, 31);
         gv_fliph("i_coins49fH", "i_coins49");
-        // SPEC: i_gold2000 references "i_coins29fH" which is never defined.
-        // Substituting i_coins24fH so the name resolves — TODO confirm slice.
-        gv_compose("i_coins29fH", 17, 23,
-            (GvPart[]){ { "i_coins24fH", 0, 0 } }, 1);
     }
 
     // ---- small-pile components sliced from i_gold ----
@@ -807,9 +803,9 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
             { "i_gold1000", 1, -2 },
             { "i_coins49fH", -17, -6 },
             { "i_coins49fH", -19, 6 },
-            { "i_coins29fH", -15, -9 },
-            { "i_coins29fH", 13, -21 },
-            { "i_coins29fH", 26, 6 },
+            { "i_coins24fH", -15, -9 },
+            { "i_coins24fH", 13, -21 },
+            { "i_coins24fH", 26, 6 },
             { "i_gold1000", 1, 1 },
             { "i_goldCfH", 12, -13 },
             { "i_goldCfH", -17, 8 },
