@@ -731,13 +731,12 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         (GvPart[]){ { "i_gold4ish", -3, 0 }, { "i_goldC", 3, 3 } }, 2);
     gv_fliph("i_gold5fH", "i_gold5");
 
-    gv_slice("i_gold10", gold_aid, 0, 0, 30, 32);
+    gv_slice("i_gold10", gold_aid, 15, 11, 15, 21);
     gv_fliph("i_gold10fH", "i_gold10");
     gv_slice("i_gold24", gold_aid, 31, 6, 18, 22);
     gv_fliph("i_gold24fH", "i_gold24");
     gv_compose("i_gold25", 24, 24,
         (GvPart[]){ { "i_gold24", 1, -3 }, { "i_goldC", 6, 7 } }, 2);
-    // SPEC said "i_gold flip_h" — interpreting as i_gold25 flip_h (24x24).
     gv_fliph("i_gold25fH", "i_gold25");
 
     gv_slice("i_gold50", gold_aid, 0, 0, 30, 32);

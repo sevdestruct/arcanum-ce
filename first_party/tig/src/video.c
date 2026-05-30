@@ -1772,19 +1772,59 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
         SDL_SetSurfaceAlphaMod(blit_info->src_video_buffer->surface, blit_info->alpha[0]);
     }
 
+    // CE: FLIP_X / FLIP_Y were never honored by this blitter (only the art-id
+    // path flipped). The ce_sprite compositor relies on vbuffer→vbuffer flips
+    // for its "*fH" components, so support them here: extract the source region
+    // into a temp surface, mirror it with SDL_FlipSurface, then blit that. Only
+    // the non-stretched path is needed by current callers.
+    SDL_Surface* flip_src = NULL;
+    SDL_Surface* eff_src = blit_info->src_video_buffer->surface;
+    SDL_Rect eff_src_rect = native_src_rect;
+    SDL_FlipMode flip_mode = SDL_FLIP_NONE;
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0) {
+        flip_mode |= SDL_FLIP_HORIZONTAL;
+    }
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0) {
+        flip_mode |= SDL_FLIP_VERTICAL;
+    }
+    if (flip_mode != SDL_FLIP_NONE) {
+        SDL_Surface* s = blit_info->src_video_buffer->surface;
+        flip_src = SDL_CreateSurface(native_src_rect.w, native_src_rect.h,
+            s->format);
+        if (flip_src != NULL) {
+            SDL_Rect whole = { 0, 0, native_src_rect.w, native_src_rect.h };
+            // Preserve color-key transparency through the copy.
+            bool had_key = SDL_SurfaceHasColorKey(s);
+            uint32_t key = 0;
+            if (had_key) {
+                SDL_GetSurfaceColorKey(s, &key);
+                SDL_SetSurfaceColorKey(flip_src, true, key);
+            }
+            SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+            SDL_BlitSurface(s, &native_src_rect, flip_src, &whole);
+            SDL_FlipSurface(flip_src, flip_mode);
+            eff_src = flip_src;
+            eff_src_rect = whole;
+        }
+    }
+
     bool ok = true;
     if (stretched) {
         SDL_ScaleMode scale_mode = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_SCALE_LINEAR)
             ? SDL_SCALEMODE_LINEAR
             : SDL_SCALEMODE_NEAREST;
 
-        if (!SDL_BlitSurfaceScaled(blit_info->src_video_buffer->surface, &native_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect, scale_mode)) {
+        if (!SDL_BlitSurfaceScaled(eff_src, &eff_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect, scale_mode)) {
             ok = false;
         }
     } else {
-        if (!SDL_BlitSurface(blit_info->src_video_buffer->surface, &native_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect)) {
+        if (!SDL_BlitSurface(eff_src, &eff_src_rect, blit_info->dst_video_buffer->surface, &native_dst_rect)) {
             ok = false;
         }
+    }
+
+    if (flip_src != NULL) {
+        SDL_DestroySurface(flip_src);
     }
 
     if (alpha_const) {
