@@ -680,8 +680,9 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         if (have_coins) {
             l[0].src_art = coins_aid;
             l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 27;
-            l[0].flip_x = true; l[0].off_x = -8; l[0].off_y = -3;
+            l[0].flip_x = true; l[0].off_x = -5; l[0].off_y = -3;
             l[1].src_sprite = "i_gold100";
+            l[1].off_x = 4; l[1].off_y = 0;
             ce_sprite_define("i_gold250", 64, 32, l, 2);
         } else {
             l[0].src_sprite = "i_gold100";
