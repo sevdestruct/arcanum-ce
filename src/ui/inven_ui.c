@@ -2507,7 +2507,8 @@ bool sub_5755A0(void* userinfo)
 
     inven_ui_drag_item_obj = entry->field_8;
     sub_4A50D0(player_get_local_pc_obj(), entry->field_8);
-    art_id = obj_field_int32_get(entry->field_8, OBJ_F_ITEM_INV_AID);
+    // CE: gold drags its quantity-variant composite (not the plain i_gold art).
+    art_id = inven_ui_drag_art_id(entry->field_8);
 
     if ((entry->x == -1 && entry->y == -1)
         || IS_WEAR_INV_LOC(entry->field_24)
