@@ -584,6 +584,33 @@ int item_aptitude_crit_failure_chance(int64_t item_obj, int64_t owner_obj)
 // at the correct footprint until the i_coins00 composite source is wired.)
 static bool item_gold_variants_built;
 
+// CE: if a loose / module / .dat asset named "art\item\<name>.art" exists, define
+// the variant as that art (a 1-layer pass-through) so user & mod art override the
+// built-in composite. Resolution uses the engine's normal file precedence
+// (module > loose data > base .dat), so a .dat or a dropped-in file both work.
+// Returns true if an override was used.
+static bool item_gold_define_override(const char* name)
+{
+    char path[TIG_MAX_PATH];
+    TigFileInfo fi;
+    tig_art_id_t aid;
+    TigArtFrameData afd;
+    CeSpriteLayer l[1];
+
+    snprintf(path, sizeof(path), "art\\item\\%s.art", name);
+    if (!tig_file_exists(path, &fi)) {
+        return false;
+    }
+    aid = ce_named_art(path);
+    if (aid == TIG_ART_ID_INVALID || tig_art_frame_data(aid, &afd) != TIG_OK) {
+        return false;
+    }
+    memset(l, 0, sizeof(l));
+    l[0].src_art = aid;
+    ce_sprite_define(name, afd.width, afd.height, l, 1);
+    return true;
+}
+
 static void item_gold_build_variants(tig_art_id_t gold_aid)
 {
     TigArtFrameData afd;
@@ -613,24 +640,32 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         }
     }
 
+    // Each variant: a user/mod override file wins; else the built-in build.
+    // (Overriding i_gold100 also flows into the i_gold250/500 composites, which
+    // reference it by name.)
+
     // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (15,11) 15x21.
-    memset(l, 0, sizeof(l));
-    l[0].src_art = gold_aid;
-    l[0].sx = 15;
-    l[0].sy = 11;
-    l[0].sw = 15;
-    l[0].sh = 21;
-    ce_sprite_define("i_gold1", 15, 21, l, 1);
+    if (!item_gold_define_override("i_gold1")) {
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gold_aid;
+        l[0].sx = 15;
+        l[0].sy = 11;
+        l[0].sw = 15;
+        l[0].sh = 21;
+        ce_sprite_define("i_gold1", 15, 21, l, 1);
+    }
 
     // i_gold50 = i_gold slice (0,0) 30x32 (1 slot).
-    memset(l, 0, sizeof(l));
-    l[0].src_art = gold_aid;
-    l[0].sw = 30;
-    l[0].sh = 32;
-    ce_sprite_define("i_gold50", 30, 32, l, 1);
+    if (!item_gold_define_override("i_gold50")) {
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gold_aid;
+        l[0].sw = 30;
+        l[0].sh = 32;
+        ce_sprite_define("i_gold50", 30, 32, l, 1);
+    }
 
     // i_gold100 = the original gold pile, as-is (2 slots, 2x1).
-    {
+    if (!item_gold_define_override("i_gold100")) {
         TigArtFrameData gfd;
         tig_art_frame_data(gold_aid, &gfd);
         memset(l, 0, sizeof(l));
@@ -640,31 +675,35 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
 
     // i_gold250: 64x32 (2 slots) = i_coins00 slice (0,4) 46x27, flipped_h,
     // off (-8,-3) UNDER i_gold100. Falls back to the gold pile if no i_coins00.
-    memset(l, 0, sizeof(l));
-    if (have_coins) {
-        l[0].src_art = coins_aid;
-        l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 27;
-        l[0].flip_x = true; l[0].off_x = -8; l[0].off_y = -3;
-        l[1].src_sprite = "i_gold100";
-        ce_sprite_define("i_gold250", 64, 32, l, 2);
-    } else {
-        l[0].src_sprite = "i_gold100";
-        ce_sprite_define("i_gold250", 64, 32, l, 1);
+    if (!item_gold_define_override("i_gold250")) {
+        memset(l, 0, sizeof(l));
+        if (have_coins) {
+            l[0].src_art = coins_aid;
+            l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 27;
+            l[0].flip_x = true; l[0].off_x = -8; l[0].off_y = -3;
+            l[1].src_sprite = "i_gold100";
+            ce_sprite_define("i_gold250", 64, 32, l, 2);
+        } else {
+            l[0].src_sprite = "i_gold100";
+            ce_sprite_define("i_gold250", 64, 32, l, 1);
+        }
     }
 
     // i_gold500: 64x64 (4 slots) = i_coins00 slice (0,4) 46x31, flipped_h,
     // off (-2,-6) UNDER i_gold250 off (0,9) (back-to-front).
-    memset(l, 0, sizeof(l));
-    if (have_coins) {
-        l[0].src_art = coins_aid;
-        l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 31;
-        l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -6;
-        l[1].src_sprite = "i_gold250";
-        l[1].off_x = 0; l[1].off_y = 9;
-        ce_sprite_define("i_gold500", 64, 64, l, 2);
-    } else {
-        l[0].src_sprite = "i_gold100";
-        ce_sprite_define("i_gold500", 64, 64, l, 1);
+    if (!item_gold_define_override("i_gold500")) {
+        memset(l, 0, sizeof(l));
+        if (have_coins) {
+            l[0].src_art = coins_aid;
+            l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 31;
+            l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -6;
+            l[1].src_sprite = "i_gold250";
+            l[1].off_x = 0; l[1].off_y = 9;
+            ce_sprite_define("i_gold500", 64, 64, l, 2);
+        } else {
+            l[0].src_sprite = "i_gold100";
+            ce_sprite_define("i_gold500", 64, 64, l, 1);
+        }
     }
 
     item_gold_variants_built = true;
