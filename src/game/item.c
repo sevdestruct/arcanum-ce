@@ -653,15 +653,15 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     }
 
     // i_gold500: 64x64 (4 slots) = i_coins00 slice (0,4) 46x31, flipped_h,
-    // off (-2,-14), then i_gold250, then i_gold100 (back-to-front).
+    // off (-2,-6) UNDER i_gold250 off (0,9) (back-to-front).
     memset(l, 0, sizeof(l));
     if (have_coins) {
         l[0].src_art = coins_aid;
         l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 31;
-        l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -14;
+        l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -6;
         l[1].src_sprite = "i_gold250";
-        l[2].src_sprite = "i_gold100";
-        ce_sprite_define("i_gold500", 64, 64, l, 3);
+        l[1].off_x = 0; l[1].off_y = 9;
+        ce_sprite_define("i_gold500", 64, 64, l, 2);
     } else {
         l[0].src_sprite = "i_gold100";
         ce_sprite_define("i_gold500", 64, 64, l, 1);
