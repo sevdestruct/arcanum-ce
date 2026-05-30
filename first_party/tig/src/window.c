@@ -482,6 +482,71 @@ int tig_window_data(tig_window_handle_t window_handle, TigWindowData* window_dat
     return TIG_OK;
 }
 
+// CE: <math.h>-free floor/ceil that handle negative inputs (the
+// oversized mainmenu backdrop has a negative frame.x/.y).
+static int tig_floor_i(float v)
+{
+    int i = (int)v;
+    return (v < (float)i) ? i - 1 : i;
+}
+static int tig_ceil_i(float v)
+{
+    int i = (int)v;
+    return (v > (float)i) ? i + 1 : i;
+}
+
+// CE: compute the integer screen-space dst rect for a ui_anim
+// transformed window.
+//
+// Rounds the dst edges OUTWARD — floor the left/top, ceil the
+// right/bottom. Two reasons:
+//
+//  1. Settle stability. When a window rests at a non-1.0 scale
+//     (the mainmenu backdrop recede sits at 0.96), the resting
+//     dst edge can land exactly on a .5 boundary for common
+//     resolutions (e.g. a 1080-tall screen: the centered backdrop
+//     frame's integer offset is a half-pixel off, so the bottom
+//     edge hits N.5 at scale 0.96). Round-to-nearest flips across
+//     .5 — the penultimate spring frame rounds one way, the
+//     finalize-to-exact-target frame rounds the other → a visible
+//     1px snap right as it locks in. ceil/floor never flip at .5
+//     (ceil(N.49)==ceil(N.5)==N+1), so the dst is identical on the
+//     last animating frame and the finalize frame — no snap.
+//     (Windows that settle at scale 1.0 don't hit this: they call
+//     tig_window_transform_clear and revert to a crisp 1:1 blit.)
+//
+//  2. Coverage. Outward rounding guarantees the dst fully covers
+//     the scaled content (and, for the oversized backdrop, the
+//     screen) — no 1px black gap at an edge.
+//
+// Cost: the dst is up to 1px larger than the exact scaled size per
+// edge, a <0.1% overscale at these scales — imperceptible. The
+// center stays stable (floor(C-d)+ceil(C+d) is constant), so there's
+// no lateral wobble. Springs are overdamped (no overshoot past 1.0),
+// so shrinking windows never paint outside their natural frame.
+static void tig_window_transform_dst(const TigRect* frame,
+    float scale_x, float scale_y,
+    float anchor_x, float anchor_y,
+    int* out_x, int* out_y, int* out_w, int* out_h)
+{
+    float scaled_left = (float)frame->x
+        + (float)frame->width * anchor_x * (1.0f - scale_x);
+    float scaled_top = (float)frame->y
+        + (float)frame->height * anchor_y * (1.0f - scale_y);
+    float scaled_right = scaled_left + (float)frame->width * scale_x;
+    float scaled_bottom = scaled_top + (float)frame->height * scale_y;
+
+    int left = tig_floor_i(scaled_left);
+    int top = tig_floor_i(scaled_top);
+    int right = tig_ceil_i(scaled_right);
+    int bottom = tig_ceil_i(scaled_bottom);
+
+    *out_x = left;
+    *out_y = top;
+    *out_w = right - left;
+    *out_h = bottom - top;
+}
+
 // 0x51CF40
 int tig_window_display(void)
 {
@@ -658,50 +723,19 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             int transform_dst_x = 0, transform_dst_y = 0;
             int transform_dst_w = 0, transform_dst_h = 0;
             if (transform_active) {
-                // CE: round-to-nearest (not truncate) for the scaled
-                // dst size, AND match the parity of frame.width/.height.
-                //
-                // The parity match is the important one for visual
-                // smoothness during animation: with center anchor
-                // (0.5) the dst is positioned at
-                // `(frame.dim - dst_dim) / 2` (integer div). When
-                // frame.dim is even and dst_dim is odd, the integer
-                // div drops the .5, so the dst's center lands half
-                // a pixel off from the frame's center. As the
-                // spring advances and dst_dim increments through
-                // odd/even values, the dst center oscillates ±0.5
-                // pixel per frame — under LINEAR filtering this
-                // reads as a sub-pixel "wobble" on high-contrast
-                // content (text, button outlines). Forcing dst_dim
-                // to match frame.dim parity makes the integer div
-                // exact every frame — content stays at the same
-                // sub-pixel position throughout the animation.
-                //
-                // Round-to-nearest is still done first so the spring
-                // approaching 1.0 lands dst == frame; the parity
-                // adjustment is at most ±1 pixel which is well under
-                // the per-frame motion during the animation.
-                int raw_w = (int)((float)win->frame.width
-                    * win->transform_scale_x + 0.5f);
-                int raw_h = (int)((float)win->frame.height
-                    * win->transform_scale_y + 0.5f);
-                // Parity-match by ROUNDING UP (not down) on mismatch.
-                // Both directions achieve sub-pixel center stability,
-                // but rounding up keeps dst_dim >= the raw scaled
-                // value. The mainmenu backdrop is sized with a
-                // 1/0.96 overdraw so that at the receded scale 0.96
-                // the dst rect lands exactly screen-sized (no gap).
-                // Rounding DOWN would shave 1 pixel off → expose a
-                // 1-px black gap at the screen edge whenever
-                // frame.dim parity differed from the raw rounding
-                // result (e.g. 1080 screens: frame.height=1125 odd,
-                // raw_h at scale 0.96 rounds to 1080 even). Rounding
-                // up keeps full coverage; the +1px lands in the
-                // overdraw margin and gets clipped invisibly.
-                if ((raw_w & 1) != (win->frame.width & 1)) raw_w++;
-                if ((raw_h & 1) != (win->frame.height & 1)) raw_h++;
-                transform_dst_w = raw_w;
-                transform_dst_h = raw_h;
+                // CE: independent-edge rounding (see
+                // tig_window_transform_dst) — width changes in 1px
+                // steps with a sub-pixel-stable anchor, so the dst
+                // converges smoothly through the spring's settle tail
+                // with no terminal 1-2px snap (the old round-width-
+                // then-center-with-parity approach stepped the width
+                // in 2px chunks, which was visible on the slow
+                // mainmenu backdrop recede).
+                tig_window_transform_dst(&win->frame,
+                    win->transform_scale_x, win->transform_scale_y,
+                    win->transform_anchor_x, win->transform_anchor_y,
+                    &transform_dst_x, &transform_dst_y,
+                    &transform_dst_w, &transform_dst_h);
                 if (transform_dst_w <= 0 || transform_dst_h <= 0
                     || win->transform_alpha <= 0.0f) {
                     // Effectively invisible — skip this window's
@@ -710,12 +744,6 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                     top_window_index--;
                     continue;
                 }
-                transform_dst_x = win->frame.x
-                    + (int)((float)(win->frame.width - transform_dst_w)
-                            * win->transform_anchor_x);
-                transform_dst_y = win->frame.y
-                    + (int)((float)(win->frame.height - transform_dst_h)
-                            * win->transform_anchor_y);
                 effective_frame.x = transform_dst_x;
                 effective_frame.y = transform_dst_y;
                 effective_frame.width = transform_dst_w;
@@ -910,32 +938,13 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             && !wins[v38]->has_clip;
         int tx_dx = 0, tx_dy = 0, tx_dw = 0, tx_dh = 0;
         if (defer_transform) {
-            // CE: same round-to-nearest + parity match as the pre-pass
-            // above. Parity ensures (frame.dim - dst_dim) / 2 is exact
-            // for center anchor — keeps the dst center sub-pixel-stable
-            // across frames so high-contrast content doesn't wobble
-            // during the scale animation.
-            int rw = (int)((float)wins[v38]->frame.width
-                * wins[v38]->transform_scale_x + 0.5f);
-            int rh = (int)((float)wins[v38]->frame.height
-                * wins[v38]->transform_scale_y + 0.5f);
-            // Round UP on parity mismatch — same rationale as the
-            // pre-pass calc: maintains screen coverage at the
-            // receded scale where the backdrop's overdraw lands
-            // exactly screen-sized. Rounding down here was the
-            // cause of the 1-px gap exposed during the menu recede
-            // animation on screens where frame.height parity
-            // differed from raw_h (e.g. 1080).
-            if ((rw & 1) != (wins[v38]->frame.width & 1)) rw++;
-            if ((rh & 1) != (wins[v38]->frame.height & 1)) rh++;
-            tx_dw = rw;
-            tx_dh = rh;
-            tx_dx = wins[v38]->frame.x
-                + (int)((float)(wins[v38]->frame.width - tx_dw)
-                        * wins[v38]->transform_anchor_x);
-            tx_dy = wins[v38]->frame.y
-                + (int)((float)(wins[v38]->frame.height - tx_dh)
-                        * wins[v38]->transform_anchor_y);
+            // CE: independent-edge rounding — MUST match the pre-pass
+            // computation exactly (same tig_window_transform_dst) so
+            // the queued-rect src reprojection below maps correctly.
+            tig_window_transform_dst(&wins[v38]->frame,
+                wins[v38]->transform_scale_x, wins[v38]->transform_scale_y,
+                wins[v38]->transform_anchor_x, wins[v38]->transform_anchor_y,
+                &tx_dx, &tx_dy, &tx_dw, &tx_dh);
         }
 
         blt_src_rect.x = rects[v38].x - wins[v38]->frame.x;
