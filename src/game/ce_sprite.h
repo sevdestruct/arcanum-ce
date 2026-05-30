@@ -71,9 +71,16 @@ void ce_sprite_shutdown(void);
 // engine on first use (guard call sites with tig_file_exists for the path).
 tig_art_id_t ce_named_art(const char* art_path);
 
-// Path resolver hook: if `aid` is one of our reserved ids, fill `path` and
-// return true. Wired into the game's art file-path resolver (name_resolve_path).
+// Path resolver hook: if `aid` is one of our reserved PATH-backed ids, fill
+// `path` and return true. Wired into the game's art file-path resolver
+// (name_resolve_path). Composite-backed ids return false here.
 bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen);
+
+// Reserve (or reuse) an art id that renders a defined composite sprite, so it
+// can be used anywhere an art id is expected (mouse cursor, etc.). The first
+// call registers the tig composite resolver. TIG_ART_ID_INVALID if `name` isn't
+// a defined sprite or the registry is full.
+tig_art_id_t ce_sprite_art_id(const char* name);
 
 #ifdef __cplusplus
 }

@@ -1218,6 +1218,21 @@ int64_t inven_ui_drag_item_obj_get(void)
     return inven_ui_drag_item_obj;
 }
 
+// CE: art id for the drag cursor. Gold uses its quantity-variant composite (so
+// the dragged coin matches the inventory icon instead of reverting to the plain
+// i_gold art); everything else uses its normal inventory art.
+static tig_art_id_t inven_ui_drag_art_id(int64_t obj)
+{
+    const char* name = item_gold_inv_variant(obj, NULL, NULL);
+    if (name != NULL) {
+        tig_art_id_t aid = ce_sprite_art_id(name);
+        if (aid != TIG_ART_ID_INVALID) {
+            return aid;
+        }
+    }
+    return obj_field_int32_get(obj, OBJ_F_ITEM_INV_AID);
+}
+
 // 0x573630
 void sub_573630(int64_t obj)
 {
@@ -1232,7 +1247,7 @@ void sub_573630(int64_t obj)
     inven_ui_drag_item_obj = obj;
     dword_6810E8 = obj_field_int32_get(obj, OBJ_F_ITEM_INV_LOCATION);
 
-    inv_art_id = obj_field_int32_get(inven_ui_drag_item_obj, OBJ_F_ITEM_INV_AID);
+    inv_art_id = inven_ui_drag_art_id(inven_ui_drag_item_obj);
     intgame_refresh_cursor();
     mouse_art_id = tig_mouse_cursor_get_art_id();
     tig_mouse_hide();
@@ -1252,7 +1267,7 @@ void sub_5736E0(void)
         return;
     }
 
-    inv_art_id = obj_field_int32_get(inven_ui_drag_item_obj, OBJ_F_ITEM_INV_AID);
+    inv_art_id = inven_ui_drag_art_id(inven_ui_drag_item_obj);
     mouse_art_id = tig_mouse_cursor_get_art_id();
     tig_mouse_hide();
     tig_mouse_cursor_set_art_id(inv_art_id);
@@ -1289,7 +1304,7 @@ void sub_573740(int64_t a1, bool a2)
         }
     }
 
-    inv_art_id = obj_field_int32_get(inven_ui_drag_item_obj, OBJ_F_ITEM_INV_AID);
+    inv_art_id = inven_ui_drag_art_id(inven_ui_drag_item_obj);
     tig_mouse_hide();
     tig_mouse_cursor_set_art_id(inv_art_id);
     tig_mouse_cursor_overlay(mouse_art_id, 2, 2);

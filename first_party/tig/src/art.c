@@ -519,10 +519,27 @@ void sub_5022D0(void)
     }
 }
 
+// CE: composite-sprite resolver (set by the game). Maps reserved art ids to a
+// runtime-built video buffer; NULL for all normal art.
+static TigArtCompositeResolver tig_art_composite_resolver_func;
+
+void tig_art_set_composite_resolver(TigArtCompositeResolver func)
+{
+    tig_art_composite_resolver_func = func;
+}
+
+static TigVideoBuffer* tig_art_composite_vb(tig_art_id_t art_id)
+{
+    return tig_art_composite_resolver_func != NULL
+        ? tig_art_composite_resolver_func(art_id)
+        : NULL;
+}
+
 // 0x502360
 int tig_art_blit(TigArtBlitInfo* blit_info)
 {
     TigArtBlitInfo mut_art_blit_info;
+    TigVideoBuffer* composite_vb;
     TigVideoBuffer* video_buffer;
     TigVideoBufferData video_buffer_data;
     TigVideoBufferBlitInfo vb_blit_info;
@@ -531,6 +548,28 @@ int tig_art_blit(TigArtBlitInfo* blit_info)
     unsigned int type;
 
     mut_art_blit_info = *blit_info;
+
+    // CE: composite sprites are backed by a runtime video buffer, not a .dat
+    // frame — blit that buffer (honoring flip / src / dst) instead of the cache.
+    composite_vb = tig_art_composite_vb(mut_art_blit_info.art_id);
+    if (composite_vb != NULL) {
+        if (mut_art_blit_info.dst_video_buffer == NULL) {
+            return TIG_OK;
+        }
+        memset(&vb_blit_info, 0, sizeof(vb_blit_info));
+        vb_blit_info.flags = 0;
+        if ((mut_art_blit_info.flags & TIG_ART_BLT_FLIP_X) != 0) {
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_X;
+        }
+        if ((mut_art_blit_info.flags & TIG_ART_BLT_FLIP_Y) != 0) {
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_Y;
+        }
+        vb_blit_info.src_video_buffer = composite_vb;
+        vb_blit_info.src_rect = mut_art_blit_info.src_rect;
+        vb_blit_info.dst_video_buffer = mut_art_blit_info.dst_video_buffer;
+        vb_blit_info.dst_rect = mut_art_blit_info.dst_rect;
+        return tig_video_buffer_blit(&vb_blit_info);
+    }
 
     cache_entry_index = sub_51AA90(mut_art_blit_info.art_id);
     if (cache_entry_index == -1) {
@@ -1162,6 +1201,21 @@ int tig_art_anim_data(tig_art_id_t art_id, TigArtAnimData* data)
     int cache_entry_index;
     TigArtCacheEntry* cache_entry;
     int palette;
+    TigVideoBuffer* composite_vb;
+
+    composite_vb = tig_art_composite_vb(art_id);
+    if (composite_vb != NULL) {
+        TigVideoBufferData vbd;
+        tig_video_buffer_data(composite_vb, &vbd);
+        if (data != NULL) {
+            memset(data, 0, sizeof(*data));
+            data->fps = 0;
+            data->bpp = 32;
+            data->num_frames = 1;
+            data->color_key = vbd.color_key;
+        }
+        return TIG_OK;
+    }
 
     cache_entry_index = sub_51AA90(art_id);
     if (cache_entry_index == -1) {
@@ -1202,6 +1256,22 @@ int tig_art_frame_data(tig_art_id_t art_id, TigArtFrameData* data)
     int frame;
     bool mirrored;
     int type;
+    TigVideoBuffer* composite_vb;
+
+    composite_vb = tig_art_composite_vb(art_id);
+    if (composite_vb != NULL) {
+        TigVideoBufferData vbd;
+        tig_video_buffer_data(composite_vb, &vbd);
+        if (data != NULL) {
+            data->width = vbd.width;
+            data->height = vbd.height;
+            data->hot_x = 0;
+            data->hot_y = 0;
+            data->offset_x = 0;
+            data->offset_y = 0;
+        }
+        return TIG_OK;
+    }
 
     cache_entry_index = sub_51AA90(art_id);
     if (cache_entry_index == -1) {
@@ -1382,6 +1452,20 @@ int tig_art_size(tig_art_id_t art_id, int* width_ptr, int* height_ptr)
     int frame;
     int width = 0;
     int height = 0;
+    TigVideoBuffer* composite_vb;
+
+    composite_vb = tig_art_composite_vb(art_id);
+    if (composite_vb != NULL) {
+        TigVideoBufferData vbd;
+        tig_video_buffer_data(composite_vb, &vbd);
+        if (width_ptr != NULL) {
+            *width_ptr = vbd.width;
+        }
+        if (height_ptr != NULL) {
+            *height_ptr = vbd.height;
+        }
+        return TIG_OK;
+    }
 
     cache_entry_index = sub_51AA90(art_id);
     if (cache_entry_index == -1) {

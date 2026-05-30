@@ -227,8 +227,24 @@ void ce_sprite_shutdown(void)
 #define CE_ART_TYPE_NAMED 15
 #define CE_NAMED_ART_CAP 64
 
-static char ce_named_art_paths[CE_NAMED_ART_CAP][TIG_MAX_PATH];
+// Each reserved id is either PATH-backed (a raw .dat art loaded by the normal
+// pipeline via name_resolve_path) or COMPOSITE-backed (a ce_sprite vbuffer
+// served through tig's composite resolver). The low 28 bits of the id index
+// this table; the top 4 bits are CE_ART_TYPE_NAMED.
+typedef struct CeNamedArt {
+    bool is_composite;
+    char path[TIG_MAX_PATH];          // is_composite == false
+    char sprite[CE_SPRITE_NAME_MAX];  // is_composite == true
+} CeNamedArt;
+
+static CeNamedArt ce_named_art_tbl[CE_NAMED_ART_CAP];
 static int ce_named_art_count;
+static bool ce_composite_resolver_registered;
+
+static tig_art_id_t ce_named_art_id_for(int index)
+{
+    return ((tig_art_id_t)CE_ART_TYPE_NAMED << 28) | (tig_art_id_t)index;
+}
 
 tig_art_id_t ce_named_art(const char* art_path)
 {
@@ -237,17 +253,19 @@ tig_art_id_t ce_named_art(const char* art_path)
         return TIG_ART_ID_INVALID;
     }
     for (i = 0; i < ce_named_art_count; i++) {
-        if (strcmp(ce_named_art_paths[i], art_path) == 0) {
-            return ((tig_art_id_t)CE_ART_TYPE_NAMED << 28) | (tig_art_id_t)i;
+        if (!ce_named_art_tbl[i].is_composite
+            && strcmp(ce_named_art_tbl[i].path, art_path) == 0) {
+            return ce_named_art_id_for(i);
         }
     }
     if (ce_named_art_count >= CE_NAMED_ART_CAP) {
         return TIG_ART_ID_INVALID;
     }
-    strncpy(ce_named_art_paths[ce_named_art_count], art_path, TIG_MAX_PATH - 1);
-    ce_named_art_paths[ce_named_art_count][TIG_MAX_PATH - 1] = '\0';
     i = ce_named_art_count++;
-    return ((tig_art_id_t)CE_ART_TYPE_NAMED << 28) | (tig_art_id_t)i;
+    ce_named_art_tbl[i].is_composite = false;
+    strncpy(ce_named_art_tbl[i].path, art_path, TIG_MAX_PATH - 1);
+    ce_named_art_tbl[i].path[TIG_MAX_PATH - 1] = '\0';
+    return ce_named_art_id_for(i);
 }
 
 bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen)
@@ -260,6 +278,50 @@ bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen)
     if (index < 0 || index >= ce_named_art_count) {
         return false;
     }
-    snprintf(path, maxlen, "%s", ce_named_art_paths[index]);
+    if (ce_named_art_tbl[index].is_composite) {
+        return false; // served as a composite video buffer, not a path
+    }
+    snprintf(path, maxlen, "%s", ce_named_art_tbl[index].path);
     return true;
+}
+
+// tig composite resolver: reserved id -> the named sprite's video buffer.
+static TigVideoBuffer* ce_sprite_composite_resolve(tig_art_id_t aid)
+{
+    int index;
+    if ((aid >> 28) != CE_ART_TYPE_NAMED) {
+        return NULL;
+    }
+    index = (int)(aid & 0x0FFFFFFF);
+    if (index < 0 || index >= ce_named_art_count
+        || !ce_named_art_tbl[index].is_composite) {
+        return NULL;
+    }
+    return ce_sprite_vbuffer(ce_named_art_tbl[index].sprite);
+}
+
+tig_art_id_t ce_sprite_art_id(const char* name)
+{
+    int i;
+    if (name == NULL || !ce_sprite_exists(name)) {
+        return TIG_ART_ID_INVALID;
+    }
+    if (!ce_composite_resolver_registered) {
+        tig_art_set_composite_resolver(ce_sprite_composite_resolve);
+        ce_composite_resolver_registered = true;
+    }
+    for (i = 0; i < ce_named_art_count; i++) {
+        if (ce_named_art_tbl[i].is_composite
+            && strncmp(ce_named_art_tbl[i].sprite, name, CE_SPRITE_NAME_MAX) == 0) {
+            return ce_named_art_id_for(i);
+        }
+    }
+    if (ce_named_art_count >= CE_NAMED_ART_CAP) {
+        return TIG_ART_ID_INVALID;
+    }
+    i = ce_named_art_count++;
+    ce_named_art_tbl[i].is_composite = true;
+    strncpy(ce_named_art_tbl[i].sprite, name, CE_SPRITE_NAME_MAX - 1);
+    ce_named_art_tbl[i].sprite[CE_SPRITE_NAME_MAX - 1] = '\0';
+    return ce_named_art_id_for(i);
 }

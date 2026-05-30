@@ -426,6 +426,14 @@ void sub_5022B0(TigArtBlitPaletteAdjustCallback callback);
 TigArtBlitPaletteAdjustCallback sub_5022C0(void);
 void sub_5022D0(void);
 int tig_art_blit(TigArtBlitInfo* blit_info);
+
+// CE: resolve a (reserved) art id to a runtime-built video buffer (composite
+// sprites). Returns NULL if the id isn't a composite — the normal art pipeline
+// then handles it. Registered by the game so these ids flow through the regular
+// art API (frame_data / anim_data / size / blit), e.g. as a mouse cursor.
+typedef TigVideoBuffer* (*TigArtCompositeResolver)(tig_art_id_t art_id);
+void tig_art_set_composite_resolver(TigArtCompositeResolver func);
+
 int tig_art_type(tig_art_id_t art_id);
 unsigned int tig_art_num_get(tig_art_id_t art_id);
 tig_art_id_t tig_art_num_set(tig_art_id_t art_id, unsigned int value);
