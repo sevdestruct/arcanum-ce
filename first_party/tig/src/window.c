@@ -639,6 +639,35 @@ int tig_window_display(void)
     return TIG_OK;
 }
 
+// CE: resolve a tint underlay window's video buffer for the compositor, or NULL
+// if the underlay handle is unset or points at a window slot that has since been
+// freed (or has no buffer). Without the usage check the compositor would read a
+// destroyed window's dangling video_buffer and lock its freed surface (observed
+// crash: SDL_LockSurface on a -1 surface). off_x/off_y receive the underlay's
+// negated frame origin (0 when there's no valid underlay).
+static TigVideoBuffer* tig_window_tint_underlay_vb(tig_window_handle_t underlay,
+    int* off_x, int* off_y)
+{
+    int uidx;
+
+    *off_x = 0;
+    *off_y = 0;
+    if (underlay == TIG_WINDOW_HANDLE_INVALID) {
+        return NULL;
+    }
+    uidx = tig_window_handle_to_index(underlay);
+    if (uidx < 0 || uidx >= TIG_WINDOW_MAX) {
+        return NULL;
+    }
+    if ((windows[uidx].usage & TIG_WINDOW_USAGE_FREE) != 0
+        || windows[uidx].video_buffer == NULL) {
+        return NULL;
+    }
+    *off_x = -windows[uidx].frame.x;
+    *off_y = -windows[uidx].frame.y;
+    return windows[uidx].video_buffer;
+}
+
 // 0x51D050
 void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int dy, int top_window_index)
 {
@@ -828,15 +857,8 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             TigVideoBuffer* under_vb = NULL;
                             int under_off_x = 0;
                             int under_off_y = 0;
-                            if (win->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
-                                int uidx = tig_window_handle_to_index(win->tint_underlay);
-                                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-                                    TigWindow* uw = &(windows[uidx]);
-                                    under_vb = uw->video_buffer;
-                                    under_off_x = -uw->frame.x;
-                                    under_off_y = -uw->frame.y;
-                                }
-                            }
+                            under_vb = tig_window_tint_underlay_vb(
+                                win->tint_underlay, &under_off_x, &under_off_y);
                             // CE: tint_reveal controls how much of
                             // the see-through tinted result is mixed
                             // in vs the opaque source pixel. 0 = the
@@ -995,15 +1017,8 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                     TigVideoBuffer* under_vb = NULL;
                     int under_off_x = 0;
                     int under_off_y = 0;
-                    if (wins[v38]->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
-                        int uidx = tig_window_handle_to_index(wins[v38]->tint_underlay);
-                        if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-                            TigWindow* uw = &(windows[uidx]);
-                            under_vb = uw->video_buffer;
-                            under_off_x = -uw->frame.x;
-                            under_off_y = -uw->frame.y;
-                        }
-                    }
+                    under_vb = tig_window_tint_underlay_vb(
+                        wins[v38]->tint_underlay, &under_off_x, &under_off_y);
                     tig_video_blit_transform_tinted(wins[v38]->video_buffer,
                         &blt_src_rect, &blt_dst_rect,
                         under_vb, under_off_x, under_off_y,
@@ -1021,15 +1036,8 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
             TigVideoBuffer* under_vb = NULL;
             int under_off_x = 0;
             int under_off_y = 0;
-            if (wins[v38]->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
-                int uidx = tig_window_handle_to_index(wins[v38]->tint_underlay);
-                if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-                    TigWindow* uw = &(windows[uidx]);
-                    under_vb = uw->video_buffer;
-                    under_off_x = -uw->frame.x;
-                    under_off_y = -uw->frame.y;
-                }
-            }
+            under_vb = tig_window_tint_underlay_vb(
+                wins[v38]->tint_underlay, &under_off_x, &under_off_y);
             uint8_t reveal_def = (uint8_t)(wins[v38]->tint_reveal * 255.0f + 0.5f);
             tig_video_blit_near_black_tinted(wins[v38]->video_buffer,
                 &blt_src_rect,
@@ -2269,15 +2277,8 @@ int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle)
     TigVideoBuffer* under_vb = NULL;
     int under_off_x = 0;
     int under_off_y = 0;
-    if (win->tint_underlay != TIG_WINDOW_HANDLE_INVALID) {
-        int uidx = tig_window_handle_to_index(win->tint_underlay);
-        if (uidx >= 0 && uidx < TIG_WINDOW_MAX) {
-            TigWindow* uw = &(windows[uidx]);
-            under_vb = uw->video_buffer;
-            under_off_x = -uw->frame.x;
-            under_off_y = -uw->frame.y;
-        }
-    }
+    under_vb = tig_window_tint_underlay_vb(win->tint_underlay,
+        &under_off_x, &under_off_y);
 
     // Copy window VB into snapshot, replacing near-black pixels with
     // tinted underlay sampled at the window's NATURAL screen position
