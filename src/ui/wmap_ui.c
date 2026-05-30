@@ -438,9 +438,9 @@ static bool wmap_ui_initialized;
 static bool wmap_ui_created;
 
 static const char* wmap_ui_bg_candidates[] = {
-    "art\\ui\\worldmap_bg.bmp",
-    "art\\ui\\map_bg.bmp",
-    "art\\ui\\wmap_bg.bmp",
+    "art\\interface\\worldmap_bg.bmp",
+    "art\\interface\\map_bg.bmp",
+    "art\\interface\\wmap_bg.bmp",
     NULL,
 };
 

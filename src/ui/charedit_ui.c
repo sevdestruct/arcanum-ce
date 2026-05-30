@@ -817,41 +817,41 @@ static int64_t charedit_obj;
 static bool charedit_created;
 
 static const char* charedit_bg_candidates[] = {
-    "art\\ui\\character_bg.bmp",
-    "art\\ui\\status_bg.bmp",
-    "art\\ui\\charedit_bg.bmp",
+    "art\\interface\\character_bg.bmp",
+    "art\\interface\\status_bg.bmp",
+    "art\\interface\\charedit_bg.bmp",
     NULL,
 };
 
 static const char* charedit_skills_bg_candidates[] = {
-    "art\\ui\\skills_bg.bmp",
-    "art\\ui\\charedit_skills_bg.bmp",
-    "art\\ui\\character_bg.bmp",
-    "art\\ui\\charedit_bg.bmp",
+    "art\\interface\\skills_bg.bmp",
+    "art\\interface\\charedit_skills_bg.bmp",
+    "art\\interface\\character_bg.bmp",
+    "art\\interface\\charedit_bg.bmp",
     NULL,
 };
 
 static const char* charedit_tech_bg_candidates[] = {
-    "art\\ui\\tech_bg.bmp",
-    "art\\ui\\charedit_tech_bg.bmp",
-    "art\\ui\\character_bg.bmp",
-    "art\\ui\\charedit_bg.bmp",
+    "art\\interface\\tech_bg.bmp",
+    "art\\interface\\charedit_tech_bg.bmp",
+    "art\\interface\\character_bg.bmp",
+    "art\\interface\\charedit_bg.bmp",
     NULL,
 };
 
 static const char* charedit_spells_bg_candidates[] = {
-    "art\\ui\\spellbook_bg.bmp",
-    "art\\ui\\charedit_spells_bg.bmp",
-    "art\\ui\\character_bg.bmp",
-    "art\\ui\\charedit_bg.bmp",
+    "art\\interface\\spellbook_bg.bmp",
+    "art\\interface\\charedit_spells_bg.bmp",
+    "art\\interface\\character_bg.bmp",
+    "art\\interface\\charedit_bg.bmp",
     NULL,
 };
 
 static const char* charedit_scheme_bg_candidates[] = {
-    "art\\ui\\crafting_tab_bg.bmp",
-    "art\\ui\\charedit_scheme_bg.bmp",
-    "art\\ui\\character_bg.bmp",
-    "art\\ui\\charedit_bg.bmp",
+    "art\\interface\\crafting_tab_bg.bmp",
+    "art\\interface\\charedit_scheme_bg.bmp",
+    "art\\interface\\character_bg.bmp",
+    "art\\interface\\charedit_bg.bmp",
     NULL,
 };
 

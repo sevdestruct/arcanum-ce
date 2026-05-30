@@ -970,38 +970,38 @@ void written_ui_draw_background(int num, int x, int y)
 static const char* const* written_ui_bg_candidates(void)
 {
     static const char* book_candidates[] = {
-        "art\\ui\\book_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\book_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* note_candidates[] = {
-        "art\\ui\\note_bg.bmp",
-        "art\\ui\\paper_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\note_bg.bmp",
+        "art\\interface\\paper_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* newspaper_candidates[] = {
-        "art\\ui\\newspaper_bg.bmp",
-        "art\\ui\\paper_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\newspaper_bg.bmp",
+        "art\\interface\\paper_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* vendigroth_newspaper_candidates[] = {
-        "art\\ui\\vendigroth_newspaper_bg.bmp",
-        "art\\ui\\newspaper_bg.bmp",
-        "art\\ui\\paper_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\vendigroth_newspaper_bg.bmp",
+        "art\\interface\\newspaper_bg.bmp",
+        "art\\interface\\paper_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* telegram_candidates[] = {
-        "art\\ui\\telegram_bg.bmp",
-        "art\\ui\\paper_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\telegram_bg.bmp",
+        "art\\interface\\paper_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* plaque_candidates[] = {
-        "art\\ui\\plaque_bg.bmp",
-        "art\\ui\\written_bg.bmp",
+        "art\\interface\\plaque_bg.bmp",
+        "art\\interface\\written_bg.bmp",
         NULL,
     };
 

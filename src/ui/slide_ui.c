@@ -362,17 +362,17 @@ static bool slide_ui_get_custom_credits_bg_path(char* bmp_path)
 {
     FILE* stream;
 
-    stream = fopen("data/art/ui/credits_bg.bmp", "rb");
+    stream = fopen("data/art/interface/credits_bg.bmp", "rb");
     if (stream != NULL) {
         fclose(stream);
-        strcpy(bmp_path, "art\\ui\\credits_bg.bmp");
+        strcpy(bmp_path, "art\\interface\\credits_bg.bmp");
         return true;
     }
 
-    stream = fopen("data/art/ui/mainmenu_bg.bmp", "rb");
+    stream = fopen("data/art/interface/mainmenu_bg.bmp", "rb");
     if (stream != NULL) {
         fclose(stream);
-        strcpy(bmp_path, "art\\ui\\mainmenu_bg.bmp");
+        strcpy(bmp_path, "art\\interface\\mainmenu_bg.bmp");
         return true;
     }
 
