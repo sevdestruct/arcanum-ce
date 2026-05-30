@@ -279,6 +279,9 @@ static char byte_5D0EA4[TIG_MAX_PATH];
 // 0x5D0FA8
 static char gamelib_mod_dat_path[TIG_MAX_PATH];
 
+// CE: per-module custom override dir (custom\modules\<name>) currently mounted.
+static char gamelib_mod_custom_path[TIG_MAX_PATH];
+
 // 0x5D10AC
 static void (*gamelib_draw_func)(GameDrawInfo* draw_info);
 
@@ -872,6 +875,57 @@ void gamelib_modlist_destroy(GameModuleList* module_list)
     module_list->paths = NULL;
 }
 
+// CE: bare module name from a possibly-pathed/extensioned arg (strip leading
+// directory and a trailing ".dat").
+static void gamelib_module_basename(const char* name, char* out, size_t out_sz)
+{
+    const char* base = name;
+    const char* p;
+    size_t n;
+
+    if (name == NULL || out_sz == 0) {
+        if (out_sz != 0) {
+            out[0] = '\0';
+        }
+        return;
+    }
+    for (p = name; *p != '\0'; p++) {
+        if (*p == '\\' || *p == '/') {
+            base = p + 1;
+        }
+    }
+    strncpy(out, base, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    n = strlen(out);
+    if (n > 4 && out[n - 4] == '.'
+        && (out[n - 3] == 'd' || out[n - 3] == 'D')
+        && (out[n - 2] == 'a' || out[n - 2] == 'A')
+        && (out[n - 1] == 't' || out[n - 1] == 'T')) {
+        out[n - 4] = '\0';
+    }
+}
+
+// CE: keep the custom override dirs on top of the just-loaded module. Head-
+// insertion order matters: promote custom\default first (above the module),
+// then custom\modules\<name> (above default).
+static void gamelib_mount_custom_overrides(const char* name)
+{
+    char base[TIG_MAX_PATH];
+    char custom_mod[TIG_MAX_PATH];
+
+    tig_file_repository_add("custom\\default");
+
+    gamelib_module_basename(name, base, sizeof(base));
+    if (base[0] != '\0') {
+        snprintf(custom_mod, sizeof(custom_mod), "custom\\modules\\%s", base);
+        if (tig_file_is_directory(custom_mod)) {
+            tig_file_repository_add(custom_mod);
+            strncpy(gamelib_mod_custom_path, custom_mod, TIG_MAX_PATH - 1);
+            gamelib_mod_custom_path[TIG_MAX_PATH - 1] = '\0';
+        }
+    }
+}
+
 // 0x402A50
 bool gamelib_mod_load(const char* path)
 {
@@ -884,6 +938,9 @@ bool gamelib_mod_load(const char* path)
     if (!gamelib_load_module_data(path)) {
         return false;
     }
+
+    // CE: re-promote custom overrides above the module just mounted.
+    gamelib_mount_custom_overrides(path);
 
     if (gamelib_mod_dat_path[0] != '\0') {
         tig_file_repository_guid(gamelib_mod_dat_path, &gamelib_mod_guid);
@@ -3138,6 +3195,15 @@ void gamelib_load_data(void)
 
     tig_file_mkdir("data");
     tig_file_repository_add("data");
+
+    // CE custom asset overrides. "custom\default" is the always-on global skin;
+    // mounted here above the base .dat + loose data, and re-promoted above the
+    // active module on load (gamelib_mount_custom_overrides). Per-module dirs
+    // "custom\modules\<name>" mount on top of default when that module loads.
+    // Original module > loose > .dat order is otherwise untouched.
+    tig_file_mkdir("custom");
+    tig_file_mkdir("custom\\default");
+    tig_file_repository_add("custom\\default");
 }
 
 // 0x404C10
@@ -3228,6 +3294,12 @@ void gamelib_unload_module_data(void)
 
     if (gamelib_mod_dat_path[0] != '\0') {
         tig_file_repository_remove(gamelib_mod_dat_path);
+    }
+
+    // CE: drop the per-module custom override dir (custom\default persists).
+    if (gamelib_mod_custom_path[0] != '\0') {
+        tig_file_repository_remove(gamelib_mod_custom_path);
+        gamelib_mod_custom_path[0] = '\0';
     }
 
     gamelib_mod_dir_path[0] = '\0';
