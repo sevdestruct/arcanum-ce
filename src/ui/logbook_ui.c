@@ -356,16 +356,16 @@ static bool logbook_ui_initialized;
 static bool logbook_ui_created;
 
 static const char* logbook_ui_bg_candidates[] = {
-    "art\\ui\\journal_bg.bmp",
-    "art\\ui\\logbook_bg.bmp",
+    "art\\interface\\journal_bg.bmp",
+    "art\\interface\\logbook_bg.bmp",
     NULL,
 };
 
 static const char* logbook_ui_panel_bg_candidates[] = {
-    "art\\ui\\journal_panel_bg.bmp",
-    "art\\ui\\logbook_panel_bg.bmp",
-    "art\\ui\\journal_page_bg.bmp",
-    "art\\ui\\logbook_page_bg.bmp",
+    "art\\interface\\journal_panel_bg.bmp",
+    "art\\interface\\logbook_panel_bg.bmp",
+    "art\\interface\\journal_page_bg.bmp",
+    "art\\interface\\logbook_page_bg.bmp",
     NULL,
 };
 

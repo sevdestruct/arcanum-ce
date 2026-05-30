@@ -3988,33 +3988,33 @@ tig_art_id_t sub_5782D0(void)
 static const char* const* inven_ui_bg_candidates(void)
 {
     static const char* inventory_candidates[] = {
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* barter_candidates[] = {
-        "art\\ui\\barter_bg.bmp",
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\barter_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* loot_candidates[] = {
-        "art\\ui\\loot_bg.bmp",
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\loot_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* steal_candidates[] = {
-        "art\\ui\\steal_bg.bmp",
-        "art\\ui\\loot_bg.bmp",
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\steal_bg.bmp",
+        "art\\interface\\loot_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* identify_candidates[] = {
-        "art\\ui\\identify_bg.bmp",
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\identify_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* repair_candidates[] = {
-        "art\\ui\\repair_bg.bmp",
-        "art\\ui\\inventory_bg.bmp",
+        "art\\interface\\repair_bg.bmp",
+        "art\\interface\\inventory_bg.bmp",
         NULL,
     };
 

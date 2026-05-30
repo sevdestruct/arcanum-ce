@@ -356,8 +356,8 @@ static bool schematic_ui_initialized;
 static bool schematic_ui_created;
 
 static const char* schematic_ui_bg_candidates[] = {
-    "art\\ui\\crafting_bg.bmp",
-    "art\\ui\\schematic_bg.bmp",
+    "art\\interface\\crafting_bg.bmp",
+    "art\\interface\\schematic_bg.bmp",
     NULL,
 };
 
