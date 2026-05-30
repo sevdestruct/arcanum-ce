@@ -736,7 +736,7 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     gv_slice("i_gold24", gold_aid, 31, 6, 18, 22);
     gv_fliph("i_gold24fH", "i_gold24");
     gv_compose("i_gold25", 24, 24,
-        (GvPart[]){ { "i_gold24", 1, -3 }, { "i_goldC", 6, 7 } }, 2);
+        (GvPart[]){ { "i_gold24fH", -2, 0 }, { "i_goldC", 6, 7 } }, 2);
     gv_fliph("i_gold25fH", "i_gold25");
 
     gv_slice("i_gold50", gold_aid, 0, 0, 30, 32);
