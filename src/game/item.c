@@ -613,9 +613,11 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
         }
     }
 
-    // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (0,0) 15x21.
+    // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (15,11) 15x21.
     memset(l, 0, sizeof(l));
     l[0].src_art = gold_aid;
+    l[0].sx = 15;
+    l[0].sy = 11;
     l[0].sw = 15;
     l[0].sh = 21;
     ce_sprite_define("i_gold1", 15, 21, l, 1);
