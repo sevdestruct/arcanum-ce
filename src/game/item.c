@@ -1,5 +1,6 @@
 #include "game/item.h"
 
+#include "game/a_name.h"
 #include "game/anim.h"
 #include "game/background.h"
 #include "game/ce_sprite.h"
@@ -587,6 +588,8 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
 {
     TigArtFrameData afd;
     CeSpriteLayer l[3];
+    tig_art_id_t coins_aid;
+    bool have_coins;
 
     if (item_gold_variants_built) {
         return;
@@ -594,6 +597,12 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     if (tig_art_frame_data(gold_aid, &afd) != TIG_OK) {
         return; // art not ready yet — retry on a later call
     }
+
+    // The superseded "i_coins00" pile (still in the .dat) is the composing
+    // source for the big stacks; fall back to plain gold if it can't be found.
+    coins_aid = a_name_item_inven_aid_by_name("i_coins00");
+    have_coins = (coins_aid != TIG_ART_ID_INVALID
+        && tig_art_frame_data(coins_aid, &afd) == TIG_OK);
 
     // < 100: a small pinch (1 slot). i_gold1 = i_gold slice (0,0) 15x21.
     memset(l, 0, sizeof(l));
@@ -610,21 +619,42 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     ce_sprite_define("i_gold50", 30, 32, l, 1);
 
     // i_gold100 = the original gold pile, as-is (2 slots, 2x1).
-    memset(l, 0, sizeof(l));
-    l[0].src_art = gold_aid;
-    ce_sprite_define("i_gold100", afd.width, afd.height, l, 1);
+    {
+        TigArtFrameData gfd;
+        tig_art_frame_data(gold_aid, &gfd);
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gold_aid;
+        ce_sprite_define("i_gold100", gfd.width, gfd.height, l, 1);
+    }
 
-    // i_gold250: 64x32 (2 slots). TODO: prepend i_coins00 slice (0,4) 46x27,
-    // flipped_h, off (-8,-3). Placeholder = the gold pile centered.
+    // i_gold250: 64x32 (2 slots) = i_coins00 slice (0,4) 46x27, flipped_h,
+    // off (-8,-3) UNDER i_gold100. Falls back to the gold pile if no i_coins00.
     memset(l, 0, sizeof(l));
-    l[0].src_sprite = "i_gold100";
-    ce_sprite_define("i_gold250", 64, 32, l, 1);
+    if (have_coins) {
+        l[0].src_art = coins_aid;
+        l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 27;
+        l[0].flip_x = true; l[0].off_x = -8; l[0].off_y = -3;
+        l[1].src_sprite = "i_gold100";
+        ce_sprite_define("i_gold250", 64, 32, l, 2);
+    } else {
+        l[0].src_sprite = "i_gold100";
+        ce_sprite_define("i_gold250", 64, 32, l, 1);
+    }
 
-    // i_gold500: 64x64 (4 slots). TODO: prepend i_coins00 slice (0,4) 46x31,
-    // flipped_h, off (-2,-14), then i_gold250 + i_gold100. Placeholder for now.
+    // i_gold500: 64x64 (4 slots) = i_coins00 slice (0,4) 46x31, flipped_h,
+    // off (-2,-14), then i_gold250, then i_gold100 (back-to-front).
     memset(l, 0, sizeof(l));
-    l[0].src_sprite = "i_gold100";
-    ce_sprite_define("i_gold500", 64, 64, l, 1);
+    if (have_coins) {
+        l[0].src_art = coins_aid;
+        l[0].sx = 0; l[0].sy = 4; l[0].sw = 46; l[0].sh = 31;
+        l[0].flip_x = true; l[0].off_x = -2; l[0].off_y = -14;
+        l[1].src_sprite = "i_gold250";
+        l[2].src_sprite = "i_gold100";
+        ce_sprite_define("i_gold500", 64, 64, l, 3);
+    } else {
+        l[0].src_sprite = "i_gold100";
+        ce_sprite_define("i_gold500", 64, 64, l, 1);
+    }
 
     item_gold_variants_built = true;
 }

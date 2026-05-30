@@ -28,6 +28,9 @@ int sub_4EBEF0(int a1, int a2, int a3, int a4, int a5, int a6);
 bool a_name_item_init(void);
 void a_name_item_exit(void);
 bool a_name_item_aid_to_fname(tig_art_id_t aid, char* fname, size_t maxlen);
+// CE: reverse lookup of an inventory item art id by art name (e.g. "i_coins00"),
+// including superseded assets still in the .dat. TIG_ART_ID_INVALID if none.
+tig_art_id_t a_name_item_inven_aid_by_name(const char* name);
 bool a_name_facade_init(void);
 void a_name_facade_exit(void);
 bool a_name_facade_aid_to_fname(tig_art_id_t aid, char* fname, size_t maxlen);

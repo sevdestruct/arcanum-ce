@@ -1,6 +1,7 @@
 #include "game/a_name.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "game/mes.h"
 #include "game/obj_private.h"
@@ -1101,6 +1102,52 @@ bool a_name_item_aid_to_fname(tig_art_id_t aid, char* fname, size_t maxlen)
     snprintf(fname, maxlen, "art\\item\\%s", mes_file_entry.str);
 
     return true;
+}
+
+// CE: reverse lookup — resolve an INVENTORY item art id from its art name (e.g.
+// "i_coins00"), including superseded assets still present in the .dat. Lets the
+// sprite compositor reference source art by stable name. Linear scan over the
+// item-art id space (one-time per name; cache the result at the call site).
+// Returns TIG_ART_ID_INVALID if no inventory art with that name exists.
+tig_art_id_t a_name_item_inven_aid_by_name(const char* name)
+{
+    char want[80];
+    char fname[TIG_MAX_PATH];
+    size_t wlen;
+    int type;
+    int subtype;
+    int num;
+    tig_art_id_t aid;
+
+    if (name == NULL) {
+        return TIG_ART_ID_INVALID;
+    }
+    snprintf(want, sizeof(want), "art\\item\\%s", name);
+    wlen = strlen(want);
+
+    // Item art ids partition as num + 20*(subtype + 50*type); the inventory name
+    // table only has entries for valid combinations (a_name_item_aid_to_fname
+    // misses the rest). num < 20, subtype < 50, and item types are few.
+    for (type = 0; type < 16; type++) {
+        for (subtype = 0; subtype < 50; subtype++) {
+            for (num = 0; num < 20; num++) {
+                if (tig_art_item_id_create(num,
+                        TIG_ART_ITEM_DISPOSITION_INVENTORY, 0, 0, subtype, type,
+                        0, 0, &aid)
+                    != TIG_OK) {
+                    continue;
+                }
+                if (!a_name_item_aid_to_fname(aid, fname, sizeof(fname))) {
+                    continue;
+                }
+                if (strncmp(fname, want, wlen) == 0
+                    && (fname[wlen] == '\0' || fname[wlen] == '.')) {
+                    return aid;
+                }
+            }
+        }
+    }
+    return TIG_ART_ID_INVALID;
 }
 
 // 0x4EC370
