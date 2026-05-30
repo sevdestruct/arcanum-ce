@@ -1793,11 +1793,16 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
             s->format);
         if (flip_src != NULL) {
             SDL_Rect whole = { 0, 0, native_src_rect.w, native_src_rect.h };
-            // Preserve color-key transparency through the copy.
+            // Preserve color-key transparency through the copy. The source's
+            // color-keyed (transparent) pixels are SKIPPED by SDL_BlitSurface,
+            // so they'd land on flip_src's fresh-allocation default (black) and
+            // then read as opaque black. Pre-fill flip_src with the key colour
+            // and carry the key forward so those areas stay transparent.
             bool had_key = SDL_SurfaceHasColorKey(s);
             uint32_t key = 0;
             if (had_key) {
                 SDL_GetSurfaceColorKey(s, &key);
+                SDL_FillSurfaceRect(flip_src, NULL, key);
                 SDL_SetSurfaceColorKey(flip_src, true, key);
             }
             SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
