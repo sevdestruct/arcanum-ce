@@ -2964,10 +2964,50 @@ bool redraw_inven_fix_bad_inven(int64_t a1, int64_t a2)
     return false;
 }
 
+// CE: draw a stack's quantity in the lower-right of its cell footprint, so
+// coin/ammo piles show how many they hold. Skips < 2 to avoid cluttering singles.
+static void inven_ui_draw_stack_count(int cx, int cy, int cw, int ch, int amount)
+{
+    char cnt[16];
+    TigFont fd;
+    TigRect r;
+
+    if (amount < 2) {
+        return;
+    }
+    snprintf(cnt, sizeof(cnt), "%d", amount);
+    tig_font_push(dword_682C74);
+    memset(&fd, 0, sizeof(fd));
+    fd.str = cnt;
+    fd.width = 0;
+    tig_font_measure(&fd);
+    r.width = fd.width;
+    r.height = fd.height;
+    r.x = cx + cw - fd.width - 2;
+    r.y = cy + ch - fd.height - 1;
+    tig_window_text_write(inven_ui_window_handle, cnt, &r);
+    tig_font_pop();
+}
+
+// CE: draw a coin/ammo pile's quantity at its footprint bottom-right. No-op for
+// other item types.
+static void inven_ui_draw_item_qty(int64_t item_obj, int cx, int cy, int cw,
+    int ch)
+{
+    int type = obj_field_int32_get(item_obj, OBJ_F_TYPE);
+    if (type == OBJ_TYPE_GOLD) {
+        inven_ui_draw_stack_count(cx, cy, cw, ch,
+            obj_field_int32_get(item_obj, OBJ_F_GOLD_QUANTITY));
+    } else if (type == OBJ_TYPE_AMMO) {
+        inven_ui_draw_stack_count(cx, cy, cw, ch,
+            obj_field_int32_get(item_obj, OBJ_F_AMMO_QUANTITY));
+    }
+}
+
 // CE: if `item_obj` is a gold pile with a quantity-based variant sprite, draw it
-// centered in its cell footprint (footprint_w/h = cells*32) and return true so
-// the caller skips the normal icon blit. Gives 1 / 2 / 4-slot coin piles that
-// match the slot count item_inv_icon_size now reports for gold.
+// centered in its cell footprint (footprint_w/h = cells*32), stamp the amount,
+// and return true so the caller skips the normal icon blit. Gives 1 / 2 / 4-slot
+// coin piles that match the slot count item_inv_icon_size now reports for gold.
 static bool inven_ui_draw_gold_variant(int64_t item_obj, int cell_x, int cell_y,
     int footprint_w, int footprint_h)
 {
@@ -2983,6 +3023,7 @@ static bool inven_ui_draw_gold_variant(int64_t item_obj, int cell_x, int cell_y,
     ce_sprite_draw(inven_ui_window_handle, name,
         cell_x + (footprint_w - sw) / 2,
         cell_y + (footprint_h - sh) / 2, 255);
+    inven_ui_draw_item_qty(item_obj, cell_x, cell_y, footprint_w, footprint_h);
     return true;
 }
 
@@ -3590,6 +3631,10 @@ void redraw_inven(bool a1)
             if (palette_modify_info.dst_palette != NULL) {
                 tig_palette_destroy(palette_modify_info.dst_palette);
             }
+
+            // CE: stamp pile quantity (ammo here; gold drew its variant above
+            // and skipped to the next item).
+            inven_ui_draw_item_qty(item_obj, x, y, width, height);
         }
     }
 
@@ -3794,6 +3839,8 @@ void redraw_inven(bool a1)
                 y = v102 + 32 * (inventory_location / 10 - dword_681508);
 
                 if (y < v109 + v102) {
+                    int pcx = x; // cell origin (x/y get mutated for centering)
+                    int pcy = y;
                     // CE: gold draws as its quantity-variant sprite (sized to
                     // its slots) when the whole footprint fits the visible band;
                     // otherwise fall through to the normal (clipped) blit.
@@ -3862,6 +3909,16 @@ void redraw_inven(bool a1)
 
                     if (palette_modify_info.dst_palette != NULL) {
                         tig_palette_destroy(palette_modify_info.dst_palette);
+                    }
+
+                    // CE: stamp pile quantity (ammo; gold drew its variant and
+                    // skipped above) at the cell's footprint bottom-right.
+                    {
+                        int aw = 1;
+                        int ah = 1;
+                        item_inv_icon_size(item_obj, &aw, &ah);
+                        inven_ui_draw_item_qty(item_obj, pcx, pcy,
+                            aw * 32, ah * 32);
                     }
                 }
             }
