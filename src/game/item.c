@@ -52,6 +52,7 @@ static void sub_466A50(int64_t key_obj, int64_t key_ring_obj);
 static void sub_466AA0(int64_t critter_obj, int64_t a2);
 static void sub_466BD0(int64_t key_ring_obj);
 static bool sub_466EF0(int64_t obj, int64_t loc);
+static void item_gold_inventory_revalidate(int64_t gold_obj);
 static char* item_error_str(int reason);
 static int find_free_inv_loc_horizontal(int64_t item_obj, int64_t parent_obj, int* slots);
 static int find_free_inv_loc_vertical(int64_t item_obj, int64_t parent_obj, int* slots);
@@ -3031,6 +3032,7 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
                 to_qty = obj_field_int32_get(gold_obj, OBJ_F_GOLD_QUANTITY);
                 obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, to_qty + qty);
                 item_gold_world_update(gold_obj); // CE: update world art if world pile
+                item_gold_inventory_revalidate(gold_obj); // CE: re-fit slots if in inventory
             } else {
                 loc = obj_field_int64_get(to_obj, OBJ_F_LOCATION);
                 gold_obj = item_gold_create(qty, loc);
@@ -4167,6 +4169,75 @@ int item_find_free_inv_loc_for_insertion(int64_t item_obj, int64_t parent_obj)
     return find_free_inv_loc_horizontal(item_obj, parent_obj, slots);
 }
 
+// CE: a gold pile's inventory footprint grows with its quantity (1/2/4 cells).
+// When the amount changes in place (merge on pickup/receive) the slot grid is
+// rebuilt from the new footprint, so the larger icon would overlap whatever
+// sits in the newly-claimed cells — visually bleeding over without actually
+// reserving them until a manual move or Arrange. Re-validate here: if the pile
+// no longer fits where it sits, relocate it to the first free slot that does.
+static void item_gold_inventory_revalidate(int64_t gold_obj)
+{
+    int64_t parent_obj;
+    int loc;
+    int new_loc;
+    int num_fld;
+    int list_fld;
+    int capacity;
+    int cnt;
+    int idx;
+    int64_t other_obj;
+    int slots[960];
+
+    if (gold_obj == OBJ_HANDLE_NULL
+        || obj_field_int32_get(gold_obj, OBJ_F_TYPE) != OBJ_TYPE_GOLD
+        || (obj_field_int32_get(gold_obj, OBJ_F_FLAGS) & OF_INVENTORY) == 0) {
+        return;
+    }
+    if (!item_parent(gold_obj, &parent_obj) || parent_obj == OBJ_HANDLE_NULL) {
+        return;
+    }
+
+    loc = item_inventory_location_get(gold_obj);
+    if (IS_WEAR_INV_LOC(loc) || IS_HOTKEY_INV_LOC(loc)) {
+        return;
+    }
+
+    // Build the occupancy grid EXCLUDING this gold pile. We can't build it
+    // normally and then blank the pile's footprint, because the grown footprint
+    // overlaps neighbouring cells — blanking it would also erase whatever it's
+    // overlapping (e.g. the ring), making the spot look free. Excluding the pile
+    // keeps every other item's claim intact so the fit test is honest.
+    if (obj_field_int32_get(parent_obj, OBJ_F_TYPE) == OBJ_TYPE_CONTAINER) {
+        num_fld = OBJ_F_CONTAINER_INVENTORY_NUM;
+        list_fld = OBJ_F_CONTAINER_INVENTORY_LIST_IDX;
+        capacity = 960;
+    } else {
+        num_fld = OBJ_F_CRITTER_INVENTORY_NUM;
+        list_fld = OBJ_F_CRITTER_INVENTORY_LIST_IDX;
+        capacity = 120;
+    }
+    memset(slots, 0, sizeof(*slots) * capacity);
+    cnt = obj_field_int32_get(parent_obj, num_fld);
+    for (idx = 0; idx < cnt; idx++) {
+        other_obj = obj_arrayfield_handle_get(parent_obj, list_fld, idx);
+        if (other_obj == gold_obj) {
+            continue;
+        }
+        item_inventory_slots_set(other_obj,
+            item_inventory_location_get(other_obj), slots, idx + 1);
+    }
+
+    if (item_inventory_slots_has_room_for(gold_obj, parent_obj, loc, slots)) {
+        return; // still fits where it is — nothing to do
+    }
+
+    new_loc = find_free_inv_loc_horizontal(gold_obj, parent_obj, slots);
+    if (new_loc != -1) {
+        obj_field_int32_set(gold_obj, OBJ_F_ITEM_INV_LOCATION, new_loc);
+    }
+    // If nothing fits, leave it in place; the player can rearrange or drop.
+}
+
 // 0x466510
 int item_check_insert(int64_t item_obj, int64_t parent_obj, int* inventory_location_ptr)
 {
@@ -4251,6 +4322,7 @@ void item_insert(int64_t item_obj, int64_t parent_obj, int inventory_location)
             qty = obj_field_int32_get(item_obj, qty_fld);
             existing_qty = obj_field_int32_get(existing_item_obj, qty_fld);
             obj_field_int32_set(existing_item_obj, qty_fld, existing_qty + qty);
+            item_gold_inventory_revalidate(existing_item_obj); // CE: re-fit slots if gold grew
 
             object_drop(item_obj, obj_field_int64_get(parent_obj, OBJ_F_LOCATION));
             sub_466D60(parent_obj);
