@@ -6389,7 +6389,14 @@ void mainmenu_ui_create_window_func(bool should_display)
             // partially-transparent black backdrop.
             float alpha_from =
                 (mainmenu_ui_has_custom_bg || !is_in_game) ? 0.0f : 1.0f;
-            ui_anim_profile_t entrance_profile = { 300, 1.2f };
+            // Damping 1.0 (critical) when ending at the receded
+            // 0.96 soft rest; 1.2 (overdamped) when ending at 1.0
+            // where transform_clear gives a crisp 1:1 endpoint
+            // (see the want_receded != bg_receded branch below for
+            // the full rationale).
+            ui_anim_profile_t entrance_profile = {
+                300,
+                want_receded ? 1.0f : 1.2f };
             ui_anim_window_transform_from_to(
                 mainmenu_ui_backdrop_handle,
                 0.98f, alpha_from, target_scale, 1.0f,
@@ -6402,7 +6409,9 @@ void mainmenu_ui_create_window_func(bool should_display)
             // tween is still active, so the from_* values are ignored
             // — retarget preserves current spring value + velocity.
             mainmenu_ui_bg_exit_pending = false;
-            ui_anim_profile_t entrance_profile = { 300, 1.2f };
+            ui_anim_profile_t entrance_profile = {
+                300,
+                want_receded ? 1.0f : 1.2f };
             ui_anim_window_transform_from_to(mainmenu_ui_backdrop_handle,
                 1.0f, 1.0f, target_scale, 1.0f,
                 UI_ANIM_ANCHOR_CENTER, &entrance_profile);
@@ -6425,8 +6434,25 @@ void mainmenu_ui_create_window_func(bool should_display)
             // ui_anim has no active state), so without an explicit
             // from-value the new spring would start at 1.0 → 1.0
             // for the sub→shell case (already at target = snap).
+            //
+            // Damping 1.0 (critical) for the recede instead of 1.2
+            // (overdamped): the integer-pixel dst has to step ~22
+            // times during the 1.0→0.96 transition (each 1px
+            // shrink), with the FINAL step landing at scale ≈
+            // 0.9605. Overdamped's slow tail puts that last step
+            // at near-zero velocity, which the eye reads as a
+            // perceptible 1px snap right at lock-in. Critical
+            // damping is the fastest monotonic-no-overshoot
+            // profile — same total settle time but the tail moves
+            // faster, so the final 1px step happens during
+            // meaningful motion and is masked. The un-recede stays
+            // at 1.2 because its 1.0 endpoint reverts to a crisp
+            // 1:1 blit via transform_clear and doesn't have a
+            // visible settle snap to worry about.
             float current_scale = mainmenu_ui_bg_receded ? 0.96f : 1.0f;
-            ui_anim_profile_t bg_profile = { want_receded ? 240 : 180, 1.2f };
+            ui_anim_profile_t bg_profile = {
+                want_receded ? 240 : 180,
+                want_receded ? 1.0f : 1.2f };
             ui_anim_window_transform_from_to(mainmenu_ui_backdrop_handle,
                 current_scale, 1.0f, target_scale, 1.0f,
                 UI_ANIM_ANCHOR_CENTER, &bg_profile);
