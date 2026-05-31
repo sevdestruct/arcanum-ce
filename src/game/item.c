@@ -1278,7 +1278,6 @@ bool item_drop_ex(int64_t item_obj, int distance)
 
     item_remove(item_obj);
     sub_466E50(item_obj, loc);
-    item_gold_world_update(item_obj); // CE: set quantity-based world art if gold
 
     if (obj_type == OBJ_TYPE_NPC) {
         switch (obj_field_int32_get(item_obj, OBJ_F_TYPE)) {
@@ -3020,7 +3019,6 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
                     object_destroy(gold_obj);
                 } else {
                     obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, from_qty - qty);
-                    item_gold_world_update(gold_obj); // CE: update world art if world pile
                 }
             }
         }
@@ -3030,7 +3028,6 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
             if (gold_obj != OBJ_HANDLE_NULL) {
                 to_qty = obj_field_int32_get(gold_obj, OBJ_F_GOLD_QUANTITY);
                 obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, to_qty + qty);
-                item_gold_world_update(gold_obj); // CE: update world art if world pile
             } else {
                 loc = obj_field_int64_get(to_obj, OBJ_F_LOCATION);
                 gold_obj = item_gold_create(qty, loc);
@@ -3051,7 +3048,6 @@ int64_t item_gold_create(int amount, int64_t loc)
 
     if (mp_object_create(BP_GOLD, loc, &gold_obj)) {
         obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, amount);
-        item_gold_world_update(gold_obj);
     }
 
     return gold_obj;
