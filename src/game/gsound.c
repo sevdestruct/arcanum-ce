@@ -1866,10 +1866,21 @@ void gsound_listener_set(int64_t loc)
 
     location_xy(loc, &x, &y);
 
-    // Update origin x/y if present.
-    if (gsound_origin_loc != 0) {
-        location_xy(gsound_origin_loc, &gsound_origin_x, &gsound_origin_y);
+    // CE: establish the positional-audio origin from the listener if no sound
+    // has set it yet. Without this, at map-load the listener is set BEFORE any
+    // positional sound exists, so gsound_origin_loc is still 0 (origin_xy 0,0)
+    // and the listener is stored in raw map-pixel coords (e.g. 600,402) instead
+    // of origin-relative. The first sound then sets the origin to ITS own tile,
+    // putting sounds and the listener in different coordinate frames — so PC
+    // sounds (gold pickup, footsteps) attenuate to silence until the next
+    // scroll re-runs this with a valid origin. Seeding the origin here keeps
+    // both in the same frame from the start.
+    if (gsound_origin_loc == 0) {
+        gsound_origin_loc = loc;
     }
+
+    // Update origin x/y (now guaranteed present).
+    location_xy(gsound_origin_loc, &gsound_origin_x, &gsound_origin_y);
 
     // Express the listener position in origin-relative coordinates.
     set_listener_xy(x - gsound_origin_x, y - gsound_origin_y);
