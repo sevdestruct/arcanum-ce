@@ -451,6 +451,12 @@ bool gamelib_init(GameInitInfo* init_info)
     // (lens copies whatever is at screen center).
     settings_register(&settings, PC_LENS_FOLLOWS_PLAYER_KEY, "1", NULL);
 
+    // CE: who has priority for the cells a growing gold pile needs. Default
+    // "0" — existing items win and the gold pile relocates itself. Set to "1"
+    // to give the pile priority: it keeps its spot and the items it overlaps
+    // are shuffled out to other free slots.
+    settings_register(&settings, GOLD_EXPANSION_SLOT_PRIORITY_KEY, "0", NULL);
+
     // CE: Renderer vsync mode. Default 2 (adaptive) — measured ~17%
     // lower frame avg and ~21% lower stddev vs vanilla vsync on a 120Hz
     // ProMotion display, with no perceptible tearing during normal
@@ -2934,6 +2940,12 @@ bool gamelib_recenter_camera_on_overlay(void)
 bool gamelib_pc_lens_follows_player(void)
 {
     return settings_get_value(&settings, PC_LENS_FOLLOWS_PLAYER_KEY) != 0;
+}
+
+// CE: Read the GOLD_EXPANSION_SLOT_PRIORITY_KEY setting.
+bool gamelib_gold_expansion_slot_priority(void)
+{
+    return settings_get_value(&settings, GOLD_EXPANSION_SLOT_PRIORITY_KEY) != 0;
 }
 
 // 0x4046F0

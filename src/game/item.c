@@ -7,6 +7,7 @@
 #include "game/critter.h"
 #include "game/description.h"
 #include "game/descriptions.h"
+#include "game/gamelib.h"
 #include "game/invensource.h"
 #include "game/magictech.h"
 #include "game/mes.h"
@@ -4229,6 +4230,113 @@ static void item_gold_inventory_revalidate(int64_t gold_obj)
 
     if (item_inventory_slots_has_room_for(gold_obj, parent_obj, loc, slots)) {
         return; // still fits where it is — nothing to do
+    }
+
+    // Doesn't fit. Resolution depends on GOLD_EXPANSION_SLOT_PRIORITY_KEY:
+    //   off (default) -> relocate the gold pile to a free slot (below).
+    //   on            -> keep the pile put and shuffle the items it now overlaps
+    //                    out to other free slots.
+    {
+        int gw;
+        int gh;
+        int rows;
+        int gx = loc % 10;
+        int gy = loc / 10;
+
+        item_inv_icon_size(gold_obj, &gw, &gh);
+        rows = (obj_field_int32_get(parent_obj, OBJ_F_TYPE) == OBJ_TYPE_CONTAINER) ? 96 : 12;
+
+        // Pushing only makes sense if the pile actually fits on the grid at its
+        // current cell (it just collides with neighbours). If its footprint runs
+        // off the edge there is nowhere to push to — relocate the pile instead.
+        if (gamelib_gold_expansion_slot_priority()
+            && gx + gw <= 10
+            && gy + gh <= rows) {
+            int64_t overlappers[120];
+            int new_locs[120];
+            int n_over = 0;
+            int work[960];
+            bool ok = true;
+            int i;
+            int x;
+            int y;
+
+            // Items whose footprint intersects the pile's grown footprint.
+            for (idx = 0; idx < cnt; idx++) {
+                int ow;
+                int oh;
+                int ox;
+                int oy;
+                int oloc;
+
+                other_obj = obj_arrayfield_handle_get(parent_obj, list_fld, idx);
+                if (other_obj == gold_obj) {
+                    continue;
+                }
+                oloc = item_inventory_location_get(other_obj);
+                if (IS_WEAR_INV_LOC(oloc) || IS_HOTKEY_INV_LOC(oloc)) {
+                    continue;
+                }
+                item_inv_icon_size(other_obj, &ow, &oh);
+                ox = oloc % 10;
+                oy = oloc / 10;
+                if (!(ox + ow <= gx || gx + gw <= ox || oy + oh <= gy || gy + gh <= oy)
+                    && n_over < (int)(sizeof(overlappers) / sizeof(overlappers[0]))) {
+                    overlappers[n_over++] = other_obj;
+                }
+            }
+
+            // Working grid: every NON-overlapping item, plus the pile's new
+            // footprint reserved, so relocated neighbours can't land back under
+            // the gold or on top of each other.
+            memset(work, 0, sizeof(*work) * capacity);
+            for (idx = 0; idx < cnt; idx++) {
+                bool is_over = false;
+
+                other_obj = obj_arrayfield_handle_get(parent_obj, list_fld, idx);
+                if (other_obj == gold_obj) {
+                    continue;
+                }
+                for (i = 0; i < n_over; i++) {
+                    if (overlappers[i] == other_obj) {
+                        is_over = true;
+                        break;
+                    }
+                }
+                if (is_over) {
+                    continue;
+                }
+                item_inventory_slots_set(other_obj,
+                    item_inventory_location_get(other_obj), work, idx + 1);
+            }
+            for (y = 0; y < gh; y++) {
+                for (x = 0; x < gw; x++) {
+                    work[loc + y * 10 + x] = -1; // reserve the pile's cells
+                }
+            }
+
+            // Plan a destination for each overlapped item without committing,
+            // reserving each chosen spot so later items avoid it.
+            for (i = 0; i < n_over; i++) {
+                int nl = find_free_inv_loc_horizontal(overlappers[i], parent_obj, work);
+                if (nl == -1) {
+                    ok = false;
+                    break;
+                }
+                new_locs[i] = nl;
+                item_inventory_slots_set(overlappers[i], nl, work, i + 1);
+            }
+
+            if (ok) {
+                // Everyone fits — commit the moves and leave the pile in place.
+                for (i = 0; i < n_over; i++) {
+                    obj_field_int32_set(overlappers[i], OBJ_F_ITEM_INV_LOCATION, new_locs[i]);
+                }
+                return;
+            }
+            // Couldn't rehome every neighbour (nothing moved yet) — fall through
+            // to relocating the pile itself.
+        }
     }
 
     new_loc = find_free_inv_loc_horizontal(gold_obj, parent_obj, slots);

@@ -92,6 +92,14 @@
 // Set in arcanum.cfg. Reapplied at startup.
 #define VSYNC_MODE_KEY "vsync mode"
 
+// When a gold pile's inventory footprint grows past a slot threshold (1->2->4
+// cells) and no longer fits where it sits, this controls who has priority for
+// the contested cells. Default 0 — the existing items win; the gold pile
+// relocates itself to the first free slot that fits. Set to 1 to give the
+// growing gold pile priority — it keeps its spot and the items it now overlaps
+// are shuffled out to other free slots.
+#define GOLD_EXPANSION_SLOT_PRIORITY_KEY "gold expansion slot priority"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
@@ -212,6 +220,12 @@ bool gamelib_recenter_camera_on_overlay(void);
 // iso camera has been panned away. See PC_LENS_FOLLOWS_PLAYER_KEY.
 // Defaults to true.
 bool gamelib_pc_lens_follows_player(void);
+
+// CE: when a growing gold pile no longer fits its slot, whether the pile has
+// priority — keep its spot and push overlapped neighbours out to free slots
+// (true) — or yields and relocates itself (false, default). See
+// GOLD_EXPANSION_SLOT_PRIORITY_KEY.
+bool gamelib_gold_expansion_slot_priority(void);
 
 // Debug perf counter for the zoom-out draw path. When enabled, gamelib
 // times each zoom-active frame (gamelib_draw_func + downscale blit) and
