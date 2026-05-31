@@ -4481,6 +4481,27 @@ bool sub_466EF0(int64_t obj, int64_t loc)
 
     new_container_obj = OBJ_HANDLE_NULL;
     object_list_location(loc, OBJ_TM_ITEM, &objects);
+
+    // CE: if the incoming item is gold AND every existing item on this tile is
+    // also gold, skip junk-pile creation — gold stacks automatically via
+    // item_gold_transfer and should never be wrapped in a junk pile unless
+    // non-gold items are also present on the same tile.
+    if (obj_field_int32_get(obj, OBJ_F_TYPE) == OBJ_TYPE_GOLD) {
+        bool all_gold = true;
+        node = objects.head;
+        while (node != NULL) {
+            if (obj_field_int32_get(node->obj, OBJ_F_TYPE) != OBJ_TYPE_GOLD) {
+                all_gold = false;
+                break;
+            }
+            node = node->next;
+        }
+        if (all_gold) {
+            object_list_destroy(&objects);
+            return false; // let caller use object_drop; gold merges on pickup
+        }
+    }
+
     node = objects.head;
     while (node != NULL) {
         if (new_container_obj == OBJ_HANDLE_NULL) {
