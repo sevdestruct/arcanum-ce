@@ -62,6 +62,11 @@ void item_inv_icon_size(int64_t item_id, int* width, int* height);
 // CE: quantity-based gold variant sprite name (NULL if not gold / not built);
 // optionally returns its inventory cell footprint.
 const char* item_gold_inv_variant(int64_t item_id, int* cells_w, int* cells_h);
+// CE: world/ground gold variant sprite name for quantity. NULL if not gold/unavailable.
+const char* item_gold_world_variant(int64_t item_id);
+// CE: update OBJ_F_CURRENT_AID on a world gold object to match its quantity.
+// Call whenever gold is placed in or removed from the world.
+void item_gold_world_update(int64_t gold_obj);
 bool item_transfer(int64_t item_obj, int64_t critter_obj);
 bool item_transfer_ex(int64_t item_obj, int64_t critter_obj, int inventory_location);
 bool item_drop(int64_t item_obj);

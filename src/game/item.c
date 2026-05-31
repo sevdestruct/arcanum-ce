@@ -813,6 +813,222 @@ static void item_gold_build_variants(tig_art_id_t gold_aid)
     item_gold_variants_built = true;
 }
 
+// ---- World / ground gold variants from g_coins00 ----------------------------
+static bool item_gold_world_variants_built;
+
+static void item_gold_build_world_variants(void)
+{
+    tig_art_id_t gc;
+    TigFileInfo fi;
+
+    if (item_gold_world_variants_built) {
+        return;
+    }
+
+    // g_coins00 is the ground-disposition pile; load via raw path (no mes entry).
+    if (!tig_file_exists("art\\item\\g_coins00.art", &fi)) {
+        return;
+    }
+    gc = ce_named_art("art\\item\\g_coins00.art");
+    if (gc == TIG_ART_ID_INVALID) {
+        return;
+    }
+
+    // ---- Components ----
+    gv_slice("g_gold1",   gc,  4, 13,  4,  3);  // 4x3 pinch of coin
+    gv_fliph("g_gold1fH",  "g_gold1");
+    // g_gold1fF = g_gold1fH flip_v
+    if (!item_gold_define_override("g_gold1fF")) {
+        CeSpriteLayer l[1];
+        memset(l, 0, sizeof(l));
+        l[0].src_sprite = "g_gold1fH";
+        l[0].flip_y = true;
+        ce_sprite_define("g_gold1fF", 4, 3, l, 1);
+    }
+
+    gv_slice("g_goldC1",  gc,  4, 15,  4,  2);
+    gv_fliph("g_goldC1fH", "g_goldC1");
+    gv_slice("g_goldC2",  gc,  7,  0,  4,  3);
+    gv_fliph("g_goldC2fH", "g_goldC2");
+    gv_slice("g_goldC3",  gc, 12, 10,  4,  2);
+    gv_fliph("g_goldC3fH", "g_goldC3");
+
+    // g_gold5ish: 3x6 strip of coin column
+    if (!item_gold_define_override("g_gold5ish")) {
+        CeSpriteLayer l[1];
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gc;
+        l[0].sx = 7; l[0].sy = 0; l[0].sw = 3; l[0].sh = 6;
+        ce_sprite_define("g_gold5ish", 3, 6, l, 1);
+    }
+
+    // g_gold7ish: 3x8 taller coin column
+    if (!item_gold_define_override("g_gold7ish")) {
+        CeSpriteLayer l[1];
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gc;
+        l[0].sx = 7; l[0].sy = 0; l[0].sw = 3; l[0].sh = 8;
+        ce_sprite_define("g_gold7ish", 3, 8, l, 1);
+    }
+
+    // g_gold100 = full g_coins00 as-is
+    {
+        TigArtFrameData afd;
+        if (!item_gold_define_override("g_gold100") && tig_art_frame_data(gc, &afd) == TIG_OK) {
+            CeSpriteLayer l[1];
+            memset(l, 0, sizeof(l));
+            l[0].src_art = gc;
+            ce_sprite_define("g_gold100", afd.width, afd.height, l, 1);
+        }
+    }
+    gv_art_fliph("g_gold100fH", gc);
+
+    // ---- Small piles ----
+    gv_compose("g_gold2", 10, 7,
+        (GvPart[]){ { "g_gold1", -2, 1 }, { "g_goldC2fH", 1, -1 } }, 2);
+    gv_compose("g_gold3", 11, 8,
+        (GvPart[]){ { "g_gold2", 0, 1 }, { "g_goldC2fH", 0, -1 }, { "g_gold1fH", 2, -1 } }, 3);
+    gv_compose("g_gold4", 11, 9,
+        (GvPart[]){ { "g_gold3", 0, 1 }, { "g_goldC2", 2, 0 }, { "g_gold1", 0, -1 } }, 3);
+    gv_compose("g_gold5", 15, 9,
+        (GvPart[]){ { "g_gold4", -2, 0 }, { "g_gold1fF", 5, 1 } }, 2);
+    gv_compose("g_gold10", 15, 12,
+        (GvPart[]){
+            { "g_gold3",   -2,  2 },
+            { "g_gold1fF",  5,  2 },
+            { "g_gold5ish", 0, -2 },
+            { "g_goldC2",  -2,  1 },
+        }, 4);
+
+    // ---- Medium piles ----
+    // g_gold25: uses a full-canvas slice of g_coins00 as base
+    if (!item_gold_define_override("g_gold25")) {
+        CeSpriteLayer l[4];
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gc; l[0].sx = 0; l[0].sy = 0; l[0].sw = 12; l[0].sh = 10; l[0].off_x = -1; l[0].off_y = -1;
+        l[1].src_sprite = "g_gold1";   l[1].off_x = -3; l[1].off_y =  4;
+        l[2].src_sprite = "g_goldC3";  l[2].off_x =  4; l[2].off_y =  3;
+        l[3].src_sprite = "g_goldC1";  l[3].off_x =  2; l[3].off_y =  6;
+        ce_sprite_define("g_gold25", 16, 14, l, 4);
+    }
+
+    // g_gold50: wide base slice + accents
+    if (!item_gold_define_override("g_gold50")) {
+        CeSpriteLayer l[3];
+        memset(l, 0, sizeof(l));
+        l[0].src_art = gc; l[0].sx = 0; l[0].sy = 0; l[0].sw = 16; l[0].sh = 12; l[0].off_y = -1;
+        l[1].src_sprite = "g_gold1";    l[1].off_x = -3; l[1].off_y =  5;
+        l[2].src_sprite = "g_goldC2fH"; l[2].off_x =  2; l[2].off_y =  6;
+        ce_sprite_define("g_gold50", 17, 17, l, 3);
+    }
+
+    // ---- Large piles ----
+    gv_compose("g_gold250", 19, 18,
+        (GvPart[]){
+            { "g_gold25",   2,  2 },
+            { "g_gold100",  1,  0 },
+            { "g_gold5ish", -2,  1 },
+            { "g_gold3",   -5,  6 },
+        }, 4);
+
+    // g_goldC1fH used in g_gold500 (already built as g_goldC1fH above)
+    gv_compose("g_gold500", 23, 22,
+        (GvPart[]){
+            { "g_gold250",  0, -1 },
+            { "g_gold25",   5,  3 },
+            { "g_gold7ish", 2,  3 },
+            { "g_gold1fH",  3,  7 },
+            { "g_gold1",   -3,  9 },
+            { "g_goldC2",  -6,  6 },
+            { "g_goldC1fH",-8,  8 },
+        }, 7);
+
+    gv_compose("g_gold1000", 32, 26,
+        (GvPart[]){
+            { "g_gold100",  0,  0 },
+            { "g_gold500",  1, -2 },
+            { "g_gold500", -4,  1 },
+            { "g_gold25",   7,  5 },
+            { "g_gold5",    5, 10 },
+            { "g_goldC1",  13,  6 },
+        }, 6);
+
+    // g_gold2000 has no recipe in spec yet — fall back to g_gold1000.
+    if (!ce_sprite_exists("g_gold2000")) {
+        gv_compose("g_gold2000", 32, 26,
+            (GvPart[]){ { "g_gold1000", 0, 0 } }, 1);
+    }
+
+    item_gold_world_variants_built = true;
+}
+
+// Return the world-pile sprite name for this gold object's quantity, building
+// variants on first use. NULL if not gold or variants unavailable.
+// Callers should update OBJ_F_CURRENT_AID via item_gold_world_update.
+const char* item_gold_world_variant(int64_t item_id)
+{
+    int amount;
+    const char* name;
+
+    if (obj_field_int32_get(item_id, OBJ_F_TYPE) != OBJ_TYPE_GOLD) {
+        return NULL;
+    }
+    item_gold_build_world_variants();
+
+    amount = obj_field_int32_get(item_id, OBJ_F_GOLD_QUANTITY);
+    if (amount >= 2000) {
+        name = "g_gold2000";
+    } else if (amount >= 1000) {
+        name = "g_gold1000";
+    } else if (amount >= 500) {
+        name = "g_gold500";
+    } else if (amount >= 250) {
+        name = "g_gold250";
+    } else if (amount >= 100) {
+        name = "g_gold100";
+    } else if (amount >= 50) {
+        name = "g_gold50";
+    } else if (amount >= 25) {
+        name = "g_gold25";
+    } else if (amount >= 10) {
+        name = "g_gold10";
+    } else if (amount >= 5) {
+        name = "g_gold5";
+    } else if (amount == 4) {
+        name = "g_gold4";
+    } else if (amount == 3) {
+        name = "g_gold3";
+    } else if (amount == 2) {
+        name = "g_gold2";
+    } else {
+        name = "g_gold1";
+    }
+
+    return ce_sprite_exists(name) ? name : NULL;
+}
+
+// Update a gold object's world art (OBJ_F_CURRENT_AID) to match its quantity.
+// Call whenever gold is placed in or removed from the world (drop, create, transfer).
+void item_gold_world_update(int64_t gold_obj)
+{
+    const char* name;
+    tig_art_id_t aid;
+
+    if (gold_obj == OBJ_HANDLE_NULL
+        || obj_field_int32_get(gold_obj, OBJ_F_TYPE) != OBJ_TYPE_GOLD
+        || (obj_field_int32_get(gold_obj, OBJ_F_FLAGS) & OF_INVENTORY) != 0) {
+        return;
+    }
+    name = item_gold_world_variant(gold_obj);
+    if (name == NULL) {
+        return;
+    }
+    aid = ce_sprite_art_id(name);
+    if (aid != TIG_ART_ID_INVALID) {
+        object_set_current_aid(gold_obj, aid);
+    }
+}
+
 // For a gold pile, return the variant sprite name for its amount (building the
 // variants on first use), and optionally its cell footprint. NULL if `item_id`
 // isn't gold or the variants aren't built yet (caller falls back to vanilla art).
@@ -1062,6 +1278,7 @@ bool item_drop_ex(int64_t item_obj, int distance)
 
     item_remove(item_obj);
     sub_466E50(item_obj, loc);
+    item_gold_world_update(item_obj); // CE: set quantity-based world art if gold
 
     if (obj_type == OBJ_TYPE_NPC) {
         switch (obj_field_int32_get(item_obj, OBJ_F_TYPE)) {
@@ -2803,6 +3020,7 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
                     object_destroy(gold_obj);
                 } else {
                     obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, from_qty - qty);
+                    item_gold_world_update(gold_obj); // CE: update world art if world pile
                 }
             }
         }
@@ -2812,6 +3030,7 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
             if (gold_obj != OBJ_HANDLE_NULL) {
                 to_qty = obj_field_int32_get(gold_obj, OBJ_F_GOLD_QUANTITY);
                 obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, to_qty + qty);
+                item_gold_world_update(gold_obj); // CE: update world art if world pile
             } else {
                 loc = obj_field_int64_get(to_obj, OBJ_F_LOCATION);
                 gold_obj = item_gold_create(qty, loc);
@@ -2832,6 +3051,7 @@ int64_t item_gold_create(int amount, int64_t loc)
 
     if (mp_object_create(BP_GOLD, loc, &gold_obj)) {
         obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, amount);
+        item_gold_world_update(gold_obj);
     }
 
     return gold_obj;
