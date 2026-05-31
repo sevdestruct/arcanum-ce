@@ -140,6 +140,41 @@ static int gameuilib_custom_ui_width;
 static int gameuilib_custom_ui_height;
 static char gameuilib_custom_ui_bmp_path[TIG_MAX_PATH];
 
+// Negative cache: candidate lists whose files were all absent. Without this,
+// every UI repaint with no custom-bg file re-probes the disk for each candidate
+// via tig_video_buffer_load_from_bmp — a per-frame I/O storm that stalls the
+// main thread (and starves same-thread sound updates, causing intermittently
+// silent SFX). The candidate arrays are file-static `const`, so their pointer
+// is a stable identity to key on. Reset whenever a mod (and thus the asset
+// repository set) changes, so newly-added files are picked up.
+#define GAMEUILIB_NEG_CACHE_CAP 48
+static const char* const* gameuilib_neg_cache[GAMEUILIB_NEG_CACHE_CAP];
+static int gameuilib_neg_cache_count;
+
+static bool gameuilib_neg_cache_has(const char* const* candidates)
+{
+    int i;
+    for (i = 0; i < gameuilib_neg_cache_count; i++) {
+        if (gameuilib_neg_cache[i] == candidates) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gameuilib_neg_cache_add(const char* const* candidates)
+{
+    if (gameuilib_neg_cache_count < GAMEUILIB_NEG_CACHE_CAP
+        && !gameuilib_neg_cache_has(candidates)) {
+        gameuilib_neg_cache[gameuilib_neg_cache_count++] = candidates;
+    }
+}
+
+static void gameuilib_neg_cache_clear(void)
+{
+    gameuilib_neg_cache_count = 0;
+}
+
 /**
  * Called when the game is initialized.
  *
@@ -196,6 +231,7 @@ void gameuilib_exit(void)
     }
 
     gameuilib_custom_ui_cache_reset();
+    gameuilib_neg_cache_clear();
     gameuilib_initialized = false;
 }
 
@@ -258,6 +294,8 @@ bool gameuilib_mod_load(void)
     }
 
     gameuilib_mod_loaded = true;
+    // A module just mounted (possibly with its own UI bg files) — re-probe.
+    gameuilib_neg_cache_clear();
 
     return true;
 }
@@ -284,6 +322,7 @@ void gameuilib_mod_unload(void)
 
     gameuilib_mod_loaded = false;
     gameuilib_custom_ui_cache_reset();
+    gameuilib_neg_cache_clear();
 }
 
 bool gameuilib_custom_ui_blit(tig_window_handle_t window_handle, const TigRect* canvas_rect, const TigRect* dst_rect, const char* const* candidates)
@@ -359,6 +398,11 @@ static bool gameuilib_custom_ui_cache_load(const char* const* candidates)
         return false;
     }
 
+    // Known-absent set? Skip the per-frame disk probing entirely.
+    if (gameuilib_neg_cache_has(candidates)) {
+        return false;
+    }
+
     for (index = 0; candidates[index] != NULL; index++) {
         if (gameuilib_custom_ui_vb != NULL
             && strcmp(gameuilib_custom_ui_bmp_path, candidates[index]) == 0) {
@@ -380,6 +424,9 @@ static bool gameuilib_custom_ui_cache_load(const char* const* candidates)
         }
     }
 
+    // Every candidate was absent — remember so we don't re-probe the disk
+    // each frame. Cleared on mod load/unload (new files may appear).
+    gameuilib_neg_cache_add(candidates);
     return false;
 }
 
