@@ -82,6 +82,12 @@ bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen);
 // a defined sprite or the registry is full.
 tig_art_id_t ce_sprite_art_id(const char* name);
 
+// True if `aid` is a composite-backed named art (a ce_sprite video buffer),
+// as opposed to a real .dat-backed art id. Composites are RGB and have no
+// palette, so the object render path must light them via color-multiply
+// (COLOR_CONST/ARRAY blend) rather than palette modification.
+bool ce_sprite_is_composite_art(tig_art_id_t aid);
+
 #ifdef __cplusplus
 }
 #endif

@@ -564,6 +564,43 @@ int tig_art_blit(TigArtBlitInfo* blit_info)
         if ((mut_art_blit_info.flags & TIG_ART_BLT_FLIP_Y) != 0) {
             vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_Y;
         }
+
+        // CE: composites are RGB and have no palette, so the object render
+        // path can't light them by palette modification. Honor the lighting
+        // blend flags here instead by color-multiplying through the existing
+        // COLOR_LERP blitter (which respects the color key). A single light
+        // color (COLOR_CONST) or the dominant color of a 2-color array maps to
+        // a uniform multiply across all four lerp corners — visually identical
+        // to the palette tint other ground items get, for a tiny pile.
+        //
+        // The hover/Opt highlight pass is COLOR_CONST | BLEND_ADD: it must
+        // BRIGHTEN (additive), not darken. Check BLEND_ADD first and route it
+        // to an additive color-modulated blit so highlight reads as a glow
+        // instead of a dim. (Order matters — the highlight pass also sets
+        // COLOR_CONST, so the multiply branch must not claim it.)
+        if ((mut_art_blit_info.flags & TIG_ART_BLT_BLEND_ADD) != 0) {
+            vb_blit_info.lerp_colors[0] = mut_art_blit_info.color;
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ADD;
+        } else if ((mut_art_blit_info.flags & TIG_ART_BLT_BLEND_COLOR_CONST) != 0) {
+            vb_blit_info.lerp_colors[0] = mut_art_blit_info.color;
+            vb_blit_info.lerp_colors[1] = mut_art_blit_info.color;
+            vb_blit_info.lerp_colors[2] = mut_art_blit_info.color;
+            vb_blit_info.lerp_colors[3] = mut_art_blit_info.color;
+            vb_blit_info.lerp_rect = mut_art_blit_info.dst_rect;
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
+        } else if ((mut_art_blit_info.flags & TIG_ART_BLT_BLEND_COLOR_ARRAY) != 0
+            && mut_art_blit_info.field_14 != NULL) {
+            vb_blit_info.lerp_colors[0] = mut_art_blit_info.field_14[0];
+            vb_blit_info.lerp_colors[1] = mut_art_blit_info.field_14[0];
+            vb_blit_info.lerp_colors[2] = mut_art_blit_info.field_14[0];
+            vb_blit_info.lerp_colors[3] = mut_art_blit_info.field_14[0];
+            vb_blit_info.lerp_rect = mut_art_blit_info.dst_rect;
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
+        } else if ((mut_art_blit_info.flags & TIG_ART_BLT_BLEND_ALPHA_CONST) != 0) {
+            vb_blit_info.alpha[0] = mut_art_blit_info.alpha[0];
+            vb_blit_info.flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST;
+        }
+
         vb_blit_info.src_video_buffer = composite_vb;
         vb_blit_info.src_rect = mut_art_blit_info.src_rect;
         vb_blit_info.dst_video_buffer = mut_art_blit_info.dst_video_buffer;

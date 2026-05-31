@@ -1772,6 +1772,26 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
         SDL_SetSurfaceAlphaMod(blit_info->src_video_buffer->surface, blit_info->alpha[0]);
     }
 
+    // CE: BLEND_ADD — additive blit modulated by lerp_colors[0]. Used for the
+    // composite-sprite highlight pass (hover/Opt), which brightens the sprite
+    // by adding a fraction of itself on top. SDL's color-keyed transparent
+    // pixels are still skipped in ADD blend mode, so the magenta key doesn't
+    // bleed in. Mirrors the alpha_const save/restore dance.
+    bool color_add = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ADD) != 0;
+    SDL_BlendMode prev_add_blend = SDL_BLENDMODE_NONE;
+    uint8_t prev_mod_r = 255;
+    uint8_t prev_mod_g = 255;
+    uint8_t prev_mod_b = 255;
+    if (color_add) {
+        SDL_GetSurfaceBlendMode(blit_info->src_video_buffer->surface, &prev_add_blend);
+        SDL_GetSurfaceColorMod(blit_info->src_video_buffer->surface, &prev_mod_r, &prev_mod_g, &prev_mod_b);
+        SDL_SetSurfaceBlendMode(blit_info->src_video_buffer->surface, SDL_BLENDMODE_ADD);
+        SDL_SetSurfaceColorMod(blit_info->src_video_buffer->surface,
+            (uint8_t)tig_color_get_red(blit_info->lerp_colors[0]),
+            (uint8_t)tig_color_get_green(blit_info->lerp_colors[0]),
+            (uint8_t)tig_color_get_blue(blit_info->lerp_colors[0]));
+    }
+
     // CE: FLIP_X / FLIP_Y were never honored by this blitter (only the art-id
     // path flipped). The ce_sprite compositor relies on vbuffer→vbuffer flips
     // for its "*fH" components, so support them here: extract the source region
@@ -1835,6 +1855,11 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
     if (alpha_const) {
         SDL_SetSurfaceBlendMode(blit_info->src_video_buffer->surface, prev_blend);
         SDL_SetSurfaceAlphaMod(blit_info->src_video_buffer->surface, prev_alpha);
+    }
+
+    if (color_add) {
+        SDL_SetSurfaceBlendMode(blit_info->src_video_buffer->surface, prev_add_blend);
+        SDL_SetSurfaceColorMod(blit_info->src_video_buffer->surface, prev_mod_r, prev_mod_g, prev_mod_b);
     }
 
     if (!ok) {

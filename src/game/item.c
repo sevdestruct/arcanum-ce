@@ -885,11 +885,11 @@ static void item_gold_build_world_variants(void)
 
     // ---- Small piles ----
     gv_compose("g_gold2", 10, 7,
-        (GvPart[]){ { "g_gold1", -2, 1 }, { "g_goldC2fH", 1, -1 } }, 2);
+        (GvPart[]){ { "g_goldC2fH", 1, -1 }, { "g_gold1", -2, 1 } }, 2);
     gv_compose("g_gold3", 11, 8,
-        (GvPart[]){ { "g_gold2", 0, 1 }, { "g_goldC2fH", 0, -1 }, { "g_gold1fH", 2, -1 } }, 3);
+        (GvPart[]){ { "g_gold2", 0, 1 }, { "g_goldC2fH", 1, -1 }, { "g_goldC1fH", 3, 1 } }, 3);
     gv_compose("g_gold4", 11, 9,
-        (GvPart[]){ { "g_gold3", 0, 1 }, { "g_goldC2", 2, 0 }, { "g_gold1", 0, -1 } }, 3);
+        (GvPart[]){ { "g_gold3", 0, 1 }, { "g_goldC2", 0, -1 }, { "g_gold1fH", 2, -1 } }, 3);
     gv_compose("g_gold5", 15, 9,
         (GvPart[]){ { "g_gold4", -2, 0 }, { "g_gold1fF", 5, 1 } }, 2);
     gv_compose("g_gold10", 15, 12,
@@ -1278,6 +1278,7 @@ bool item_drop_ex(int64_t item_obj, int distance)
 
     item_remove(item_obj);
     sub_466E50(item_obj, loc);
+    item_gold_world_update(item_obj); // CE: set quantity-based world art if gold
 
     if (obj_type == OBJ_TYPE_NPC) {
         switch (obj_field_int32_get(item_obj, OBJ_F_TYPE)) {
@@ -3019,6 +3020,7 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
                     object_destroy(gold_obj);
                 } else {
                     obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, from_qty - qty);
+                    item_gold_world_update(gold_obj); // CE: update world art if world pile
                 }
             }
         }
@@ -3028,6 +3030,7 @@ bool item_gold_transfer(int64_t from_obj, int64_t to_obj, int qty, int64_t gold_
             if (gold_obj != OBJ_HANDLE_NULL) {
                 to_qty = obj_field_int32_get(gold_obj, OBJ_F_GOLD_QUANTITY);
                 obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, to_qty + qty);
+                item_gold_world_update(gold_obj); // CE: update world art if world pile
             } else {
                 loc = obj_field_int64_get(to_obj, OBJ_F_LOCATION);
                 gold_obj = item_gold_create(qty, loc);
@@ -3048,6 +3051,7 @@ int64_t item_gold_create(int amount, int64_t loc)
 
     if (mp_object_create(BP_GOLD, loc, &gold_obj)) {
         obj_field_int32_set(gold_obj, OBJ_F_GOLD_QUANTITY, amount);
+        item_gold_world_update(gold_obj);
     }
 
     return gold_obj;
@@ -4478,24 +4482,40 @@ bool sub_466EF0(int64_t obj, int64_t loc)
     new_container_obj = OBJ_HANDLE_NULL;
     object_list_location(loc, OBJ_TM_ITEM, &objects);
 
-    // CE: if the incoming item is gold AND every existing item on this tile is
-    // also gold, skip junk-pile creation — gold stacks automatically via
-    // item_gold_transfer and should never be wrapped in a junk pile unless
-    // non-gold items are also present on the same tile.
+    // CE: gold dropped onto a tile that already holds gold merges into a single
+    // pile (summing quantities) instead of stacking as separate objects or being
+    // wrapped in a junk pile. Fold the incoming amount — and any pre-existing
+    // duplicate gold stacks on the tile — into one target pile and update its
+    // world art to the new total. (Non-gold items present alongside still fall
+    // through to the normal junk-pile path below.)
     if (obj_field_int32_get(obj, OBJ_F_TYPE) == OBJ_TYPE_GOLD) {
-        bool all_gold = true;
+        int64_t target_gold = OBJ_HANDLE_NULL;
+        int extra_qty = obj_field_int32_get(obj, OBJ_F_GOLD_QUANTITY);
+
         node = objects.head;
         while (node != NULL) {
-            if (obj_field_int32_get(node->obj, OBJ_F_TYPE) != OBJ_TYPE_GOLD) {
-                all_gold = false;
-                break;
+            ObjectNode* next = node->next;
+            if (obj_field_int32_get(node->obj, OBJ_F_TYPE) == OBJ_TYPE_GOLD) {
+                if (target_gold == OBJ_HANDLE_NULL) {
+                    target_gold = node->obj;
+                } else {
+                    extra_qty += obj_field_int32_get(node->obj, OBJ_F_GOLD_QUANTITY);
+                    object_destroy(node->obj);
+                }
             }
-            node = node->next;
+            node = next;
         }
-        if (all_gold) {
+
+        if (target_gold != OBJ_HANDLE_NULL) {
+            obj_field_int32_set(target_gold, OBJ_F_GOLD_QUANTITY,
+                obj_field_int32_get(target_gold, OBJ_F_GOLD_QUANTITY) + extra_qty);
+            item_gold_world_update(target_gold);
+            object_destroy(obj);
             object_list_destroy(&objects);
-            return false; // let caller use object_drop; gold merges on pickup
+            return true;
         }
+        // No gold already here: a lone gold drop lands loose (falls through;
+        // the junk loop below creates nothing for an empty tile).
     }
 
     node = objects.head;

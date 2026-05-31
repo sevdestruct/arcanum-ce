@@ -285,6 +285,19 @@ bool ce_named_art_resolve(tig_art_id_t aid, char* path, size_t maxlen)
     return true;
 }
 
+bool ce_sprite_is_composite_art(tig_art_id_t aid)
+{
+    int index;
+    if ((aid >> 28) != CE_ART_TYPE_NAMED) {
+        return false;
+    }
+    index = (int)(aid & 0x0FFFFFFF);
+    if (index < 0 || index >= ce_named_art_count) {
+        return false;
+    }
+    return ce_named_art_tbl[index].is_composite;
+}
+
 // tig composite resolver: reserved id -> the named sprite's video buffer.
 static TigVideoBuffer* ce_sprite_composite_resolve(tig_art_id_t aid)
 {

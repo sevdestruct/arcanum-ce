@@ -5,6 +5,7 @@
 
 #include "game/ai.h"
 #include "game/anim.h"
+#include "game/ce_sprite.h"
 #include "game/critter.h"
 #include "game/description.h"
 #include "game/descriptions.h"
@@ -4582,7 +4583,14 @@ void sub_442D90(int64_t obj, ObjectRenderColors* colors)
     render_flags = obj_field_int32_get(obj, OBJ_F_RENDER_FLAGS);
     blit_flags = obj_field_int32_get(obj, OBJ_F_BLIT_FLAGS);
 
-    if ((obj_flags & OF_STONED) != 0) {
+    // CE: composite art (ce_sprite, e.g. quantity-variant gold piles) is RGB
+    // with no palette, so it can't be lit by palette modification. Light it the
+    // same way the hardware path does — via a COLOR_CONST color-multiply at blit
+    // time — and never take the palette-override path (which would dereference a
+    // null palette in tig_palette_modify).
+    bool is_composite = ce_sprite_is_composite_art(obj_field_int32_get(obj, OBJ_F_CURRENT_AID));
+
+    if ((obj_flags & OF_STONED) != 0 && !is_composite) {
         render_flags |= TIG_ART_BLT_PALETTE_OVERRIDE;
         palette_modify_info.flags |= TIG_PALETTE_MODIFY_GRAYSCALE;
     }
@@ -4596,7 +4604,7 @@ void sub_442D90(int64_t obj, ObjectRenderColors* colors)
     }
 
     if ((render_flags & ORF_20000000) != 0) {
-        if (object_hardware_accelerated) {
+        if (object_hardware_accelerated || is_composite) {
             render_flags |= TIG_ART_BLT_BLEND_COLOR_CONST;
         } else {
             palette_modify_info.flags |= TIG_PALETTE_MODIFY_TINT;
