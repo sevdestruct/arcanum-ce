@@ -5,6 +5,7 @@
 
 #include "tig/bmp.h"
 #include "tig/color.h"
+#include "tig/file.h"
 #include "tig/memory.h"
 
 #include "game/gamelib.h"
@@ -24,12 +25,21 @@
 #define CREDITS_BG_PANEL_HEIGHT 365
 #define CREDITS_BG_PANEL_CORNER_RADIUS_X 28
 #define CREDITS_BG_PANEL_CORNER_RADIUS_Y 37
+// CE: content-layer cross-fade for credits over a custom background.
+// Instead of fading the whole SCREEN to black between slides (the
+// legacy gfade dip), only the credits CONTENT (text/portraits) fades
+// in/out over the static custom bg, which stays fully visible — so
+// there's no dip to black. STEPS * DELAY_MS ≈ 190ms per fade.
+#define CREDITS_CONTENT_FADE_STEPS 12
+#define CREDITS_CONTENT_FADE_DELAY_MS 16
 
 static void slide_ui_prepare(int type);
 static bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide);
 static bool slide_ui_get_assets(int slide, char* bmp_path, size_t bmp_path_maxlen, char* speech_path, size_t speech_path_maxlen);
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path);
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle);
+static bool slide_ui_blit_custom_credits_slide_alpha(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, int alpha);
+static void slide_ui_custom_credits_fade(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, bool fade_in);
 static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y);
 static bool slide_ui_build_background_mask(TigBmp* slide_bmp, uint8_t* mask);
 static bool slide_ui_build_background_mask_in_rect(TigBmp* slide_bmp, uint8_t* mask, int left, int top, int right, int bottom);
@@ -111,8 +121,19 @@ void slide_ui_start(int type)
     tig_window_handle_t window_handle;
     tig_sound_handle_t sound_handle;
     int index;
+    bool overlay_credits;
+    char custom_bg_path[TIG_MAX_PATH];
 
     slide_ui_active = true;
+
+    // CE: when credits play over a custom background, the slides
+    // cross-fade their CONTENT over the bg (which stays visible) —
+    // no whole-screen dip to black. In that mode we skip the global
+    // gfade out/in entirely (both the initial fade-out below and the
+    // final fade-in at the end of this function); the per-slide
+    // content fades in slide_ui_do_slide carry the transitions.
+    overlay_credits = type == SLIDE_UI_TYPE_CREDITS
+        && slide_ui_get_custom_credits_bg_path(custom_bg_path);
 
     // Remove all enqeueued slides.
     slide_ui_queue_clear();
@@ -129,7 +150,9 @@ void slide_ui_start(int type)
     }
 
     // Perform initial fade-out.
-    slide_ui_fade_out();
+    if (!overlay_credits) {
+        slide_ui_fade_out();
+    }
 
     // Display slides if queue is not empty.
     if (slide_ui_queue_size > 0) {
@@ -166,8 +189,10 @@ void slide_ui_start(int type)
     }
 
     // Perform fade-in when we're presenting credits. Otherwise the caller is
-    // responsible to remove fading.
-    if (type == SLIDE_UI_TYPE_CREDITS) {
+    // responsible to remove fading. Skipped for the custom-bg overlay
+    // path — the screen was never faded to black, so there's nothing
+    // to fade back in.
+    if (type == SLIDE_UI_TYPE_CREDITS && !overlay_credits) {
         slide_ui_fade_in();
     }
 
@@ -219,6 +244,8 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
     char custom_bg_path[TIG_MAX_PATH];
     char speech_path[TIG_MAX_PATH];
     tig_sound_handle_t speech_handle;
+    TigBmp slide_bmp;
+    bool slide_bmp_valid = false;
     bool cont = true;
     bool stop;
     bool custom_override;
@@ -240,15 +267,29 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
         if (custom_override) {
             // Credits compositing needs CPU-side pixel access (flood-fill of
             // the original background, then merge with the custom BG), so
-            // load the slide via the legacy TigBmp API for direct pixel access.
-            TigBmp slide_bmp;
+            // load the slide via the legacy TigBmp API for direct pixel
+            // access. The bmp is kept alive across the whole slide (closed
+            // at the end) so the content cross-fade can re-composite it at
+            // varying alpha without reloading.
             strncpy(slide_bmp.name, bmp_path, sizeof(slide_bmp.name) - 1);
             slide_bmp.name[sizeof(slide_bmp.name) - 1] = '\0';
             if (tig_bmp_create(&slide_bmp) == TIG_OK) {
-                if (slide_ui_blit_custom_credits_slide(&slide_bmp, custom_bg_path, window_handle)) {
+                slide_bmp_valid = true;
+                // Composite the content at alpha 0 first (bg only), present
+                // it, then fade the content IN over the static custom bg —
+                // the bg stays fully visible, so there's no dip to black.
+                if (slide_ui_blit_custom_credits_slide_alpha(&slide_bmp,
+                        custom_bg_path, window_handle, 0)) {
+                    sub_51E850(window_handle);
+                    tig_window_display();
+                    slide_ui_custom_credits_fade(&slide_bmp, custom_bg_path,
+                        window_handle, true);
                     drew = true;
                 }
-                tig_bmp_destroy(&slide_bmp);
+                if (!drew) {
+                    tig_bmp_destroy(&slide_bmp);
+                    slide_bmp_valid = false;
+                }
             }
         }
 
@@ -274,17 +315,16 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
                 tig_window_blit(&blit_info);
                 tig_video_buffer_destroy(video_buffer);
                 drew = true;
+
+                // Legacy path keeps the whole-screen fade-in (it drew over
+                // a black screen left by the prior slide's screen fade-out).
+                sub_51E850(window_handle);
+                tig_window_display();
+                slide_ui_fade_in();
             }
         }
 
         if (drew) {
-            // Refresh screen.
-            sub_51E850(window_handle);
-            tig_window_display();
-
-            // Perform fade-in effect.
-            slide_ui_fade_in();
-
             // Play voiceover.
             speech_handle = gsound_play_voice(speech_path, 0);
 
@@ -351,17 +391,29 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
 
             // Clean up voiceover.
             tig_sound_destroy(speech_handle);
-        }
 
-        // Clear remaining message queue.
-        while (tig_message_dequeue(&msg) == TIG_OK) {
-            if (msg.type == TIG_MESSAGE_REDRAW) {
-                gamelib_redraw();
+            // Clear remaining message queue.
+            while (tig_message_dequeue(&msg) == TIG_OK) {
+                if (msg.type == TIG_MESSAGE_REDRAW) {
+                    gamelib_redraw();
+                }
+            }
+
+            // Transition out. Custom-bg credits fade only the CONTENT
+            // back out over the still-visible bg (no dip to black); the
+            // legacy path keeps the whole-screen fade-to-black.
+            if (custom_override && slide_bmp_valid) {
+                slide_ui_custom_credits_fade(&slide_bmp, custom_bg_path,
+                    window_handle, false);
+            } else {
+                slide_ui_fade_out();
             }
         }
 
-        // Perform fade-out effect.
-        slide_ui_fade_out();
+        if (slide_bmp_valid) {
+            tig_bmp_destroy(&slide_bmp);
+            slide_bmp_valid = false;
+        }
     }
 
     return cont;
@@ -369,18 +421,27 @@ bool slide_ui_do_slide(tig_window_handle_t window_handle, int type, int slide)
 
 static bool slide_ui_get_custom_credits_bg_path(char* bmp_path)
 {
-    FILE* stream;
-
-    stream = fopen("data/art/interface/credits_bg.bmp", "rb");
-    if (stream != NULL) {
-        fclose(stream);
+    // CE: detect the custom credits background through tig's unified
+    // file layer (tig_file_exists searches DAT archives, the
+    // custom/default + custom/modules override tiers, module dirs,
+    // and loose files) rather than a raw fopen on a loose data/
+    // path. This MUST match how the bg is actually loaded below —
+    // slide_ui_blit_custom_credits_slide opens it via tig_bmp_create
+    // → tig_file_io_open, the same unified layer. Using fopen here
+    // only ever saw a loose data/art/interface/*.bmp, so when the
+    // custom bg lived in a .dat or an override tier (the normal case
+    // now that every other custom-UI window resolves art that way),
+    // detection failed, custom_override came back false, and credits
+    // fell through to the legacy slide + vignette path even though
+    // the load would have succeeded. credits_bg first, then the
+    // shared mainmenu_bg fallback — mirrors the unified candidates
+    // table for MM_WINDOW_CREDITS.
+    if (tig_file_exists("art\\interface\\credits_bg.bmp", NULL)) {
         strcpy(bmp_path, "art\\interface\\credits_bg.bmp");
         return true;
     }
 
-    stream = fopen("data/art/interface/mainmenu_bg.bmp", "rb");
-    if (stream != NULL) {
-        fclose(stream);
+    if (tig_file_exists("art\\interface\\mainmenu_bg.bmp", NULL)) {
         strcpy(bmp_path, "art\\interface\\mainmenu_bg.bmp");
         return true;
     }
@@ -389,6 +450,17 @@ static bool slide_ui_get_custom_credits_bg_path(char* bmp_path)
 }
 
 static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle)
+{
+    return slide_ui_blit_custom_credits_slide_alpha(slide_bmp, custom_bg_path, window_handle, 255);
+}
+
+// CE: alpha-aware credits composite. alpha == 255 is the original
+// fully-opaque content over the custom bg; alpha < 255 blends the
+// slide CONTENT toward the bg color so the content cross-fades while
+// the background stays fully visible (no dip to black). Background /
+// frame / corner-cutout regions always paint the bg at full opacity
+// regardless of alpha.
+static bool slide_ui_blit_custom_credits_slide_alpha(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, int alpha)
 {
     TigWindowData window_data;
     TigBmp custom_bg_bmp;
@@ -529,7 +601,9 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
             } else if (background_mask[y * comp_w + x] != 0) {
                 out_color = bg_color;
             } else {
-                out_color = slide_color;
+                out_color = alpha >= 255
+                    ? slide_color
+                    : tig_color_blend_alpha(slide_color, bg_color, alpha);
             }
 
             r = (out_color >> 16) & 0xFF;
@@ -552,6 +626,29 @@ static bool slide_ui_blit_custom_credits_slide(TigBmp* slide_bmp, const char* cu
     FREE(background_mask);
     tig_bmp_destroy(&custom_bg_bmp);
     return true;
+}
+
+// CE: cross-fade the credits CONTENT in or out over the static custom
+// background by re-compositing at stepped alpha. The background never
+// changes brightness, so the transition reads as the text/portrait
+// dissolving rather than the whole screen dipping to black. Runs
+// CREDITS_CONTENT_FADE_STEPS+1 frames at CREDITS_CONTENT_FADE_DELAY_MS
+// each (~190ms total). Blocking, matching the surrounding slide loop.
+static void slide_ui_custom_credits_fade(TigBmp* slide_bmp, const char* custom_bg_path, tig_window_handle_t window_handle, bool fade_in)
+{
+    int step;
+
+    for (step = 0; step <= CREDITS_CONTENT_FADE_STEPS; step++) {
+        int alpha = fade_in
+            ? (step * 255) / CREDITS_CONTENT_FADE_STEPS
+            : ((CREDITS_CONTENT_FADE_STEPS - step) * 255) / CREDITS_CONTENT_FADE_STEPS;
+        tig_ping();
+        if (slide_ui_blit_custom_credits_slide_alpha(slide_bmp, custom_bg_path, window_handle, alpha)) {
+            sub_51E850(window_handle);
+            tig_window_display();
+        }
+        SDL_Delay(CREDITS_CONTENT_FADE_DELAY_MS);
+    }
 }
 
 static bool slide_ui_point_in_credits_panel(int x, int y, int left, int top, int right, int bottom, int radius_x, int radius_y)
