@@ -104,6 +104,13 @@ bool intgame_pc_lens_check_pt(int x, int y);
 bool intgame_pc_lens_check_pt_unscale(int x, int y);
 bool intgame_should_dismiss_overlay_click(int screen_x, int screen_y, const TigRect* menu_rect);
 
+// CE: arm a one-shot suppression of the next overlay click-outside
+// dismiss. Call right before opening an overlay from a dialogue
+// option so the mouse-up that pairs with the option's mouse-down
+// doesn't immediately dismiss the just-opened overlay. See the
+// definition in intgame.c for the full rationale.
+void intgame_suppress_overlay_dismiss_once(void);
+
 // CE: Snap the iso camera back to the local PC. Used by overlay screens
 // that close via a PC-lens click — the lens widget acts as a "back to
 // the player" button, so clicking it implies "take me back to the PC"
