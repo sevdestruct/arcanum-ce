@@ -10,6 +10,7 @@
 #include "game/obj_private.h"
 #include "game/terrain.h"
 #include "game/tile.h"
+#include "game/tile_gap_fill.h"
 #include "game/timeevent.h"
 #include "game/townmap.h"
 
@@ -1713,6 +1714,7 @@ bool sector_load_game(int64_t id, Sector* sector)
     }
 
     sector_validate_game("sector post-load (pre-fold)");
+    tile_gap_fill_sector(id, sector);
     li_update();
     objlist_fold(&(sector->objects), id, sub_45A9B0(&(sector->datetime), 3000));
     li_update();

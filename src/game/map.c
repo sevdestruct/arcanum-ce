@@ -31,6 +31,7 @@
 #include "game/terrain.h"
 #include "game/tf.h"
 #include "game/tile.h"
+#include "game/tile_gap_fill.h"
 #include "game/timeevent.h"
 #include "game/townmap.h"
 #include "game/ui.h"
@@ -39,7 +40,7 @@
 
 #define MAP_LIST_CAPACITY 200
 #define MAP_NAME_LENGTH 256
-#define MAP_MODULE_COUNT 17
+#define MAP_MODULE_COUNT 18
 #define SENTINEL 0xBADDBEEF
 
 typedef bool (*MapInitFunc)(GameInitInfo* init_info);
@@ -125,6 +126,7 @@ static MapModule map_modules[MAP_MODULE_COUNT] = {
     { "Object", object_init, object_reset, NULL, NULL, object_exit, object_ping, object_update_view, NULL, NULL, NULL, object_map_close, object_resize },
     { "Terrain", terrain_init, terrain_reset, NULL, NULL, terrain_exit, NULL, NULL, NULL, NULL, terrain_map_new, terrain_map_close, NULL },
     { "Sector", sector_init, sector_reset, NULL, NULL, sector_exit, NULL, sector_update_view, NULL, NULL, NULL, sector_map_close, sector_resize },
+    { "TileGapFill", tile_gap_fill_init, NULL, NULL, NULL, tile_gap_fill_exit, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
     { "TB", tb_init, tb_reset, NULL, NULL, tb_exit, tb_ping, tb_update_view, NULL, NULL, NULL, tb_map_close, tb_resize },
     { "TF", tf_init, tf_reset, NULL, NULL, tf_exit, tf_ping, tf_update_view, NULL, NULL, NULL, tf_map_close, tf_resize },
     { "Wall", wall_init, NULL, NULL, NULL, wall_exit, NULL, wall_update_view, NULL, NULL, NULL, NULL, wall_resize },

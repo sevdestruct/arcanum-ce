@@ -10,6 +10,7 @@
 #include "game/roof.h"
 #include "game/sector.h"
 #include "game/tile_block.h"
+#include "game/tile_gap_fill.h"
 
 #define TILE_CACHE_CAPACITY 64
 
@@ -30,6 +31,7 @@ static void sub_4D7C70(void);
 static TigVideoBuffer* sub_4D7E90(unsigned int art_id);
 static void tile_draw_topdown(GameDrawInfo* draw_info);
 static void tile_draw_iso(GameDrawInfo* draw_info);
+static void tile_draw_iso_gap_skirt(GameDrawInfo* draw_info, tig_color_t outdoor_color);
 
 // 0x602AE0
 static TileCacheEntry stru_602AE0[TILE_CACHE_CAPACITY];
@@ -628,6 +630,155 @@ void tile_draw_topdown(GameDrawInfo* draw_info)
     }
 }
 
+// CE: Fill the untiled void the camera exposes beyond the map edges at zoom-out.
+//
+// The normal iso pass draws `draw_info->sector_rect`, which is built from a
+// loc_rect that `location_screen_rect_to_loc_rect` clamps to [0, location_limit).
+// At zoom-out the visible window spills past the map on every side; those screen
+// regions map to out-of-bounds (or pre-origin, unrepresentable) locations and are
+// never drawn, leaving black. This pass sweeps the iso tile lattice directly in
+// render-target space — using plain integer tile indices so it can address tiles
+// before the origin too — and blits synthesized terrain (sampled from the nearest
+// in-bounds sector) for every cell whose sector is out of bounds. In-bounds cells
+// are skipped; the normal pass already drew them.
+static void tile_draw_iso_gap_skirt(GameDrawInfo* draw_info, tig_color_t outdoor_color)
+{
+    int64_t limit_x;
+    int64_t limit_y;
+    int64_t ox;
+    int64_t oy;
+    int64_t origin_sx;
+    int64_t origin_sy;
+    int64_t tx;
+    int64_t ty;
+    int64_t tx_min;
+    int64_t tx_max;
+    int64_t ty_min;
+    int64_t ty_max;
+    TigRect* content;
+    TigRect tile_rect;
+    TigRect dst_rect;
+    TigRect src_rect;
+    TigArtBlitInfo blit;
+    tig_color_t field_14[4];
+    TigRectListNode* rect_node;
+    int corners_x[2];
+    int corners_y[2];
+    int ci;
+    int cj;
+    bool range_init;
+
+    if (!tile_gap_fill_enabled()) {
+        return;
+    }
+
+    sector_limits_get(&limit_x, &limit_y);
+    if (limit_x <= 0 || limit_y <= 0) {
+        return;
+    }
+
+    content = draw_info->screen_rect;
+    if (content == NULL) {
+        return;
+    }
+
+    // location_xy(loc 0) = (ox - 40, oy), so recover the iso origin.
+    location_xy(0, &origin_sx, &origin_sy);
+    ox = origin_sx + 40;
+    oy = origin_sy;
+
+    // Invert the lattice at the four content-rect corners to bound the sweep.
+    //   px = ox + 40*(ty - tx - 1) ; py = oy + 20*(ty + tx)
+    //   a = (px - ox)/40 + 1 = ty - tx ; b = (py - oy)/20 = ty + tx
+    //   ty = (a + b)/2 ; tx = (b - a)/2
+    corners_x[0] = content->x;
+    corners_x[1] = content->x + content->width;
+    corners_y[0] = content->y;
+    corners_y[1] = content->y + content->height;
+    range_init = false;
+    tx_min = tx_max = ty_min = ty_max = 0;
+    for (ci = 0; ci < 2; ci++) {
+        for (cj = 0; cj < 2; cj++) {
+            double a = (double)(corners_x[ci] - ox) / 40.0 + 1.0;
+            double b = (double)(corners_y[cj] - oy) / 20.0;
+            int64_t cty = (int64_t)floor((a + b) / 2.0);
+            int64_t ctx = (int64_t)floor((b - a) / 2.0);
+            if (!range_init) {
+                tx_min = tx_max = ctx;
+                ty_min = ty_max = cty;
+                range_init = true;
+            } else {
+                if (ctx < tx_min) tx_min = ctx;
+                if (ctx > tx_max) tx_max = ctx;
+                if (cty < ty_min) ty_min = cty;
+                if (cty > ty_max) ty_max = cty;
+            }
+        }
+    }
+
+    // Cover diamonds that straddle the content edge.
+    tx_min -= 2;
+    ty_min -= 2;
+    tx_max += 2;
+    ty_max += 2;
+
+    // Nothing to do when the whole visible span is in bounds.
+    if (tx_min >= 0 && ty_min >= 0
+        && (tx_max >> 6) < limit_x && (ty_max >> 6) < limit_y) {
+        return;
+    }
+
+    blit.src_rect = &src_rect;
+    blit.dst_rect = &dst_rect;
+    blit.field_14 = field_14;
+    blit.dst_video_buffer = dword_602DF0;
+    tile_rect.width = 78;
+    tile_rect.height = 40;
+
+    for (ty = ty_min; ty <= ty_max; ty++) {
+        for (tx = tx_min; tx <= tx_max; tx++) {
+            int64_t secx = tx >> 6;
+            int64_t secy = ty >> 6;
+            int px;
+            int py;
+
+            if (secx >= 0 && secx < limit_x && secy >= 0 && secy < limit_y) {
+                continue;
+            }
+
+            blit.art_id = tile_gap_fill_synth_tile(tx, ty);
+            if (blit.art_id == TIG_ART_ID_INVALID) {
+                continue;
+            }
+
+            px = (int)(ox + 40 * (ty - tx - 1));
+            py = (int)(oy + 20 * (ty + tx));
+            tile_rect.x = px + 1;
+            tile_rect.y = py;
+
+            rect_node = *draw_info->rects;
+            while (rect_node != NULL) {
+                if (tig_rect_intersection(&tile_rect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                    src_rect.x = dst_rect.x - tile_rect.x;
+                    src_rect.y = dst_rect.y - tile_rect.y;
+                    src_rect.width = dst_rect.width;
+                    src_rect.height = dst_rect.height;
+
+                    if (tile_hardware_accelerated) {
+                        blit.flags = TIG_ART_BLT_BLEND_COLOR_CONST;
+                    } else {
+                        blit.flags = TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
+                    }
+                    blit.color = outdoor_color;
+
+                    tig_art_blit(&blit);
+                }
+                rect_node = rect_node->next;
+            }
+        }
+    }
+}
+
 // NOTE: In the original code this function is a part of `tile_draw`, however
 // if `tile_draw_topdown` is definitely there, why `tile_draw_iso` should not?
 void tile_draw_iso(GameDrawInfo* draw_info)
@@ -896,6 +1047,11 @@ void tile_draw_iso(GameDrawInfo* draw_info)
             }
         }
     }
+
+    // CE: fill the untiled void the camera exposes past the map edges (zoom-out
+    // reaches sectors that don't exist; the clamped sector_rect above never
+    // visits them). Synthesizes terrain from the nearest in-bounds sector.
+    tile_draw_iso_gap_skirt(draw_info, outdoor_color);
 
     light_buffers_unlock();
 }
