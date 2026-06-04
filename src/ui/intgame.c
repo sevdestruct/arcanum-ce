@@ -175,6 +175,12 @@ static bool sub_552050(int x, int y, TargetDescriptor* td);
 static void sub_5520D0(RotatingWindowType window_type, int step);
 static void iso_interface_window_swap(RotatingWindowType window_type);
 static void intgame_hud_apply_clips(void);
+// CE: FULL->MEDIUM wings-slide ghost (defined near the HUD window
+// helpers; used earlier in iso_interface_destroy and the TAB toggle).
+static void intgame_hud_ghost_destroy(void);
+static void intgame_hud_ghost_slide_down(void);
+static void intgame_hud_ghost_med_to_mini(void);
+static void intgame_hud_ghost_ping(void);
 // CE: MINI-peek press handler. Returns true if the press should be
 // swallowed (peek-expand to MEDIUM, or return-from-peek to MINI),
 // false if it should fall through to normal rotwin toggle-off.
@@ -1486,6 +1492,10 @@ void iso_interface_destroy(void)
 
     if (intgame_iso_interface_created) {
         intgame_hud_bar_uses_tint = false;
+
+        // CE: reap any in-flight FULL->MEDIUM wings-slide ghost before
+        // the bar windows it snapshots are torn down.
+        intgame_hud_ghost_destroy();
 
         for (index = 0; index < 2; index++) {
             tig_window_destroy(dword_64C4F8[index]);
@@ -2825,6 +2835,39 @@ bool handle_button_unhover(TigMessage* msg)
     return false;
 }
 
+// CE: clamp a click-to-move destination to within the in-map
+// pathfinder's reach. Every in-map path runs on a 64x64 local A* grid
+// and bails when the straight-line distance exceeds 32 tiles (see
+// path.c sub_41F840 / sub_41F9F0). At 1x zoom the clickable area is
+// under that, but the zoom-out view lets the player click much farther
+// — and a too-far click otherwise produces no path and does nothing.
+// Clamp the target along the line toward it so the click at least
+// walks the player in that direction (they can click again to
+// continue). Returns loc unchanged when it's already in reach.
+static int64_t intgame_clamp_move_target(int64_t pc_obj, int64_t loc)
+{
+    if (pc_obj == OBJ_HANDLE_NULL) {
+        return loc;
+    }
+
+    int64_t from = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
+    int64_t dist = location_dist(from, loc);
+
+    // Margin below the 32-tile grid cap so the A* has room to maneuver.
+    const int64_t max_dist = 28;
+    if (dist <= max_dist) {
+        return loc;
+    }
+
+    int64_t fx = location_get_x(from);
+    int64_t fy = location_get_y(from);
+    int64_t tx = location_get_x(loc);
+    int64_t ty = location_get_y(loc);
+    int64_t cx = fx + (tx - fx) * max_dist / dist;
+    int64_t cy = fy + (ty - fy) * max_dist / dist;
+    return location_make(cx, cy);
+}
+
 // 0x54DE50
 void intgame_process_event(TigMessage* msg)
 {
@@ -2882,12 +2925,14 @@ void intgame_process_event(TigMessage* msg)
                             }
                         } else if (critter_is_active(pc_obj)
                             && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
+                            int64_t move_loc =
+                                intgame_clamp_move_target(pc_obj, td.loc);
                             if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
                                     || tig_kb_get_modifier(SDL_KMOD_NUM))
                                 && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                                anim_goal_run_to_tile(pc_obj, td.loc);
+                                anim_goal_run_to_tile(pc_obj, move_loc);
                             } else {
-                                anim_goal_move_to_tile(pc_obj, td.loc);
+                                anim_goal_move_to_tile(pc_obj, move_loc);
                             }
 
                             if (dword_64C6D8) {
@@ -3164,12 +3209,14 @@ void intgame_process_event(TigMessage* msg)
                         && !inven_ui_drag_item_obj_get()
                         && !critter_is_dead(pc_obj)
                         && !tig_kb_get_modifier(SDL_KMOD_SHIFT)) {
+                        int64_t move_loc =
+                            intgame_clamp_move_target(pc_obj, td.loc);
                         if ((tig_kb_get_modifier(SDL_KMOD_CTRL)
                                 || tig_kb_get_modifier(SDL_KMOD_NUM))
                             && !settings_get_value(&settings, ALWAYS_RUN_KEY)) {
-                            anim_goal_run_to_tile(pc_obj, td.loc);
+                            anim_goal_run_to_tile(pc_obj, move_loc);
                         } else {
-                            anim_goal_move_to_tile(pc_obj, td.loc);
+                            anim_goal_move_to_tile(pc_obj, move_loc);
                         }
 
                         if (dword_64C6D8) {
@@ -9752,6 +9799,26 @@ void intgame_hud_user_toggle(void)
     bool leaving_mini = (prev_stage == INTGAME_HUD_STAGE_MINI
         && intgame_hud_stage != INTGAME_HUD_STAGE_MINI);
 
+    // CE: FULL -> MEDIUM "wings slide down" ghost. Spawn BEFORE
+    // apply_clips below — it snapshots the bar while it's still FULL,
+    // then apply_clips re-clips the real bar to the MEDIUM band. The
+    // ghost slides the full-bar snapshot down behind the band. (Other
+    // transitions keep their existing behavior for now; this prototype
+    // covers the FULL->MEDIUM step only.)
+    if (prev_stage == INTGAME_HUD_STAGE_FULL
+        && intgame_hud_stage == INTGAME_HUD_STAGE_MEDIUM) {
+        intgame_hud_ghost_slide_down();
+    }
+    // CE: MEDIUM -> MINI. Snapshot the MEDIUM band BEFORE the
+    // entering_mini block below swaps the rotwin to SKILLS (which
+    // redraws the bar VB) — so the ghost captures the departing
+    // MEDIUM content, then slides+fades it down behind the new MINI
+    // slim row.
+    if (prev_stage == INTGAME_HUD_STAGE_MEDIUM
+        && intgame_hud_stage == INTGAME_HUD_STAGE_MINI) {
+        intgame_hud_ghost_med_to_mini();
+    }
+
     if (entering_mini) {
         intgame_hud_enter_mini_with_skills();
         // Fall through to the populate hook below so MINI's slim row
@@ -9940,6 +10007,357 @@ tig_window_handle_t intgame_get_band_bar_handle(void)
 bool intgame_hud_is_band_mode(void)
 {
     return intgame_hud_band_mode;
+}
+
+// ===========================================================================
+// CE: FULL -> MEDIUM "wings slide down" ghost.
+//
+// MEDIUM crops the bottom bar to a centered band (rotwin + message
+// area) via a clip rect — the left/right chrome "wings" just vanish.
+// To make that read as the wings sliding DOWN off the bottom, we can't
+// slide the real bar window: the rotwin text is drawn into that same
+// window, so it would slide too. Instead, on the FULL->MEDIUM step we:
+//
+//   1. snapshot the live FULL bar (chrome + current rotwin) into a
+//      throwaway "ghost" window at the bar's rest position,
+//   2. promote the REAL bar above the ghost, then switch the real bar
+//      to its MEDIUM band clip (band + rotwin, static, in front),
+//   3. slide the ghost DOWN behind the real bar and destroy it on
+//      settle.
+//
+// Because the real band sits in FRONT, it occludes the ghost's center
+// — the viewer only sees the ghost's WINGS sliding down past the
+// persistent band. No inverse-clip needed, and the rotwin never moves.
+// One ghost at a time; a new spawn replaces any in-flight one (rapid
+// TAB cycling). Skipped entirely when UI animations are disabled.
+// ===========================================================================
+static tig_window_handle_t intgame_hud_ghost_window = TIG_WINDOW_HANDLE_INVALID;
+static int intgame_hud_ghost_slide_offset = 0;
+static int intgame_hud_ghost_last_applied = INT_MIN;
+static int intgame_hud_ghost_rest_x = 0;
+static int intgame_hud_ghost_rest_y = 0;
+static int intgame_hud_ghost_slide_distance = 0;
+static ui_anim_handle_t intgame_hud_ghost_handle = UI_ANIM_HANDLE_INVALID;
+static bool intgame_hud_ghost_pending_destroy = false;
+// CE: optional animated "morph" on the ghost (MED->MINI). Each frame
+// the visible footprint is lerped (by slide progress) from the MEDIUM
+// band toward the MINI band: bottom rises to the MINI crop's bottom,
+// width narrows MED->MINI, top rides the sliding window. The crop is
+// done at the VB LEVEL (clear ghost VB to the transparent key, then
+// re-blit just the morphing sub-region from a pristine snapshot)
+// rather than via a tig clip rect — that keeps the window clip-free so
+// the transform/fade path stays usable (the compositor disables
+// transform on any clipped window). The ghost composites in FRONT (the
+// transform/deferred path always paints last); for MED->MINI that's
+// intentional — it fades out over the real MINI row. Screen-coord
+// endpoints.
+static bool intgame_hud_ghost_clip_morph = false;
+static int intgame_hud_ghost_clip_x0 = 0;
+static int intgame_hud_ghost_clip_x1 = 0;
+static int intgame_hud_ghost_clip_w0 = 0;
+static int intgame_hud_ghost_clip_w1 = 0;
+static int intgame_hud_ghost_clip_bottom0 = 0;
+static int intgame_hud_ghost_clip_bottom1 = 0;
+// Top inset (ghost-local px shaved off the band's top), lerped over
+// the slide. A few px of top recession makes the band read as
+// collapsing from both edges rather than just sliding off the bottom.
+static int intgame_hud_ghost_clip_top0 = 0;
+static int intgame_hud_ghost_clip_top1 = 0;
+// Pristine band snapshot (morph source), the bar's transparent key,
+// and the ghost dimensions — used to rebuild the morphing crop each
+// frame.
+static TigVideoBuffer* intgame_hud_ghost_src_vb = NULL;
+static tig_color_t intgame_hud_ghost_key_color = 0;
+static int intgame_hud_ghost_width = 0;
+static int intgame_hud_ghost_height = 0;
+
+static void intgame_hud_ghost_destroy(void)
+{
+    if (intgame_hud_ghost_handle != UI_ANIM_HANDLE_INVALID) {
+        ui_anim_cancel(intgame_hud_ghost_handle);
+        intgame_hud_ghost_handle = UI_ANIM_HANDLE_INVALID;
+    }
+    if (intgame_hud_ghost_window != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_destroy(intgame_hud_ghost_window);
+        intgame_hud_ghost_window = TIG_WINDOW_HANDLE_INVALID;
+    }
+    if (intgame_hud_ghost_src_vb != NULL) {
+        tig_video_buffer_destroy(intgame_hud_ghost_src_vb);
+        intgame_hud_ghost_src_vb = NULL;
+    }
+    intgame_hud_ghost_pending_destroy = false;
+    intgame_hud_ghost_last_applied = INT_MIN;
+    intgame_hud_ghost_slide_offset = 0;
+    intgame_hud_ghost_clip_morph = false;
+}
+
+// ui_anim on_complete: defer the actual window destroy to the next
+// ghost ping (don't tear down a tig window from inside the ui_anim
+// integration loop).
+static void intgame_hud_ghost_on_settle(void* ctx)
+{
+    (void)ctx;
+    intgame_hud_ghost_pending_destroy = true;
+}
+
+// Core spawn: snapshot a sub-region of the bottom bar (bar-local
+// coords) into a same-sized ghost window at that region's rest screen
+// position, promote the real bar above it, then slide the ghost DOWN
+// by slide_distance. Destroyed on settle. One ghost at a time.
+// (Clip-morph, if any, is configured by the caller after this returns.)
+// transparent: create the ghost with TIG_WINDOW_TRANSPARENT so its VB
+// gets an SDL surface color key. Required when the ghost will FADE
+// (transform path) AND have key-filled regions (the morph crop): the
+// fade blit (SDL_BlitSurfaceScaled) only keys via the surface key, so
+// without this the key-filled margins composite opaque (a coloured /
+// "white" fill). The plain-slide ghost (FULL->MEDIUM) doesn't fade and
+// keys via the normal manual-key blit, so it passes false.
+static void intgame_hud_ghost_spawn(TigRect region_local, int slide_distance,
+    bool transparent)
+{
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    // Animations off → no ghost; the stage just snaps as before.
+    if (!settings_get_value(&settings, UI_ANIMATIONS_KEY)) {
+        return;
+    }
+
+    // Replace any in-flight ghost (rapid TAB cycling).
+    intgame_hud_ghost_destroy();
+
+    TigWindowData bar_wd;
+    if (tig_window_data(dword_64C4F8[1], &bar_wd) != TIG_OK) {
+        return;
+    }
+
+    int rest_y = intgame_hud_bottom_rest_y_compute();
+
+    TigWindowData ghost_wd;
+    ghost_wd.flags = transparent ? TIG_WINDOW_TRANSPARENT : 0;
+    ghost_wd.rect.x = bar_wd.rect.x + region_local.x;
+    ghost_wd.rect.y = rest_y + region_local.y; // region's rest screen y
+    ghost_wd.rect.width = region_local.width;
+    ghost_wd.rect.height = region_local.height;
+    ghost_wd.background_color = bar_wd.background_color;
+    ghost_wd.color_key = bar_wd.color_key;
+    ghost_wd.message_filter = NULL;
+    if (tig_window_create(&ghost_wd, &intgame_hud_ghost_window) != TIG_OK) {
+        intgame_hud_ghost_window = TIG_WINDOW_HANDLE_INVALID;
+        return;
+    }
+
+    // Snapshot the region from the live bar VB into the ghost
+    // (dst is ghost-local {0,0,w,h}; src is the bar-local region).
+    TigRect dst = { 0, 0, region_local.width, region_local.height };
+    tig_window_copy(intgame_hud_ghost_window, &dst, dword_64C4F8[1], &region_local);
+
+    // For the plain-slide ghost (FULL->MEDIUM): promote the REAL bar
+    // above it so the ghost sits BEHIND (real band occludes the
+    // ghost's center, only the departing chrome shows). The fading
+    // morph ghost (MED->MINI) intentionally composites in FRONT via
+    // the transform path; the promote is a harmless no-op there.
+    tig_window_move_on_top(dword_64C4F8[1]);
+
+    intgame_hud_ghost_rest_x = ghost_wd.rect.x;
+    intgame_hud_ghost_rest_y = ghost_wd.rect.y;
+    intgame_hud_ghost_width = region_local.width;
+    intgame_hud_ghost_height = region_local.height;
+    intgame_hud_ghost_key_color = bar_wd.color_key;
+    intgame_hud_ghost_slide_offset = 0;
+    intgame_hud_ghost_last_applied = INT_MIN;
+    intgame_hud_ghost_pending_destroy = false;
+    intgame_hud_ghost_clip_morph = false;
+    intgame_hud_ghost_slide_distance = slide_distance;
+    intgame_hud_ghost_handle = ui_anim_int_to_with_complete(
+        &intgame_hud_ghost_slide_offset,
+        slide_distance,
+        &UI_ANIM_PROFILE_DEFAULT_SLIDE,
+        intgame_hud_ghost_on_settle,
+        NULL);
+}
+
+// FULL -> MEDIUM: slide the whole full-bar snapshot down (no clip
+// morph); the wings clear the bottom edge while the real MEDIUM band
+// holds in front.
+static void intgame_hud_ghost_slide_down(void)
+{
+    TigRect full = { 0, 0, INTGAME_HUD_BOTTOM_W, INTGAME_HUD_BOTTOM_H };
+    intgame_hud_ghost_spawn(full, INTGAME_HUD_BOTTOM_H, /*transparent=*/false);
+}
+
+// MEDIUM -> MINI: snapshot the MEDIUM band and slide it DOWN over the
+// real MINI slim row while morphing toward the MINI footprint (bottom
+// rises to the MINI crop's bottom, width narrows MED->MINI) and fading
+// out. The crop is done at the VB level so the window stays clip-free
+// and the transform fade is usable; the ghost is created TRANSPARENT so
+// its VB has a surface key (the fade blit only keys via that). Composites
+// in front and fades out over the real MINI row.
+static void intgame_hud_ghost_med_to_mini(void)
+{
+    // Match intgame_hud_bottom_set_clip's MEDIUM band y: default
+    // INTGAME_HUD_MEDIUM_BAND_Y, shifted to the active rotwin button's
+    // row when that sits below the bar's top edge.
+    int chrome_strip_y = INTGAME_HUD_MEDIUM_BAND_Y;
+    if (intgame_iso_window_type >= 0
+        && intgame_iso_window_type < ROTWIN_TYPE_COUNT) {
+        int btn_y = intgame_rotwin_button_info[intgame_iso_window_type].y;
+        if (btn_y > intgame_interface_window_frames[1].y) {
+            chrome_strip_y = btn_y - intgame_interface_window_frames[1].y;
+        }
+    }
+    TigRect band = {
+        INTGAME_HUD_MEDIUM_BAND_X,
+        chrome_strip_y,
+        INTGAME_HUD_MEDIUM_BAND_W,
+        INTGAME_HUD_MEDIUM_BAND_H,
+    };
+
+    // Slide the band-top down to the MINI band's top, so at settle the
+    // visible region (top=window, bottom=MINI crop bottom) equals the
+    // MINI band footprint. MINI top is MEDIUM-relative, matching
+    // intgame_hud_bottom_set_clip's MINI offset.
+    int slide_distance = INTGAME_HUD_MINI_BAND_Y - INTGAME_HUD_MEDIUM_BAND_Y;
+    if (slide_distance < 1) slide_distance = 1;
+
+    intgame_hud_ghost_spawn(band, slide_distance, /*transparent=*/true);
+
+    if (intgame_hud_ghost_window == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
+    // Pristine band snapshot to rebuild the morphing crop from each
+    // frame (the ghost VB itself gets overwritten by the per-frame
+    // fill+reblit).
+    TigVideoBufferCreateInfo vb_info;
+    vb_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY
+        | TIG_VIDEO_BUFFER_CREATE_COLOR_KEY;
+    vb_info.width = INTGAME_HUD_MEDIUM_BAND_W;
+    vb_info.height = INTGAME_HUD_MEDIUM_BAND_H;
+    vb_info.background_color = intgame_hud_ghost_key_color;
+    vb_info.color_key = intgame_hud_ghost_key_color;
+    if (tig_video_buffer_create(&vb_info, &intgame_hud_ghost_src_vb) != TIG_OK) {
+        intgame_hud_ghost_src_vb = NULL;
+        return; // falls back to plain slide (no morph/fade)
+    }
+    TigRect band_dst = { 0, 0, INTGAME_HUD_MEDIUM_BAND_W, INTGAME_HUD_MEDIUM_BAND_H };
+    tig_window_copy_to_vbuffer(intgame_hud_ghost_window, &band_dst,
+        intgame_hud_ghost_src_vb, &band_dst);
+
+    // Configure the screen-space morph endpoints. bar_x / bar_rest_y are
+    // recovered from the ghost's rest position and the band offsets.
+    int bar_x = intgame_hud_ghost_rest_x - INTGAME_HUD_MEDIUM_BAND_X;
+    int bar_rest_y = intgame_hud_ghost_rest_y - chrome_strip_y;
+    // MINI crop bottom in screen coords — matches set_clip exactly:
+    // chrome_strip_y + (MINI_Y - MEDIUM_Y) + MINI_H.
+    int mini_bottom_screen = bar_rest_y + chrome_strip_y
+        + (INTGAME_HUD_MINI_BAND_Y - INTGAME_HUD_MEDIUM_BAND_Y)
+        + INTGAME_HUD_MINI_BAND_H;
+    intgame_hud_ghost_clip_morph = true;
+    // Width: MED band width -> MINI band width.
+    intgame_hud_ghost_clip_w0 = INTGAME_HUD_MEDIUM_BAND_W;
+    intgame_hud_ghost_clip_w1 = INTGAME_HUD_MINI_BAND_W;
+    // X (screen): MED band left -> MINI band left (MINI sits inward).
+    intgame_hud_ghost_clip_x0 = bar_x + INTGAME_HUD_MEDIUM_BAND_X;
+    intgame_hud_ghost_clip_x1 = bar_x + INTGAME_HUD_MINI_BAND_X;
+    // Bottom (screen): ghost's own bottom (at rest) -> MINI crop bottom.
+    intgame_hud_ghost_clip_bottom0 =
+        intgame_hud_ghost_rest_y + INTGAME_HUD_MEDIUM_BAND_H;
+    intgame_hud_ghost_clip_bottom1 = mini_bottom_screen;
+    // Top inset (ghost-local): shave a few px off the band top over the
+    // slide so the top edge recedes too.
+    intgame_hud_ghost_clip_top0 = 0;
+    intgame_hud_ghost_clip_top1 = 4;
+}
+
+// Per-frame: move the ghost to its tweened y, drive its clip morph (if
+// any), and reap it once the slide has settled. Called from
+// intgame_hud_ping.
+static void intgame_hud_ghost_ping(void)
+{
+    if (intgame_hud_ghost_window == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    if (intgame_hud_ghost_pending_destroy) {
+        intgame_hud_ghost_destroy();
+        return;
+    }
+    if (intgame_hud_ghost_slide_offset != intgame_hud_ghost_last_applied) {
+        intgame_hud_ghost_last_applied = intgame_hud_ghost_slide_offset;
+        int cur_y = intgame_hud_ghost_rest_y + intgame_hud_ghost_slide_offset;
+        tig_window_move(intgame_hud_ghost_window,
+            intgame_hud_ghost_rest_x, cur_y);
+
+        if (intgame_hud_ghost_clip_morph
+            && intgame_hud_ghost_slide_distance > 0
+            && intgame_hud_ghost_src_vb != NULL) {
+            float t = (float)intgame_hud_ghost_slide_offset
+                / (float)intgame_hud_ghost_slide_distance;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            // Morph rect, SCREEN coords: top rides the sliding window;
+            // bottom lerps toward the MINI crop bottom; width narrows
+            // MED->MINI; x drifts MED->MINI.
+            int x_screen = intgame_hud_ghost_clip_x0
+                + (int)((intgame_hud_ghost_clip_x1
+                    - intgame_hud_ghost_clip_x0) * t + 0.5f);
+            int w = intgame_hud_ghost_clip_w0
+                + (int)((intgame_hud_ghost_clip_w1
+                    - intgame_hud_ghost_clip_w0) * t + 0.5f);
+            int bottom_screen = intgame_hud_ghost_clip_bottom0
+                + (int)((intgame_hud_ghost_clip_bottom1
+                    - intgame_hud_ghost_clip_bottom0) * t + 0.5f);
+            int top_inset = intgame_hud_ghost_clip_top0
+                + (int)((intgame_hud_ghost_clip_top1
+                    - intgame_hud_ghost_clip_top0) * t + 0.5f);
+
+            // Convert to ghost-local (window x is fixed). top_inset
+            // shaves the band top; crop bottom tracks the MINI crop.
+            int crop_x = x_screen - intgame_hud_ghost_rest_x;
+            int crop_y = top_inset;
+            int crop_h = bottom_screen - (cur_y + top_inset);
+            if (crop_x < 0) crop_x = 0;
+            if (crop_y < 0) crop_y = 0;
+            if (w > intgame_hud_ghost_width - crop_x) {
+                w = intgame_hud_ghost_width - crop_x;
+            }
+            if (crop_h < 0) crop_h = 0;
+            if (crop_h > intgame_hud_ghost_height - crop_y) {
+                crop_h = intgame_hud_ghost_height - crop_y;
+            }
+
+            // Rebuild the ghost VB: clear to the transparent key, then
+            // re-blit only the morphing sub-region from the pristine
+            // snapshot. The VB has a surface key (TRANSPARENT window),
+            // so the fade blit below keys the cleared margins out.
+            TigRect full_local = {
+                0, 0, intgame_hud_ghost_width, intgame_hud_ghost_height
+            };
+            tig_window_fill(intgame_hud_ghost_window, &full_local,
+                intgame_hud_ghost_key_color);
+            if (w > 0 && crop_h > 0) {
+                TigRect crop = { crop_x, crop_y, w, crop_h };
+                tig_window_copy_from_vbuffer(intgame_hud_ghost_window, &crop,
+                    intgame_hud_ghost_src_vb, &crop);
+            }
+
+            // Fade out over the slide.
+            float alpha = 1.0f - t;
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+            tig_window_transform_set(intgame_hud_ghost_window,
+                1.0f, 1.0f, alpha, 0.5f, 0.5f);
+        }
+
+        // Safety: once the slide has reached its target, reap the ghost
+        // even if the settle callback is delayed.
+        if (intgame_hud_ghost_slide_offset >= intgame_hud_ghost_slide_distance) {
+            intgame_hud_ghost_pending_destroy = true;
+        }
+    }
 }
 
 // CE: slide both HUD bars off-screen, ignoring TAB stage. Used by
@@ -10154,6 +10572,9 @@ void intgame_hud_ping(void)
         intgame_hud_bottom_last_applied = INT_MIN;
         return;
     }
+
+    // CE: advance / reap the FULL->MEDIUM wings-slide ghost.
+    intgame_hud_ghost_ping();
 
     // Top bar slide.
     if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID
