@@ -156,6 +156,36 @@ void slide_ui_start(int type)
 
     // Display slides if queue is not empty.
     if (slide_ui_queue_size > 0) {
+        // CE: in-game slideshows (death / end-game) play over the live
+        // world. The slide window is only 800x600 (centered), so at
+        // higher resolutions the world shows around it — and the
+        // do_slide loop's gamelib_redraw keeps repainting that world
+        // into the surrounding area after the initial fade-to-black.
+        // Cover the whole screen with an opaque black backdrop beneath
+        // the slide window for the duration. Not needed for CREDITS:
+        // those run from the main menu, which already owns a
+        // full-screen backdrop (and may composite over a custom bg).
+        tig_window_handle_t backdrop_handle = TIG_WINDOW_HANDLE_INVALID;
+        if (type != SLIDE_UI_TYPE_CREDITS) {
+            TigWindowData backdrop_data;
+            backdrop_data.flags = TIG_WINDOW_ALWAYS_ON_TOP;
+            backdrop_data.rect.x = 0;
+            backdrop_data.rect.y = 0;
+            backdrop_data.rect.width = hrp_iso_window_width_get();
+            backdrop_data.rect.height = hrp_iso_window_height_get();
+            backdrop_data.background_color = tig_color_make(0, 0, 0);
+            backdrop_data.color_key = 0;
+            backdrop_data.message_filter = NULL;
+            // Created BEFORE the slide window so the slide window (also
+            // ALWAYS_ON_TOP, created later) composites above it.
+            if (tig_window_create(&backdrop_data, &backdrop_handle) == TIG_OK) {
+                TigRect full = {
+                    0, 0, backdrop_data.rect.width, backdrop_data.rect.height
+                };
+                tig_window_fill(backdrop_handle, &full, tig_color_make(0, 0, 0));
+            }
+        }
+
         // Set up window properties.
         window_data.flags = TIG_WINDOW_ALWAYS_ON_TOP;
         window_data.rect.x = 0;
@@ -185,6 +215,10 @@ void slide_ui_start(int type)
 
             tig_mouse_show();
             tig_window_display();
+        }
+
+        if (backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
+            tig_window_destroy(backdrop_handle);
         }
     }
 
