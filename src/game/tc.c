@@ -1,5 +1,7 @@
 #include "game/tc.h"
 
+#include <stdio.h>
+
 #include "ui/ui_anim.h"
 
 /**
@@ -117,6 +119,17 @@ static bool tc_editor;
  */
 static tig_font_handle_t tc_red_font;
 
+// CE: dim gray font (~50% of the white option color) for the "N. "
+// keyboard-shortcut number prefix. Always used for the prefix — it
+// never highlights on rollover; only the option text after it does.
+static tig_font_handle_t tc_number_font;
+
+// CE: fixed width (px) reserved for the number prefix column, so the
+// option text after it always starts at the same x regardless of which
+// digit precedes it (a proportional font makes "1. " narrower than
+// "4. "). Computed once in tc_init as the widest single-digit prefix.
+static int tc_number_prefix_width;
+
 /**
  * Handle to the parent window.
  *
@@ -230,6 +243,28 @@ bool tc_init(GameInitInfo* init_info)
     font.color = tig_color_make(255, 0, 0);
     tig_font_create(&font, &tc_red_font);
 
+    // CE: dim gray (~50% of white) for the option number prefix.
+    font.color = tig_color_make(128, 128, 128);
+    tig_font_create(&font, &tc_number_font);
+
+    // CE: reserve a fixed prefix-column width = the widest single-digit
+    // "N. " in the number font, so option text always left-aligns to
+    // the same x regardless of the digit's glyph width.
+    tc_number_prefix_width = 0;
+    tig_font_push(tc_number_font);
+    for (int digit = 1; digit <= 9; digit++) {
+        char prefix[8];
+        TigFont fm;
+        snprintf(prefix, sizeof(prefix), "%d. ", digit);
+        fm.width = 0;
+        fm.str = prefix;
+        tig_font_measure(&fm);
+        if (fm.width > tc_number_prefix_width) {
+            tc_number_prefix_width = fm.width;
+        }
+    }
+    tig_font_pop();
+
     // Calculate the line height based on the available vertical space.
     tc_line_height = (tc_intermediate_video_buffer_rect.height - ((TEXT_CONVERSATION_LINES + 1) * TEXT_CONVERSATION_VERT_SPACING)) / TEXT_CONVERSATION_LINES;
 
@@ -249,6 +284,7 @@ void tc_exit(void)
     }
 
     // Destroy fonts.
+    tig_font_destroy(tc_number_font);
     tig_font_destroy(tc_red_font);
     tig_font_destroy(tc_yellow_font);
     tig_font_destroy(tc_white_font);
@@ -537,6 +573,24 @@ void tc_set_option(int index, const char* str)
         &rect,
         tig_color_make(0, 0, 0));
 
+    // CE: render the keyboard-shortcut number prefix ("1. ", "2. ", ...)
+    // in the dim font. It never highlights — only the option text after
+    // it does (below).
+    {
+        char prefix[8];
+        TigRect prefix_dirty;
+        snprintf(prefix, sizeof(prefix), "%d. ", index + 1);
+        tig_font_push(tc_number_font);
+        tig_font_write(tc_scratch_video_buffer, prefix, &rect, &prefix_dirty);
+        tig_font_pop();
+    }
+
+    // Option text starts past a FIXED-width prefix column, so it left-
+    // aligns identically across rows regardless of the digit's width.
+    TigRect text_rect = rect;
+    text_rect.x += tc_number_prefix_width;
+    text_rect.width -= tc_number_prefix_width;
+
     highlighted = false;
 
     // Check of the mouse is over the option's rect and pick an appropriate
@@ -565,13 +619,14 @@ void tc_set_option(int index, const char* str)
     }
 
     // Render the option text to the scratch (text) video buffer.
-    tig_font_write(tc_scratch_video_buffer, str, &rect, &dirty_rect);
+    tig_font_write(tc_scratch_video_buffer, str, &text_rect, &dirty_rect);
     tig_font_pop();
 
-    // Update content rect's width and reposition it if the text in this option
-    // is wider than the current width.
-    if (tc_content_rect.width < dirty_rect.width + TEXT_CONVERSATION_HOR_PADDING * 2) {
-        tc_content_rect.width = dirty_rect.width + TEXT_CONVERSATION_HOR_PADDING * 2;
+    // Update content rect's width and reposition it if the prefix + text in
+    // this option is wider than the current width.
+    int line_width = tc_number_prefix_width + dirty_rect.width;
+    if (tc_content_rect.width < line_width + TEXT_CONVERSATION_HOR_PADDING * 2) {
+        tc_content_rect.width = line_width + TEXT_CONVERSATION_HOR_PADDING * 2;
         tc_content_rect.x = (tc_iso_window_rect.width - tc_content_rect.width) / 2;
     }
 
@@ -610,7 +665,29 @@ int tc_handle_message(TigMessage* msg)
         return -1;
     }
 
-    // Only process mouse messages.
+    // CE: keyboard shortcuts — number keys 1..N select the matching
+    // option (Baldur's Gate style), matching the "N. " prefixes drawn
+    // by tc_set_option. Act on key-down only; the dialogue dispatcher
+    // also delivers key-up events. Top-row and numpad digits both work
+    // (physical scancodes, layout-independent).
+    if (msg->type == TIG_MESSAGE_KEYBOARD) {
+        if (!msg->data.keyboard.pressed) {
+            return -1;
+        }
+        SDL_Scancode sc = msg->data.keyboard.scancode;
+        int n = -1;
+        if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) {
+            n = sc - SDL_SCANCODE_1;
+        } else if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) {
+            n = sc - SDL_SCANCODE_KP_1;
+        }
+        if (n >= 0 && n < TEXT_CONVERSATION_LINES && tc_options[n] != NULL) {
+            return n;
+        }
+        return -1;
+    }
+
+    // Only process mouse messages below.
     if (msg->type != TIG_MESSAGE_MOUSE) {
         return -1;
     }
