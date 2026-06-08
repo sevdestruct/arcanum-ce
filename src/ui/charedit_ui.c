@@ -1284,18 +1284,6 @@ bool charedit_open(int64_t obj, ChareditMode mode)
     return true;
 }
 
-// CE: ui_anim on_complete — runs when the parent's entrance spring
-// settles. Shows all 4 subwindows (the original code's pattern: all
-// shown then skills brought to top; the other 3 are visible-in-tig-
-// terms but hidden behind skills in z-order, so only skills shows).
-// Guarded against the case where charedit_close was called mid-
-// entrance — fires the callback after the cancel, but charedit_created
-// is false so we skip the show.
-// CE: bring a charedit subwindow to the top of its z-class and play the
-// subtle scale+fade entrance on it, so switching tabs (and the initial
-// open) animates like the main windows. Scale-from 0.96 is subtler than
-// the parent's 0.92 — keeps the sibling tab sitting behind from peeking
-// at the edges during the scale. The window must already be shown.
 // CE: compute the scale-anchor for a subwindow's entrance/exit so it
 // pivots about the PARENT (big) window's center rather than the
 // subwindow's own geometric center. The skills/spells/tech/scheme panels
@@ -1327,6 +1315,11 @@ static void charedit_subwindow_anchor(tig_window_handle_t win,
     *out_rel_y = (cy - (float)sub_data.rect.y) / (float)sub_data.rect.height;
 }
 
+// CE: bring a charedit subwindow to the top of its z-class and play the
+// subtle scale+fade entrance on it, so switching tabs (and the initial
+// open) animates like the main windows. Scale-from 0.96 is subtler than
+// the parent's 0.92 — keeps the sibling tab sitting behind from peeking
+// at the edges during the scale. The window must already be shown.
 static void charedit_subwindow_enter(tig_window_handle_t win)
 {
     float rel_x, rel_y;
@@ -1352,6 +1345,13 @@ static void charedit_hide_subwindows_on_exit(void* ctx)
     tig_window_hide(charedit_scheme_win);
 }
 
+// CE: ui_anim on_complete — runs when the parent's entrance spring
+// settles. Shows all 4 subwindows (the original code's pattern: all
+// shown then skills brought to top; the other 3 are visible-in-tig-
+// terms but hidden behind skills in z-order, so only skills shows).
+// Guarded against the case where charedit_close was called mid-
+// entrance — fires the callback after the cancel, but charedit_created
+// is false so we skip the show.
 static void charedit_show_subwindows_on_entrance_complete(void* ctx)
 {
     (void)ctx;

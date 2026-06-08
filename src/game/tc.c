@@ -591,10 +591,11 @@ void tc_set_option(int index, const char* str)
     int prefix_col = numbers ? tc_number_prefix_width : 0;
     if (numbers) {
         char prefix[8];
-        TigRect prefix_dirty;
         snprintf(prefix, sizeof(prefix), "%d. ", index + 1);
         tig_font_push(tc_number_font);
-        tig_font_write(tc_scratch_video_buffer, prefix, &rect, &prefix_dirty);
+        // Dirty rect discarded — the prefix occupies a fixed column, so
+        // its actual glyph extent doesn't drive any later layout.
+        tig_font_write(tc_scratch_video_buffer, prefix, &rect, NULL);
         tig_font_pop();
     }
 
