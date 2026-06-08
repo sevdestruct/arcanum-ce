@@ -396,21 +396,23 @@ bool tb_init(GameInitInfo* init_info)
     tig_art_interface_id_create(229, 0, 0, 0, &(font.art_id));
 
     // Centered — used for TB_POS_TOP and TB_POS_BOTTOM.
-    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_CENTERED | TIG_FONT_SHADOW;
+    // CE: TIG_FONT_DIM_BRACKETS opts these into the emote-dim effect
+    // (gated at runtime by tig_font_dim_brackets_set_enabled).
+    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_CENTERED | TIG_FONT_SHADOW | TIG_FONT_DIM_BRACKETS;
     for (idx = 0; idx < TB_TYPE_COUNT; idx++) {
         font.color = tig_color_make(tb_colors[idx][0], tb_colors[idx][1], tb_colors[idx][2]);
         tig_font_create(&font, &(tb_fonts[idx]));
     }
 
     // Left-aligned — used for right-side positions (text starts near sprite).
-    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_SHADOW;
+    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_SHADOW | TIG_FONT_DIM_BRACKETS;
     for (idx = 0; idx < TB_TYPE_COUNT; idx++) {
         font.color = tig_color_make(tb_colors[idx][0], tb_colors[idx][1], tb_colors[idx][2]);
         tig_font_create(&font, &(tb_fonts_left[idx]));
     }
 
     // Right-aligned — used for left-side positions (text ends near sprite).
-    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_RIGHT | TIG_FONT_SHADOW;
+    font.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_RIGHT | TIG_FONT_SHADOW | TIG_FONT_DIM_BRACKETS;
     for (idx = 0; idx < TB_TYPE_COUNT; idx++) {
         font.color = tig_color_make(tb_colors[idx][0], tb_colors[idx][1], tb_colors[idx][2]);
         tig_font_create(&font, &(tb_fonts_right[idx]));

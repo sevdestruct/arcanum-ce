@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "game/gamelib.h"
 #include "ui/ui_anim.h"
 
 /**
@@ -227,12 +228,20 @@ bool tc_init(GameInitInfo* init_info)
 
     // Set up font creation parameters.
     tig_art_interface_id_create(229, 0, 0, 0, &art_id);
-    font.flags = TIG_FONT_SHADOW;
     font.art_id = art_id;
 
-    // Create white font for normal text.
+    // Create white font for normal (resting) text.
+    // CE: TIG_FONT_DIM_BRACKETS_ALT opts the resting option text into
+    // the PC-choice bracket-dim channel (its own cfg toggle, separate
+    // from NPC speech bubbles). The highlight fonts below deliberately
+    // omit it, so a rolled-over option highlights fully — brackets
+    // included — with no dimming.
+    font.flags = TIG_FONT_SHADOW | TIG_FONT_DIM_BRACKETS_ALT;
     font.color = tig_color_make(255, 255, 255);
     tig_font_create(&font, &tc_white_font);
+
+    // Highlight fonts: no bracket-dim (rollover shows full color).
+    font.flags = TIG_FONT_SHADOW;
 
     // Create yellow font for highlighted text.
     font.color = tig_color_make(255, 255, 0);
@@ -573,10 +582,14 @@ void tc_set_option(int index, const char* str)
         &rect,
         tig_color_make(0, 0, 0));
 
-    // CE: render the keyboard-shortcut number prefix ("1. ", "2. ", ...)
-    // in the dim font. It never highlights — only the option text after
-    // it does (below).
-    {
+    // CE: optionally render the keyboard-shortcut number prefix
+    // ("1. ", "2. ", ...) in the dim font. It never highlights — only
+    // the option text after it does (below). The text then starts past
+    // a FIXED-width prefix column so it left-aligns identically across
+    // rows regardless of the digit's glyph width. Off → vanilla layout.
+    bool numbers = settings_get_value(&settings, DIALOGUE_OPTION_NUMBERS_KEY) != 0;
+    int prefix_col = numbers ? tc_number_prefix_width : 0;
+    if (numbers) {
         char prefix[8];
         TigRect prefix_dirty;
         snprintf(prefix, sizeof(prefix), "%d. ", index + 1);
@@ -585,11 +598,9 @@ void tc_set_option(int index, const char* str)
         tig_font_pop();
     }
 
-    // Option text starts past a FIXED-width prefix column, so it left-
-    // aligns identically across rows regardless of the digit's width.
     TigRect text_rect = rect;
-    text_rect.x += tc_number_prefix_width;
-    text_rect.width -= tc_number_prefix_width;
+    text_rect.x += prefix_col;
+    text_rect.width -= prefix_col;
 
     highlighted = false;
 
@@ -624,7 +635,7 @@ void tc_set_option(int index, const char* str)
 
     // Update content rect's width and reposition it if the prefix + text in
     // this option is wider than the current width.
-    int line_width = tc_number_prefix_width + dirty_rect.width;
+    int line_width = prefix_col + dirty_rect.width;
     if (tc_content_rect.width < line_width + TEXT_CONVERSATION_HOR_PADDING * 2) {
         tc_content_rect.width = line_width + TEXT_CONVERSATION_HOR_PADDING * 2;
         tc_content_rect.x = (tc_iso_window_rect.width - tc_content_rect.width) / 2;
@@ -671,7 +682,8 @@ int tc_handle_message(TigMessage* msg)
     // also delivers key-up events. Top-row and numpad digits both work
     // (physical scancodes, layout-independent).
     if (msg->type == TIG_MESSAGE_KEYBOARD) {
-        if (!msg->data.keyboard.pressed) {
+        if (!msg->data.keyboard.pressed
+            || !settings_get_value(&settings, DIALOGUE_OPTION_NUMBERS_KEY)) {
             return -1;
         }
         SDL_Scancode sc = msg->data.keyboard.scancode;

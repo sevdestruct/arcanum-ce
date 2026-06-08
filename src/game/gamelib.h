@@ -43,6 +43,30 @@
 // screenshot/debugging, or anyone who prefers snap-instant UIs.
 #define UI_ANIMATIONS_KEY "ui animations"
 
+// CE: Baldur's-Gate-style "1. / 2. / ..." number prefixes on dialogue
+// options, selectable with the matching number key. The prefix is a
+// dim 50% color and never highlights; only the option text after it
+// does. Defaults to 1 (on); set 0 for the vanilla unnumbered look.
+#define DIALOGUE_OPTION_NUMBERS_KEY "dialogue option numbers"
+
+// CE: dim bracketed emote / stage-direction spans (e.g. "[Sigh]",
+// "[The guard eyes you warily]") in dialogue text — speech bubbles
+// and option lines — to ~50% of the text color, keeping the brackets
+// visible. Sets off in-character action text from spoken words.
+// Defaults to 1 (on); set 0 for the vanilla uniform color.
+#define DIALOGUE_EMOTE_DIM_KEY "dialogue emote dim"
+
+// CE: how bright the dimmed emote text stays, as a percent of the
+// normal color (0 = black, 100 = no dimming). Defaults to 60. Lower
+// is dimmer. Only matters when DIALOGUE_EMOTE_DIM_KEY is on.
+#define DIALOGUE_EMOTE_DIM_PERCENT_KEY "dialogue emote dim percent"
+
+// CE: also dim bracketed emotes in the player's own dialogue choices
+// (not just NPC speech bubbles). Resting choices dim; a rolled-over
+// choice always highlights at full color. Defaults to 1 (on). Has no
+// effect unless DIALOGUE_EMOTE_DIM_KEY is also on.
+#define DIALOGUE_EMOTE_DIM_CHOICES_KEY "dialogue emote dim choices"
+
 // CE: opt-in elliptical-vignette fade-to-black on legacy mainmenu
 // panel art (mainmenu / pause / single-player / sub-windows when
 // custom-UI bg art isn't loaded). Darkens the corners + edges of

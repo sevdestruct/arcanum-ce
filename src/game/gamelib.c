@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "tig/font.h"
+
 #include "game/camera_follow.h"
 #include "game/camera_tween.h"
 #include "game/dialog_camera.h"
@@ -132,6 +134,7 @@ typedef struct GameSaveEntry {
 static int game_save_entry_compare_by_date(const void* va, const void* vb);
 static int game_save_entry_compare_by_name(const void* va, const void* vb);
 static void difficulty_changed(void);
+static void dialogue_emote_dim_changed(void);
 static void gamelib_draw_game(GameDrawInfo* draw_info);
 static void gamelib_draw_editor(GameDrawInfo* draw_info);
 static uint64_t gamelib_zoom_perf_now_ns(void);
@@ -439,6 +442,17 @@ bool gamelib_init(GameInitInfo* init_info)
     // system. Defaults on. Disable for instant-snap UIs (accessibility,
     // screenshots, personal preference).
     settings_register(&settings, UI_ANIMATIONS_KEY, "1", NULL);
+
+    // CE: numbered dialogue options (default on).
+    settings_register(&settings, DIALOGUE_OPTION_NUMBERS_KEY, "1", NULL);
+
+    // CE: dim bracketed emote spans in dialogue (default on, 50%).
+    // Register both keys, then mirror their values into the tig font
+    // layer; either changing re-applies both.
+    settings_register(&settings, DIALOGUE_EMOTE_DIM_KEY, "1", dialogue_emote_dim_changed);
+    settings_register(&settings, DIALOGUE_EMOTE_DIM_PERCENT_KEY, "60", dialogue_emote_dim_changed);
+    settings_register(&settings, DIALOGUE_EMOTE_DIM_CHOICES_KEY, "1", dialogue_emote_dim_changed);
+    dialogue_emote_dim_changed();
 
     // CE: Opt-in for vanilla "snap camera to PC on overlay open". Default
     // off — opening Inventory / Logbook / Schematic / Written / Options
@@ -2844,6 +2858,17 @@ void gamelib_thumbnail_size_set(int width, int height)
 void difficulty_changed(void)
 {
     gamelib_game_difficulty = settings_get_value(&settings, DIFFICULTY_KEY);
+}
+
+// CE: push the dialogue-emote-dim config to the tig font layer.
+void dialogue_emote_dim_changed(void)
+{
+    bool master = settings_get_value(&settings, DIALOGUE_EMOTE_DIM_KEY) != 0;
+    bool choices = settings_get_value(&settings, DIALOGUE_EMOTE_DIM_CHOICES_KEY) != 0;
+    // Primary channel = NPC speech bubbles; alt channel = PC choices.
+    tig_font_dim_brackets_set_enabled(master);
+    tig_font_dim_brackets_set_alt_enabled(master && choices);
+    tig_font_dim_brackets_set_percent(settings_get_value(&settings, DIALOGUE_EMOTE_DIM_PERCENT_KEY));
 }
 
 // 0x404590

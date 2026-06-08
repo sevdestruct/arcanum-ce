@@ -8,7 +8,7 @@
 
 #define FONT_STACK_SIZE 20
 
-static int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArtBlitInfo* blit_info, bool shadow);
+static int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArtBlitInfo* blit_info, bool shadow, bool* in_bracket);
 static int sub_535C40(tig_art_id_t font_art_id, const char* str, int max_width, int* width_ptr);
 static bool tig_font_glyph_data(tig_art_id_t font_art_id, int ch, int* width_ptr, int* height_ptr, int* dx_ptr, int* dy_ptr);
 
@@ -23,6 +23,35 @@ static tig_color_t tig_font_shadow_color;
 
 // 0x630D54
 static tig_font_handle_t tig_font_default_font;
+
+// CE: runtime toggles for the two bracket-dim channels.
+static bool tig_font_dim_brackets_enabled = false;
+static bool tig_font_dim_brackets_alt_enabled = false;
+
+// CE: blend alpha for the dim color (0 = black, 256 = no dimming).
+// Derived from a 0..100 percent; default 60% -> 153.
+static int tig_font_dim_brackets_alpha = 153;
+
+void tig_font_dim_brackets_set_enabled(bool enabled)
+{
+    tig_font_dim_brackets_enabled = enabled;
+}
+
+void tig_font_dim_brackets_set_alt_enabled(bool enabled)
+{
+    tig_font_dim_brackets_alt_enabled = enabled;
+}
+
+void tig_font_dim_brackets_set_percent(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    // Map 0..100 -> 0..256 so 100% is fully unblended.
+    tig_font_dim_brackets_alpha = percent * 256 / 100;
+}
 
 // 0x5351D0
 int tig_font_init(TigInitInfo* init_info)
@@ -276,6 +305,9 @@ int tig_font_write(TigVideoBuffer* video_buffer, const char* str, const TigRect*
             int line_width;
             int dx;
             int rc;
+            // CE: bracket-dim state, carried across wrapped lines so an
+            // emote that spans a line break stays dim. Reset per pass.
+            bool in_bracket = false;
 
             while (1) {
                 line_length = sub_535C40(tig_font_stack[tig_font_stack_index]->art_id, remainder, rect->width, &line_width);
@@ -305,7 +337,7 @@ int tig_font_write(TigVideoBuffer* video_buffer, const char* str, const TigRect*
                     dst_rect.x = dst_rect_x + dx;
                 }
 
-                rc = sub_535850(video_buffer, remainder, line_length + 1, &blit_info, shadow);
+                rc = sub_535850(video_buffer, remainder, line_length + 1, &blit_info, shadow, &in_bracket);
                 if (rc != TIG_OK) {
                     return rc;
                 }
@@ -345,7 +377,7 @@ int tig_font_write(TigVideoBuffer* video_buffer, const char* str, const TigRect*
 }
 
 // 0x535850
-int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArtBlitInfo* blit_info, bool shadow)
+int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArtBlitInfo* blit_info, bool shadow, bool* in_bracket)
 {
     tig_art_id_t glyph_art_id;
     int blt_dst_rect_x;
@@ -364,6 +396,20 @@ int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArt
     blt_dst_rect_x = blit_info->dst_rect->x;
     blt_dst_rect_y = blit_info->dst_rect->y;
 
+    // CE: bracket-dim setup. Only on the non-shadow pass, when the
+    // current font opts in (TIG_FONT_DIM_BRACKETS) and the runtime
+    // toggle is on. normal_color is the font's color; dim_color is it
+    // blended 50% toward black. Per-glyph color is selected below.
+    TigFontFlags font_flags = tig_font_stack[tig_font_stack_index]->flags;
+    bool dim_active = !shadow
+        && in_bracket != NULL
+        && ((((font_flags & TIG_FONT_DIM_BRACKETS) != 0) && tig_font_dim_brackets_enabled)
+            || (((font_flags & TIG_FONT_DIM_BRACKETS_ALT) != 0) && tig_font_dim_brackets_alt_enabled));
+    tig_color_t normal_color = tig_font_stack[tig_font_stack_index]->color;
+    tig_color_t dim_color = dim_active
+        ? tig_color_blend_alpha(normal_color, tig_color_make(0, 0, 0), tig_font_dim_brackets_alpha)
+        : normal_color;
+
     for (pos = 0; pos < length; pos++) {
         if (str[pos] == '\0') {
             break;
@@ -375,6 +421,19 @@ int sub_535850(TigVideoBuffer* video_buffer, const char* str, int length, TigArt
 
             if (!tig_font_glyph_data(glyph_art_id, str[pos], &glyph_width, &glyph_height, &glyph_dx, &glyph_dy)) {
                 return TIG_ERR_GENERIC;
+            }
+
+            // CE: dim the glyph if it's inside (or is) a [bracket] span.
+            // The brackets themselves are dimmed too (kept visible).
+            if (dim_active) {
+                char c = str[pos];
+                bool glyph_dim = *in_bracket || c == '[' || c == ']';
+                blit_info->color = glyph_dim ? dim_color : normal_color;
+                if (c == '[') {
+                    *in_bracket = true;
+                } else if (c == ']') {
+                    *in_bracket = false;
+                }
             }
 
             if (str[pos] != '\t') {
