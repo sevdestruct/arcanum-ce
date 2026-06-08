@@ -1296,10 +1296,43 @@ bool charedit_open(int64_t obj, ChareditMode mode)
 // open) animates like the main windows. Scale-from 0.96 is subtler than
 // the parent's 0.92 — keeps the sibling tab sitting behind from peeking
 // at the edges during the scale. The window must already be shown.
+// CE: compute the scale-anchor for a subwindow's entrance/exit so it
+// pivots about the PARENT (big) window's center rather than the
+// subwindow's own geometric center. The skills/spells/tech/scheme panels
+// each occupy only a sub-region of the char window (skills sits to the
+// right, etc.), so scaling from their own center makes them appear to
+// zoom out of an arbitrary off-panel point. Re-expressing the parent
+// center as a frame-relative (0..1, but may fall outside that range)
+// anchor on the subwindow's frame makes every subwindow scale about the
+// same fixed point as the parent entrance — the whole panel reads as one
+// unit. Falls back to the subwindow's own center if either frame query
+// fails or the subwindow has zero extent.
+static void charedit_subwindow_anchor(tig_window_handle_t win,
+    float* out_rel_x,
+    float* out_rel_y)
+{
+    TigWindowData parent_data;
+    TigWindowData sub_data;
+
+    *out_rel_x = 0.5f;
+    *out_rel_y = 0.5f;
+
+    if (tig_window_data(charedit_window_handle, &parent_data) != TIG_OK) return;
+    if (tig_window_data(win, &sub_data) != TIG_OK) return;
+    if (sub_data.rect.width <= 0 || sub_data.rect.height <= 0) return;
+
+    float cx = (float)parent_data.rect.x + (float)parent_data.rect.width * 0.5f;
+    float cy = (float)parent_data.rect.y + (float)parent_data.rect.height * 0.5f;
+    *out_rel_x = (cx - (float)sub_data.rect.x) / (float)sub_data.rect.width;
+    *out_rel_y = (cy - (float)sub_data.rect.y) / (float)sub_data.rect.height;
+}
+
 static void charedit_subwindow_enter(tig_window_handle_t win)
 {
+    float rel_x, rel_y;
     sub_51E850(win);
-    ui_anim_window_show(win, UI_ANIM_ANCHOR_CENTER, 0.96f, NULL);
+    charedit_subwindow_anchor(win, &rel_x, &rel_y);
+    ui_anim_window_show_ex(win, rel_x, rel_y, 0.96f, NULL);
 }
 
 // CE: on_complete for the active subwindow's exit animation — hides all
@@ -1381,8 +1414,10 @@ void charedit_close(void)
             if (active_sub != charedit_tech_win) tig_window_hide(charedit_tech_win);
             if (active_sub != charedit_scheme_win) tig_window_hide(charedit_scheme_win);
             ui_anim_profile_t sub_exit = { 110, 1.2f };
+            float sub_rel_x, sub_rel_y;
+            charedit_subwindow_anchor(active_sub, &sub_rel_x, &sub_rel_y);
             charedit_subwindow_exit_pending = true;
-            ui_anim_window_hide(active_sub, UI_ANIM_ANCHOR_CENTER, 0.96f,
+            ui_anim_window_hide_ex(active_sub, sub_rel_x, sub_rel_y, 0.96f,
                 &sub_exit, charedit_hide_subwindows_on_exit, NULL);
         }
         charedit_obj = OBJ_HANDLE_NULL;
