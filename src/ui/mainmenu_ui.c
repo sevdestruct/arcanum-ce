@@ -5387,6 +5387,59 @@ static void mainmenu_ui_reapply_custom_bg(void)
     }
 }
 
+// CE: true when the hi-res patch's border art archive
+// (ArcanumZHighResBorders.dat) is present. Only then do the panel arts
+// (Schematic_Base etc.) carry the ornate HD borders we steal from.
+// Cached — the archive can't appear/disappear at runtime.
+static bool mainmenu_ui_hires_borders_present(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = tig_file_exists("ArcanumZHighResBorders.dat", NULL) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// CE: the HD OptionsBase art is a borderless "full" panel, so the cropped
+// hi-res Options window has no frame. Synthesize one by stealing the
+// outer 6px ring of the Schematic_Base panel (art 365) — an 800x400
+// bordered panel that matches our cropped Options size 1:1 — and blitting
+// just its four edge strips around the Options window. Interior untouched
+// (the Options art shows through). Only meaningful when the hi-res patch
+// art is present (gated by the caller).
+static void mainmenu_ui_draw_stolen_border(tig_window_handle_t window_handle)
+{
+    // Schematic_Base is drawn into an 800x400 window (schematic_ui_window_rect),
+    // so its visible bordered region — and our cropped Options panel — are
+    // both 800x400; the ring maps 1:1.
+    enum { PW = 800, PH = 400, B = 6 };
+    tig_art_id_t art_id;
+    TigArtBlitInfo bi;
+    TigRect s;
+    TigRect d;
+
+    if (tig_art_interface_id_create(365, 0, 0, 0, &art_id) != TIG_OK) {
+        return;
+    }
+    bi.flags = 0;
+    bi.art_id = art_id;
+    bi.src_rect = &s;
+    bi.dst_rect = &d;
+
+    // Top edge (full width, includes the two top corners).
+    s.x = 0; s.y = 0; s.width = PW; s.height = B; d = s;
+    tig_window_blit_art(window_handle, &bi);
+    // Bottom edge (full width, includes the two bottom corners).
+    s.x = 0; s.y = PH - B; s.width = PW; s.height = B; d = s;
+    tig_window_blit_art(window_handle, &bi);
+    // Left edge (between the corners).
+    s.x = 0; s.y = B; s.width = B; s.height = PH - 2 * B; d = s;
+    tig_window_blit_art(window_handle, &bi);
+    // Right edge (between the corners).
+    s.x = PW - B; s.y = B; s.width = B; s.height = PH - 2 * B; d = s;
+    tig_window_blit_art(window_handle, &bi);
+}
+
 // 0x546340
 void mainmenu_ui_create_window_func(bool should_display)
 {
@@ -5666,15 +5719,17 @@ void mainmenu_ui_create_window_func(bool should_display)
         //
         // CE: also crop the TOP 41px decorative header off Options at
         // hi-res — same rationale as the bottom: no content lives in
-        // those rows. After both crops the Options panel is 800x402.
+        // those rows. After both crops the Options panel is exactly
+        // 800x400 (600 - 159 - 41), matching the in-game 800x400 panels
+        // (and Schematic_Base) so the stolen border ring maps 1:1.
         // Button positions (read in design space and translated via
         // mainmenu_ui_window_rect.y) ride along correctly. src_rect.y
         // is set from rect.y in the Options blit branch below so the
-        // panel's VB actually shows art y=41..443.
+        // panel's VB actually shows art y=41..441.
         if (is_hires
             && mainmenu_ui_window_type == MM_WINDOW_OPTIONS) {
-            if (mainmenu_ui_window_rect.height > 157) {
-                mainmenu_ui_window_rect.height -= 157;
+            if (mainmenu_ui_window_rect.height > 159) {
+                mainmenu_ui_window_rect.height -= 159;
             }
             if (mainmenu_ui_window_rect.height > 41) {
                 mainmenu_ui_window_rect.y += 41;
@@ -5847,10 +5902,24 @@ void mainmenu_ui_create_window_func(bool should_display)
                 // bg slice come from the same source, so the panel's
                 // chromakey'd regions composite seamlessly into the
                 // surrounding backdrop bg without visible seams.
-                if (mainmenu_ui_has_custom_bg
-                    && !mainmenu_ui_custom_bg_is_fallback) {
+                bool custom_bg_painted = mainmenu_ui_has_custom_bg
+                    && !mainmenu_ui_custom_bg_is_fallback;
+                if (custom_bg_painted) {
                     mainmenu_ui_blit_custom_bg_to_window(
                         mainmenu_ui_window_handle, window_data.rect);
+                }
+
+                // CE: give the cropped hi-res Options panel a frame. Its
+                // own HD OptionsBase art is borderless, so steal the outer
+                // ring of Schematic_Base and blit it around the edges.
+                // Only when: hi-res, this is Options, the hi-res patch art
+                // is present, and custom UI didn't already paint its own
+                // frame (options_bg.bmp / mainmenu_bg overrides this).
+                if (is_hires
+                    && mainmenu_ui_window_type == MM_WINDOW_OPTIONS
+                    && !custom_bg_painted
+                    && mainmenu_ui_hires_borders_present()) {
+                    mainmenu_ui_draw_stolen_border(mainmenu_ui_window_handle);
                 }
 
                 // CE: opt-in elliptical-vignette fade on legacy
