@@ -212,33 +212,6 @@ int tig_window_transform_clear(tig_window_handle_t window_handle);
 // (set at window create) is 1.0.
 int tig_window_tint_reveal_set(tig_window_handle_t window_handle, float reveal);
 
-// CE: cache a pre-tinted snapshot of the window's VB. Used by the
-// ui_anim transform path when the window also has tint_enabled —
-// without a snapshot the compositor falls back to a per-pixel
-// integrated blit (~10× slower than SDL_BlitSurfaceScaled). The
-// snapshot is the window's VB with near-black pixels replaced by
-// the underlay tinted at the window's NATURAL screen position (the
-// "at-rest" tinted look). Compositor uses SDL_BlitSurfaceScaled +
-// alpha mod on the snapshot during the brief anim window.
-//
-// Brief staleness: the snapshot is captured ONCE at anim start;
-// during the ~130ms anim the underlay (iso world) may drift a few
-// pixels — visible only as a very slight smear in the panel's
-// dark-area see-through, almost certainly imperceptible.
-//
-// _release frees the snapshot VB. Safe to call when no snapshot
-// is allocated (no-op).
-int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle);
-void tig_window_tint_snapshot_release(tig_window_handle_t window_handle);
-TigVideoBuffer* tig_window_tint_snapshot_get(tig_window_handle_t window_handle);
-
-// CE: post-animation snapshot cross-fade opacity, 0.0..1.0. After a
-// transform entrance settles, ui_anim keeps the snapshot alive and
-// ramps this 1.0 → 0.0 over a short window while the compositor blends
-// the snapshot over the realtime tint, then calls _release. Avoids the
-// snapshot→realtime "pop". 1.0 = snapshot fully covers, 0.0 = realtime.
-void tig_window_tint_snapshot_fade_set(tig_window_handle_t window_handle, float fade);
-
 // CE: register a callback that fires whenever a tig window is
 // destroyed. Used by ui_anim to cancel any in-flight tween targeting
 // a now-dead handle (avoids stale-handle writes on the next ping).

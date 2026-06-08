@@ -92,24 +92,10 @@ void ui_anim_perf_reset(void)
 // padding); int/float var tweens use 1. Bumping this is cheap.
 #define UI_ANIM_MAX_SCALARS 4
 
-// CE: animate tint-enabled windows in REALTIME instead of from a frozen
-// snapshot. When 1, transform animations on tinted windows DON'T capture
-// a pre-baked snapshot, so the compositor uses its integrated
-// transform-tinted blit each frame — the near-black see-through tracks
-// the LIVE underlay during the scale/alpha phase and is identical to the
-// settled 1:1 realtime tint, so there's nothing to snap to (no frozen
-// underlay, no post-settle cross-fade needed). The snapshot path was a
-// perf optimization (HW scaled blit) that froze the underlay at anim
-// start and caused the snap. Set to 0 to restore snapshot + cross-fade.
-#define UI_ANIM_TINT_ANIMATE_REALTIME 1
-
 typedef enum {
     UI_ANIM_KIND_NONE,
     UI_ANIM_KIND_WINDOW_TRANSFORM,
     UI_ANIM_KIND_WINDOW_TINT_REVEAL,
-    // CE: post-entrance dissolve of the tint snapshot over the realtime
-    // tint (value[0] = snapshot fade, 1→0; releases the snapshot at end).
-    UI_ANIM_KIND_WINDOW_TINT_XFADE,
     UI_ANIM_KIND_INT_VAR,
     UI_ANIM_KIND_FLOAT_VAR,
 } ui_anim_kind_t;
@@ -142,9 +128,6 @@ typedef struct {
         struct {
             tig_window_handle_t window;
         } tint_reveal;
-        struct {
-            tig_window_handle_t window;
-        } tint_xfade;
         struct {
             int* slot;
         } int_var;
@@ -350,13 +333,6 @@ static void ui_anim_apply(ui_anim_slot_t* s)
         tig_window_tint_reveal_set(s->u.tint_reveal.window, reveal);
         break;
     }
-    case UI_ANIM_KIND_WINDOW_TINT_XFADE: {
-        float fade = s->value[0];
-        if (fade < 0.0f) fade = 0.0f;
-        if (fade > 1.0f) fade = 1.0f;
-        tig_window_tint_snapshot_fade_set(s->u.tint_xfade.window, fade);
-        break;
-    }
     case UI_ANIM_KIND_INT_VAR:
         if (s->u.int_var.slot != NULL) {
             *s->u.int_var.slot = (int)(s->value[0] + (s->value[0] >= 0 ? 0.5f : -0.5f));
@@ -370,73 +346,6 @@ static void ui_anim_apply(ui_anim_slot_t* s)
     case UI_ANIM_KIND_NONE:
         break;
     }
-}
-
-// CE: approximate dissolve time for the post-entrance snapshot→realtime
-// tint cross-fade.
-#define UI_ANIM_TINT_XFADE_MS 170
-
-// CE: drop any in-flight tint cross-fade for `window` WITHOUT releasing
-// the snapshot — called when a new transform animation starts on the
-// same window (the new anim re-captures and owns the snapshot). Without
-// this, the stale xfade's delayed release would destroy the snapshot
-// mid-animation.
-static void ui_anim_cancel_tint_xfade(tig_window_handle_t window)
-{
-    if (window == TIG_WINDOW_HANDLE_INVALID) return;
-    for (int i = 0; i < UI_ANIM_POOL_SIZE; i++) {
-        if (s_slots[i].active
-            && s_slots[i].kind == UI_ANIM_KIND_WINDOW_TINT_XFADE
-            && s_slots[i].u.tint_xfade.window == window) {
-            ui_anim_clear_slot(&s_slots[i]);
-        }
-    }
-}
-
-// CE: kick off the post-entrance tint cross-fade for `window`. The
-// transform has just cleared, so the compositor is on the realtime tint
-// path; the snapshot is still alive and fully covering (fade=1). Ramp
-// the snapshot fade 1→0 over UI_ANIM_TINT_XFADE_MS, then release it
-// (handled in finalize). Falls back to an immediate release whenever
-// there's nothing to dissolve or no slot/animation is available.
-static void ui_anim_start_tint_xfade(tig_window_handle_t window)
-{
-    if (window == TIG_WINDOW_HANDLE_INVALID) return;
-
-    // No snapshot (untinted window) → nothing to dissolve.
-    if (tig_window_tint_snapshot_get(window) == NULL) {
-        tig_window_tint_snapshot_release(window);  // no-op
-        return;
-    }
-
-    // Start fully covering so the first cross-fade frame matches the
-    // last animation frame exactly (no seam).
-    tig_window_tint_snapshot_fade_set(window, 1.0f);
-
-    if (!ui_anim_cfg_enabled()) {
-        tig_window_tint_snapshot_release(window);
-        return;
-    }
-
-    int slot_index = ui_anim_alloc_slot();
-    if (slot_index < 0) {
-        tig_window_tint_snapshot_release(window);
-        return;
-    }
-    ui_anim_slot_t* s = &s_slots[slot_index];
-    s->kind = UI_ANIM_KIND_WINDOW_TINT_XFADE;
-    s->n_scalars = 1;
-    s->value[0] = 1.0f;
-    s->velocity[0] = 0.0f;
-    s->target[0] = 0.0f;
-    s->u.tint_xfade.window = window;
-    ui_anim_profile_t prof;
-    prof.settle_ms = UI_ANIM_TINT_XFADE_MS;
-    prof.damping_ratio = 1.2f;
-    ui_anim_profile_to_spring(&prof, &s->stiffness, &s->damping);
-    s->on_complete = NULL;
-    s->on_complete_ctx = NULL;
-    ui_anim_apply(s);
 }
 
 // Final-frame apply: snap values to target and clear the transform on
@@ -456,23 +365,12 @@ static void ui_anim_finalize(ui_anim_slot_t* s)
         // Otherwise hold the transform (e.g. hidden state, scale != 1).
         if (scale >= 1.0f - UI_ANIM_VALUE_EPS && alpha >= 1.0f - UI_ANIM_VALUE_EPS) {
             tig_window_transform_clear(s->u.transform.window);
-            // Settled fully visible: dissolve the snapshot out over the
-            // realtime tint instead of dropping it instantly (avoids the
-            // snapshot→realtime pop). No-op for untinted windows.
-            ui_anim_start_tint_xfade(s->u.transform.window);
         } else {
             tig_window_transform_set(s->u.transform.window,
                 scale, scale, alpha,
                 s->u.transform.anchor_rel_x,
                 s->u.transform.anchor_rel_y);
-            // Hidden / non-unit end state — nothing on screen to
-            // dissolve; drop the snapshot immediately.
-            tig_window_tint_snapshot_release(s->u.transform.window);
         }
-    } else if (s->kind == UI_ANIM_KIND_WINDOW_TINT_XFADE) {
-        // Dissolve complete — realtime tint stands alone; drop snapshot.
-        tig_window_tint_snapshot_fade_set(s->u.tint_xfade.window, 0.0f);
-        tig_window_tint_snapshot_release(s->u.tint_xfade.window);
     } else {
         ui_anim_apply(s);
     }
@@ -760,17 +658,6 @@ static ui_anim_handle_t ui_anim_window_show_ex_with_complete(
     s->on_complete = on_complete;
     s->on_complete_ctx = ctx;
 
-    // CE: capture a pre-tinted snapshot of the window's VB so the
-    // compositor's anim path can use SDL_BlitSurfaceScaled (HW
-    // accelerated, ~10× cheaper than the per-pixel integrated
-    // transform-tint-alpha blit). No-op for non-tint windows. The
-    // snapshot is released on settle (in finalize via the
-    // transform-clear branch) or on cancel.
-#if !UI_ANIM_TINT_ANIMATE_REALTIME
-    ui_anim_cancel_tint_xfade(window);
-    tig_window_tint_snapshot_capture(window);
-#endif
-
     // Prime the compositor with the starting transform so the very
     // first frame shows the scaled-down state, not full-size.
     ui_anim_apply(s);
@@ -849,18 +736,6 @@ ui_anim_handle_t ui_anim_window_hide_ex(tig_window_handle_t window,
     ui_anim_profile_to_spring(profile, &s->stiffness, &s->damping);
     s->on_complete = on_complete;
     s->on_complete_ctx = ctx;
-
-    // CE: capture a pre-tinted snapshot for tint-enabled windows so
-    // the compositor uses the fast scaled-blit path during the
-    // animation instead of the per-pixel integrated tint blit. The
-    // exit (hide) path was previously falling back to the slow path
-    // because the snapshot was only captured on show — visible as
-    // stuttering frame drops on the bottom-HUD FULL→HIDDEN scale.
-    // No-op on non-tint windows. Released on settle/cancel.
-#if !UI_ANIM_TINT_ANIMATE_REALTIME
-    ui_anim_cancel_tint_xfade(window);
-    tig_window_tint_snapshot_capture(window);
-#endif
 
     ui_anim_apply(s);
     return ui_anim_make_handle(slot_index, s->generation);
@@ -955,15 +830,6 @@ ui_anim_handle_t ui_anim_window_transform_from_to_with_complete(
     ui_anim_profile_to_spring(profile, &s->stiffness, &s->damping);
     s->on_complete = on_complete;
     s->on_complete_ctx = ctx;
-
-    // CE: capture tint snapshot for the same reason as show/hide —
-    // tint-enabled windows otherwise use the slow per-pixel blit
-    // during the animation. No-op on non-tint windows (mainmenu
-    // backdrop doesn't use tint anymore, so this is defensive).
-#if !UI_ANIM_TINT_ANIMATE_REALTIME
-    ui_anim_cancel_tint_xfade(window);
-    tig_window_tint_snapshot_capture(window);
-#endif
 
     ui_anim_apply(s);
     return ui_anim_make_handle(slot_index, s->generation);
@@ -1120,7 +986,6 @@ void ui_anim_cancel_for_window(tig_window_handle_t window)
     // last wrote.
     tig_window_transform_clear(window);
     tig_window_tint_reveal_set(window, 1.0f);
-    tig_window_tint_snapshot_release(window);
 }
 
 // CE: internal — starts a tint_reveal tween toward `target` on the
@@ -1275,12 +1140,9 @@ void ui_anim_notify_window_destroyed(tig_window_handle_t window)
     for (int i = 0; i < UI_ANIM_POOL_SIZE; i++) {
         if (s_slots[i].active
             && (s_slots[i].kind == UI_ANIM_KIND_WINDOW_TRANSFORM
-                || s_slots[i].kind == UI_ANIM_KIND_WINDOW_TINT_REVEAL
-                || s_slots[i].kind == UI_ANIM_KIND_WINDOW_TINT_XFADE)
+                || s_slots[i].kind == UI_ANIM_KIND_WINDOW_TINT_REVEAL)
             && s_slots[i].u.transform.window == window) {
             ui_anim_clear_slot(&s_slots[i]);
         }
     }
-    // tig_window_destroy already destroys the snapshot VB itself —
-    // we just need to drop slot references here.
 }

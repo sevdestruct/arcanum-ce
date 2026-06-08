@@ -99,25 +99,6 @@ typedef struct TigWindow {
     // masking the "snap to tinted" pop that would otherwise occur
     // when the transform path clears and tint takes over.
     float tint_reveal;
-    // CE: pre-baked snapshot of the window's VB with near-black
-    // source pixels replaced by the underlay-at-natural-position
-    // tinted result. Used by the compositor's transform path on
-    // tint-enabled windows: SDL_BlitSurfaceScaled (HW-accelerated)
-    // on this snapshot is ~10× cheaper than the integrated per-
-    // pixel scale+tint+alpha blit. Allocated by
-    // tig_window_tint_snapshot_capture, released by
-    // tig_window_tint_snapshot_release. NULL when no anim is
-    // active.
-    TigVideoBuffer* tint_snapshot_vb;
-    // CE: post-animation cross-fade opacity for the snapshot. After a
-    // transform entrance settles, instead of dropping the snapshot
-    // instantly (a visible snapshot→realtime "pop"), the compositor
-    // keeps drawing the realtime tint AND overlays the snapshot on top
-    // at this opacity while ui_anim ramps it 1.0 → 0.0, then releases
-    // the snapshot. 1.0 = snapshot fully covers (matches the last anim
-    // frame); 0.0 = pure realtime. Only consulted in the realtime
-    // (non-transform) branch.
-    float tint_snapshot_fade;
 } TigWindow;
 
 // CE: optional notification when a window is destroyed. ui_anim
@@ -307,8 +288,6 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->transform_anchor_y = 0.5f;
     // CE: tint at full strength when enabled (no fade modulation).
     win->tint_reveal = 1.0f;
-    win->tint_snapshot_vb = NULL;
-    win->tint_snapshot_fade = 0.0f;
 
     vb_create_info.flags = 0;
 
@@ -401,14 +380,6 @@ int tig_window_destroy(tig_window_handle_t window_handle)
     if ((tig_window_ctx_flags & TIG_INITIALIZE_SCRATCH_BUFFER) != 0
         && (win->flags & TIG_WINDOW_TRANSPARENT) != 0) {
         tig_video_buffer_destroy(win->secondary_video_buffer);
-    }
-
-    // CE: clean up ui_anim pre-baked tint snapshot if one was
-    // allocated for an animation that didn't run to completion (e.g.
-    // window destroyed mid-anim).
-    if (win->tint_snapshot_vb != NULL) {
-        tig_video_buffer_destroy(win->tint_snapshot_vb);
-        win->tint_snapshot_vb = NULL;
     }
 
     pop_window_stack(window_handle);
@@ -1023,20 +994,10 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 if (blt_src_rect.width <= 0) blt_src_rect.width = 1;
                 if (blt_src_rect.height <= 0) blt_src_rect.height = 1;
                 uint8_t a = (uint8_t)(wins[v38]->transform_alpha * 255.0f + 0.5f);
-                if (wins[v38]->tint_enabled
-                    && wins[v38]->tint_snapshot_vb != NULL) {
-                    // CE: HW-accelerated path — the snapshot VB
-                    // already has near-black pixels replaced by the
-                    // tinted underlay (captured at anim start). A
-                    // plain scaled+alpha SDL blit on it is ~10×
-                    // cheaper than the per-pixel integrated blit.
-                    tig_video_blit_scaled_alpha(wins[v38]->tint_snapshot_vb,
-                        &blt_src_rect, &blt_dst_rect, a);
-                } else if (wins[v38]->tint_enabled) {
-                    // CE: integrated fallback — scale + tint + alpha
-                    // all in one pass. Used when no snapshot exists
-                    // (anim started without snapshot capture, or the
-                    // capture failed). Slow but correct.
+                if (wins[v38]->tint_enabled) {
+                    // CE: integrated scale + tint + alpha in one pass —
+                    // the near-black see-through tracks the live underlay
+                    // each frame during the scale/alpha phase.
                     TigVideoBuffer* under_vb = NULL;
                     int under_off_x = 0;
                     int under_off_y = 0;
@@ -1073,17 +1034,6 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 wins[v38]->tint_g,
                 wins[v38]->tint_b,
                 reveal_def);
-            // CE: post-animation cross-fade. While a snapshot lingers
-            // after the transform settled, overlay it (same window-local
-            // sub-rect) on top of the freshly-drawn realtime tint at the
-            // current fade opacity. ui_anim ramps fade 1→0 then releases
-            // the snapshot — a smooth dissolve instead of a hard swap.
-            if (wins[v38]->tint_snapshot_vb != NULL
-                && wins[v38]->tint_snapshot_fade > 0.0f) {
-                uint8_t snap_a = (uint8_t)(wins[v38]->tint_snapshot_fade * 255.0f + 0.5f);
-                tig_video_blit_scaled_alpha(wins[v38]->tint_snapshot_vb,
-                    &blt_src_rect, &blt_dst_rect, snap_a);
-            }
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
         }
@@ -2278,164 +2228,6 @@ int tig_window_tint_reveal_set(tig_window_handle_t window_handle, float reveal)
         tig_window_invalidate_rect(&(win->frame));
     }
     return TIG_OK;
-}
-
-int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle)
-{
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return TIG_ERR_INVALID_PARAM;
-    if (!tig_window_initialized) return TIG_ERR_NOT_INITIALIZED;
-
-    int window_index = tig_window_handle_to_index(window_handle);
-    TigWindow* win = &(windows[window_index]);
-    if (!win->tint_enabled) return TIG_OK;  // nothing to capture
-    if (win->video_buffer == NULL) return TIG_ERR_GENERIC;
-
-    // Fresh capture → snapshot fully covers during any post-anim
-    // cross-fade (until ui_anim ramps it back down).
-    win->tint_snapshot_fade = 1.0f;
-
-    // Allocate snapshot VB if needed, sized to match the window's
-    // natural frame.
-    if (win->tint_snapshot_vb == NULL) {
-        TigVideoBufferCreateInfo vb_create_info;
-        vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
-        vb_create_info.width = win->frame.width;
-        vb_create_info.height = win->frame.height;
-        vb_create_info.background_color = win->background_color;
-        vb_create_info.color_key = win->color_key;
-        if (tig_video_buffer_create(&vb_create_info, &(win->tint_snapshot_vb)) != TIG_OK) {
-            win->tint_snapshot_vb = NULL;
-            return TIG_ERR_GENERIC;
-        }
-    }
-
-    // Resolve the underlay VB and the offset that maps screen coords
-    // → underlay-VB coords. For a fullscreen iso underlay, the offset
-    // is just -frame.x / -frame.y of the underlay window.
-    TigVideoBuffer* under_vb = NULL;
-    int under_off_x = 0;
-    int under_off_y = 0;
-    under_vb = tig_window_tint_underlay_vb(win->tint_underlay,
-        &under_off_x, &under_off_y);
-
-    // Copy window VB into snapshot, replacing near-black pixels with
-    // tinted underlay sampled at the window's NATURAL screen position
-    // (since the snapshot represents the at-rest tinted look). Use
-    // the public VB lock/data API so we don't reach into video.c's
-    // opaque struct from here.
-    TigVideoBufferData src_data, dst_data, under_data;
-    if (tig_video_buffer_lock(win->video_buffer) != TIG_OK) {
-        return TIG_ERR_GENERIC;
-    }
-    if (tig_video_buffer_lock(win->tint_snapshot_vb) != TIG_OK) {
-        tig_video_buffer_unlock(win->video_buffer);
-        return TIG_ERR_GENERIC;
-    }
-    bool have_under = false;
-    if (under_vb != NULL) {
-        if (tig_video_buffer_lock(under_vb) == TIG_OK) {
-            have_under = true;
-        }
-    }
-    tig_video_buffer_data(win->video_buffer, &src_data);
-    tig_video_buffer_data(win->tint_snapshot_vb, &dst_data);
-    if (have_under) tig_video_buffer_data(under_vb, &under_data);
-
-    int src_pitch_px = src_data.pitch / 4;
-    int dst_pitch_px = dst_data.pitch / 4;
-    int under_pitch_px = have_under ? (under_data.pitch / 4) : 0;
-    int under_w = have_under ? under_data.width : 0;
-    int under_h = have_under ? under_data.height : 0;
-    int factor_r = 255 - win->tint_r;
-    int factor_g = 255 - win->tint_g;
-    int factor_b = 255 - win->tint_b;
-    uint8_t threshold = win->tint_threshold;
-    int w = win->frame.width;
-    int h = win->frame.height;
-
-    for (int y = 0; y < h; y++) {
-        uint32_t* sp = (uint32_t*)src_data.pixels + y * src_pitch_px;
-        uint32_t* dp = (uint32_t*)dst_data.pixels + y * dst_pitch_px;
-        uint32_t* up = NULL;
-        if (have_under) {
-            int uy = win->frame.y + y + under_off_y;
-            if (uy >= 0 && uy < under_h) {
-                up = (uint32_t*)under_data.pixels + uy * under_pitch_px;
-            }
-        }
-        for (int x = 0; x < w; x++) {
-            uint32_t s = sp[x];
-            uint8_t sr = (uint8_t)(s >> 16);
-            uint8_t sg = (uint8_t)(s >> 8);
-            uint8_t sb = (uint8_t)s;
-            if (sr <= threshold && sg <= threshold && sb <= threshold
-                && up != NULL) {
-                int ux = win->frame.x + x + under_off_x;
-                if (ux >= 0 && ux < under_w) {
-                    uint32_t u = up[ux];
-                    int ur = (int)((uint8_t)(u >> 16));
-                    int ug = (int)((uint8_t)(u >> 8));
-                    int ub = (int)((uint8_t)u);
-                    int tr = (ur * factor_r + 128) >> 8;
-                    int tg = (ug * factor_g + 128) >> 8;
-                    int tb = (ub * factor_b + 128) >> 8;
-                    dp[x] = 0xFF000000u
-                        | ((uint32_t)tr << 16)
-                        | ((uint32_t)tg << 8)
-                        | (uint32_t)tb;
-                    continue;
-                }
-            }
-            dp[x] = s;
-        }
-    }
-
-    if (have_under) tig_video_buffer_unlock(under_vb);
-    tig_video_buffer_unlock(win->tint_snapshot_vb);
-    tig_video_buffer_unlock(win->video_buffer);
-    return TIG_OK;
-}
-
-void tig_window_tint_snapshot_release(tig_window_handle_t window_handle)
-{
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return;
-    if (!tig_window_initialized) return;
-    int window_index = tig_window_handle_to_index(window_handle);
-    TigWindow* win = &(windows[window_index]);
-    if (win->tint_snapshot_vb != NULL) {
-        tig_video_buffer_destroy(win->tint_snapshot_vb);
-        win->tint_snapshot_vb = NULL;
-    }
-    win->tint_snapshot_fade = 0.0f;
-    if (win->tint_enabled) {
-        tig_window_invalidate_rect(&(win->frame));
-    }
-}
-
-// CE: set the post-animation snapshot cross-fade opacity (1.0 = snapshot
-// fully covers, 0.0 = pure realtime tint). Invalidates so the next
-// composite reflects the new blend. See tint_snapshot_fade docs.
-void tig_window_tint_snapshot_fade_set(tig_window_handle_t window_handle, float fade)
-{
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return;
-    if (!tig_window_initialized) return;
-    int window_index = tig_window_handle_to_index(window_handle);
-    TigWindow* win = &(windows[window_index]);
-    if (fade < 0.0f) fade = 0.0f;
-    if (fade > 1.0f) fade = 1.0f;
-    float prev = win->tint_snapshot_fade;
-    win->tint_snapshot_fade = fade;
-    if (prev != fade && win->tint_enabled && win->tint_snapshot_vb != NULL) {
-        tig_window_invalidate_rect(&(win->frame));
-    }
-}
-
-TigVideoBuffer* tig_window_tint_snapshot_get(tig_window_handle_t window_handle)
-{
-    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return NULL;
-    if (!tig_window_initialized) return NULL;
-    int window_index = tig_window_handle_to_index(window_handle);
-    return windows[window_index].tint_snapshot_vb;
 }
 
 void tig_window_destroy_notify_set(void (*func)(tig_window_handle_t))
