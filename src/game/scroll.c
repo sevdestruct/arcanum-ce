@@ -16,15 +16,35 @@
 
 #define SCROLL_DIAG_X 4
 #define SCROLL_DIAG_Y 2
-#define SCROLL_LEASH_SPRING_START_RATIO 0.7f
-#define SCROLL_LEASH_SPRING_MIN_SCALE 0.2f
+// Leash resistance spring (CE). As the view approaches the leash limit,
+// scroll input is scaled down so it eases into the edge instead of
+// slamming to a stop.
+//
+//   START_RATIO — where resistance begins, as a fraction of the leash
+//     limit. Lower = resistance starts sooner = longer, more gradual
+//     ramp. 0.50 begins gently at the halfway point.
+//   MIN_SCALE   — slowest crawl, applied right at the edge. Lower =
+//     firmer final resistance (a slower crawl into the limit).
+//   CURVE       — ease-in exponent on the resistance ramp. 1.0 is the
+//     old linear feel; > 1 keeps the start gentle and makes the spring
+//     "tighten" progressively, so it really clamps down only near the
+//     very edge (takes a bit to hit max resistance, then crawls).
+#define SCROLL_LEASH_SPRING_START_RATIO 0.50f
+#define SCROLL_LEASH_SPRING_MIN_SCALE 0.05f
+#define SCROLL_LEASH_SPRING_CURVE 2.0f
+// Final-approach taper, in pixels. Over the last this-many pixels before
+// the leash limit the scale ramps linearly to 0, so velocity reaches
+// zero exactly AT the wall instead of snapping from the MIN_SCALE crawl
+// to a dead stop. Bigger = longer, softer settle into the edge.
+#define SCROLL_LEASH_SPRING_END_TAPER 28
 
 static void scroll_by(int64_t dx, int64_t dy);
 static void scroll_origin_changed(int64_t loc);
 static void scroll_speed_changed(void);
 static bool scroll_cursor_art_set(tig_art_id_t art_id);
 static void scroll_refresh_clamped_view(void);
-static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit);
+static float scroll_leash_scale(int current_dist, int next_dist, int limit);
+static void scroll_leash_apply(float fdx, float fdy);
 
 /**
  * The minimum time (in milliseconds) between scroll updates.
@@ -123,45 +143,88 @@ static void scroll_refresh_clamped_view(void)
     }
 }
 
-static int scroll_apply_leash_spring_component(int delta, int current_dist, int next_dist, int limit)
+// Sub-pixel remainder so the leashed crawl can move at fractional
+// velocity (e.g. 1px every few frames) and ease smoothly into the
+// wall instead of stepping at a constant >=1px until the hard limit.
+// Reset when a scroll gesture ends (scroll_stop).
+static float scroll_leash_accum_x;
+static float scroll_leash_accum_y;
+
+// Returns a 0..1 multiplier for the scroll delta based on how close the
+// view is to the leash limit on one axis. 1 = full speed (not near the
+// limit, or moving back toward center); shrinks through the spring zone
+// to MIN_SCALE; 0 exactly at/past the limit. Pure — no rounding, no
+// per-pixel floor; the caller applies it in float and accumulates the
+// fraction, which is what produces the smooth ease-in.
+static float scroll_leash_scale(int current_dist, int next_dist, int limit)
 {
     int spring_start;
-    int adjusted;
+    int remaining;
     float t;
     float scale;
 
-    if (delta == 0 || limit <= 0 || next_dist <= current_dist) {
-        return delta;
+    if (limit <= 0 || next_dist <= current_dist) {
+        // Not approaching the limit (idle axis or moving toward center).
+        return 1.0f;
+    }
+    if (current_dist >= limit) {
+        return 0.0f;
     }
 
     spring_start = (int)roundf((float)limit * SCROLL_LEASH_SPRING_START_RATIO);
     if (spring_start >= limit) {
         spring_start = limit - 1;
     }
-
     if (current_dist < spring_start) {
-        return delta;
+        scale = 1.0f;
+    } else {
+        // t = 1 at spring_start (full speed), 0 at the limit (max
+        // resistance). Ease-in curve (power > 1) keeps the early
+        // approach near full speed, then drops scale off steeply and
+        // flattens into the slow crawl close to the edge — the spring
+        // "tightening".
+        t = (float)(limit - current_dist) / (float)(limit - spring_start);
+        if (t < 0.0f) {
+            t = 0.0f;
+        } else if (t > 1.0f) {
+            t = 1.0f;
+        }
+        t = powf(t, SCROLL_LEASH_SPRING_CURVE);
+        scale = SCROLL_LEASH_SPRING_MIN_SCALE
+            + (1.0f - SCROLL_LEASH_SPRING_MIN_SCALE) * t;
     }
 
-    if (current_dist >= limit) {
-        return 0;
+    // Final-approach taper: over the last END_TAPER px, ramp scale
+    // linearly to 0 so velocity reaches zero exactly AT the wall rather
+    // than snapping from the MIN_SCALE crawl to a dead stop. This is the
+    // bit that removes the residual abruptness right at max distance.
+    remaining = limit - current_dist;
+    if (remaining < SCROLL_LEASH_SPRING_END_TAPER) {
+        scale *= (float)remaining / (float)SCROLL_LEASH_SPRING_END_TAPER;
     }
 
-    t = (float)(limit - current_dist) / (float)(limit - spring_start);
-    if (t < 0.0f) {
-        t = 0.0f;
-    } else if (t > 1.0f) {
-        t = 1.0f;
-    }
+    return scale;
+}
 
-    scale = SCROLL_LEASH_SPRING_MIN_SCALE
-        + (1.0f - SCROLL_LEASH_SPRING_MIN_SCALE) * t;
-    adjusted = (int)roundf((float)delta * scale);
-    if (adjusted == 0) {
-        adjusted = delta > 0 ? 1 : -1;
-    }
+// Apply a (possibly fractional) leashed scroll delta through the
+// sub-pixel accumulator. Only the integer part scrolls this frame; the
+// fraction carries to the next. Frames where the accumulator hasn't
+// reached a whole pixel simply don't move — that's the slow crawl that
+// eases the view into the leash wall.
+static void scroll_leash_apply(float fdx, float fdy)
+{
+    int idx;
+    int idy;
 
-    return adjusted;
+    scroll_leash_accum_x += fdx;
+    scroll_leash_accum_y += fdy;
+    idx = (int)scroll_leash_accum_x;  // truncate toward zero
+    idy = (int)scroll_leash_accum_y;
+    scroll_leash_accum_x -= (float)idx;
+    scroll_leash_accum_y -= (float)idy;
+    if (idx != 0 || idy != 0) {
+        scroll_by(idx, idy);
+    }
 }
 
 /**
@@ -267,6 +330,8 @@ void scroll_start(int direction)
 
     int dx;
     int dy;
+    float fdx;
+    float fdy;
     tig_art_id_t art_id;
     TigArtFrameData art_frame_data;
     int distance;
@@ -368,14 +433,17 @@ void scroll_start(int direction)
     hor_limit = 80 * distance;
     vert_limit = 40 * distance;
 
-    dx = scroll_apply_leash_spring_component(dx,
-        current_hor,
-        abs(viewport_center_x - dx - (int)center_x),
-        hor_limit);
-    dy = scroll_apply_leash_spring_component(dy,
-        current_vert,
-        abs(viewport_center_y - dy - (int)center_y),
-        vert_limit);
+    // Apply the leash resistance spring in float, per axis. next_dist
+    // uses the full (unsprung) delta — as before — to gauge how far
+    // this step would push toward the limit. The scaled result stays a
+    // float (fdx/fdy) so the sub-pixel accumulator can ease the crawl;
+    // dx/dy hold the rounded values the bounds/direction logic uses.
+    fdx = (float)dx * scroll_leash_scale(current_hor,
+        abs(viewport_center_x - dx - (int)center_x), hor_limit);
+    fdy = (float)dy * scroll_leash_scale(current_vert,
+        abs(viewport_center_y - dy - (int)center_y), vert_limit);
+    dx = (int)lroundf(fdx);
+    dy = (int)lroundf(fdy);
 
     // Calculate horizontal and vertical distance (in pixels) from the scroll
     // center.
@@ -386,7 +454,7 @@ void scroll_start(int direction)
     if (hor < hor_limit && vert < vert_limit) {
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
-        scroll_by(dx, dy);
+        scroll_leash_apply(fdx, fdy);
         return;
     }
 
@@ -398,18 +466,26 @@ void scroll_start(int direction)
         || rot == direction) {
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
-        scroll_by(dx, dy);
+        scroll_leash_apply(fdx, fdy);
         return;
     }
 
     blocked = false;
 
     // Adjust direction if horizontal distance exceeds scroll distance limit.
+    // A diagonal that hits the horizontal leash slides along the vertical
+    // edge: zero the horizontal component, keep the vertical one. We set
+    // dx = 0 directly rather than algebraically cancelling it (the old
+    // `dx += scroll_speed_x + SCROLL_DIAG_X` only zeroed the FULL delta;
+    // the leash spring above has already scaled dx down, so the add
+    // overshot into the opposite direction and kicked the view back
+    // toward center — the corner "bounce").
     if (hor >= hor_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP_RIGHT:
             direction = SCROLL_DIRECTION_UP;
-            dx += scroll_speed_x + SCROLL_DIAG_X;
+            dx = 0;
+            fdx = 0.0f;
             break;
         case SCROLL_DIRECTION_RIGHT:
         case SCROLL_DIRECTION_LEFT:
@@ -417,20 +493,27 @@ void scroll_start(int direction)
             break;
         case SCROLL_DIRECTION_DOWN_RIGHT:
             direction = SCROLL_DIRECTION_DOWN;
-            dx += scroll_speed_x + SCROLL_DIAG_X;
+            dx = 0;
+            fdx = 0.0f;
             break;
         case SCROLL_DIRECTION_DOWN_LEFT:
             direction = SCROLL_DIRECTION_DOWN;
-            dx -= scroll_speed_x + SCROLL_DIAG_X;
+            dx = 0;
+            fdx = 0.0f;
             break;
         case SCROLL_DIRECTION_UP_LEFT:
             direction = SCROLL_DIRECTION_UP;
-            dx -= scroll_speed_x + SCROLL_DIAG_X;
+            dx = 0;
+            fdx = 0.0f;
             break;
         }
     }
 
     // Adjust direction if vertical distance exceeds scroll distance limit.
+    // Mirror of the horizontal case: zero the vertical component to slide
+    // along the horizontal edge. dy = 0 directly, same spring-overshoot
+    // reasoning as above. At a true corner both axes zero and `blocked`
+    // is set (cardinal sub-case), so the view settles instead of bouncing.
     if (vert >= vert_limit) {
         switch (direction) {
         case SCROLL_DIRECTION_UP:
@@ -439,37 +522,36 @@ void scroll_start(int direction)
             break;
         case SCROLL_DIRECTION_UP_RIGHT:
             direction = SCROLL_DIRECTION_RIGHT;
-            dy -= scroll_speed_y + SCROLL_DIAG_Y;
+            dy = 0;
+            fdy = 0.0f;
             break;
         case SCROLL_DIRECTION_DOWN_RIGHT:
             direction = SCROLL_DIRECTION_RIGHT;
-            dy += scroll_speed_y + SCROLL_DIAG_Y;
+            dy = 0;
+            fdy = 0.0f;
             break;
         case SCROLL_DIRECTION_DOWN_LEFT:
             direction = SCROLL_DIRECTION_LEFT;
-            dy += scroll_speed_y + SCROLL_DIAG_Y;
+            dy = 0;
+            fdy = 0.0f;
             break;
         case SCROLL_DIRECTION_UP_LEFT:
             direction = SCROLL_DIRECTION_LEFT;
-            dy -= scroll_speed_y + SCROLL_DIAG_Y;
+            dy = 0;
+            fdy = 0.0f;
             break;
         }
     }
 
-    dx = scroll_apply_leash_spring_component(dx,
-        current_hor,
-        abs(viewport_center_x - dx - (int)center_x),
-        hor_limit);
-    dy = scroll_apply_leash_spring_component(dy,
-        current_vert,
-        abs(viewport_center_y - dy - (int)center_y),
-        vert_limit);
-
-    // Perform scroll unless blocked.
+    // Perform scroll unless blocked. The surviving axis keeps its
+    // already-sprung float value (fdx/fdy from the single spring pass
+    // above); the blocked axis was zeroed in the switches. No second
+    // spring pass — the old code re-sprung here, double-scaling the
+    // surviving axis and (pre-fix) feeding the corner bounce.
     if (!blocked) {
         tig_art_interface_id_create(direction + 679, 0, 0, 0, &art_id);
         scroll_cursor_art_set(art_id);
-        scroll_by(dx, dy);
+        scroll_leash_apply(fdx, fdy);
         return;
     }
 
@@ -520,6 +602,9 @@ void scroll_stop(void)
         ui_refresh_cursor();
         is_scrolling = false;
     }
+    // Drop any sub-pixel leash remainder so the next gesture starts clean.
+    scroll_leash_accum_x = 0.0f;
+    scroll_leash_accum_y = 0.0f;
 }
 
 /**
