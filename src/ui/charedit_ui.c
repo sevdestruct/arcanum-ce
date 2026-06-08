@@ -1755,7 +1755,14 @@ bool charedit_window_message_filter(TigMessage* msg)
                 }
             }
 
+            // CE: clicking the already-active tab is a no-op. Re-running
+            // charedit_subwindow_enter would replay the scale+fade
+            // entrance on the subwindow we're already showing, which reads
+            // as a flicker when a tab button is clicked twice/repeatedly.
             if (msg->data.button.button_handle == dword_64C7B4) {
+                if (dword_64E01C == 0) {
+                    return true;
+                }
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
@@ -1766,6 +1773,9 @@ bool charedit_window_message_filter(TigMessage* msg)
             }
 
             if (msg->data.button.button_handle == dword_64C83C) {
+                if (dword_64E01C == 1) {
+                    return true;
+                }
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
@@ -1776,6 +1786,9 @@ bool charedit_window_message_filter(TigMessage* msg)
             }
 
             if (msg->data.button.button_handle == dword_64D3B8) {
+                if (dword_64E01C == 2) {
+                    return true;
+                }
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
@@ -1786,10 +1799,11 @@ bool charedit_window_message_filter(TigMessage* msg)
             }
 
             if (msg->data.button.button_handle == dword_64CA54) {
-                charedit_subwindow_enter(charedit_scheme_win);
-                if (dword_64E01C != 3) {
-                    sub_55EFE0();
+                if (dword_64E01C == 3) {
+                    return true;
                 }
+                charedit_subwindow_enter(charedit_scheme_win);
+                sub_55EFE0();
                 dword_64E01C = 3;
                 charedit_refresh_internal();
                 return true;
