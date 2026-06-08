@@ -232,6 +232,13 @@ int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle);
 void tig_window_tint_snapshot_release(tig_window_handle_t window_handle);
 TigVideoBuffer* tig_window_tint_snapshot_get(tig_window_handle_t window_handle);
 
+// CE: post-animation snapshot cross-fade opacity, 0.0..1.0. After a
+// transform entrance settles, ui_anim keeps the snapshot alive and
+// ramps this 1.0 → 0.0 over a short window while the compositor blends
+// the snapshot over the realtime tint, then calls _release. Avoids the
+// snapshot→realtime "pop". 1.0 = snapshot fully covers, 0.0 = realtime.
+void tig_window_tint_snapshot_fade_set(tig_window_handle_t window_handle, float fade);
+
 // CE: register a callback that fires whenever a tig window is
 // destroyed. Used by ui_anim to cancel any in-flight tween targeting
 // a now-dead handle (avoids stale-handle writes on the next ping).

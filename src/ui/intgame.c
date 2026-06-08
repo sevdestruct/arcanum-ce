@@ -912,6 +912,11 @@ static UiMessage intgame_message_history[MAX_MESSAGE_HISTORY_ITEMS];
 // 0x64C630
 static bool intgame_big_window_locked;
 
+// CE: see intgame_big_window_close_animated — true while a deferred
+// animated-exit teardown is pending (declared here so the lock function
+// above the unlock block can consult it).
+static bool intgame_big_window_exit_pending = false;
+
 // 0x64C634
 static IntgameMode intgame_mode_stack[11];
 
@@ -8724,6 +8729,19 @@ bool intgame_big_window_lock(TigWindowMessageFilterFunc func, tig_window_handle_
         return false;
     }
 
+    // CE: reopening while a previous close is still animating out (e.g.
+    // switching inventory → character → worldmap, which all share this
+    // window). Cancel the deferred teardown, drop the stale buttons, and
+    // CANCEL the in-flight exit tween so the new window's entrance plays
+    // FRESH (from its scaled-down/transparent start) rather than
+    // retargeting the near-full hide value — otherwise the switch reads
+    // as an instant in-place swap with no animation.
+    if (intgame_big_window_exit_pending) {
+        intgame_big_window_exit_pending = false;
+        tig_window_button_destroy(intgame_big_window_handle);
+        ui_anim_cancel_for_window(intgame_big_window_handle);
+    }
+
     intgame_big_window_locked = true;
     tig_window_message_filter_set(intgame_big_window_handle, func);
     tig_window_show(intgame_big_window_handle);
@@ -8733,13 +8751,64 @@ bool intgame_big_window_lock(TigWindowMessageFilterFunc func, tig_window_handle_
     return true;
 }
 
-// 0x557330
-void intgame_big_window_unlock(void)
+// CE: exit-animation bookkeeping for the shared big window. When a
+// window closes via intgame_big_window_close_animated, the lock is
+// released immediately (so a reopen can re-acquire) but the teardown
+// (button destroy, filter reset, hide) is deferred to the hide tween's
+// on_complete. intgame_big_window_exit_pending (declared above the lock
+// function) guards that finalize so a reopen mid-exit cancels it.
+
+// Exit feel: subtle scale (0.96) + fade, faster than the entrance.
+static const ui_anim_profile_t INTGAME_BIG_WINDOW_EXIT_PROFILE = { 110, 1.2f };
+
+// The actual teardown — shared by the synchronous unlock and the
+// deferred animated-exit finalize.
+static void intgame_big_window_teardown(void)
 {
-    intgame_big_window_locked = false;
     tig_window_button_destroy(intgame_big_window_handle);
     tig_window_message_filter_set(intgame_big_window_handle, intgame_big_window_message_filter);
     tig_window_hide(intgame_big_window_handle);
+}
+
+// 0x557330
+void intgame_big_window_unlock(void)
+{
+    // Synchronous teardown — used by creation error/abort paths (the
+    // window was never presented, so it must NOT animate out).
+    intgame_big_window_locked = false;
+    intgame_big_window_exit_pending = false;
+    intgame_big_window_teardown();
+}
+
+// CE: hide tween on_complete — runs the deferred teardown once the exit
+// animation settles. No-op if the window was re-locked mid-exit (lock
+// clears exit_pending).
+static void intgame_big_window_finalize_exit(void* ctx)
+{
+    (void)ctx;
+    if (!intgame_big_window_exit_pending) {
+        return;
+    }
+    intgame_big_window_exit_pending = false;
+    intgame_big_window_teardown();
+}
+
+// CE: animated close for the shared big window. Releases the lock
+// immediately (a reopen can re-acquire mid-exit), then scales+fades the
+// window out and runs the teardown on settle. cfg-disabled / pool-full:
+// ui_anim_window_hide fires the on_complete synchronously, so this
+// degrades to the old instant close. Re-locking mid-exit retargets this
+// tween gracefully back to full (see intgame_big_window_lock).
+void intgame_big_window_close_animated(void)
+{
+    if (!intgame_big_window_locked) {
+        return;
+    }
+    intgame_big_window_locked = false;
+    intgame_big_window_exit_pending = true;
+    ui_anim_window_hide(intgame_big_window_handle, UI_ANIM_ANCHOR_CENTER,
+        0.96f, &INTGAME_BIG_WINDOW_EXIT_PROFILE,
+        intgame_big_window_finalize_exit, NULL);
 }
 
 bool intgame_big_window_screen_rect(TigRect* rect)
@@ -10797,8 +10866,16 @@ static IntgameTintParams intgame_translucent_black_pick(void)
     // function. Checking the backdrop window directly catches that
     // window of time and prevents the bar from picking up the iso
     // world (pregame "world") as its tint underlay for a frame.
+    // CE: while the backdrop is animating OUT into gameplay (just
+    // started/loaded a game), its handle is still valid + has-custom-art
+    // still true, but the view is becoming the live iso world. Don't
+    // pick the fading menu backdrop as the underlay or a window opened
+    // right after load shows the menu / black through its dark areas.
+    // Fall through to the iso world instead.
+    bool backdrop_exiting = mainmenu_ui_backdrop_is_exiting();
     tig_window_handle_t backdrop = mainmenu_ui_get_backdrop_handle();
-    if (backdrop != TIG_WINDOW_HANDLE_INVALID
+    if (!backdrop_exiting
+        && backdrop != TIG_WINDOW_HANDLE_INVALID
         && mainmenu_ui_has_custom_backdrop_art()) {
         params.underlay = backdrop;
         // ~80% darken
@@ -10807,7 +10884,7 @@ static IntgameTintParams intgame_translucent_black_pick(void)
         params.b = 204;
         return params;
     }
-    if (mainmenu_ui_is_active()) {
+    if (mainmenu_ui_is_active() && !backdrop_exiting) {
         // Legacy / no-custom-bg mainmenu: don't use the panel as
         // the underlay (panel-as-its-own-underlay creates feedback:
         // a panel near-black pixel reading from its same near-black

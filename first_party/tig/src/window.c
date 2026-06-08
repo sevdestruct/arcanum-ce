@@ -109,6 +109,15 @@ typedef struct TigWindow {
     // tig_window_tint_snapshot_release. NULL when no anim is
     // active.
     TigVideoBuffer* tint_snapshot_vb;
+    // CE: post-animation cross-fade opacity for the snapshot. After a
+    // transform entrance settles, instead of dropping the snapshot
+    // instantly (a visible snapshot→realtime "pop"), the compositor
+    // keeps drawing the realtime tint AND overlays the snapshot on top
+    // at this opacity while ui_anim ramps it 1.0 → 0.0, then releases
+    // the snapshot. 1.0 = snapshot fully covers (matches the last anim
+    // frame); 0.0 = pure realtime. Only consulted in the realtime
+    // (non-transform) branch.
+    float tint_snapshot_fade;
 } TigWindow;
 
 // CE: optional notification when a window is destroyed. ui_anim
@@ -132,6 +141,19 @@ static void tig_window_modal_dialog_exit(void);
 
 // 0x5BED98
 static tig_window_handle_t tig_window_modal_dialog_window_handle = TIG_WINDOW_HANDLE_INVALID;
+
+// CE: modal close is now deferred — the filter/process sets this flag
+// (via tig_window_modal_dialog_close) and the modal loop plays a brief
+// exit animation before actually destroying the window.
+static bool tig_window_modal_dialog_close_requested = false;
+
+// CE: modal entrance/exit animation timing. The modal runs its own
+// blocking pump and can't use the game's ui_anim, so the loop drives a
+// time-based scale+alpha transform directly. Exit is faster than
+// entrance (snappier dismissal).
+#define MODAL_ANIM_SCALE_FROM 0.94f
+#define MODAL_ANIM_ENTER_MS 140u
+#define MODAL_ANIM_EXIT_MS 90u
 
 // CE: modal-dialog auto-tint state. When enabled (configured by
 // gamelib at iso-interface-create time and cleared at destroy),
@@ -286,6 +308,7 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     // CE: tint at full strength when enabled (no fade modulation).
     win->tint_reveal = 1.0f;
     win->tint_snapshot_vb = NULL;
+    win->tint_snapshot_fade = 0.0f;
 
     vb_create_info.flags = 0;
 
@@ -1050,6 +1073,17 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 wins[v38]->tint_g,
                 wins[v38]->tint_b,
                 reveal_def);
+            // CE: post-animation cross-fade. While a snapshot lingers
+            // after the transform settled, overlay it (same window-local
+            // sub-rect) on top of the freshly-drawn realtime tint at the
+            // current fade opacity. ui_anim ramps fade 1→0 then releases
+            // the snapshot — a smooth dissolve instead of a hard swap.
+            if (wins[v38]->tint_snapshot_vb != NULL
+                && wins[v38]->tint_snapshot_fade > 0.0f) {
+                uint8_t snap_a = (uint8_t)(wins[v38]->tint_snapshot_fade * 255.0f + 0.5f);
+                tig_video_blit_scaled_alpha(wins[v38]->tint_snapshot_vb,
+                    &blt_src_rect, &blt_dst_rect, snap_a);
+            }
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
         }
@@ -2256,6 +2290,10 @@ int tig_window_tint_snapshot_capture(tig_window_handle_t window_handle)
     if (!win->tint_enabled) return TIG_OK;  // nothing to capture
     if (win->video_buffer == NULL) return TIG_ERR_GENERIC;
 
+    // Fresh capture → snapshot fully covers during any post-anim
+    // cross-fade (until ui_anim ramps it back down).
+    win->tint_snapshot_fade = 1.0f;
+
     // Allocate snapshot VB if needed, sized to match the window's
     // natural frame.
     if (win->tint_snapshot_vb == NULL) {
@@ -2367,6 +2405,28 @@ void tig_window_tint_snapshot_release(tig_window_handle_t window_handle)
     if (win->tint_snapshot_vb != NULL) {
         tig_video_buffer_destroy(win->tint_snapshot_vb);
         win->tint_snapshot_vb = NULL;
+    }
+    win->tint_snapshot_fade = 0.0f;
+    if (win->tint_enabled) {
+        tig_window_invalidate_rect(&(win->frame));
+    }
+}
+
+// CE: set the post-animation snapshot cross-fade opacity (1.0 = snapshot
+// fully covers, 0.0 = pure realtime tint). Invalidates so the next
+// composite reflects the new blend. See tint_snapshot_fade docs.
+void tig_window_tint_snapshot_fade_set(tig_window_handle_t window_handle, float fade)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) return;
+    if (!tig_window_initialized) return;
+    int window_index = tig_window_handle_to_index(window_handle);
+    TigWindow* win = &(windows[window_index]);
+    if (fade < 0.0f) fade = 0.0f;
+    if (fade > 1.0f) fade = 1.0f;
+    float prev = win->tint_snapshot_fade;
+    win->tint_snapshot_fade = fade;
+    if (prev != fade && win->tint_enabled && win->tint_snapshot_vb != NULL) {
+        tig_window_invalidate_rect(&(win->frame));
     }
 }
 
@@ -2507,28 +2567,92 @@ int tig_window_modal_dialog(TigWindowModalDialogInfo* modal_info, TigWindowModal
     tig_window_modal_dialog_create_buttons(modal_info->type, tig_window_modal_dialog_window_handle);
     tig_window_modal_dialog_refresh(NULL);
 
-    while (tig_window_modal_dialog_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-        tig_ping();
+    // CE: drive a time-based scale+alpha entrance/exit on the modal. The
+    // modal owns its own blocking pump (no game ui_anim tick here), so we
+    // compute the transform inline each frame. Prime the first frame to
+    // the scaled-down / transparent start state before the loop displays.
+    tig_window_modal_dialog_close_requested = false;
+    {
+        TigRect* modal_frame =
+            &windows[tig_window_handle_to_index(tig_window_modal_dialog_window_handle)].frame;
+        tig_timestamp_t modal_anim_t0;
+        tig_timestamp_t modal_exit_t0 = 0;
+        bool modal_entering = true;
+        bool modal_exiting = false;
 
-        if (tig_window_modal_dialog_window_handle == TIG_WINDOW_HANDLE_INVALID) {
-            break;
-        }
+        tig_window_transform_set(tig_window_modal_dialog_window_handle,
+            MODAL_ANIM_SCALE_FROM, MODAL_ANIM_SCALE_FROM, 0.0f, 0.5f, 0.5f);
+        tig_timer_now(&modal_anim_t0);
 
-        while (tig_message_dequeue(&msg) == TIG_OK) {
-            if (msg.type == TIG_MESSAGE_REDRAW) {
-                if (modal_info->redraw != NULL) {
-                    modal_info->redraw();
-                }
+        while (tig_window_modal_dialog_window_handle != TIG_WINDOW_HANDLE_INVALID) {
+            tig_ping();
 
-                tig_window_invalidate_rect(NULL);
+            if (tig_window_modal_dialog_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+                break;
             }
-        }
 
-        if (modal_info->process != NULL && modal_info->process(&tig_message_modal_dialog_choice)) {
-            tig_window_modal_dialog_close();
-        }
+            while (tig_message_dequeue(&msg) == TIG_OK) {
+                if (msg.type == TIG_MESSAGE_REDRAW) {
+                    if (modal_info->redraw != NULL) {
+                        modal_info->redraw();
+                    }
 
-        tig_window_display();
+                    tig_window_invalidate_rect(NULL);
+                }
+            }
+
+            // Don't take new input once we've started dismissing.
+            if (!modal_exiting
+                && modal_info->process != NULL
+                && modal_info->process(&tig_message_modal_dialog_choice)) {
+                tig_window_modal_dialog_close_requested = true;
+            }
+
+            // A close request (button / keyboard via the filter, or the
+            // process callback) begins the exit animation instead of
+            // destroying the window immediately.
+            if (tig_window_modal_dialog_close_requested && !modal_exiting) {
+                modal_exiting = true;
+                modal_entering = false;
+                tig_timer_now(&modal_exit_t0);
+            }
+
+            tig_timestamp_t modal_now;
+            tig_timer_now(&modal_now);
+            if (modal_exiting) {
+                unsigned int el = (unsigned int)tig_timer_between(modal_exit_t0, modal_now);
+                float t = el >= MODAL_ANIM_EXIT_MS
+                    ? 1.0f : (float)el / (float)MODAL_ANIM_EXIT_MS;
+                float e = t * t * (3.0f - 2.0f * t);  // smoothstep
+                float scale = 1.0f + (MODAL_ANIM_SCALE_FROM - 1.0f) * e;
+                tig_window_transform_set(tig_window_modal_dialog_window_handle,
+                    scale, scale, 1.0f - e, 0.5f, 0.5f);
+                tig_window_invalidate_rect(modal_frame);
+                if (t >= 1.0f) {
+                    // Dismissal complete — destroy for real and end loop.
+                    tig_window_destroy(tig_window_modal_dialog_window_handle);
+                    tig_window_modal_dialog_window_handle = TIG_WINDOW_HANDLE_INVALID;
+                    tig_window_display();
+                    break;
+                }
+            } else if (modal_entering) {
+                unsigned int el = (unsigned int)tig_timer_between(modal_anim_t0, modal_now);
+                float t = el >= MODAL_ANIM_ENTER_MS
+                    ? 1.0f : (float)el / (float)MODAL_ANIM_ENTER_MS;
+                float e = t * t * (3.0f - 2.0f * t);  // smoothstep
+                if (t >= 1.0f) {
+                    tig_window_transform_clear(tig_window_modal_dialog_window_handle);
+                    modal_entering = false;
+                } else {
+                    float scale = MODAL_ANIM_SCALE_FROM + (1.0f - MODAL_ANIM_SCALE_FROM) * e;
+                    tig_window_transform_set(tig_window_modal_dialog_window_handle,
+                        scale, scale, e, 0.5f, 0.5f);
+                }
+                tig_window_invalidate_rect(modal_frame);
+            }
+
+            tig_window_display();
+        }
     }
 
     if (choice_ptr != NULL) {
@@ -2650,11 +2774,10 @@ bool tig_window_modal_dialog_message_filter(TigMessage* msg)
 // 0x51ED10
 void tig_window_modal_dialog_close(void)
 {
-    if (tig_window_modal_dialog_window_handle != TIG_WINDOW_HANDLE_INVALID) {
-        if (tig_window_destroy(tig_window_modal_dialog_window_handle) == TIG_OK) {
-            tig_window_modal_dialog_window_handle = TIG_WINDOW_HANDLE_INVALID;
-        }
-    }
+    // CE: just request the close; the modal loop plays the exit
+    // animation and destroys the window when it finishes. (Was: destroy
+    // synchronously here.)
+    tig_window_modal_dialog_close_requested = true;
 }
 
 // 0x51ED40

@@ -151,6 +151,11 @@ void intgame_notify_item_inserted_or_removed(int64_t item_obj, bool removed, int
 void intgame_refresh_health_bar(int64_t obj);
 bool intgame_big_window_lock(TigWindowMessageFilterFunc func, tig_window_handle_t* window_handle_ptr);
 void intgame_big_window_unlock(void);
+// CE: animated close for the shared big window (scale+fade out, faster
+// than the entrance, gracefully interruptible by a reopen). Use from a
+// window's real close/destroy path; keep intgame_big_window_unlock for
+// creation error/abort paths (synchronous, no animation).
+void intgame_big_window_close_animated(void);
 bool intgame_big_window_screen_rect(TigRect* rect);
 void intgame_big_window_promote(void);
 void intgame_iso_strips_promote(void);

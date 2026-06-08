@@ -704,7 +704,8 @@ void schematic_ui_destroy(void)
     // Disable the PC lens.
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
 
-    intgame_big_window_unlock();
+    // CE: animated close (scale+fade out, gracefully interruptible).
+    intgame_big_window_close_animated();
     schematic_ui_window = TIG_WINDOW_HANDLE_INVALID;
 
     if (schematic_ui_num_found_schematics > 0) {

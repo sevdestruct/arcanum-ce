@@ -92,6 +92,16 @@ tig_window_handle_t mainmenu_ui_get_backdrop_handle(void);
 // or the panel as the tint underlay.
 bool mainmenu_ui_has_custom_backdrop_art(void);
 
+// CE: true while the custom-bg backdrop is animating OUT into gameplay
+// (the ~300ms scale+alpha exit after a game starts/loads, before the
+// backdrop window is destroyed). During this window the backdrop handle
+// is still valid and has_custom_backdrop_art() still true, but the
+// view is transitioning to the live iso world — so the translucent-
+// black tint pathway must NOT pick the (fading) backdrop as its
+// underlay, or a window opened right after load shows the menu / black
+// through its dark areas instead of the game world.
+bool mainmenu_ui_backdrop_is_exiting(void);
+
 // CE: returns the current per-screen panel handle (mainmenu / pause
 // / Options / Save / Load / etc.). For custom-UI shell menus this is
 // aliased to the backdrop; for sub-windows and for legacy / no-

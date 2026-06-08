@@ -2083,6 +2083,16 @@ bool mainmenu_ui_handle(void)
             ui_anim_profile_t exit_profile = { 300, 1.2f };
             float exit_from = mainmenu_ui_bg_receded ? 0.96f : 1.0f;
             mainmenu_ui_bg_exit_pending = true;
+            // CE: the backdrop is now leaving into gameplay. Re-pick the
+            // persistent HUD bar / modal tint underlays immediately so
+            // they read the live iso world for the whole exit instead of
+            // sampling the fading menu backdrop they were bound to. (The
+            // exit-pending gate in intgame_translucent_black_pick now
+            // routes them to iso.) They're re-picked again when the
+            // backdrop is finally destroyed — this just closes the gap
+            // during the exit animation.
+            intgame_refresh_hud_bar_tint();
+            intgame_refresh_modal_tint();
             ui_anim_window_transform_from_to_with_complete(
                 mainmenu_ui_backdrop_handle,
                 exit_from, 1.0f, 0.96f, 0.0f,
@@ -2122,6 +2132,12 @@ tig_window_handle_t mainmenu_ui_get_backdrop_handle(void)
 bool mainmenu_ui_has_custom_backdrop_art(void)
 {
     return mainmenu_ui_has_custom_bg;
+}
+
+// CE: see mainmenu_ui.h.
+bool mainmenu_ui_backdrop_is_exiting(void)
+{
+    return mainmenu_ui_bg_exit_pending;
 }
 
 // CE: see mainmenu_ui.h.

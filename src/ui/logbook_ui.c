@@ -702,7 +702,8 @@ void logbook_ui_destroy(void)
     ui_anim_cancel_for_window(logbook_ui_window);
 
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
-    intgame_big_window_unlock();
+    // CE: animated close (scale+fade out, gracefully interruptible).
+    intgame_big_window_close_animated();
     logbook_ui_window = TIG_WINDOW_HANDLE_INVALID;
     gsound_play_sfx(SND_INTERFACE_BOOK_CLOSE, 1);
     logbook_ui_created = false;

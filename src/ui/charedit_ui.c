@@ -155,6 +155,11 @@ static bool charedit_scheme_win_message_filter(TigMessage* msg);
 static bool charedit_labels_init(void);
 static void charedit_labels_exit(void);
 static void charedit_show_subwindows_on_entrance_complete(void* ctx);
+static void charedit_subwindow_enter(tig_window_handle_t win);
+static void charedit_hide_subwindows_on_exit(void* ctx);
+// CE: guards the deferred subwindow-hide so reopening charedit mid-exit
+// cancels it (mirrors intgame_big_window's exit_pending).
+static bool charedit_subwindow_exit_pending = false;
 static void charedit_refresh_alignment_aptitude_bars(void);
 static void sub_55EFB0(void);
 static void sub_55EFE0(void);
@@ -1258,12 +1263,20 @@ bool charedit_open(int64_t obj, ChareditMode mode)
     }
 
     // CE: spring-driven entrance — scales 92% → 100% with alpha 0 → 1
-    // on the shared big-window. The on_complete callback shows the
-    // skill/spell/tech/scheme subwindows once the parent settles, so
-    // they don't pop in above the spring-scaled parent (the user
-    // reported them appearing instantly while the parent was still
-    // animating — they were tig_window_show'd above, but that call
-    // was removed; the show happens here in on_complete instead).
+    // on the shared big-window.
+    //
+    // The default (skills) subwindow is shown NOW and animated in (subtle
+    // scale 0.96 + alpha) in SYNC with the parent entrance, instead of
+    // popping in after the parent settles (which read as the panel
+    // "loading late"). The other 3 subwindows stay deferred to
+    // on_complete: they sit hidden behind skills and are never visible at
+    // entrance, so their timing doesn't matter.
+    // Cancel any deferred subwindow-hide from a still-animating previous
+    // close (reopen mid-exit) so it doesn't hide our fresh subwindows.
+    charedit_subwindow_exit_pending = false;
+    tig_window_show(charedit_skills_win);
+    charedit_subwindow_enter(charedit_skills_win);
+
     ui_anim_window_show_with_complete(charedit_window_handle,
         UI_ANIM_ANCHOR_CENTER, 0.92f, NULL,
         charedit_show_subwindows_on_entrance_complete, NULL);
@@ -1278,13 +1291,44 @@ bool charedit_open(int64_t obj, ChareditMode mode)
 // Guarded against the case where charedit_close was called mid-
 // entrance — fires the callback after the cancel, but charedit_created
 // is false so we skip the show.
+// CE: bring a charedit subwindow to the top of its z-class and play the
+// subtle scale+fade entrance on it, so switching tabs (and the initial
+// open) animates like the main windows. Scale-from 0.96 is subtler than
+// the parent's 0.92 — keeps the sibling tab sitting behind from peeking
+// at the edges during the scale. The window must already be shown.
+static void charedit_subwindow_enter(tig_window_handle_t win)
+{
+    sub_51E850(win);
+    ui_anim_window_show(win, UI_ANIM_ANCHOR_CENTER, 0.96f, NULL);
+}
+
+// CE: on_complete for the active subwindow's exit animation — hides all
+// four subwindows once it settles. Guarded: reopening charedit mid-exit
+// clears charedit_subwindow_exit_pending so this no-ops (and the reopen
+// retargets the active subwindow's tween back to visible).
+static void charedit_hide_subwindows_on_exit(void* ctx)
+{
+    (void)ctx;
+    if (!charedit_subwindow_exit_pending) {
+        return;
+    }
+    charedit_subwindow_exit_pending = false;
+    tig_window_hide(charedit_skills_win);
+    tig_window_hide(charedit_spells_win);
+    tig_window_hide(charedit_tech_win);
+    tig_window_hide(charedit_scheme_win);
+}
+
 static void charedit_show_subwindows_on_entrance_complete(void* ctx)
 {
     (void)ctx;
     if (!charedit_created) {
         return;
     }
-    tig_window_show(charedit_skills_win);
+    // Skills was already shown + faded in with the entrance. Reveal the
+    // other 3 now (they sit hidden behind skills, so showing them is
+    // invisible) so tab-switching has them ready, then keep skills on
+    // top.
     tig_window_show(charedit_spells_win);
     tig_window_show(charedit_tech_win);
     tig_window_show(charedit_scheme_win);
@@ -1302,6 +1346,10 @@ void charedit_close(void)
         // retargets from stale values — produces a "stuck mid-scale"
         // wobble on the re-open.
         ui_anim_cancel_for_window(charedit_window_handle);
+        // CE: skills now has its own entrance fade tween — cancel it too
+        // so closing mid-fade resets its transform to natural (alpha 1,
+        // scale 1) and the next open starts clean.
+        ui_anim_cancel_for_window(charedit_skills_win);
 
         charedit_created = false;
         if (charedit_mode == CHAREDIT_MODE_ACTIVE || charedit_mode == CHAREDIT_MODE_PASSIVE) {
@@ -1312,11 +1360,31 @@ void charedit_close(void)
             critter_fatigue_damage_set(charedit_obj, 0);
         }
         intgame_apply_translucent_black(charedit_window_handle, false);
-        intgame_big_window_unlock();
-        tig_window_hide(charedit_skills_win);
-        tig_window_hide(charedit_spells_win);
-        tig_window_hide(charedit_tech_win);
-        tig_window_hide(charedit_scheme_win);
+        // CE: animated close. The parent (big window) scales+fades out via
+        // close_animated; the active subwindow plays the same exit and
+        // hides all four on settle (deferred so the panel doesn't vanish
+        // before the frame finishes animating out). Both are gracefully
+        // interruptible by a reopen.
+        intgame_big_window_close_animated();
+        {
+            tig_window_handle_t active_sub =
+                dword_64E01C == 1 ? charedit_tech_win :
+                dword_64E01C == 2 ? charedit_spells_win :
+                dword_64E01C == 3 ? charedit_scheme_win :
+                                    charedit_skills_win;
+            // Hide the NON-active subwindows immediately — they sit
+            // occluded behind the active one, so hiding them is invisible,
+            // and it stops the previously-active tab being "left behind"
+            // (revealed at full opacity) once the active one fades out.
+            if (active_sub != charedit_skills_win) tig_window_hide(charedit_skills_win);
+            if (active_sub != charedit_spells_win) tig_window_hide(charedit_spells_win);
+            if (active_sub != charedit_tech_win) tig_window_hide(charedit_tech_win);
+            if (active_sub != charedit_scheme_win) tig_window_hide(charedit_scheme_win);
+            ui_anim_profile_t sub_exit = { 110, 1.2f };
+            charedit_subwindow_exit_pending = true;
+            ui_anim_window_hide(active_sub, UI_ANIM_ANCHOR_CENTER, 0.96f,
+                &sub_exit, charedit_hide_subwindows_on_exit, NULL);
+        }
         charedit_obj = OBJ_HANDLE_NULL;
         iso_interface_refresh();
         intgame_mode_set(INTGAME_MODE_MAIN);
@@ -1656,7 +1724,7 @@ bool charedit_window_message_filter(TigMessage* msg)
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
-                sub_51E850(charedit_skills_win);
+                charedit_subwindow_enter(charedit_skills_win);
                 dword_64E01C = 0;
                 charedit_refresh_internal();
                 return true;
@@ -1666,7 +1734,7 @@ bool charedit_window_message_filter(TigMessage* msg)
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
-                sub_51E850(charedit_tech_win);
+                charedit_subwindow_enter(charedit_tech_win);
                 dword_64E01C = 1;
                 charedit_refresh_internal();
                 return true;
@@ -1676,14 +1744,14 @@ bool charedit_window_message_filter(TigMessage* msg)
                 if (dword_64E01C == 3) {
                     sub_55F0D0();
                 }
-                sub_51E850(charedit_spells_win);
+                charedit_subwindow_enter(charedit_spells_win);
                 dword_64E01C = 2;
                 charedit_refresh_internal();
                 return true;
             }
 
             if (msg->data.button.button_handle == dword_64CA54) {
-                sub_51E850(charedit_scheme_win);
+                charedit_subwindow_enter(charedit_scheme_win);
                 if (dword_64E01C != 3) {
                     sub_55EFE0();
                 }

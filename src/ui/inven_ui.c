@@ -1172,7 +1172,8 @@ void inven_ui_destroy(void)
     // CE: drop the near-black alpha before unlocking so the next
     // big-window user (e.g. worldmap) starts opaque.
     intgame_apply_translucent_black(inven_ui_window_handle, false);
-    intgame_big_window_unlock();
+    // CE: animated close (scale+fade out, gracefully interruptible).
+    intgame_big_window_close_animated();
     iso_interface_refresh();
     mode = intgame_mode_get();
     if (mode != INTGAME_MODE_INVEN

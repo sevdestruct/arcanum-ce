@@ -1454,7 +1454,8 @@ void wmap_ui_close(void)
         ambient_lighting_enable();
         intgame_button_destroy(&wmap_ui_navigate_button_info);
         intgame_apply_translucent_black(wmap_ui_window, false);
-        intgame_big_window_unlock();
+        // CE: animated close (scale+fade out, gracefully interruptible).
+        intgame_big_window_close_animated();
 
         wmap_ui_window = TIG_WINDOW_HANDLE_INVALID;
         for (index = 0; index < WMAP_NOTE_TYPE_COUNT; index++) {
