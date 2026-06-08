@@ -5519,6 +5519,20 @@ bool intgame_mode_set(IntgameMode mode)
             }
         }
 
+        // CE: a non-MAIN mode is being pushed (a window, dialog, or
+        // targeting mode laid on top of MAIN). Dismiss the fate overlay if
+        // it's showing — fate is a pure overlay that never pushes an
+        // intgame mode, so without this it lingers behind the new
+        // fullscreen window and reappears when that window closes. This is
+        // the reverse of fate_ui_toggle, which pops back to MAIN (closing
+        // other windows) before opening fate. No-op when fate isn't open.
+        // The animated slide-up is kept; fate_ui_toggle's dismiss-reversal
+        // branch re-dismisses any open window if the user re-activates fate
+        // mid-slide, so fate no longer gets stuck half-dismissed.
+        if (v18) {
+            fate_ui_close();
+        }
+
         intgame_mode_stack[intgame_mode_stack_size] = mode;
         intgame_refresh_cursor();
 

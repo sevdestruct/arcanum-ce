@@ -181,6 +181,15 @@ void fate_ui_toggle(int64_t obj)
             // just cleared it. Result: smooth slide-back from
             // current position, no completion-then-reopen pop.
             fate_ui_dismiss_pending = false;
+            // CE: fate is being re-opened (it was mid-slide-out). If it
+            // was dismissed because another window took over the screen
+            // (intgame_mode_set's reverse hook calls fate_ui_close when a
+            // window opens), that window is still up — pop back to MAIN to
+            // dismiss it, same as the fresh-open path below. Without this,
+            // re-activating fate mid-dismiss slid the panel back but left
+            // the other window open, so fate appeared to "stop dismissing
+            // windows after the first time." No-op when nothing else is open.
+            intgame_mode_set(INTGAME_MODE_MAIN);
             int slide_ms = (int)((float)fate_ui_window_height / 0.85f + 0.5f);
             if (slide_ms < 140) slide_ms = 140;
             if (slide_ms > 350) slide_ms = 350;
@@ -199,6 +208,18 @@ void fate_ui_toggle(int64_t obj)
     }
 
     fate_ui_obj = obj;
+
+    // CE: dismiss any other open interface window before showing fate, so
+    // the fate panel doesn't end up stacked on top of (e.g.) the open
+    // inventory or character window. This mirrors the sleep button, which
+    // resets to MAIN mode (closing inventory / charedit / logbook / wmap /
+    // etc.) before opening. Fate is a pure overlay and never pushes an
+    // intgame mode of its own, so popping back to MAIN is all that's
+    // needed here; it's a no-op when nothing else is open. The reverse
+    // case — another window opening while fate is up — is handled in
+    // intgame_mode_set, which closes the fate overlay on any non-MAIN
+    // mode push.
+    intgame_mode_set(INTGAME_MODE_MAIN);
 
     // Proceed to create the UI.
     fate_ui_create();
