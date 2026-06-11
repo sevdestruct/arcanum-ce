@@ -10,7 +10,7 @@
 #include "game/roof.h"
 #include "game/sector.h"
 #include "game/tile_block.h"
-#include "game/tile_gap_fill.h"
+#include "game/void_edge_fade.h"
 
 #define TILE_CACHE_CAPACITY 64
 
@@ -693,8 +693,8 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     // Apply any "renders black" marks collected last frame (turns the black off-area
     // facades into void so the fade feathers from them) before this frame draws.
-    if (tile_gap_fill_enabled()) {
-        tile_gap_fill_flush_dark();
+    if (void_edge_fade_enabled()) {
+        void_edge_fade_flush_dark();
     }
     gap_scan_count = 0;
 
@@ -775,7 +775,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                             && (center_y + tile_rect.height) > tile_draw_dirty_union.y;
                         if (tile_in_dirty && !roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
                             // CE: void/gap tiles were already replaced with real terrain
-                            // in this sector's tile data at load (tile_gap_fill_sector),
+                            // in this sector's tile data at load (void_edge_fade_sector),
                             // so the normal draw path renders them affixed to the map.
                             art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
 
@@ -828,7 +828,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             tile_pre_sum = (int)tig_color_get_red(v51[4])
                                                 + (int)tig_color_get_green(v51[4])
                                                 + (int)tig_color_get_blue(v51[4]);
-                                            if (tile_gap_fill_fade_factors(v3->sector_ids[v15], sectors[v15], indexes[v15], ff)) {
+                                            if (void_edge_fade_fade_factors(v3->sector_ids[v15], sectors[v15], indexes[v15], ff)) {
                                                 v51[0] = tig_color_mul(v51[0], tig_color_make(ff[0], ff[0], ff[0]));
                                                 v51[1] = tig_color_mul(v51[1], tig_color_make(ff[1], ff[1], ff[1]));
                                                 v51[2] = tig_color_mul(v51[2], tig_color_make(ff[2], ff[2], ff[2]));
@@ -944,11 +944,11 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                             // re-probing). The center fade factor is recorded so the
                             // scan can divide the fade back out and judge the
                             // PRE-fade brightness.
-                            if (tile_gap_fill_enabled()
+                            if (void_edge_fade_enabled()
                                 && blit_info_initialized
                                 && tile_pre_sum >= 300
                                 && tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
-                                && !tile_gap_fill_dark_marked(v3->sector_ids[v15], indexes[v15])
+                                && !void_edge_fade_dark_marked(v3->sector_ids[v15], indexes[v15])
                                 && gap_scan_count < (int)(sizeof(gap_scan_list) / sizeof(gap_scan_list[0]))) {
                                 gap_scan_list[gap_scan_count].sec_id = v3->sector_ids[v15];
                                 gap_scan_list[gap_scan_count].index = indexes[v15];
@@ -986,7 +986,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     // lock). Any that blit pure black are the black off-camera scenery — mark them
     // void so next frame's fade feathers from them. note_dark ignores already-void
     // tiles, so this settles after the area's first full draw.
-    if (tile_gap_fill_enabled() && gap_scan_count > 0) {
+    if (void_edge_fade_enabled() && gap_scan_count > 0) {
         TigVideoBufferData vbd;
         if (tig_video_buffer_lock(dword_602DF0) == TIG_OK) {
             if (tig_video_buffer_data(dword_602DF0, &vbd) == TIG_OK && vbd.pixels != NULL) {
@@ -1025,7 +1025,7 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                             }
                         }
                         if (probes >= 3 && blacks == probes) {
-                            tile_gap_fill_note_dark(gap_scan_list[i].sec_id, gap_scan_list[i].index);
+                            void_edge_fade_note_dark(gap_scan_list[i].sec_id, gap_scan_list[i].index);
                         }
                     }
                 }

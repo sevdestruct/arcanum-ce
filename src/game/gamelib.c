@@ -73,7 +73,7 @@
 #include "game/skill.h"
 #include "game/spell.h"
 #include "game/stat.h"
-#include "game/tile_gap_fill.h"
+#include "game/void_edge_fade.h"
 #include "game/tb.h"
 #include "game/tc.h"
 #include "game/tech.h"
@@ -462,7 +462,7 @@ bool gamelib_init(GameInitInfo* init_info)
     // exposed by the zoomed-out camera (vignette at map edges, feather around
     // black off-area facades). Default on; set to "0" for vanilla hard edges.
     // Adds a small amount of sector-load work while enabled.
-    settings_register(&settings, VOID_EDGE_FADE_KEY, "1", tile_gap_fill_settings_changed);
+    settings_register(&settings, VOID_EDGE_FADE_KEY, "1", void_edge_fade_settings_changed);
 
     // CE: Renderer vsync mode. Default 2 (adaptive) — measured ~17%
     // lower frame avg and ~21% lower stddev vs vanilla vsync on a 120Hz
@@ -487,9 +487,9 @@ bool gamelib_init(GameInitInfo* init_info)
 
     // TEMP: offline all-maps fade audit — must run before any window display
     // (a sandboxed/headless launch blocks forever in SwapWindow). Writes
-    // /tmp/tgf_audit.txt and exits the process.
-    if (getenv("ARCANUM_TGF_AUDIT") != NULL) {
-        tile_gap_fill_run_audit();
+    // /tmp/void_fade_audit.txt and exits the process.
+    if (getenv("ARCANUM_VOID_FADE_AUDIT") != NULL) {
+        void_edge_fade_run_audit();
     }
 
     if (!init_info->editor) {

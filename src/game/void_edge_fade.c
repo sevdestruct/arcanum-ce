@@ -1,4 +1,4 @@
-#include "game/tile_gap_fill.h"
+#include "game/void_edge_fade.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -113,7 +113,7 @@ static bool gap_cfg_enabled = true;
 // Settings callback: refresh the cached flag and repaint so a live toggle takes
 // effect immediately. Safe before init (gap_invalidate_rect is NULL then; init
 // re-reads the value itself).
-void tile_gap_fill_settings_changed(void)
+void void_edge_fade_settings_changed(void)
 {
     gap_cfg_enabled = gamelib_void_edge_fade();
     if (gap_invalidate_rect != NULL) {
@@ -121,7 +121,7 @@ void tile_gap_fill_settings_changed(void)
     }
 }
 
-bool tile_gap_fill_init(GameInitInfo* init_info)
+bool void_edge_fade_init(GameInitInfo* init_info)
 {
     gap_editor_mode = init_info->editor;
     gap_invalidate_rect = init_info->invalidate_rect_func;
@@ -131,19 +131,19 @@ bool tile_gap_fill_init(GameInitInfo* init_info)
     return true;
 }
 
-void tile_gap_fill_exit(void)
+void void_edge_fade_exit(void)
 {
     gap_initialized = false;
 }
 
-bool tile_gap_fill_enabled(void)
+bool void_edge_fade_enabled(void)
 {
     return gap_initialized && !gap_editor_mode && gap_cfg_enabled;
 }
 
-bool tile_gap_fill_fade_enabled(void)
+bool void_edge_fade_fade_enabled(void)
 {
-    return tile_gap_fill_enabled();
+    return void_edge_fade_enabled();
 }
 
 // Void-edge fade via a blurred void-density field (morphological rounding). A
@@ -408,7 +408,7 @@ static bool gap_void_at(int64_t gx, int64_t gy)
 // own perimeter, so off-area black joins the fade while isolated black content
 // (burnt wrecks, cave shadows) never seeds it. Accepted marks go to the persistent
 // dark store and are mirrored into the resident vmask immediately.
-bool tile_gap_fill_note_dark(int64_t sec_id, int index)
+bool void_edge_fade_note_dark(int64_t sec_id, int index)
 {
     static const int ndx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
     static const int ndy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
@@ -446,7 +446,7 @@ bool tile_gap_fill_note_dark(int64_t sec_id, int index)
 // block so it rebuilds seeing the new void, and force a full-window repaint — the
 // renderer is dirty-rect driven, so without this the healed fade never reaches the
 // pixels already on screen until the user happens to scroll them.
-void tile_gap_fill_flush_dark(void)
+void void_edge_fade_flush_dark(void)
 {
     bool any = false;
     int s;
@@ -471,7 +471,7 @@ void tile_gap_fill_flush_dark(void)
 
 // True if the draw-time scan has already verified this tile renders black. Lets
 // the draw loop skip re-probing settled tiles every frame.
-bool tile_gap_fill_dark_marked(int64_t sec_id, int index)
+bool void_edge_fade_dark_marked(int64_t sec_id, int index)
 {
     const GapDarkEntry* e = gap_dark_find(sec_id);
     return e != NULL && gap_dark_bit(e, index);
@@ -738,7 +738,7 @@ static int gap_vert(const uint8_t* bt, int ax, int ay, int bx, int by, int cx, i
     return n > 0 ? sum / n : 255;
 }
 
-bool tile_gap_fill_fade_factors(int64_t sec_id, Sector* sector, int index, unsigned char out_factor[9])
+bool void_edge_fade_fade_factors(int64_t sec_id, Sector* sector, int index, unsigned char out_factor[9])
 {
     const uint8_t* bt;
     int slot;
@@ -750,7 +750,7 @@ bool tile_gap_fill_fade_factors(int64_t sec_id, Sector* sector, int index, unsig
         out_factor[i] = 255;
     }
 
-    if (sector == NULL || !tile_gap_fill_fade_enabled()) {
+    if (sector == NULL || !void_edge_fade_fade_enabled()) {
         return false;
     }
 
@@ -797,13 +797,13 @@ bool tile_gap_fill_fade_factors(int64_t sec_id, Sector* sector, int index, unsig
 // void (and this sector sees theirs) — the fade carries across the seam
 // regardless of the order sectors stream in. The void tiles themselves are left
 // untouched (they render black); the fade feathers the content around them.
-void tile_gap_fill_sector(int64_t sec_id, Sector* sector)
+void void_edge_fade_sector(int64_t sec_id, Sector* sector)
 {
     int sx;
     int sy;
     int ddx, ddy;
 
-    if (!tile_gap_fill_enabled()) {
+    if (!void_edge_fade_enabled()) {
         return;
     }
 
@@ -819,10 +819,10 @@ void tile_gap_fill_sector(int64_t sec_id, Sector* sector)
 
 // ============================================================================
 // TEMP ALL-MAPS STRUCTURAL AUDIT
-// Run with ARCANUM_TGF_AUDIT=1. Mounts every module group under modules/,
+// Run with ARCANUM_VOID_FADE_AUDIT=1. Mounts every module group under modules/,
 // reads every sector of every map with the engine's own file layer, classifies
 // tiles (gap / facade / terrain), floods void regions across sector seams, and
-// reports edge-case classes for the void-edge fade. Writes /tmp/tgf_audit.txt
+// reports edge-case classes for the void-edge fade. Writes /tmp/void_fade_audit.txt
 // and exits.
 // ============================================================================
 
@@ -1120,9 +1120,9 @@ static void aud_audit_map(FILE* rep, const char* group, const char* map, AuditTo
     free(queue);
 }
 
-void tile_gap_fill_run_audit(void)
+void void_edge_fade_run_audit(void)
 {
-    FILE* rep = fopen("/tmp/tgf_audit.txt", "w");
+    FILE* rep = fopen("/tmp/void_fade_audit.txt", "w");
     // The classifier needs art-id -> filename resolution (tig_art_exists), which
     // is gated on the Name system. Initialize it directly — the audit runs before
     // the normal game-systems init (so the loading screen's blocking SwapWindow
@@ -1143,7 +1143,7 @@ void tile_gap_fill_run_audit(void)
     if (rep == NULL) {
         exit(1);
     }
-    fprintf(rep, "=== tile_gap_fill all-maps audit ===\n");
+    fprintf(rep, "=== void_edge_fade all-maps audit ===\n");
 
     tig_file_list_create(&ml, "modules\\*");
     for (mi = 0; mi < ml.count; mi++) {
