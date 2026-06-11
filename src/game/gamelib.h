@@ -124,6 +124,12 @@
 // are shuffled out to other free slots.
 #define GOLD_EXPANSION_SLOT_PRIORITY_KEY "gold expansion slot priority"
 
+// CE: feather terrain/cliff edges into the black void the zoomed-out camera
+// exposes (vignette at map edges, feather around black off-area facades).
+// Default 1; set to 0 for vanilla hard edges (also skips the fade's
+// sector-load mask work).
+#define VOID_EDGE_FADE_KEY "void edge fade"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
@@ -250,6 +256,9 @@ bool gamelib_pc_lens_follows_player(void);
 // (true) — or yields and relocates itself (false, default). See
 // GOLD_EXPANSION_SLOT_PRIORITY_KEY.
 bool gamelib_gold_expansion_slot_priority(void);
+
+// CE: whether the void-edge fade is enabled. See VOID_EDGE_FADE_KEY.
+bool gamelib_void_edge_fade(void);
 
 // Debug perf counter for the zoom-out draw path. When enabled, gamelib
 // times each zoom-active frame (gamelib_draw_func + downscale blit) and

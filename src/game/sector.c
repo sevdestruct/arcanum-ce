@@ -10,6 +10,7 @@
 #include "game/obj_private.h"
 #include "game/terrain.h"
 #include "game/tile.h"
+#include "game/void_edge_fade.h"
 #include "game/timeevent.h"
 #include "game/townmap.h"
 
@@ -737,17 +738,27 @@ bool sector_rect_from_loc_rect(LocRect* loc_rect, SectorRect* sector_rect)
     int y;
     int width;
     int height;
-    int64_t horizontal[4];
-    int64_t vertical[4];
+    // CE: large enough to hold the boundaries of any realistic zoomed-out view
+    // without overflowing (sector_compute_boundaries is unbounded). The original
+    // [4] overflowed once the view spanned >3 sectors (zoom-out / high-res),
+    // which is exactly what left the periphery untiled (black).
+    int64_t horizontal[128];
+    int64_t vertical[128];
 
     width = sector_compute_boundaries(loc_rect->x1, loc_rect->x2 + 1, 64, horizontal) - 1;
     if (width == 0) {
         return false;
     }
+    if (width > SECTOR_RECT_DIM) {
+        width = SECTOR_RECT_DIM;
+    }
 
     height = sector_compute_boundaries(loc_rect->y1, loc_rect->y2 + 1, 64, vertical) - 1;
     if (height == 0) {
         return false;
+    }
+    if (height > SECTOR_RECT_DIM) {
+        height = SECTOR_RECT_DIM;
     }
 
     for (y = 0; y < height; y++) {
@@ -1713,6 +1724,7 @@ bool sector_load_game(int64_t id, Sector* sector)
     }
 
     sector_validate_game("sector post-load (pre-fold)");
+    void_edge_fade_sector(id, sector);
     li_update();
     objlist_fold(&(sector->objects), id, sub_45A9B0(&(sector->datetime), 3000));
     li_update();

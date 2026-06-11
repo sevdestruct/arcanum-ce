@@ -243,6 +243,8 @@ set(SRCS
     "src/game/tile_script.h"
     "src/game/tile.c"
     "src/game/tile.h"
+    "src/game/void_edge_fade.c"
+    "src/game/void_edge_fade.h"
     "src/game/timeevent.c"
     "src/game/timeevent.h"
     "src/game/townmap.c"

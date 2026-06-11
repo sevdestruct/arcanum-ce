@@ -83,6 +83,8 @@ bool sector_history_load(GameLoadInfo* load_info);
 
 #define SECTOR_X(a) ((a) & 0x3FFFFFF)
 #define SECTOR_Y(a) (((a) >> 26) & 0x3FFFFFF)
-#define SECTOR_MAKE(a, b) ((a) | ((b) << 26))
+// Must compose in 64-bit: sector Y exceeds 5 bits map-wide, so with int operands
+// `(b) << 26` overflows int32 (UB — truncates Y mod 64) and yields a garbage id.
+#define SECTOR_MAKE(a, b) ((int64_t)(a) | ((int64_t)(b) << 26))
 
 #endif /* ARCANUM_GAME_SECTOR_H_ */

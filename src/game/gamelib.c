@@ -75,6 +75,7 @@
 #include "game/skill.h"
 #include "game/spell.h"
 #include "game/stat.h"
+#include "game/void_edge_fade.h"
 #include "game/tb.h"
 #include "game/tc.h"
 #include "game/tech.h"
@@ -471,6 +472,12 @@ bool gamelib_init(GameInitInfo* init_info)
     // are shuffled out to other free slots.
     settings_register(&settings, GOLD_EXPANSION_SLOT_PRIORITY_KEY, "0", NULL);
 
+    // CE: void-edge fade — feather terrain/cliff edges into the black void
+    // exposed by the zoomed-out camera (vignette at map edges, feather around
+    // black off-area facades). Default on; set to "0" for vanilla hard edges.
+    // Adds a small amount of sector-load work while enabled.
+    settings_register(&settings, VOID_EDGE_FADE_KEY, "1", void_edge_fade_settings_changed);
+
     // CE: Renderer vsync mode. Default 2 (adaptive) — measured ~17%
     // lower frame avg and ~21% lower stddev vs vanilla vsync on a 120Hz
     // ProMotion display, with no perceptible tearing during normal
@@ -491,6 +498,13 @@ bool gamelib_init(GameInitInfo* init_info)
 
     gamelib_mod_loaded = false;
     gamelib_load_data();
+
+    // TEMP: offline all-maps fade audit — must run before any window display
+    // (a sandboxed/headless launch blocks forever in SwapWindow). Writes
+    // /tmp/void_fade_audit.txt and exits the process.
+    if (getenv("ARCANUM_VOID_FADE_AUDIT") != NULL) {
+        void_edge_fade_run_audit();
+    }
 
     if (!init_info->editor) {
         if (highres_config_get()->logos) {
@@ -2971,6 +2985,12 @@ bool gamelib_pc_lens_follows_player(void)
 bool gamelib_gold_expansion_slot_priority(void)
 {
     return settings_get_value(&settings, GOLD_EXPANSION_SLOT_PRIORITY_KEY) != 0;
+}
+
+// CE: Read the VOID_EDGE_FADE_KEY setting.
+bool gamelib_void_edge_fade(void)
+{
+    return settings_get_value(&settings, VOID_EDGE_FADE_KEY) != 0;
 }
 
 // 0x4046F0

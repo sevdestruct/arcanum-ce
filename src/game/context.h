@@ -49,18 +49,24 @@ typedef struct SectorListNode {
     /* 0018 */ struct SectorListNode* next;
 } SectorListNode;
 
+// CE: the original game capped a draw at 3x3 sectors because its fixed-zoom
+// camera never showed more. The zoom-out / high-res viewport can span more, so
+// the rect (and every per-column array sized to it) is enlarged. Anything beyond
+// this many sectors per axis would need an ~8K display at 0.5x zoom.
+#define SECTOR_RECT_DIM 10
+
 typedef struct SectorRectRow {
     /* 0000 */ int num_cols;
-    /* 0008 */ int64_t origin_locs[3];
-    /* 0020 */ int64_t sector_ids[3];
-    /* 0038 */ int tile_ids[3];
-    /* 0044 */ int num_hor_tiles[3];
-    /* 0050 */ int num_vert_tiles;
+    /* 0008 */ int64_t origin_locs[SECTOR_RECT_DIM];
+    /* ____ */ int64_t sector_ids[SECTOR_RECT_DIM];
+    /* ____ */ int tile_ids[SECTOR_RECT_DIM];
+    /* ____ */ int num_hor_tiles[SECTOR_RECT_DIM];
+    /* ____ */ int num_vert_tiles;
 } SectorRectRow;
 
 typedef struct SectorRect {
     /* 0000 */ int num_rows;
-    /* 0008 */ SectorRectRow rows[3];
+    /* 0008 */ SectorRectRow rows[SECTOR_RECT_DIM];
 } SectorRect;
 
 typedef struct GameDrawInfo {
