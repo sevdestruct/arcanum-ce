@@ -31,7 +31,6 @@ static void sub_4D7C70(void);
 static TigVideoBuffer* sub_4D7E90(unsigned int art_id);
 static void tile_draw_topdown(GameDrawInfo* draw_info);
 static void tile_draw_iso(GameDrawInfo* draw_info);
-static void tile_draw_iso_gap_skirt(GameDrawInfo* draw_info, tig_color_t outdoor_color);
 
 // 0x602AE0
 static TileCacheEntry stru_602AE0[TILE_CACHE_CAPACITY];
@@ -630,154 +629,20 @@ void tile_draw_topdown(GameDrawInfo* draw_info)
     }
 }
 
-// CE: Fill the untiled void the camera exposes beyond the map edges at zoom-out.
-//
-// The normal iso pass draws `draw_info->sector_rect`, which is built from a
-// loc_rect that `location_screen_rect_to_loc_rect` clamps to [0, location_limit).
-// At zoom-out the visible window spills past the map on every side; those screen
-// regions map to out-of-bounds (or pre-origin, unrepresentable) locations and are
-// never drawn, leaving black. This pass sweeps the iso tile lattice directly in
-// render-target space — using plain integer tile indices so it can address tiles
-// before the origin too — and blits synthesized terrain (sampled from the nearest
-// in-bounds sector) for every cell whose sector is out of bounds. In-bounds cells
-// are skipped; the normal pass already drew them.
-static void tile_draw_iso_gap_skirt(GameDrawInfo* draw_info, tig_color_t outdoor_color)
-{
-    int64_t limit_x;
-    int64_t limit_y;
-    int64_t ox;
-    int64_t oy;
-    int64_t origin_sx;
-    int64_t origin_sy;
-    int64_t tx;
-    int64_t ty;
-    int64_t tx_min;
-    int64_t tx_max;
-    int64_t ty_min;
-    int64_t ty_max;
-    TigRect* content;
-    TigRect tile_rect;
-    TigRect dst_rect;
-    TigRect src_rect;
-    TigArtBlitInfo blit;
-    tig_color_t field_14[4];
-    TigRectListNode* rect_node;
-    int corners_x[2];
-    int corners_y[2];
-    int ci;
-    int cj;
-    bool range_init;
-
-    if (!tile_gap_fill_enabled()) {
-        return;
-    }
-
-    sector_limits_get(&limit_x, &limit_y);
-    if (limit_x <= 0 || limit_y <= 0) {
-        return;
-    }
-
-    content = draw_info->screen_rect;
-    if (content == NULL) {
-        return;
-    }
-
-    // location_xy(loc 0) = (ox - 40, oy), so recover the iso origin.
-    location_xy(0, &origin_sx, &origin_sy);
-    ox = origin_sx + 40;
-    oy = origin_sy;
-
-    // Invert the lattice at the four content-rect corners to bound the sweep.
-    //   px = ox + 40*(ty - tx - 1) ; py = oy + 20*(ty + tx)
-    //   a = (px - ox)/40 + 1 = ty - tx ; b = (py - oy)/20 = ty + tx
-    //   ty = (a + b)/2 ; tx = (b - a)/2
-    corners_x[0] = content->x;
-    corners_x[1] = content->x + content->width;
-    corners_y[0] = content->y;
-    corners_y[1] = content->y + content->height;
-    range_init = false;
-    tx_min = tx_max = ty_min = ty_max = 0;
-    for (ci = 0; ci < 2; ci++) {
-        for (cj = 0; cj < 2; cj++) {
-            double a = (double)(corners_x[ci] - ox) / 40.0 + 1.0;
-            double b = (double)(corners_y[cj] - oy) / 20.0;
-            int64_t cty = (int64_t)floor((a + b) / 2.0);
-            int64_t ctx = (int64_t)floor((b - a) / 2.0);
-            if (!range_init) {
-                tx_min = tx_max = ctx;
-                ty_min = ty_max = cty;
-                range_init = true;
-            } else {
-                if (ctx < tx_min) tx_min = ctx;
-                if (ctx > tx_max) tx_max = ctx;
-                if (cty < ty_min) ty_min = cty;
-                if (cty > ty_max) ty_max = cty;
-            }
-        }
-    }
-
-    // Cover diamonds that straddle the content edge.
-    tx_min -= 2;
-    ty_min -= 2;
-    tx_max += 2;
-    ty_max += 2;
-
-    // Nothing to do when the whole visible span is in bounds.
-    if (tx_min >= 0 && ty_min >= 0
-        && (tx_max >> 6) < limit_x && (ty_max >> 6) < limit_y) {
-        return;
-    }
-
-    blit.src_rect = &src_rect;
-    blit.dst_rect = &dst_rect;
-    blit.field_14 = field_14;
-    blit.dst_video_buffer = dword_602DF0;
-    tile_rect.width = 78;
-    tile_rect.height = 40;
-
-    for (ty = ty_min; ty <= ty_max; ty++) {
-        for (tx = tx_min; tx <= tx_max; tx++) {
-            int64_t secx = tx >> 6;
-            int64_t secy = ty >> 6;
-            int px;
-            int py;
-
-            if (secx >= 0 && secx < limit_x && secy >= 0 && secy < limit_y) {
-                continue;
-            }
-
-            blit.art_id = tile_gap_fill_synth_tile(tx, ty);
-            if (blit.art_id == TIG_ART_ID_INVALID) {
-                continue;
-            }
-
-            px = (int)(ox + 40 * (ty - tx - 1));
-            py = (int)(oy + 20 * (ty + tx));
-            tile_rect.x = px + 1;
-            tile_rect.y = py;
-
-            rect_node = *draw_info->rects;
-            while (rect_node != NULL) {
-                if (tig_rect_intersection(&tile_rect, &(rect_node->rect), &dst_rect) == TIG_OK) {
-                    src_rect.x = dst_rect.x - tile_rect.x;
-                    src_rect.y = dst_rect.y - tile_rect.y;
-                    src_rect.width = dst_rect.width;
-                    src_rect.height = dst_rect.height;
-
-                    if (tile_hardware_accelerated) {
-                        blit.flags = TIG_ART_BLT_BLEND_COLOR_CONST;
-                    } else {
-                        blit.flags = TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
-                    }
-                    blit.color = outdoor_color;
-
-                    tig_art_blit(&blit);
-                }
-                rect_node = rect_node->next;
-            }
-        }
-    }
-}
+// CE: batched scan of facade tiles' rendered pixels. Facades that blit pure black
+// are the unfinished/black-art off-camera scenery (real, renderable art that just
+// draws black) — undetectable from art or lighting, only from the final pixel. We
+// record candidates during the draw and read them back once per frame (one VB lock)
+// to mark them void, so the existing void-edge fade feathers from them.
+typedef struct {
+    int64_t sec_id;
+    int index;
+    int px;
+    int py;
+    int ff_center; // center fade factor applied this frame (255 = unfaded)
+} GapScanEntry;
+static GapScanEntry gap_scan_list[16384];
+static int gap_scan_count;
 
 // NOTE: In the original code this function is a part of `tile_draw`, however
 // if `tile_draw_topdown` is definitely there, why `tile_draw_iso` should not?
@@ -794,10 +659,10 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     tig_color_t outdoor_color;
     int v2;
     int v4;
-    int indexes[3];
-    int widths[3];
-    bool sector_lock_results[3];
-    Sector* sectors[3];
+    int indexes[SECTOR_RECT_DIM];
+    int widths[SECTOR_RECT_DIM];
+    bool sector_lock_results[SECTOR_RECT_DIM];
+    Sector* sectors[SECTOR_RECT_DIM];
     int64_t loc_x;
     int64_t loc_y;
     TigRectListNode* rect_node;
@@ -825,6 +690,13 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     indoor_color = light_get_indoor_color();
     outdoor_color = light_get_outdoor_color();
+
+    // Apply any "renders black" marks collected last frame (turns the black off-area
+    // facades into void so the fade feathers from them) before this frame draws.
+    if (tile_gap_fill_enabled()) {
+        tile_gap_fill_flush_dark();
+    }
+    gap_scan_count = 0;
 
     light_buffers_lock();
 
@@ -887,6 +759,8 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                 if (sector_lock_results[v15]) {
                     for (v42 = 0; v42 < v3->num_hor_tiles[v15]; v42++) {
                         blit_info_initialized = false;
+                        int tile_fade_center = 255;
+                        int tile_pre_sum = -1;
                         // Fast-reject tiles outside the dirty-rect union
                         // before paying for roof_is_covered_xy (which does
                         // sector lookups). Tile rect math matches what
@@ -900,7 +774,11 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                             && center_y < tile_draw_dirty_union.y + tile_draw_dirty_union.height
                             && (center_y + tile_rect.height) > tile_draw_dirty_union.y;
                         if (tile_in_dirty && !roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
+                            // CE: void/gap tiles were already replaced with real terrain
+                            // in this sector's tile data at load (tile_gap_fill_sector),
+                            // so the normal draw path renders them affixed to the map.
                             art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
+
                             tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
                             tile_rect.x = center_x + 1;
                             tile_rect.y = center_y;
@@ -934,6 +812,38 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             }
                                         } else {
                                             art_blit_info.flags = 0;
+                                        }
+
+                                        // CE void-edge fade: feather whatever edge tile
+                                        // (terrain or facade) borders the void into
+                                        // black, using a per-vertex brightness from the
+                                        // density field, then force the lerp blit.
+                                        // Indoor-type TILE art never fades (dungeon and
+                                        // cave floors keep their hard black edges — the
+                                        // original cave/dungeon exception); facade art
+                                        // is always eligible so cliff perimeters fade.
+                                        if (tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
+                                            || tile_type == TIG_ART_TILE_TYPE_OUTDOOR) {
+                                            unsigned char ff[9];
+                                            tile_pre_sum = (int)tig_color_get_red(v51[4])
+                                                + (int)tig_color_get_green(v51[4])
+                                                + (int)tig_color_get_blue(v51[4]);
+                                            if (tile_gap_fill_fade_factors(v3->sector_ids[v15], sectors[v15], indexes[v15], ff)) {
+                                                v51[0] = tig_color_mul(v51[0], tig_color_make(ff[0], ff[0], ff[0]));
+                                                v51[1] = tig_color_mul(v51[1], tig_color_make(ff[1], ff[1], ff[1]));
+                                                v51[2] = tig_color_mul(v51[2], tig_color_make(ff[2], ff[2], ff[2]));
+                                                v51[3] = tig_color_mul(v51[3], tig_color_make(ff[3], ff[3], ff[3]));
+                                                v51[4] = tig_color_mul(v51[4], tig_color_make(ff[4], ff[4], ff[4]));
+                                                v51[5] = tig_color_mul(v51[5], tig_color_make(ff[5], ff[5], ff[5]));
+                                                v51[6] = tig_color_mul(v51[6], tig_color_make(ff[6], ff[6], ff[6]));
+                                                v51[7] = tig_color_mul(v51[7], tig_color_make(ff[7], ff[7], ff[7]));
+                                                v51[8] = tig_color_mul(v51[8], tig_color_make(ff[8], ff[8], ff[8]));
+                                                art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_LERP;
+                                                if (!tile_hardware_accelerated) {
+                                                    art_blit_info.flags |= TIG_ART_BLT_PALETTE_ORIGINAL;
+                                                }
+                                                tile_fade_center = ff[4];
+                                            }
                                         }
                                     }
 
@@ -1023,6 +933,30 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                 }
                                 rect_node = rect_node->next;
                             }
+
+                            // CE: this facade tile was drawn this frame — queue its
+                            // center for the batched rendered-pixel scan below.
+                            // Record gates: facade-type art only (terrain must never
+                            // mark — dark-but-lit ground at night would fade the play
+                            // area into phantom clouds), lit (pre-fade lighting bright
+                            // — an unlit night facade is dark lighting, not black
+                            // art), and not already marked (settled tiles need no
+                            // re-probing). The center fade factor is recorded so the
+                            // scan can divide the fade back out and judge the
+                            // PRE-fade brightness.
+                            if (tile_gap_fill_enabled()
+                                && blit_info_initialized
+                                && tile_pre_sum >= 300
+                                && tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
+                                && !tile_gap_fill_dark_marked(v3->sector_ids[v15], indexes[v15])
+                                && gap_scan_count < (int)(sizeof(gap_scan_list) / sizeof(gap_scan_list[0]))) {
+                                gap_scan_list[gap_scan_count].sec_id = v3->sector_ids[v15];
+                                gap_scan_list[gap_scan_count].index = indexes[v15];
+                                gap_scan_list[gap_scan_count].px = center_x + 40;
+                                gap_scan_list[gap_scan_count].py = center_y + 20;
+                                gap_scan_list[gap_scan_count].ff_center = tile_fade_center;
+                                gap_scan_count++;
+                            }
                         }
 
                         indexes[v15]++;
@@ -1048,10 +982,58 @@ void tile_draw_iso(GameDrawInfo* draw_info)
         }
     }
 
-    // CE: fill the untiled void the camera exposes past the map edges (zoom-out
-    // reaches sectors that don't exist; the clamped sector_rect above never
-    // visits them). Synthesizes terrain from the nearest in-bounds sector.
-    tile_draw_iso_gap_skirt(draw_info, outdoor_color);
+    // CE: read back the queued facade tiles' rendered pixels in one pass (single VB
+    // lock). Any that blit pure black are the black off-camera scenery — mark them
+    // void so next frame's fade feathers from them. note_dark ignores already-void
+    // tiles, so this settles after the area's first full draw.
+    if (tile_gap_fill_enabled() && gap_scan_count > 0) {
+        TigVideoBufferData vbd;
+        if (tig_video_buffer_lock(dword_602DF0) == TIG_OK) {
+            if (tig_video_buffer_data(dword_602DF0, &vbd) == TIG_OK && vbd.pixels != NULL) {
+                int i;
+                // Probe offsets within the 80x40 tile diamond around its center.
+                // A tile is "renders black" only if EVERY probe is black: true
+                // black.ART chunks pass; good cliff art with a dark crevice at
+                // one probe fails (single-pixel sampling marked those and sprayed
+                // false dark blotches onto lit faces).
+                static const int probe_dx[5] = { 0, -14, 14, 0, 0 };
+                static const int probe_dy[5] = { 0, 0, 0, -7, 7 };
+                for (i = 0; i < gap_scan_count; i++) {
+                    int px = gap_scan_list[i].px;
+                    int py = gap_scan_list[i].py;
+                    int ffc = gap_scan_list[i].ff_center;
+                    // Divide the fade back out to recover the pre-fade pixel, so a
+                    // cliff the fade merely dimmed isn't mistaken for black art.
+                    // Skip the innermost (ffc<16) ring: too faded to tell, and it
+                    // sits right at the void where the fade already exists.
+                    if (px >= 0 && py >= 0 && px < vbd.width && py < vbd.height && ffc >= 16) {
+                        int probes = 0;
+                        int blacks = 0;
+                        int k;
+                        for (k = 0; k < 5; k++) {
+                            int qx = px + probe_dx[k];
+                            int qy = py + probe_dy[k];
+                            if (qx >= 0 && qy >= 0 && qx < vbd.width && qy < vbd.height) {
+                                uint32_t pix = ((uint32_t*)((uint8_t*)vbd.pixels + (size_t)qy * (size_t)vbd.pitch))[qx];
+                                int pr = tig_color_get_red(pix) * 255 / ffc;
+                                int pg = tig_color_get_green(pix) * 255 / ffc;
+                                int pb = tig_color_get_blue(pix) * 255 / ffc;
+                                probes++;
+                                if (pr < 16 && pg < 16 && pb < 16) {
+                                    blacks++;
+                                }
+                            }
+                        }
+                        if (probes >= 3 && blacks == probes) {
+                            tile_gap_fill_note_dark(gap_scan_list[i].sec_id, gap_scan_list[i].index);
+                        }
+                    }
+                }
+            }
+            tig_video_buffer_unlock(dword_602DF0);
+        }
+        gap_scan_count = 0;
+    }
 
     light_buffers_unlock();
 }

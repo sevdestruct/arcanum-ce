@@ -738,17 +738,27 @@ bool sector_rect_from_loc_rect(LocRect* loc_rect, SectorRect* sector_rect)
     int y;
     int width;
     int height;
-    int64_t horizontal[4];
-    int64_t vertical[4];
+    // CE: large enough to hold the boundaries of any realistic zoomed-out view
+    // without overflowing (sector_compute_boundaries is unbounded). The original
+    // [4] overflowed once the view spanned >3 sectors (zoom-out / high-res),
+    // which is exactly what left the periphery untiled (black).
+    int64_t horizontal[128];
+    int64_t vertical[128];
 
     width = sector_compute_boundaries(loc_rect->x1, loc_rect->x2 + 1, 64, horizontal) - 1;
     if (width == 0) {
         return false;
     }
+    if (width > SECTOR_RECT_DIM) {
+        width = SECTOR_RECT_DIM;
+    }
 
     height = sector_compute_boundaries(loc_rect->y1, loc_rect->y2 + 1, 64, vertical) - 1;
     if (height == 0) {
         return false;
+    }
+    if (height > SECTOR_RECT_DIM) {
+        height = SECTOR_RECT_DIM;
     }
 
     for (y = 0; y < height; y++) {
