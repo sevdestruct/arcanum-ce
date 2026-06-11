@@ -969,37 +969,47 @@ void written_ui_draw_background(int num, int x, int y)
 
 static const char* const* written_ui_bg_candidates(void)
 {
+    // CE: Original ART stems first (see written_ui_backgrounds[]):
+    // 477 bookbackground.art, 489 notebackground.art, 487 newsbackground.art,
+    // 817 vendnewsback.art, 491 telebackground.art, 633 stone_plaque.art.
     static const char* book_candidates[] = {
+        "art\\interface\\bookbackground.bmp",
         "art\\interface\\book_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* note_candidates[] = {
+        "art\\interface\\notebackground.bmp",
         "art\\interface\\note_bg.bmp",
         "art\\interface\\paper_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* newspaper_candidates[] = {
+        "art\\interface\\newsbackground.bmp",
         "art\\interface\\newspaper_bg.bmp",
         "art\\interface\\paper_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* vendigroth_newspaper_candidates[] = {
+        "art\\interface\\vendnewsback.bmp",
         "art\\interface\\vendigroth_newspaper_bg.bmp",
+        "art\\interface\\newsbackground.bmp",
         "art\\interface\\newspaper_bg.bmp",
         "art\\interface\\paper_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* telegram_candidates[] = {
+        "art\\interface\\telebackground.bmp",
         "art\\interface\\telegram_bg.bmp",
         "art\\interface\\paper_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,
     };
     static const char* plaque_candidates[] = {
+        "art\\interface\\stone_plaque.bmp",
         "art\\interface\\plaque_bg.bmp",
         "art\\interface\\written_bg.bmp",
         NULL,

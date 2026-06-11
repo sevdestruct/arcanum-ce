@@ -31,6 +31,20 @@ typedef unsigned int TigVideoBufferFlags;
 #define TIG_VIDEO_BUFFER_RENDER_TARGET 0x0010
 #define TIG_VIDEO_BUFFER_TEXTURE 0x0020
 
+// CE: Flags for `tig_video_buffer_load_from_bmp`.
+typedef unsigned int TigVideoBufferLoadFromBmpFlags;
+
+// Create the destination video buffer (and return it via the out pointer).
+// Without this bit, the caller must pre-allocate `*video_buffer_ptr`.
+#define TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE 0x0001
+
+// Treat #00FF00 (pure green) as a chroma-key transparency color: keyed
+// pixels are skipped on downstream blits. Use this when loading custom
+// UI overrides (BMPs that paint #00FF00 in the cut-out regions). Also
+// auto-converts alpha=0 pixels in 32-bit BMPs to the key colour so an
+// artist can choose either authoring style.
+#define TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY 0x0002
+
 typedef unsigned int TigVideoBufferBlitFlags;
 
 #define TIG_VIDEO_BUFFER_BLIT_FLIP_X 0x0001

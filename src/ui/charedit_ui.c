@@ -823,7 +823,11 @@ static int64_t charedit_obj;
 // 0x64E018
 static bool charedit_created;
 
+// CE: Original ART stems first — the engine art the candidates fall
+// back to is documented per list. Custom CE-only names are kept as
+// secondary fallbacks for existing user assets.
 static const char* charedit_bg_candidates[] = {
+    "art\\interface\\char_maint.bmp", // 22
     "art\\interface\\character_bg.bmp",
     "art\\interface\\status_bg.bmp",
     "art\\interface\\charedit_bg.bmp",
@@ -831,6 +835,7 @@ static const char* charedit_bg_candidates[] = {
 };
 
 static const char* charedit_skills_bg_candidates[] = {
+    "art\\interface\\skills_window.bmp", // 29
     "art\\interface\\skills_bg.bmp",
     "art\\interface\\charedit_skills_bg.bmp",
     "art\\interface\\character_bg.bmp",
@@ -839,6 +844,7 @@ static const char* charedit_skills_bg_candidates[] = {
 };
 
 static const char* charedit_tech_bg_candidates[] = {
+    "art\\interface\\disciplines_window.bmp", // 30
     "art\\interface\\tech_bg.bmp",
     "art\\interface\\charedit_tech_bg.bmp",
     "art\\interface\\character_bg.bmp",
@@ -847,6 +853,7 @@ static const char* charedit_tech_bg_candidates[] = {
 };
 
 static const char* charedit_spells_bg_candidates[] = {
+    "art\\interface\\char_spells.bmp", // 31
     "art\\interface\\spellbook_bg.bmp",
     "art\\interface\\charedit_spells_bg.bmp",
     "art\\interface\\character_bg.bmp",
@@ -855,6 +862,7 @@ static const char* charedit_spells_bg_candidates[] = {
 };
 
 static const char* charedit_scheme_bg_candidates[] = {
+    "art\\interface\\scheme_rot.bmp", // 567
     "art\\interface\\crafting_tab_bg.bmp",
     "art\\interface\\charedit_scheme_bg.bmp",
     "art\\interface\\character_bg.bmp",

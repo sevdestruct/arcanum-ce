@@ -355,7 +355,10 @@ static bool schematic_ui_initialized;
  */
 static bool schematic_ui_created;
 
+// CE: Original ART (365 Schematic_Base.ART → schematic_base.bmp) leads,
+// existing CE custom names follow as fallback.
 static const char* schematic_ui_bg_candidates[] = {
+    "art\\interface\\schematic_base.bmp",
     "art\\interface\\crafting_bg.bmp",
     "art\\interface\\schematic_bg.bmp",
     NULL,

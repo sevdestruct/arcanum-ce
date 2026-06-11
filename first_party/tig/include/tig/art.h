@@ -434,6 +434,14 @@ int tig_art_blit(TigArtBlitInfo* blit_info);
 typedef TigVideoBuffer* (*TigArtCompositeResolver)(tig_art_id_t art_id);
 void tig_art_set_composite_resolver(TigArtCompositeResolver func);
 
+// CE: secondary resolver checked AFTER the composite resolver, used for
+// drop-in BMP overrides of regular .ART assets (custom UI). When non-NULL is
+// returned the .ART pipeline is bypassed and downstream callers (blit /
+// frame_data / anim_data / size) see the override's dimensions and pixels.
+// Returns NULL to leave the asset on the .ART path. Same signature as the
+// composite resolver; either or both may be registered independently.
+void tig_art_set_override_resolver(TigArtCompositeResolver func);
+
 int tig_art_type(tig_art_id_t art_id);
 unsigned int tig_art_num_get(tig_art_id_t art_id);
 tig_art_id_t tig_art_num_set(tig_art_id_t art_id, unsigned int value);

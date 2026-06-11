@@ -355,13 +355,20 @@ static bool logbook_ui_initialized;
  */
 static bool logbook_ui_created;
 
+// CE: Original ART stems first (logbooks_side.art for the left chrome,
+// book_main.art for the main page). The two lists confusingly named
+// `_bg` vs `_panel_bg`; see the callers — `_bg` covers art id 264, and
+// `_panel_bg` covers art id 260.
 static const char* logbook_ui_bg_candidates[] = {
+    "art\\interface\\logbooks_side.bmp",
     "art\\interface\\journal_bg.bmp",
     "art\\interface\\logbook_bg.bmp",
     NULL,
 };
 
 static const char* logbook_ui_panel_bg_candidates[] = {
+    "art\\interface\\book_main.bmp",
+    "art\\interface\\book_quests.bmp",
     "art\\interface\\journal_panel_bg.bmp",
     "art\\interface\\logbook_panel_bg.bmp",
     "art\\interface\\journal_page_bg.bmp",

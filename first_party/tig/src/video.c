@@ -2071,12 +2071,67 @@ int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_
         return TIG_ERR_IO;
     }
 
-    if ((flags & 0x1) != 0) {
+    // CE: TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY — treat #00FF00 (pure green)
+    // as transparent. Also normalize alpha-channel transparency on 32-bit
+    // BMPs: pixels with alpha < 128 are rewritten to the key colour with
+    // alpha=255 so an artist may author either as #00FF00 fills (24-bit)
+    // or as cut-outs (32-bit ARGB) and both work via the same path.
+    bool chromakey = (flags & TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY) != 0;
+    uint32_t key_pixel = 0;
+    if (chromakey) {
+        // Resolve #00FF00 into the source surface's pixel format. The
+        // surface format may differ from XRGB8888 (e.g. 8-bit palettized
+        // BMPs), so use SDL's helper rather than hard-coding 0x0000FF00.
+        const SDL_PixelFormatDetails* details = SDL_GetPixelFormatDetails(surface->format);
+        SDL_Palette* palette = SDL_GetSurfacePalette(surface);
+        key_pixel = SDL_MapRGB(details, palette, 0, 255, 0);
+
+        // Promote alpha=0 → key in 32-bit ARGB sources. Cheap one-time
+        // pass; only runs if the format actually carries alpha bits.
+        if (SDL_ISPIXELFORMAT_ALPHA(surface->format)) {
+            if (SDL_LockSurface(surface)) {
+                int bpp = SDL_BYTESPERPIXEL(surface->format);
+                for (int y = 0; y < surface->h; y++) {
+                    uint8_t* row = (uint8_t*)surface->pixels + y * surface->pitch;
+                    for (int x = 0; x < surface->w; x++) {
+                        uint8_t* pix = row + x * bpp;
+                        uint8_t r, g, b, a;
+                        uint32_t px = 0;
+                        SDL_memcpy(&px, pix, (size_t)bpp);
+                        SDL_GetRGBA(px, details, palette, &r, &g, &b, &a);
+                        if (a < 128) {
+                            uint32_t out = SDL_MapRGBA(details, palette, 0, 255, 0, 255);
+                            SDL_memcpy(pix, &out, (size_t)bpp);
+                        }
+                    }
+                }
+                SDL_UnlockSurface(surface);
+            }
+        }
+
+        // Skip key pixels during the source→vbuffer blit. SDL handles the
+        // mask transparently in blend-mode NONE.
+        SDL_SetSurfaceColorKey(surface, true, key_pixel);
+    }
+
+    if ((flags & TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE) != 0) {
         vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
         vb_create_info.width = surface->w;
         vb_create_info.height = surface->h;
-        vb_create_info.color_key = 0;
-        vb_create_info.background_color = 0;
+        if (chromakey) {
+            // Re-resolve the key in the vbuffer's own format (XRGB8888 in
+            // tig_video_buffer_create) so downstream blits skip the right
+            // value. background_color must match so the unwritten regions
+            // (where SDL_BlitSurface skipped keyed source pixels) still
+            // read as transparent.
+            uint32_t vb_key = tig_color_make(0, 255, 0);
+            vb_create_info.flags |= TIG_VIDEO_BUFFER_CREATE_COLOR_KEY;
+            vb_create_info.color_key = vb_key;
+            vb_create_info.background_color = vb_key;
+        } else {
+            vb_create_info.color_key = 0;
+            vb_create_info.background_color = 0;
+        }
 
         rc = tig_video_buffer_create(&vb_create_info, video_buffer_ptr);
         if (rc != TIG_OK) {
@@ -2087,7 +2142,7 @@ int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_
     }
 
     if ((*video_buffer_ptr)->surface->w < surface->w || (*video_buffer_ptr)->surface->h < surface->h) {
-        if ((flags & 0x1) != 0) {
+        if ((flags & TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE) != 0) {
             tig_video_buffer_destroy(*video_buffer_ptr);
         }
 
@@ -2102,7 +2157,7 @@ int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_
     blit_rect.h = surface->h;
 
     if (!SDL_BlitSurface(surface, &blit_rect, (*video_buffer_ptr)->surface, &blit_rect)) {
-        if ((flags & 0x1) != 0) {
+        if ((flags & TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE) != 0) {
             tig_video_buffer_destroy(*video_buffer_ptr);
         }
 

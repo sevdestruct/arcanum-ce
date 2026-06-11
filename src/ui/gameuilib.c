@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "game/gamelib.h"
+#include "game/name.h"
 #include "game/target.h"
 #include "ui/anim_ui.h"
 #include "ui/broadcast_ui.h"
@@ -175,6 +176,154 @@ static void gameuilib_neg_cache_clear(void)
     gameuilib_neg_cache_count = 0;
 }
 
+// CE: Per-art BMP override cache + tig override-resolver glue.
+//
+// The custom-UI BG path swaps full background images. Smaller composite
+// pieces drawn through the regular .ART pipeline (the PC lens cover
+// PCWinCvr.ART, the wmap Nav_Cvr.ART, the compass, individual buttons, …)
+// don't go through gameuilib_custom_ui_blit and so had no override hook.
+//
+// Solution: register a tig art-override resolver. For any interface art id
+// requested by the engine, we derive the original .ART path via
+// name_resolve_path, swap the extension to .bmp, and look it up through the
+// file repository (which mounts custom/default and custom/modules/<m>
+// above the .dat archives). If present, the BMP is loaded into a video
+// buffer with chromakey transparency (#00FF00 + alpha=0 normalized) and
+// returned from the resolver — tig_art_blit / tig_art_frame_data / etc.
+// then use it in place of the .ART asset.
+//
+// Cache is keyed on the normalized interface art id (palette/frame stripped)
+// to a hash slot. Misses are remembered as NULL so repeated draws don't
+// re-probe the disk. Cleared on mod load/unload alongside the BG caches.
+#define GAMEUILIB_ART_OVERRIDE_CAP 256
+
+typedef struct GameuilibArtOverrideEntry {
+    tig_art_id_t key;
+    TigVideoBuffer* vb; // NULL = looked up, absent
+    bool valid;
+} GameuilibArtOverrideEntry;
+
+static GameuilibArtOverrideEntry gameuilib_art_override_cache[GAMEUILIB_ART_OVERRIDE_CAP];
+static bool gameuilib_art_override_resolver_registered;
+
+// Strip palette and frame from an interface art id so all per-palette
+// variants share one override slot. (The override is a single BMP, so we
+// can't carry palette variation; for interface assets that's fine — the
+// per-palette ART variants are rarely used outside of items.)
+static tig_art_id_t gameuilib_art_override_key(tig_art_id_t aid)
+{
+    aid = tig_art_id_frame_set(aid, 0);
+    aid = tig_art_id_palette_set(aid, 0);
+    return aid;
+}
+
+static void gameuilib_art_override_cache_clear(void)
+{
+    int i;
+    for (i = 0; i < GAMEUILIB_ART_OVERRIDE_CAP; i++) {
+        if (gameuilib_art_override_cache[i].valid
+            && gameuilib_art_override_cache[i].vb != NULL) {
+            tig_video_buffer_destroy(gameuilib_art_override_cache[i].vb);
+        }
+        gameuilib_art_override_cache[i].valid = false;
+        gameuilib_art_override_cache[i].vb = NULL;
+        gameuilib_art_override_cache[i].key = 0;
+    }
+}
+
+// Convert an "art\interface\Foo.ART" path into "art\interface\foo.bmp".
+// Path is overwritten in place. Returns true on success, false on overflow
+// or missing dot.
+static bool gameuilib_art_path_to_bmp(char* path, size_t maxlen)
+{
+    size_t n = strlen(path);
+    char* dot;
+    size_t i;
+    if (n == 0 || n + 1 >= maxlen) {
+        return false;
+    }
+    dot = strrchr(path, '.');
+    if (dot == NULL) {
+        if (n + 4 >= maxlen) return false;
+        dot = path + n;
+    } else if ((size_t)(dot - path) + 4 >= maxlen) {
+        return false;
+    }
+    // Lowercase everything from the last separator onward so the lookup
+    // matches the file-repository's case-folded index on every platform.
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] >= 'A' && path[i] <= 'Z') {
+            path[i] = (char)(path[i] - 'A' + 'a');
+        }
+    }
+    // dot may have been lowercased to a different byte but the position
+    // is the same. Replace ".art" / ".ART" / whatever with ".bmp".
+    dot = strrchr(path, '.');
+    if (dot == NULL) dot = path + strlen(path);
+    *dot++ = '.';
+    *dot++ = 'b';
+    *dot++ = 'm';
+    *dot++ = 'p';
+    *dot = '\0';
+    return true;
+}
+
+static TigVideoBuffer* gameuilib_art_override_resolve(tig_art_id_t aid)
+{
+    tig_art_id_t key;
+    int slot;
+    int i;
+    int empty_idx;
+    char art_path[TIG_MAX_PATH];
+    TigVideoBuffer* vb;
+
+    // Only interface art is overridable today. Critter / scenery / portrait
+    // sprites have palette-driven lighting that a flat BMP can't model.
+    if (tig_art_type(aid) != TIG_ART_TYPE_INTERFACE) {
+        return NULL;
+    }
+
+    key = gameuilib_art_override_key(aid);
+    slot = (int)((unsigned int)key % GAMEUILIB_ART_OVERRIDE_CAP);
+    empty_idx = -1;
+    for (i = 0; i < GAMEUILIB_ART_OVERRIDE_CAP; i++) {
+        int idx = (slot + i) % GAMEUILIB_ART_OVERRIDE_CAP;
+        if (!gameuilib_art_override_cache[idx].valid) {
+            empty_idx = idx;
+            break;
+        }
+        if (gameuilib_art_override_cache[idx].key == key) {
+            return gameuilib_art_override_cache[idx].vb;
+        }
+    }
+    if (empty_idx == -1) {
+        // Table full — degrade gracefully by skipping the cache. Should
+        // never happen in practice for a single panel session.
+        empty_idx = slot;
+    }
+
+    vb = NULL;
+    if (name_resolve_path(key, art_path, sizeof(art_path)) == TIG_OK
+        && gameuilib_art_path_to_bmp(art_path, sizeof(art_path))) {
+        tig_video_buffer_load_from_bmp(art_path, &vb,
+            TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE
+                | TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY);
+    }
+
+    gameuilib_art_override_cache[empty_idx].key = key;
+    gameuilib_art_override_cache[empty_idx].vb = vb;
+    gameuilib_art_override_cache[empty_idx].valid = true;
+    return vb;
+}
+
+static void gameuilib_art_override_register(void)
+{
+    if (!gameuilib_art_override_resolver_registered) {
+        tig_art_set_override_resolver(gameuilib_art_override_resolve);
+        gameuilib_art_override_resolver_registered = true;
+    }
+}
+
 /**
  * Called when the game is initialized.
  *
@@ -205,6 +354,11 @@ bool gameuilib_init(GameInitInfo* init_info)
 
     gameuilib_initialized = true;
 
+    // CE: register the tig art-override resolver so per-asset BMP drop-ins
+    // (e.g. art/interface/pcwincvr.bmp replacing PCWinCvr.ART) flow through
+    // the regular art API.
+    gameuilib_art_override_register();
+
     // Register save and load callbacks.
     gamelib_set_extra_save_func(gameuilib_save);
     gamelib_set_extra_load_func(gameuilib_load);
@@ -232,6 +386,7 @@ void gameuilib_exit(void)
 
     gameuilib_custom_ui_cache_reset();
     gameuilib_neg_cache_clear();
+    gameuilib_art_override_cache_clear();
     gameuilib_initialized = false;
 }
 
@@ -296,6 +451,8 @@ bool gameuilib_mod_load(void)
     gameuilib_mod_loaded = true;
     // A module just mounted (possibly with its own UI bg files) — re-probe.
     gameuilib_neg_cache_clear();
+    // Same for per-art BMP overrides: new module dirs may add or hide files.
+    gameuilib_art_override_cache_clear();
 
     return true;
 }
@@ -323,6 +480,7 @@ void gameuilib_mod_unload(void)
     gameuilib_mod_loaded = false;
     gameuilib_custom_ui_cache_reset();
     gameuilib_neg_cache_clear();
+    gameuilib_art_override_cache_clear();
 }
 
 bool gameuilib_custom_ui_blit(tig_window_handle_t window_handle, const TigRect* canvas_rect, const TigRect* dst_rect, const char* const* candidates)
@@ -409,7 +567,11 @@ static bool gameuilib_custom_ui_cache_load(const char* const* candidates)
             return true;
         }
 
-        if (tig_video_buffer_load_from_bmp(candidates[index], &vb, 0x01) == TIG_OK) {
+        // CE: ALLOCATE | CHROMAKEY — pure-green (#00FF00) pixels and
+        // alpha=0 cut-outs in the source BMP are treated as transparent
+        // so the underlying engine art shows through.
+        if (tig_video_buffer_load_from_bmp(candidates[index], &vb,
+                TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE | TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY) == TIG_OK) {
             if (tig_video_buffer_data(vb, &vb_data) != TIG_OK) {
                 tig_video_buffer_destroy(vb);
                 continue;

@@ -5102,24 +5102,30 @@ static MainMenuWindowType mainmenu_ui_bg_window_type_resolve(void)
 
 static bool mainmenu_ui_load_bg_vb(MainMenuWindowType type)
 {
+    // CE: First slot is the original ART stem (the engine's
+    // background_art_num for that window, .ART → .bmp); second slot is the
+    // legacy CE-only name for back-compat with existing custom packs.
+    // Originals from interface.mes:
+    //   329 mainmenuback.art   556 optionsmenuback.art
+    //   745 saveloadbackground.art
     static const char* candidates[MM_WINDOW_COUNT][2] = {
         /* MM_WINDOW_0                    */ { NULL, NULL },
         /* MM_WINDOW_1                    */ { NULL, NULL },
-        /* MM_WINDOW_MAINMENU             */ { "art\\interface\\mainmenu_bg.bmp", NULL },
-        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art\\interface\\inmenu_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art\\interface\\inmenu_locked_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_SINGLE_PLAYER        */ { "art\\interface\\singleplayer_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_OPTIONS              */ { "art\\interface\\options_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_LOAD_GAME            */ { "art\\interface\\loadgame_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_SAVE_GAME            */ { "art\\interface\\savegame_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art\\interface\\savegame_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_MAINMENU             */ { "art\\interface\\mainmenuback.bmp", "art\\interface\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY     */ { "art\\interface\\inmenu_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_MAINMENU_IN_PLAY_LOCKED */ { "art\\interface\\inmenu_locked_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_SINGLE_PLAYER        */ { "art\\interface\\singleplayer_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_OPTIONS              */ { "art\\interface\\optionsmenuback.bmp", "art\\interface\\options_bg.bmp" },
+        /* MM_WINDOW_LOAD_GAME            */ { "art\\interface\\saveloadbackground.bmp", "art\\interface\\loadgame_bg.bmp" },
+        /* MM_WINDOW_SAVE_GAME            */ { "art\\interface\\saveloadbackground.bmp", "art\\interface\\savegame_bg.bmp" },
+        /* MM_WINDOW_LAST_SAVE_GAME       */ { "art\\interface\\saveloadbackground.bmp", "art\\interface\\savegame_bg.bmp" },
         /* MM_WINDOW_INTRO                */ { "art\\interface\\intro_bg.bmp", NULL },
-        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_NEW_CHAR             */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_PREGEN_CHAR          */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_CHAREDIT             */ { "art\\interface\\charedit_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_SHOP                 */ { "art\\interface\\shop_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
-        /* MM_WINDOW_CREDITS              */ { "art\\interface\\credits_bg.bmp", "art\\interface\\mainmenu_bg.bmp" },
+        /* MM_WINDOW_PICK_NEW_OR_PREGEN   */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_NEW_CHAR             */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_PREGEN_CHAR          */ { "art\\interface\\newchar_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_CHAREDIT             */ { "art\\interface\\charedit_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_SHOP                 */ { "art\\interface\\shop_bg.bmp", "art\\interface\\mainmenuback.bmp" },
+        /* MM_WINDOW_CREDITS              */ { "art\\interface\\credits_bg.bmp", "art\\interface\\mainmenuback.bmp" },
         /* MM_WINDOW_26                   */ { NULL, NULL },
     };
     int i;
@@ -5134,7 +5140,9 @@ static bool mainmenu_ui_load_bg_vb(MainMenuWindowType type)
         if (candidates[type][i] == NULL) {
             break;
         }
-        if (tig_video_buffer_load_from_bmp(candidates[type][i], &vb, 0x01) == TIG_OK) {
+        // CE: ALLOCATE | CHROMAKEY — see gameuilib_custom_ui_blit.
+        if (tig_video_buffer_load_from_bmp(candidates[type][i], &vb,
+                TIG_VIDEO_BUFFER_LOAD_BMP_ALLOCATE | TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY) == TIG_OK) {
             if (tig_video_buffer_data(vb, &vb_data) != TIG_OK) {
                 tig_video_buffer_destroy(vb);
                 continue;

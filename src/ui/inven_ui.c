@@ -3988,32 +3988,44 @@ tig_art_id_t sub_5782D0(void)
 
 static const char* const* inven_ui_bg_candidates(void)
 {
+    // CE: Each list leads with the original ART stem (.bmp) — see
+    // sub_5782D0() for the per-mode art ids: 223 PDoll.ART (normal /
+    // npc-identify / npc-repair), 234 Loot.art (loot / steal / identify /
+    // repair), 235 Barter.art (barter), 825 Barter_Follower.ART (barter
+    // with cycle buttons). Authors can drop in `pdoll.bmp` etc. directly.
     static const char* inventory_candidates[] = {
+        "art\\interface\\pdoll.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* barter_candidates[] = {
+        "art\\interface\\barter.bmp",
+        "art\\interface\\barter_follower.bmp",
         "art\\interface\\barter_bg.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* loot_candidates[] = {
+        "art\\interface\\loot.bmp",
         "art\\interface\\loot_bg.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* steal_candidates[] = {
+        "art\\interface\\loot.bmp",
         "art\\interface\\steal_bg.bmp",
         "art\\interface\\loot_bg.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* identify_candidates[] = {
+        "art\\interface\\loot.bmp",
         "art\\interface\\identify_bg.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,
     };
     static const char* repair_candidates[] = {
+        "art\\interface\\loot.bmp",
         "art\\interface\\repair_bg.bmp",
         "art\\interface\\inventory_bg.bmp",
         NULL,

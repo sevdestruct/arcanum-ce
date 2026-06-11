@@ -438,7 +438,14 @@ static bool wmap_ui_initialized;
 // 0x66D864
 static bool wmap_ui_created;
 
+// CE: Drop-in BMP overrides for the world-map big-window background.
+// The first candidate uses the original ART stem (mapmain.art →
+// art/interface/mapmain.bmp) so authors can replace the engine asset by
+// its native name. The legacy CE-only names are kept as fallbacks for
+// existing customs. #00FF00 pixels and alpha=0 cut-outs in the BMP are
+// honored as transparency — see TIG_VIDEO_BUFFER_LOAD_BMP_CHROMAKEY.
 static const char* wmap_ui_bg_candidates[] = {
+    "art\\interface\\mapmain.bmp",
     "art\\interface\\worldmap_bg.bmp",
     "art\\interface\\map_bg.bmp",
     "art\\interface\\wmap_bg.bmp",
@@ -2776,10 +2783,23 @@ bool wmTileArtLockMode(WmapUiMode mode, int tile)
             wmap_ui_mode_info[mode].num_loaded_tiles++;
         } else {
             tig_debug_printf("WMapUI: Blit: ERROR: Bmp Load Failed!\n");
+            // CE: defensive null-out — wmTileArtLoad does not initialize
+            // the video_buffer on failure, so a stale pointer (or junk
+            // from a prior unload) can be read by callers if we ever
+            // reach the blit path with a half-failed tile. Returning
+            // false below also keeps callers from blitting, but the
+            // null-out ensures the asymmetric "load attempted, failed,
+            // pointer dangling" state can never crash later.
+            wmap_ui_mode_info[mode].tiles[tile].video_buffer = NULL;
         }
     }
 
-    return true;
+    // CE: was always returning true even when the load failed. Two callers
+    // explicitly branch on this — wmap_world_refresh_rect skips the blit
+    // (the crashing site if `video_buffer` is NULL — SEGV reading
+    // ->frame.width at offset 12) and wmap_load_worldmap_info reports an
+    // init error. Returning the actual lock state restores both checks.
+    return (wmap_ui_mode_info[mode].tiles[tile].flags & 0x1) != 0;
 }
 
 // 0x5630F0

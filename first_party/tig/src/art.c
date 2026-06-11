@@ -523,16 +523,38 @@ void sub_5022D0(void)
 // runtime-built video buffer; NULL for all normal art.
 static TigArtCompositeResolver tig_art_composite_resolver_func;
 
+// CE: override resolver — runs AFTER the composite resolver. Lets the game
+// substitute a runtime-loaded video buffer (e.g. a BMP override) for an
+// otherwise-normal .ART asset. NULL skips this stage.
+static TigArtCompositeResolver tig_art_override_resolver_func;
+
 void tig_art_set_composite_resolver(TigArtCompositeResolver func)
 {
     tig_art_composite_resolver_func = func;
 }
 
+void tig_art_set_override_resolver(TigArtCompositeResolver func)
+{
+    tig_art_override_resolver_func = func;
+}
+
 static TigVideoBuffer* tig_art_composite_vb(tig_art_id_t art_id)
 {
-    return tig_art_composite_resolver_func != NULL
-        ? tig_art_composite_resolver_func(art_id)
-        : NULL;
+    TigVideoBuffer* vb;
+
+    if (tig_art_composite_resolver_func != NULL) {
+        vb = tig_art_composite_resolver_func(art_id);
+        if (vb != NULL) {
+            return vb;
+        }
+    }
+    if (tig_art_override_resolver_func != NULL) {
+        vb = tig_art_override_resolver_func(art_id);
+        if (vb != NULL) {
+            return vb;
+        }
+    }
+    return NULL;
 }
 
 // 0x502360
