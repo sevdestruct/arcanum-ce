@@ -4047,15 +4047,25 @@ void mainmenu_ui_last_save_create(void)
             // would stay visible around it during the load. Fill the
             // backdrop too so the entire screen blacks out while the
             // save loads.
+            //
+            // CE: fill the backdrop's FULL extent, not a screen-sized rect
+            // at its local origin. The backdrop is oversized (screen ×
+            // 1/0.96) and its local (0,0) maps ~2% off the top-left of the
+            // screen, so a screen-sized fill at (0,0) is offset from the
+            // screen-visible center and leaves the bg showing along the
+            // right/bottom edges — the "perimeter edge" seen during load.
             if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID) {
-                TigRect backdrop_rect;
-                backdrop_rect.x = 0;
-                backdrop_rect.y = 0;
-                backdrop_rect.width = hrp_iso_window_width_get();
-                backdrop_rect.height = hrp_iso_window_height_get();
-                tig_window_fill(mainmenu_ui_backdrop_handle,
-                    &backdrop_rect,
-                    tig_color_make(0, 0, 0));
+                TigWindowData backdrop_wd;
+                if (tig_window_data(mainmenu_ui_backdrop_handle, &backdrop_wd) == TIG_OK) {
+                    TigRect backdrop_rect;
+                    backdrop_rect.x = 0;
+                    backdrop_rect.y = 0;
+                    backdrop_rect.width = backdrop_wd.rect.width;
+                    backdrop_rect.height = backdrop_wd.rect.height;
+                    tig_window_fill(mainmenu_ui_backdrop_handle,
+                        &backdrop_rect,
+                        tig_color_make(0, 0, 0));
+                }
             }
 
             rect.x = 340;
@@ -5282,6 +5292,30 @@ static void mainmenu_ui_blit_custom_bg_at(tig_window_handle_t wnd, TigRect win_s
     tig_window_copy_from_vbuffer(wnd, &dst_r, mainmenu_ui_custom_bg_vb, &src_r);
 }
 
+// CE: fill the OVERSIZED backdrop window with the bg. The backdrop is
+// sized screen × (1/0.96) so it stays screen-covering when it recedes /
+// exits to scale 0.96 (its whole extent shrinks to the screen). The
+// plain centered copy only places the asset at native size centered on
+// the SCREEN, so the ~2%-per-side overdraw margin is left as the window's
+// black background unless the asset happens to be >=4% larger than the
+// screen — and that black margin sweeps on-screen as a perimeter edge
+// around the bg when the backdrop scales toward 0.96 (most visibly during
+// the menu->game exit). Fix: first stretch the full bg to cover the
+// entire backdrop (puts slightly-zoomed bg content in the margin instead
+// of black), then overlay the native-framing centered copy so the
+// screen-visible center stays pixel-exact at scale 1.0.
+static void mainmenu_ui_fill_backdrop_bg(tig_window_handle_t wnd, TigRect win_rect)
+{
+    if (mainmenu_ui_custom_bg_vb != NULL
+        && mainmenu_ui_custom_bg_width > 0
+        && mainmenu_ui_custom_bg_height > 0) {
+        TigRect src_r = { 0, 0, mainmenu_ui_custom_bg_width, mainmenu_ui_custom_bg_height };
+        TigRect dst_r = { 0, 0, win_rect.width, win_rect.height };
+        tig_window_copy_from_vbuffer(wnd, &dst_r, mainmenu_ui_custom_bg_vb, &src_r);
+    }
+    mainmenu_ui_blit_custom_bg_to_window(wnd, win_rect);
+}
+
 // CE: thin wrapper around the shared gamelib helper — extracts the
 // panel window's video buffer and delegates the actual pixel work.
 // See gamelib_apply_legacy_vignette_to_vb for the full behavior +
@@ -5363,7 +5397,7 @@ static void mainmenu_ui_reapply_custom_bg(void)
 
     if (mainmenu_ui_backdrop_handle != TIG_WINDOW_HANDLE_INVALID
         && tig_window_data(mainmenu_ui_backdrop_handle, &window_data) == TIG_OK) {
-        mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_backdrop_handle, window_data.rect);
+        mainmenu_ui_fill_backdrop_bg(mainmenu_ui_backdrop_handle, window_data.rect);
     }
 
     if (mainmenu_ui_custom_bg_is_fallback) {
@@ -5673,7 +5707,7 @@ void mainmenu_ui_create_window_func(bool should_display)
                     && !mainmenu_ui_is_shell_menu(mainmenu_ui_window_type)) {
                     mainmenu_ui_custom_bg_is_fallback = true;
                 }
-                mainmenu_ui_blit_custom_bg_to_window(mainmenu_ui_backdrop_handle, backdrop_data.rect);
+                mainmenu_ui_fill_backdrop_bg(mainmenu_ui_backdrop_handle, backdrop_data.rect);
             }
         }
         // The backdrop is newer in MIDDLE z-class than the iso-interface
