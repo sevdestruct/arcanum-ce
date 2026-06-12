@@ -175,8 +175,9 @@ static bool sub_552050(int x, int y, TargetDescriptor* td);
 static void sub_5520D0(RotatingWindowType window_type, int step);
 static void iso_interface_window_swap(RotatingWindowType window_type);
 static void intgame_hud_apply_clips(void);
-// CE: FULL->MEDIUM wings-slide ghost (defined near the HUD window
-// helpers; used earlier in iso_interface_destroy and the TAB toggle).
+// CE: HUD collapse-transition "wings slide down" ghosts (FULL->MEDIUM and
+// MEDIUM->MINI), defined near the HUD window helpers; used earlier in
+// iso_interface_destroy and the TAB toggle.
 static void intgame_hud_ghost_destroy(void);
 static void intgame_hud_ghost_slide_down(void);
 static void intgame_hud_ghost_med_to_mini(void);
@@ -9906,12 +9907,14 @@ void intgame_hud_user_toggle(void)
     bool leaving_mini = (prev_stage == INTGAME_HUD_STAGE_MINI
         && intgame_hud_stage != INTGAME_HUD_STAGE_MINI);
 
-    // CE: FULL -> MEDIUM "wings slide down" ghost. Spawn BEFORE
-    // apply_clips below — it snapshots the bar while it's still FULL,
-    // then apply_clips re-clips the real bar to the MEDIUM band. The
-    // ghost slides the full-bar snapshot down behind the band. (Other
-    // transitions keep their existing behavior for now; this prototype
-    // covers the FULL->MEDIUM step only.)
+    // CE: collapse-transition "wings slide down" ghosts. Each step where
+    // the bar shrinks — FULL -> MEDIUM here, MEDIUM -> MINI just below —
+    // spawns a snapshot of the departing (larger) bar that slides + fades
+    // down behind the new, smaller band, so the chrome that's lost reads
+    // as sliding off rather than blinking away. Spawned BEFORE apply_clips
+    // / the rotwin swap below so the snapshot captures the bar while it's
+    // still at the larger stage. The expanding transitions (MEDIUM -> FULL,
+    // MINI -> MEDIUM) and HIDDEN just re-show their chrome directly.
     if (prev_stage == INTGAME_HUD_STAGE_FULL
         && intgame_hud_stage == INTGAME_HUD_STAGE_MEDIUM) {
         intgame_hud_ghost_slide_down();
