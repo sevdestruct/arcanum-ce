@@ -9,6 +9,7 @@
 #include "game/random.h"
 #include "game/roof.h"
 #include "game/sector.h"
+#include "game/iso_zoom.h"
 #include "game/tile_block.h"
 #include "game/void_edge_fade.h"
 
@@ -986,7 +987,14 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     // lock). Any that blit pure black are the black off-camera scenery — mark them
     // void so next frame's fade feathers from them. note_dark ignores already-void
     // tiles, so this settles after the area's first full draw.
-    if (void_edge_fade_enabled() && gap_scan_count > 0) {
+    //
+    // Skip the scan entirely while the zoom is animating: at zoom != 1 the world
+    // VB is rendered across frames and "has stale or empty regions" during a zoom
+    // step (see gamelib draw), so reading it then marks tiles black at positions
+    // that were only momentarily black mid-zoom — leaving fade painted in the
+    // wrong place. The marks are persistent, so detecting once the zoom settles is
+    // enough.
+    if (void_edge_fade_enabled() && gap_scan_count > 0 && !iso_zoom_is_animating()) {
         TigVideoBufferData vbd;
         if (tig_video_buffer_lock(dword_602DF0) == TIG_OK) {
             if (tig_video_buffer_data(dword_602DF0, &vbd) == TIG_OK && vbd.pixels != NULL) {
