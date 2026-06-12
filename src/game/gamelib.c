@@ -13,6 +13,7 @@
 #include "game/iso_zoom.h"
 #include "game/location.h"
 #include "game/tile.h"
+#include "ui/anim_ui.h"
 #include "ui/fate_ui.h"
 #include "ui/follower_ui.h"
 #include "ui/intgame.h"
@@ -1465,6 +1466,10 @@ bool gamelib_draw(void)
     follower_ui_ping();
     fate_ui_ping();
     sleep_ui_ping();
+    // CE: ease the time-of-day ambient lighting toward the current
+    // fractional hour so dawn/dusk fade gradually instead of snapping on
+    // the hour. Self-throttled; no-op outside a game session.
+    ambient_lighting_ping();
     // CE: dialog choice box slide (tc_bottom_gap_offset spring) also
     // belongs in the pre-dirty group. In practice TC's own
     // invalidations keep gamelib_dirty true through its tween, but

@@ -77,6 +77,16 @@ static mes_file_handle_t light_schemes_msg_file;
  */
 static bool light_scheme_changing;
 
+// CE: change-detection cache for the smooth time-of-day tween
+// (light_scheme_set_time). Holds the last indoor/outdoor colors actually
+// pushed to light_set_colors so the tween only triggers the expensive
+// relight when the rounded blended color genuinely changes. Invalidated
+// (have_last=false) whenever the discrete light_scheme_set_hour path
+// relights, so a map/scheme change isn't skipped.
+static bool light_scheme_tween_have_last = false;
+static tig_color_t light_scheme_tween_last_indoor;
+static tig_color_t light_scheme_tween_last_outdoor;
+
 /**
  * Called when the game is initialized.
  *
@@ -286,6 +296,11 @@ bool light_scheme_set_hour(int hour)
 
     light_scheme_hour = hour;
 
+    // CE: a discrete hour set relights directly, so drop the tween cache —
+    // otherwise the next light_scheme_set_time could skip a relight it
+    // shouldn't (e.g. after a map/scheme change reapplied a fresh hour).
+    light_scheme_tween_have_last = false;
+
     // Indicate that the light scheme is being updated.
     light_scheme_changing = true;
 
@@ -298,6 +313,180 @@ bool light_scheme_set_hour(int hour)
     light_set_colors(indoor_color, outdoor_color);
 
     // Indicate that the update is complete.
+    light_scheme_changing = false;
+
+    return true;
+}
+
+// CE: half-width of the day/night transition, in seconds-of-the-hour. The
+// per-hour scheme set-point is held flat through the middle of its hour;
+// the blend to the neighbouring hour happens only within this many seconds
+// on EITHER side of the hour boundary (so the transition is centred on the
+// boundary, half in the outgoing hour and half in the incoming one).
+//
+// 1200 = 20 min each side → a 40-minute crossfade centred on the hour,
+// with the set-point held flat for the central 20 minutes. This "splits
+// the difference": gradual like a real dawn/dusk, but the colours stay
+// anchored to their authored hours instead of sliding a full hour early.
+// 0 would reproduce the original hard hourly snap; 1800 (30 min) would be
+// a continuous full-hour crossfade with no flat hold.
+#define LIGHT_SCHEME_TWEEN_HALF_WINDOW_S 1200
+
+// CE: how fast the *applied* colour chases the (already-gradual) windowed
+// target, in 8-bit units/sec/channel. This is just real-time smoothing
+// between the once-per-second target samples — high enough to track the
+// target with no perceptible lag, finite so a discrete second-step or a
+// post-load re-anchor eases in rather than popping.
+#define LIGHT_SCHEME_TWEEN_RATE 64
+
+static int light_scheme_blend(int lo, int hi, int num, int den)
+{
+    return lo + (hi - lo) * num / den;
+}
+
+static int light_scheme_ease_channel(int cur, int target, int step)
+{
+    if (cur < target) {
+        cur += step;
+        if (cur > target) cur = target;
+    } else if (cur > target) {
+        cur -= step;
+        if (cur < target) cur = target;
+    }
+    return cur;
+}
+
+// CE: smoothly tween the ambient lighting toward a centred-window target
+// for the current time of day. Called per real-time frame (from
+// ambient_lighting_ping) with hour/minute/second and the elapsed dt.
+//
+// The target holds each hour's exact authored set-point flat through the
+// middle of the hour, and crossfades to the neighbouring hour only within
+// LIGHT_SCHEME_TWEEN_HALF_WINDOW_S of the hour boundary (centred on it). So
+// "what time is what lighting" stays anchored to the authored hours — the
+// colour never previews the next hour a full hour early — while dawn/dusk
+// still read as a gradual fade. The applied colour then eases toward that
+// target so the real-time motion is smooth between once-per-second samples.
+//
+// Performance: light_set_colors rebuilds the ambient palettes and
+// re-lights every loaded sector, so the applied colour is rounded to 8-bit
+// RGB and compared against the last one actually pushed — the relight only
+// fires when it genuinely changes. Flat stretches (the held middle of each
+// hour, deep night, midday) cost nothing; only an in-progress crossfade
+// steps, and the caller throttles how often this runs.
+bool light_scheme_set_time(int hour, int minute, int second, int dt_ms)
+{
+    // Applied (currently displayed) ambient channels, eased toward target.
+    static int a_ir, a_ig, a_ib;  // indoor
+    static int a_or, a_og, a_ob;  // outdoor
+
+    LightSchemeData* cur;
+    LightSchemeData* nbr;       // neighbour we're blending toward (or NULL)
+    int blend_num, blend_den;   // crossfade position toward nbr
+    int sec_in_hour;
+    int w;
+    int t_ir, t_ig, t_ib, t_or, t_og, t_ob;
+    tig_color_t indoor;
+    tig_color_t outdoor;
+    int step;
+
+    if (light_schemes_msg_file == MES_FILE_HANDLE_INVALID) {
+        return false;
+    }
+    if (hour < 0 || hour >= LIGHT_SCHEME_HOURS) {
+        return false;
+    }
+    if (minute < 0) minute = 0;
+    if (minute > 59) minute = 59;
+    if (second < 0) second = 0;
+    if (second > 59) second = 59;
+
+    light_scheme_hour = hour;
+
+    cur = &(light_scheme_colors[hour]);
+    w = LIGHT_SCHEME_TWEEN_HALF_WINDOW_S;
+    sec_in_hour = minute * 60 + second; // 0..3599
+
+    // Determine the centred-window target. The transition spans
+    // [3600-w, 3600+w] around each hour boundary (i.e. the last w seconds
+    // of this hour and the first w seconds of the next), reaching the 50%
+    // midpoint exactly on the boundary.
+    nbr = NULL;
+    blend_num = 0;
+    blend_den = 1;
+    if (w > 0) {
+        if (sec_in_hour < w) {
+            // Tail of the (prev hour -> this hour) crossfade: runs from
+            // 50% (at the boundary) up to 100% this-hour at +w.
+            nbr = &(light_scheme_colors[(hour + LIGHT_SCHEME_HOURS - 1) % LIGHT_SCHEME_HOURS]);
+            // fraction toward `cur` = (w + sec) / (2w); express as blend
+            // FROM nbr TO cur.
+            blend_num = w + sec_in_hour;
+            blend_den = 2 * w;
+            // target = blend(nbr, cur, blend_num/blend_den)
+            t_ir = light_scheme_blend(nbr->indoor.red, cur->indoor.red, blend_num, blend_den);
+            t_ig = light_scheme_blend(nbr->indoor.green, cur->indoor.green, blend_num, blend_den);
+            t_ib = light_scheme_blend(nbr->indoor.blue, cur->indoor.blue, blend_num, blend_den);
+            t_or = light_scheme_blend(nbr->outdoor.red, cur->outdoor.red, blend_num, blend_den);
+            t_og = light_scheme_blend(nbr->outdoor.green, cur->outdoor.green, blend_num, blend_den);
+            t_ob = light_scheme_blend(nbr->outdoor.blue, cur->outdoor.blue, blend_num, blend_den);
+        } else if (sec_in_hour > 3600 - w) {
+            // Head of the (this hour -> next hour) crossfade: 0% at -w,
+            // 50% at the boundary.
+            nbr = &(light_scheme_colors[(hour + 1) % LIGHT_SCHEME_HOURS]);
+            blend_num = sec_in_hour - (3600 - w);
+            blend_den = 2 * w;
+            t_ir = light_scheme_blend(cur->indoor.red, nbr->indoor.red, blend_num, blend_den);
+            t_ig = light_scheme_blend(cur->indoor.green, nbr->indoor.green, blend_num, blend_den);
+            t_ib = light_scheme_blend(cur->indoor.blue, nbr->indoor.blue, blend_num, blend_den);
+            t_or = light_scheme_blend(cur->outdoor.red, nbr->outdoor.red, blend_num, blend_den);
+            t_og = light_scheme_blend(cur->outdoor.green, nbr->outdoor.green, blend_num, blend_den);
+            t_ob = light_scheme_blend(cur->outdoor.blue, nbr->outdoor.blue, blend_num, blend_den);
+        } else {
+            nbr = NULL; // flat hold in the middle of the hour
+        }
+    }
+    if (nbr == NULL) {
+        t_ir = cur->indoor.red;
+        t_ig = cur->indoor.green;
+        t_ib = cur->indoor.blue;
+        t_or = cur->outdoor.red;
+        t_og = cur->outdoor.green;
+        t_ob = cur->outdoor.blue;
+    }
+
+    if (!light_scheme_tween_have_last) {
+        // First apply, or right after a discrete light_scheme_set_hour —
+        // snap to the target so there's no ease from a stale color.
+        a_ir = t_ir; a_ig = t_ig; a_ib = t_ib;
+        a_or = t_or; a_og = t_og; a_ob = t_ob;
+    } else {
+        step = dt_ms * LIGHT_SCHEME_TWEEN_RATE / 1000;
+        if (step < 1) step = 1;
+        a_ir = light_scheme_ease_channel(a_ir, t_ir, step);
+        a_ig = light_scheme_ease_channel(a_ig, t_ig, step);
+        a_ib = light_scheme_ease_channel(a_ib, t_ib, step);
+        a_or = light_scheme_ease_channel(a_or, t_or, step);
+        a_og = light_scheme_ease_channel(a_og, t_og, step);
+        a_ob = light_scheme_ease_channel(a_ob, t_ob, step);
+    }
+
+    indoor = tig_color_make(a_ir, a_ig, a_ib);
+    outdoor = tig_color_make(a_or, a_og, a_ob);
+
+    // Change-detect: skip the expensive relight when the rounded color
+    // hasn't actually moved.
+    if (light_scheme_tween_have_last
+        && indoor == light_scheme_tween_last_indoor
+        && outdoor == light_scheme_tween_last_outdoor) {
+        return true;
+    }
+    light_scheme_tween_have_last = true;
+    light_scheme_tween_last_indoor = indoor;
+    light_scheme_tween_last_outdoor = outdoor;
+
+    light_scheme_changing = true;
+    light_set_colors(indoor, outdoor);
     light_scheme_changing = false;
 
     return true;

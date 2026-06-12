@@ -7,6 +7,7 @@
 #include "game/player.h"
 #include "game/timeevent.h"
 #include "game/ui.h"
+#include "tig/timer.h"
 #include "ui/combat_ui.h"
 #include "ui/compact_ui.h"
 #include "ui/gameuilib.h"
@@ -141,9 +142,13 @@ bool anim_ui_bkg_process_callback(TimeEvent* timeevent)
 
     switch (timeevent->params[0].integer_value) {
     case ANIM_UI_EVENT_TYPE_UPDATE_HEALTH_BAR:
+        // CE: value changed → bubble the health vial (event-driven, no
+        // per-frame stat polling), then redraw it.
+        intgame_vial_disturb(INTGAME_BAR_HEALTH);
         intgame_draw_bar(INTGAME_BAR_HEALTH);
         break;
     case ANIM_UI_EVENT_TYPE_UPDATE_FATIGUE_BAR:
+        intgame_vial_disturb(INTGAME_BAR_FATIGUE);
         intgame_draw_bar(INTGAME_BAR_FATIGUE);
         break;
     case ANIM_UI_EVENT_TYPE_2:
@@ -241,23 +246,71 @@ bool ambient_lighting_is_enabled(void)
 // 0x57D660
 bool ambient_lighting_process_callback(TimeEvent* timeevent)
 {
-    int hour;
     DateTime datetime;
     TimeEvent next_timeevent;
 
     (void)timeevent;
 
-    hour = datetime_current_hour();
-    if (ambient_lighting_is_enabled()) {
-        light_scheme_set_hour(hour);
-    }
-
+    // CE: the continuous, gracefully-eased lighting is now driven per
+    // real-time frame by ambient_lighting_ping → light_scheme_set_time
+    // (which holds each hour's exact set-point and eases the hourly step).
+    // This recurring event used to snap the hour with light_scheme_set_hour
+    // — doing so here would defeat the ease at every hour boundary, so it
+    // no longer touches the lighting; it just keeps a low-rate heartbeat.
+    // The discrete baseline on map/scheme change is still set by
+    // ambient_lighting_reschedule.
     timeevent_clear_all_typed(TIMEEVENT_TYPE_AMBIENT_LIGHTING);
     next_timeevent.type = TIMEEVENT_TYPE_AMBIENT_LIGHTING;
     sub_45A950(&datetime, 3600000);
     timeevent_add_delay(&next_timeevent, &datetime);
 
     return true;
+}
+
+// CE: per real-time frame, ease the ambient lighting toward the current
+// fractional time of day so dawn/dusk fade gracefully instead of snapping
+// on the hour. Throttled so the (expensive) relight inside
+// light_scheme_set_time can't fire more than ~20×/sec, and a no-op outside
+// a game session (no local PC) or when ambient lighting is disabled.
+void ambient_lighting_ping(void)
+{
+    static tig_timestamp_t last_ms;
+    static bool have_last = false;
+    static int accum_ms = 0;
+    tig_timestamp_t now;
+    int dt;
+
+    if (!ambient_lighting_is_enabled()) {
+        return;
+    }
+    if (player_get_local_pc_obj() == OBJ_HANDLE_NULL) {
+        return;
+    }
+
+    tig_timer_now(&now);
+    if (!have_last) {
+        last_ms = now;
+        have_last = true;
+        return;
+    }
+    dt = (int)tig_timer_between(last_ms, now);
+    last_ms = now;
+    if (dt <= 0) {
+        return;
+    }
+    if (dt > 250) dt = 250; // clamp after a hitch / pause
+
+    // Throttle relights to ~20/sec; accumulate dt so the ease speed is
+    // unaffected by the throttle.
+    accum_ms += dt;
+    if (accum_ms < 50) {
+        return;
+    }
+    light_scheme_set_time(datetime_current_hour(),
+        datetime_current_minute(),
+        datetime_current_second(),
+        accum_ms);
+    accum_ms = 0;
 }
 
 // 0x57D6C0

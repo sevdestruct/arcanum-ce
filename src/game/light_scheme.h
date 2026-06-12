@@ -22,6 +22,13 @@ int light_scheme_get_map_default(void);
 bool light_scheme_set(int light_scheme, int hour);
 int light_scheme_get(void);
 bool light_scheme_set_hour(int hour);
+// CE: smooth time-of-day tween — eases the applied ambient color toward a
+// centred-window target: each hour's authored set-point held flat through
+// the middle of the hour, crossfading to the neighbouring hour only around
+// the hour boundary, so the authored timing is preserved while dawn/dusk
+// fade gradually. Relights only when the rounded color actually changes.
+// Driven per real-time frame with the elapsed dt; see light_scheme.c.
+bool light_scheme_set_time(int hour, int minute, int second, int dt_ms);
 int light_scheme_get_hour(void);
 int light_scheme_is_changing(void);
 

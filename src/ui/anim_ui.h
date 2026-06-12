@@ -31,5 +31,9 @@ void anim_ui_event_add_delay(int type, int param, int milliseconds);
 void anim_ui_event_remove(int type, int param);
 void ambient_lighting_enable(void);
 void ambient_lighting_disable(void);
+// CE: per-frame driver for the smooth time-of-day lighting fade. Call once
+// per frame from the main draw loop; cheap no-op outside a game session or
+// when no color change is due.
+void ambient_lighting_ping(void);
 
 #endif /* ARCANUM_UI_ANIM_UI_H_ */
