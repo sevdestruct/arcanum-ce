@@ -1703,6 +1703,15 @@ void intgame_draw_counter(int counter, int value, int digits)
 }
 
 // 0x54AEE0
+// CE: per-vial current frame index for the bubbling-liquid animation
+// (indexed by INTGAME_BAR_*). Advanced by intgame_vial_anim_ping; read by
+// intgame_draw_bar_rect when blitting the liquid art. The normal health
+// (redvial #18) and fatigue (bluvial #19) arts are 15-frame animations;
+// poisoned (#17) and the empty tube (#20) are single-frame and resolve to
+// frame 0 regardless. The two vials run independent state machines so they
+// bubble out of sync.
+static int intgame_vial_frame[INTGAME_BAR_COUNT] = { 0, 0 };
+
 void intgame_draw_bar(int bar)
 {
     switch (bar) {
@@ -1829,7 +1838,22 @@ void intgame_draw_bar_rect(TigRect* rect)
                 tmp_rect.y = blit_rect.y - v14 - tmp_rect.y + 8;
                 tmp_rect.width = blit_rect.width;
                 tmp_rect.height = blit_rect.height;
-                tig_art_interface_id_create(nums[bar], 0, 0, 0, &(art_blit_info.art_id));
+                // CE: animate the liquid surface — redvial (#18) / bluvial
+                // (#19) are multi-frame "bubbling" arts. Advance to the
+                // shared vial phase frame so the surface ripples; the
+                // num_frames guard keeps single-frame liquids (poisoned
+                // #17) at frame 0.
+                {
+                    TigArtAnimData liquid_anim;
+                    int liquid_frame = 0;
+                    tig_art_interface_id_create(nums[bar], 0, 0, 0, &(art_blit_info.art_id));
+                    if (tig_art_anim_data(art_blit_info.art_id, &liquid_anim) == TIG_OK
+                        && liquid_anim.num_frames > 1) {
+                        liquid_frame = intgame_vial_frame[bar] % liquid_anim.num_frames;
+                        tig_art_interface_id_create(nums[bar], liquid_frame, 0, 0,
+                            &(art_blit_info.art_id));
+                    }
+                }
 
                 dst_rect.x = blit_rect.x - intgame_interface_window_frames[1].x;
                 dst_rect.width = tmp_rect.width;
@@ -10646,6 +10670,176 @@ void intgame_hud_slide_prepare_offscreen(void)
 // Cheap fast-path when the offset hasn't changed since the last
 // invocation (early return on identity). Called from gamelib_draw
 // after ui_anim_ping so it sees the just-integrated offset.
+// CE: vial animation state — one per bar so the two liquids bubble
+// independently (out of sync) rather than in lockstep. A vial spends most
+// of its time idle (settled at frame 0) and occasionally plays a short
+// "bubble" burst — a few loops through the liquid art — then waits a
+// randomized gap before the next one. A change in the underlying value
+// (taking/healing damage, draining/restoring fatigue) triggers a burst
+// immediately so the vial reacts when disturbed or replenished.
+typedef struct {
+    int frame;          // current displayed frame (0..num_frames-1)
+    int num_frames;     // resolved from the liquid art (0 = not yet resolved)
+    int base_frame_ms;  // frame duration from the art's authored fps
+    int cur_frame_ms;   // this burst's frame duration (randomized per burst)
+    int timer_ms;       // countdown to the next frame (playing) / next burst (idle)
+    int cycles_left;    // loops remaining in the current burst
+    bool playing;       // true: mid-burst; false: idle gap
+    bool disturb_pending; // set by intgame_vial_disturb (value changed); the
+                          // ping consumes it to kick a burst
+} IntgameVialAnim;
+static IntgameVialAnim intgame_vial[INTGAME_BAR_COUNT];
+
+// CE: tiny self-contained LCG for the vial timing jitter. Deliberately
+// NOT the game RNG — this is cosmetic and must not perturb gameplay/MP
+// random state. Seeded once from the wall clock.
+static unsigned int intgame_vial_rng = 0;
+
+static int intgame_vial_rand(int lo, int hi)
+{
+    if (hi <= lo) return lo;
+    intgame_vial_rng = intgame_vial_rng * 1103515245u + 12345u;
+    return lo + (int)((intgame_vial_rng >> 16) % (unsigned int)(hi - lo + 1));
+}
+
+// Kick a vial into a burst of `cycles` loops at a randomized speed,
+// starting from a settled frame.
+static void intgame_vial_start_burst(IntgameVialAnim* v, int cycles)
+{
+    v->playing = true;
+    v->cycles_left = cycles;
+    // ±25% speed jitter so bursts don't all feel identical.
+    v->cur_frame_ms = v->base_frame_ms * intgame_vial_rand(80, 130) / 100;
+    if (v->cur_frame_ms < 1) v->cur_frame_ms = 1;
+    v->frame = 0;
+    v->timer_ms = v->cur_frame_ms;
+}
+
+// Advance one vial's state machine by dt ms; returns true if its frame
+// changed and the bar needs a redraw.
+static bool intgame_vial_update(int bar, int dt)
+{
+    IntgameVialAnim* v = &intgame_vial[bar];
+    bool changed = false;
+
+    // Resolve the liquid art metadata once (health redvial #18 /
+    // fatigue bluvial #19; both 15-frame). Poisoned health (#17) is
+    // single-frame and handled by the num_frames guard in the draw.
+    if (v->num_frames == 0) {
+        tig_art_id_t art_id;
+        TigArtAnimData anim;
+        int art_num = (bar == INTGAME_BAR_HEALTH) ? 18 : 19;
+        if (tig_art_interface_id_create(art_num, 0, 0, 0, &art_id) == TIG_OK
+            && tig_art_anim_data(art_id, &anim) == TIG_OK
+            && anim.num_frames > 1 && anim.fps > 0) {
+            v->num_frames = anim.num_frames;
+            v->base_frame_ms = 1000 / anim.fps;
+        } else {
+            v->num_frames = 1;
+            v->base_frame_ms = 80;
+        }
+        if (v->base_frame_ms < 1) v->base_frame_ms = 1;
+        v->frame = 0;
+        v->playing = false;
+        // Stagger the first spontaneous burst per vial so they start
+        // desynced.
+        v->timer_ms = intgame_vial_rand(1200, 5000) + bar * 700;
+    }
+    if (v->num_frames <= 1) {
+        v->disturb_pending = false;
+        return false; // single-frame liquid — nothing to animate
+    }
+
+    // Disturb/replenish trigger: the value changed (event-driven via
+    // intgame_vial_disturb, so no per-frame stat polling here). Bubble the
+    // vial in reaction.
+    if (v->disturb_pending) {
+        v->disturb_pending = false;
+        if (!v->playing) {
+            intgame_vial_start_burst(v, intgame_vial_rand(2, 3));
+            changed = true;
+        } else if (v->cycles_left < 2) {
+            // already bubbling — keep it going a little longer
+            v->cycles_left = 2;
+        }
+    }
+
+    // Advance the burst / idle-gap countdown.
+    v->timer_ms -= dt;
+    if (v->playing) {
+        while (v->timer_ms <= 0) {
+            v->frame++;
+            v->timer_ms += v->cur_frame_ms;
+            changed = true;
+            if (v->frame >= v->num_frames) {
+                v->frame = 0;
+                if (--v->cycles_left <= 0) {
+                    // settle and wait a randomized gap before the next
+                    // spontaneous burst.
+                    v->playing = false;
+                    v->timer_ms = intgame_vial_rand(1500, 6000);
+                    break;
+                }
+            }
+        }
+    } else if (v->timer_ms <= 0) {
+        // spontaneous ambient burst (1-2 loops)
+        intgame_vial_start_burst(v, intgame_vial_rand(1, 2));
+        changed = true;
+    }
+
+    intgame_vial_frame[bar] = v->frame;
+    return changed;
+}
+
+// CE: drive the bubbling-liquid vial animations. Each vial runs an
+// independent burst/idle state machine (see intgame_vial_update) so they
+// bubble irregularly and out of sync, with gaps between cycles, and react
+// when their value is disturbed or replenished. Gated to the cases where
+// the bottom HUD vials are actually on screen so it doesn't force redraws
+// (and a composite) under a fullscreen window, in a shell menu, or while
+// the bar is slid out — keeping the cost to the small vial rects only.
+static void intgame_vial_anim_ping(void)
+{
+    static tig_timestamp_t last_ms;
+    static bool have_last = false;
+
+    if (dword_64C4F8[1] == TIG_WINDOW_HANDLE_INVALID) return;
+    if (intgame_hud_shell_hidden) return;
+    if (intgame_fullscreen_forced) return;
+    if (intgame_hud_stage == INTGAME_HUD_STAGE_HIDDEN) return;
+    if (player_get_local_pc_obj() == OBJ_HANDLE_NULL) return;
+
+    tig_timestamp_t now;
+    tig_timer_now(&now);
+    if (!have_last) {
+        last_ms = now;
+        have_last = true;
+        intgame_vial_rng = now ^ 0x9E3779B9u;
+        return;
+    }
+    int dt = (int)tig_timer_between(last_ms, now);
+    last_ms = now;
+    if (dt <= 0) return;
+    if (dt > 250) dt = 250; // clamp after a hitch / pause so we don't lurch
+
+    for (int bar = 0; bar < INTGAME_BAR_COUNT; bar++) {
+        if (intgame_vial_update(bar, dt)) {
+            intgame_draw_bar(bar);
+        }
+    }
+}
+
+// CE: react to a health/fatigue change by bubbling the matching vial.
+// Called from the bar-refresh events (UPDATE_HEALTH_BAR / UPDATE_FATIGUE_BAR)
+// so disturbance is event-driven — no per-frame stat polling. The ping
+// picks up the pending flag on its next tick and kicks the burst.
+void intgame_vial_disturb(int bar)
+{
+    if (bar < 0 || bar >= INTGAME_BAR_COUNT) return;
+    intgame_vial[bar].disturb_pending = true;
+}
+
 void intgame_hud_ping(void)
 {
     if (!intgame_iso_interface_created) {
@@ -10654,6 +10848,34 @@ void intgame_hud_ping(void)
         intgame_hud_top_last_applied = INT_MIN;
         intgame_hud_bottom_last_applied = INT_MIN;
         return;
+    }
+
+    intgame_vial_anim_ping();
+
+    // CE: scroll the day/night clock strip smoothly. intgame_clock_refresh
+    // self-caches its pixel offset (no-op until the strip would actually
+    // move by >=1px), replacing the original's once-per-game-hour stepwise
+    // jump with continuous motion. Throttled to ~8/sec rather than every
+    // frame — the strip creeps at most a pixel every few game-minutes, so
+    // recomputing the time-of-day offset 60×/sec is wasted work; checking
+    // 8×/sec is visually identical. Gated like the vials so a hidden /
+    // covered top bar doesn't force redraws.
+    {
+        static tig_timestamp_t clk_last_ms;
+        static bool clk_have_last = false;
+        tig_timestamp_t clk_now;
+        tig_timer_now(&clk_now);
+        if (!clk_have_last
+            || (int)tig_timer_between(clk_last_ms, clk_now) >= 125) {
+            clk_have_last = true;
+            clk_last_ms = clk_now;
+            if (dword_64C4F8[0] != TIG_WINDOW_HANDLE_INVALID
+                && !intgame_hud_shell_hidden
+                && !intgame_fullscreen_forced
+                && intgame_hud_stage != INTGAME_HUD_STAGE_HIDDEN) {
+                intgame_clock_refresh();
+            }
+        }
     }
 
     // CE: advance / reap the FULL->MEDIUM wings-slide ghost.

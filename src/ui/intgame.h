@@ -83,6 +83,10 @@ bool intgame_button_create(UiButtonInfo* button_info);
 void intgame_button_destroy(UiButtonInfo* button_info);
 void intgame_draw_bar(int bar);
 void intgame_draw_bars(void);
+// CE: bubble the health/fatigue vial in reaction to a value change. Call
+// with INTGAME_BAR_HEALTH / INTGAME_BAR_FATIGUE from the bar-refresh path
+// so the liquid animation reacts when disturbed/replenished.
+void intgame_vial_disturb(int bar);
 void intgame_counters_refresh(void);
 bool sub_54B5D0(TigMessage* msg);
 void intgame_process_event(TigMessage* msg);
