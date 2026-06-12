@@ -234,6 +234,10 @@ static void sub_563590(WmapCoords* a1, bool a2);
 static void wmap_ui_handle_scroll(void);
 static void wmap_ui_scroll_with_kb(int direction);
 static void wmap_ui_scroll_internal(int direction, int scale);
+static void wmap_ui_scroll_apply(int dx, int dy);
+static void wmap_ui_scroll_tick(void);
+static void wmap_scroll_set_target(float tx, float ty);
+static void wmap_scroll_drag_to(int x, int y, int l, int t, int r, int b, float maxv);
 static void sub_563AC0(int x, int y, WmapCoords* coords);
 static void sub_563B10(int x, int y, WmapCoords* coords);
 static void sub_563C00(int x, int y, WmapCoords* coords);
@@ -359,6 +363,25 @@ static int wmap_ui_scroll_speed_x = 5;
 
 // 0x5C9B98
 static int wmap_ui_scroll_speed_y = 5;
+
+// CE: smooth velocity-based map scrolling (replaces vanilla's hard discrete
+// 20px steps). Both the arrow keys and navigate-mode drag feed a target
+// velocity; an integrator ramps the actual velocity toward it (accel) and
+// glides it to a soft stop on release. The void-edge fade is suppressed while
+// in motion (kept smooth) and applied once when the scroll settles.
+// Separate top speeds: the keyboard/edge scroll snaps to its cap (so it reads
+// faster and wants a low value), while the navigate-button drag is proportional
+// to cursor distance (so it rarely hits its cap and wants the higher one).
+#define WMAP_KEY_MAXV 1.0f      // arrow keys + screen-edge scroll (px/tick)
+#define WMAP_DRAG_MAXV 3.0f     // navigate-button drag (px/tick)
+#define WMAP_SCROLL_ACCEL 0.18f // velocity approach toward target (ramp up)
+#define WMAP_SCROLL_GLIDE 0.10f // velocity approach toward 0 (soft settle drift)
+#define WMAP_SCROLL_STOP 0.30f  // |v| under this with no target -> snap to rest
+static float wmap_sv_x, wmap_sv_y;        // current velocity
+static float wmap_st_x, wmap_st_y;        // target velocity
+static float wmap_sf_x, wmap_sf_y;        // sub-pixel position carry
+static bool wmap_sv_on;                    // integrator running (incl. glide)
+static bool wmap_nav_clicked;              // navigate button pressed w/o steering yet
 
 // 0x64E030
 static tig_color_t dword_64E030;
@@ -1829,6 +1852,10 @@ bool wmap_ui_message_filter(TigMessage* msg)
     char str[48];
     UiMessage ui_message;
     bool inside = false;
+    // CE: set when a left-up ends a navigate/drag, so the click-outside-dismiss
+    // below doesn't close the window when a drag that started on the navigate
+    // button is released outside the window.
+    bool wmap_ended_drag = false;
     TigMessage tmp_msg = *msg;
     msg = &tmp_msg;
 
@@ -1947,8 +1974,15 @@ bool wmap_ui_message_filter(TigMessage* msg)
             case WMAP_UI_MODE_WORLD:
                 wmap_ui_routes[WMAP_ROUTE_TYPE_WORLD].field_3C8 = dword_66D880 != 0;
                 if (wmap_ui_state == WMAP_UI_STATE_1 || wmap_ui_state == WMAP_UI_STATE_NAVIGATING) {
+                    wmap_ended_drag = true;
                     wmap_ui_state_set(WMAP_UI_STATE_NORMAL);
+                    // CE: navigate button clicked without steering -> recenter the
+                    // wmap on the player marker.
+                    if (wmap_nav_clicked) {
+                        sub_563590(&(wmap_ui_mode_info[wmap_ui_mode].field_3C), true);
+                    }
                 }
+                wmap_nav_clicked = false;
 
                 // CE: Move selection of the Teleport spell destination out of
                 // the "mouse down" event handler. This prevents delivering a
@@ -2008,8 +2042,13 @@ bool wmap_ui_message_filter(TigMessage* msg)
             case WMAP_UI_MODE_TOWN:
                 wmap_ui_routes[WMAP_ROUTE_TYPE_TOWN].field_3C8 = 1;
                 if (wmap_ui_state == WMAP_UI_STATE_1 || wmap_ui_state == WMAP_UI_STATE_NAVIGATING) {
+                    wmap_ended_drag = true;
                     wmap_ui_state_set(WMAP_UI_STATE_NORMAL);
+                    if (wmap_nav_clicked) {
+                        sub_563590(&(wmap_ui_mode_info[wmap_ui_mode].field_3C), true);
+                    }
                 }
+                wmap_nav_clicked = false;
                 break;
             case WMAP_UI_MODE_COUNT:
                 // Should be unreachable.
@@ -2026,8 +2065,10 @@ bool wmap_ui_message_filter(TigMessage* msg)
             }
 
             // Click outside the world map window and outside both HUD strips
-            // dismisses the overlay (hi-res convenience).
-            if (wmap_ui_window != TIG_WINDOW_HANDLE_INVALID) {
+            // dismisses the overlay (hi-res convenience). But not when this
+            // left-up just ended a navigate/drag that began on the navigate
+            // button — releasing the drag outside the window must not close it.
+            if (!wmap_ended_drag && wmap_ui_window != TIG_WINDOW_HANDLE_INVALID) {
                 TigWindowData menu_wd;
                 int screen_x = msg->data.mouse.x + (hrp_iso_window_width_get() - 800) / 2;
                 int screen_y = msg->data.mouse.y + (hrp_iso_window_height_get() - 600) / 2;
@@ -2191,8 +2232,15 @@ bool wmap_ui_message_filter(TigMessage* msg)
         switch (msg->data.button.state) {
         case TIG_BUTTON_STATE_PRESSED:
             if (msg->data.button.button_handle == wmap_ui_navigate_button_info.button_handle) {
-                if (wmap_ui_state != WMAP_UI_STATE_MOVING && wmap_ui_state_set(WMAP_UI_STATE_NAVIGATING)) {
-                    wmap_ui_navigate(msg->data.button.x, msg->data.button.y);
+                // CE: just enter navigate mode on press; don't steer from the
+                // button's own coords (it sits off-center, so steering on press
+                // kicked an arbitrary down-right glide on every click). Steering
+                // happens from cursor movement while held (the MOUSE_MOVE path).
+                // Arm a click: if released without ever steering, recenter the
+                // wmap on the player marker instead.
+                if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
+                    wmap_ui_state_set(WMAP_UI_STATE_NAVIGATING);
+                    wmap_nav_clicked = true;
                 }
                 return true;
             }
@@ -2369,27 +2417,26 @@ bool wmap_ui_message_filter(TigMessage* msg)
             }
             return true;
         case SDL_SCANCODE_LEFT:
+            // CE: actual scrolling is driven every frame from key state by the
+            // smooth-scroll engine (wmap_ui_handle_scroll); the press only cues
+            // the sound now, so there's no discrete jump on top of the glide.
             if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
                 gsound_play_sfx(0, 1);
-                wmap_ui_scroll_with_kb(6);
             }
             return true;
         case SDL_SCANCODE_UP:
             if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
                 gsound_play_sfx(0, 1);
-                wmap_ui_scroll_with_kb(0);
             }
             return true;
         case SDL_SCANCODE_RIGHT:
             if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
                 gsound_play_sfx(0, 1);
-                wmap_ui_scroll_with_kb(2);
             }
             return true;
         case SDL_SCANCODE_DOWN:
             if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
                 gsound_play_sfx(0, 1);
-                wmap_ui_scroll_with_kb(4);
             }
             return true;
         case SDL_SCANCODE_DELETE:
@@ -2531,33 +2578,25 @@ void wmap_ui_navigate(int x, int y)
 
     wmap_ui_navigating = true;
 
-    if (y < stru_5C9A88.y) {
-        wmap_ui_scroll_internal(0, 8);
-    } else if (y > stru_5C9A88.y + stru_5C9A88.height) {
-        wmap_ui_scroll_internal(4, 8);
-    }
-
-    if (x < stru_5C9A88.x) {
-        wmap_ui_scroll_internal(6, 8);
-    } else if (x > stru_5C9A88.x + stru_5C9A88.width) {
-        wmap_ui_scroll_internal(2, 8);
-    }
+    // CE: drive the smooth-scroll engine instead of vanilla's discrete steps —
+    // the further the cursor is outside the central dead-zone, the faster it
+    // glides. Uses the higher drag cap (proportional, so it rarely maxes out).
+    wmap_scroll_drag_to(x, y,
+        stru_5C9A88.x, stru_5C9A88.y,
+        stru_5C9A88.x + stru_5C9A88.width, stru_5C9A88.y + stru_5C9A88.height,
+        WMAP_DRAG_MAXV);
 }
 
 // 0x562AF0
 void sub_562AF0(int x, int y)
 {
-    if (y < wmap_ui_mode_info[wmap_ui_mode].field_14.y + 23) {
-        wmap_ui_scroll_internal(0, 10);
-    } else if (y > wmap_ui_mode_info[wmap_ui_mode].field_14.y + wmap_ui_mode_info[wmap_ui_mode].field_14.height - 23) {
-        wmap_ui_scroll_internal(4, 10);
-    }
-
-    if (x < wmap_ui_mode_info[wmap_ui_mode].field_14.x + 23) {
-        wmap_ui_scroll_internal(6, 10);
-    } else if (x > wmap_ui_mode_info[wmap_ui_mode].field_14.x + wmap_ui_mode_info[wmap_ui_mode].field_14.width - 23) {
-        wmap_ui_scroll_internal(2, 10);
-    }
+    // CE: screen-edge scroll — same engine, but the slower keyboard/edge cap.
+    wmap_scroll_drag_to(x, y,
+        wmap_ui_mode_info[wmap_ui_mode].field_14.x + 23,
+        wmap_ui_mode_info[wmap_ui_mode].field_14.y + 23,
+        wmap_ui_mode_info[wmap_ui_mode].field_14.x + wmap_ui_mode_info[wmap_ui_mode].field_14.width - 23,
+        wmap_ui_mode_info[wmap_ui_mode].field_14.y + wmap_ui_mode_info[wmap_ui_mode].field_14.height - 23,
+        WMAP_KEY_MAXV);
 }
 
 // 0x562B70
@@ -2569,6 +2608,12 @@ void wmap_ui_mode_set(WmapUiMode mode)
     tig_art_id_t art_id;
     TigArtAnimData art_anim_data;
     TigArtFrameData art_frame_data;
+
+    // CE: drop any in-flight smooth-scroll velocity so a glide can't carry into
+    // the new mode's map.
+    wmap_sv_on = false;
+    wmap_sv_x = wmap_sv_y = wmap_st_x = wmap_st_y = 0.0f;
+    wmap_sf_x = wmap_sf_y = 0.0f;
     TigArtBlitInfo art_blit_info;
     TigRect src_rect;
     TigRect dst_rect;
@@ -2799,7 +2844,13 @@ bool wmTileArtLockMode(WmapUiMode mode, int tile)
     // (the crashing site if `video_buffer` is NULL — SEGV reading
     // ->frame.width at offset 12) and wmap_load_worldmap_info reports an
     // init error. Returning the actual lock state restores both checks.
-    return (wmap_ui_mode_info[mode].tiles[tile].flags & 0x1) != 0;
+    //
+    // Also REQUIRE a non-NULL buffer: an intermittent crash (seen pre-fade on
+    // 2026-06-09 and since) has the "flag set but buffer NULL" state reach the
+    // blit anyway. Reporting not-locked there makes every caller skip the blit
+    // (the tile renders black for that frame) instead of dereferencing NULL.
+    return (wmap_ui_mode_info[mode].tiles[tile].flags & 0x1) != 0
+        && wmap_ui_mode_info[mode].tiles[tile].video_buffer != NULL;
 }
 
 // 0x5630F0
@@ -3025,76 +3076,35 @@ void sub_563590(WmapCoords* coords, bool a2)
 }
 
 // 0x563610
+// CE: every frame, translate the held arrow keys into a scroll velocity target
+// (zero when none held, so the engine glides to a soft stop) and advance the
+// smooth-scroll integrator. Replaces vanilla's per-frame discrete 20px steps.
 void wmap_ui_handle_scroll(void)
 {
-    // NOTE: Very odd initial values.
-    int horizontal_direction = -69;
-    int vertical_direction = -69;
-    bool scroll_horizontally = false;
-
     if (tig_timer_between(dword_66D9D0, gamelib_ping_time) >= 10) {
+        float tx = 0.0f;
+        float ty = 0.0f;
         dword_66D9D0 = gamelib_ping_time;
 
-        if (wmap_ui_state != WMAP_UI_STATE_MOVING) {
+        // Keys own the scroll target only in NORMAL state; the navigate-mode
+        // drags (STATE_1 / NAVIGATING) set it from the cursor instead. Setting it
+        // from live key-state every frame means release -> zero -> glide (never
+        // sticks). The integrator ticks in every state so a drag glides out too.
+        if (wmap_ui_state == WMAP_UI_STATE_NORMAL) {
             if (tig_kb_is_key_pressed(SDL_SCANCODE_LEFT)) {
-                scroll_horizontally = true;
-                horizontal_direction = 6;
+                tx = -WMAP_KEY_MAXV;
             } else if (tig_kb_is_key_pressed(SDL_SCANCODE_RIGHT)) {
-                scroll_horizontally = true;
-                horizontal_direction = 2;
+                tx = WMAP_KEY_MAXV;
             }
-
             if (tig_kb_is_key_pressed(SDL_SCANCODE_UP)) {
-                vertical_direction = 0;
+                ty = -WMAP_KEY_MAXV;
             } else if (tig_kb_is_key_pressed(SDL_SCANCODE_DOWN)) {
-                vertical_direction = 4;
-            } else {
-                if (!scroll_horizontally) {
-                    // Neither left/right nor up/down keys are pressed, no need
-                    // to continue with scrolling.
-                    return;
-                }
+                ty = WMAP_KEY_MAXV;
             }
-
-            switch (horizontal_direction) {
-            case 6:
-                switch (vertical_direction) {
-                case 0:
-                    wmap_ui_scroll_with_kb(7);
-                    break;
-                case 4:
-                    wmap_ui_scroll_with_kb(5);
-                    break;
-                default:
-                    wmap_ui_scroll_with_kb(6);
-                    break;
-                }
-                break;
-            case 2:
-                switch (vertical_direction) {
-                case 0:
-                    wmap_ui_scroll_with_kb(1);
-                    break;
-                case 4:
-                    wmap_ui_scroll_with_kb(3);
-                    break;
-                default:
-                    wmap_ui_scroll_with_kb(2);
-                    break;
-                }
-                break;
-            default:
-                switch (vertical_direction) {
-                case 0:
-                    wmap_ui_scroll_with_kb(0);
-                    break;
-                case 4:
-                    wmap_ui_scroll_with_kb(4);
-                    break;
-                }
-                break;
-            }
+            wmap_scroll_set_target(tx, ty);
         }
+
+        wmap_ui_scroll_tick();
     }
 }
 
@@ -3120,9 +3130,6 @@ void wmap_ui_scroll_internal(int direction, int scale)
     int sy;
     int dx;
     int dy;
-    int offset_x;
-    int offset_y;
-    TigRect rect;
 
     sx = scale * wmap_ui_scroll_speed_x;
     sy = scale * wmap_ui_scroll_speed_y;
@@ -3163,6 +3170,20 @@ void wmap_ui_scroll_internal(int direction, int scale)
         break;
     }
 
+    wmap_ui_scroll_apply(dx, dy);
+}
+
+// CE: apply a raw pixel scroll delta — clamp to the map bounds and repaint the
+// exposed region (vanilla scroll-blit + edge strips for town, full refresh for
+// world). The void-edge fade is gated by wmap_scroll_suppress_feather, which the
+// velocity engine raises during motion so this stays cheap and tear-free; the
+// fade is re-applied by a full refresh when the scroll settles.
+static void wmap_ui_scroll_apply(int dx, int dy)
+{
+    WmapInfo* wmap_info = &(wmap_ui_mode_info[wmap_ui_mode]);
+    int offset_x;
+    int offset_y;
+
     offset_x = wmap_info->field_34;
     offset_y = wmap_info->field_38;
 
@@ -3191,73 +3212,104 @@ void wmap_ui_scroll_internal(int direction, int scale)
         return;
     }
 
-    if (wmap_ui_mode != WMAP_UI_MODE_TOWN) {
-        wmap_info->refresh_rect(&(wmap_info->rect));
+    // Full-refresh the whole viewport (both modes). The vanilla town path used a
+    // scroll-blit + edge-strip repaint, but that mixes already-feathered pixels
+    // (shifted) with freshly-drawn un-feathered strips, which reads as glitchy
+    // until the next settle. A clean full redraw avoids the mix; with the fade
+    // suppressed mid-motion it's just tile blits (cheap for the small town maps).
+    wmap_info->refresh_rect(&(wmap_info->rect));
+}
+
+// CE: point the scroll velocity at a target (px/tick). A non-zero target wakes
+// the integrator; zero lets it glide to a soft stop.
+void wmap_scroll_set_target(float tx, float ty)
+{
+    wmap_st_x = tx;
+    wmap_st_y = ty;
+    if (tx != 0.0f || ty != 0.0f) {
+        wmap_sv_on = true;
+    }
+}
+
+// CE: navigate-mode (button-drag) steering — set the scroll target from how far
+// the cursor sits outside a dead-zone rect [l,t..r,b], proportional and clamped
+// to the same top speed as the keys, so the drag accelerates and glides exactly
+// like the keyboard. Inside the dead zone -> zero target (glide to rest).
+#define WMAP_DRAG_FULL 28.0f // px outside the dead zone for full speed
+static void wmap_scroll_drag_to(int x, int y, int l, int t, int r, int b, float maxv)
+{
+    float tx = 0.0f;
+    float ty = 0.0f;
+
+    if (x < l) {
+        tx = (float)(x - l);
+    } else if (x > r) {
+        tx = (float)(x - r);
+    }
+    if (y < t) {
+        ty = (float)(y - t);
+    } else if (y > b) {
+        ty = (float)(y - b);
+    }
+
+    tx /= WMAP_DRAG_FULL;
+    ty /= WMAP_DRAG_FULL;
+    if (tx > 1.0f) tx = 1.0f; else if (tx < -1.0f) tx = -1.0f;
+    if (ty > 1.0f) ty = 1.0f; else if (ty < -1.0f) ty = -1.0f;
+
+    if (tx != 0.0f || ty != 0.0f) {
+        wmap_nav_clicked = false; // actually steered -> not a recenter click
+    }
+    wmap_scroll_set_target(tx * maxv, ty * maxv);
+}
+
+// CE: advance the smooth scroll one tick — ramp velocity toward the target (or
+// glide toward rest), move by the integer part, and once it settles, re-apply
+// the void-edge fade with a single full refresh. Called every frame.
+void wmap_ui_scroll_tick(void)
+{
+    WmapInfo* wmap_info = &(wmap_ui_mode_info[wmap_ui_mode]);
+    int dx;
+    int dy;
+
+    // Never drive a refresh when the map UI isn't up (a glide continuing after
+    // the window is torn down / mode-switched would refresh a stale window VB and
+    // crash in the tile blit). Hard-reset the engine in that case.
+    if (!wmap_ui_is_created() || wmap_ui_state == WMAP_UI_STATE_MOVING) {
+        wmap_sv_on = false;
+        wmap_sv_x = wmap_sv_y = wmap_st_x = wmap_st_y = 0.0f;
+        wmap_sf_x = wmap_sf_y = 0.0f;
+        return;
+    }
+    if (!wmap_sv_on) {
         return;
     }
 
-    tig_window_scroll_rect(wmap_ui_window,
-        &(wmap_info->rect),
-        -dx,
-        -dy);
+    wmap_sv_x += (wmap_st_x - wmap_sv_x) * (wmap_st_x != 0.0f ? WMAP_SCROLL_ACCEL : WMAP_SCROLL_GLIDE);
+    wmap_sv_y += (wmap_st_y - wmap_sv_y) * (wmap_st_y != 0.0f ? WMAP_SCROLL_ACCEL : WMAP_SCROLL_GLIDE);
 
-    if (dx > 0) {
-        rect.x = wmap_ui_nav_cvr_frame.x - dx;
-        rect.y = wmap_ui_nav_cvr_frame.y;
-        rect.width = wmap_ui_nav_cvr_frame.width + dx;
-        rect.height = wmap_ui_nav_cvr_frame.height;
-        if (dy > 0) {
-            rect.y -= dy;
-            rect.height += dy;
-        }
-        wmap_info->refresh_rect(&rect);
-
-        rect = wmap_info->rect;
-        rect.x += rect.width - dx;
-        rect.width = dx;
-        if (dy > 0) {
-            rect.y -= dy;
-            rect.height += dy;
-        }
-        wmap_info->refresh_rect(&rect);
-    } else if (dx < 0) {
-        rect.x = wmap_ui_nav_cvr_frame.x;
-        rect.y = wmap_ui_nav_cvr_frame.y;
-        rect.height = wmap_ui_nav_cvr_frame.height;
-        rect.width = wmap_ui_nav_cvr_frame.width - dx;
-        if (dy > 0) {
-            rect.y -= dy;
-            rect.height += dy;
-        }
-        wmap_info->refresh_rect(&rect);
-
-        rect = wmap_info->rect;
-        rect.width = -dx;
-        if (dy > 0) {
-            rect.y -= dy;
-            rect.height += dy;
-        }
-        wmap_info->refresh_rect(&rect);
+    if (wmap_st_x == 0.0f && wmap_sv_x > -WMAP_SCROLL_STOP && wmap_sv_x < WMAP_SCROLL_STOP) {
+        wmap_sv_x = 0.0f;
+    }
+    if (wmap_st_y == 0.0f && wmap_sv_y > -WMAP_SCROLL_STOP && wmap_sv_y < WMAP_SCROLL_STOP) {
+        wmap_sv_y = 0.0f;
     }
 
-    if (dy > 0) {
-        rect.x = wmap_ui_nav_cvr_frame.x;
-        rect.y = wmap_ui_nav_cvr_frame.y - dy;
-        rect.width = wmap_ui_nav_cvr_frame.width;
-        rect.height = wmap_ui_nav_cvr_frame.height + dy;
-        wmap_info->refresh_rect(&rect);
+    wmap_sf_x += wmap_sv_x;
+    wmap_sf_y += wmap_sv_y;
+    dx = (int)wmap_sf_x;
+    dy = (int)wmap_sf_y;
+    wmap_sf_x -= (float)dx;
+    wmap_sf_y -= (float)dy;
 
-        rect = wmap_info->rect;
-        rect.y += rect.height - dy;
-        rect.height = dy;
-        wmap_info->refresh_rect(&rect);
-    } else if (dy < 0) {
-        rect = wmap_ui_nav_cvr_frame;
-        wmap_info->refresh_rect(&rect);
+    if (dx != 0 || dy != 0) {
+        wmap_ui_scroll_apply(dx, dy); // full refresh + fade every step (stays faded)
+    }
 
-        rect = wmap_info->rect;
-        rect.height = -dy;
-        wmap_info->refresh_rect(&rect);
+    if (wmap_sv_x == 0.0f && wmap_sv_y == 0.0f && wmap_st_x == 0.0f && wmap_st_y == 0.0f) {
+        wmap_sv_on = false;
+        wmap_sf_x = 0.0f;
+        wmap_sf_y = 0.0f;
     }
 }
 
@@ -4344,6 +4396,327 @@ void sub_5656B0(int x, int y, WmapCoords* coords)
     coords->y = (int)(offset_y * rect.height / height);
 }
 
+// CE: void-edge fade for the map viewers. The map art is an irregular shape on a
+// rectangular tile grid; where there's no art the engine paints exact black. We
+// feather content that borders a real void region into it, mirroring the iso
+// fade, with three things tuned to the flat-image case:
+//   * Void = EXACTLY (0,0,0). Textured dark content (cave rock, shadow) is never
+//     pure zero, so it's never mistaken for void.
+//   * Void must be a CONTIGUOUS region of at least WMAP_VOID_MIN_AREA px. Scattered
+//     pure-black specks (anti-aliased edges, a stray dark pixel) are ignored.
+//   * The distance pass reads a feather-wide border AROUND the dirty rect but only
+//     writes inside it, so partial-refresh strips feather consistently (no banding).
+// Fade is the MIN (darkest wins) of two layers, because neither alone is enough:
+//   * DENSITY blur: the void mask is blurred and thresholded, so concave void
+//     corners bleed in and bulk edges fade on a generous curve through the blocky
+//     90-degree town-void turns. But it fades by void MASS, so a thin convex void
+//     spike (a narrow black notch poking into content) carries little mass, reads
+//     as low density, and is left hard/unfaded — the case density can't handle.
+//   * PROXIMITY feather: a chamfer distance transform from the void darkens
+//     content by DISTANCE to the nearest void regardless of its mass, wrapping a
+//     rounded dark halo around thin convex spikes. On its own it leaves
+//     faceted/octagonal corners, which is why density carries the bulk curve and
+//     proximity only fills in where density under-fades.
+// WMAP_FEATHER_PX sets the density curve's reach; WMAP_LOCAL_FEATHER sets the
+// proximity reach (= convex-spike rounding radius). Each refresh re-blits fresh
+// tiles before this runs, so there's no feedback.
+#define WMAP_FEATHER_PX 64      // density blur radius = generosity of the bulk curve
+#define WMAP_LOCAL_FEATHER 64   // proximity-feather reach (px) = convex-spike rounding radius
+#define WMAP_PROX_SMOOTH 18     // blur radius that de-facets the proximity layer
+                                // (higher -> smoother 90 turns, but washes spike rounding)
+#define WMAP_VOID_MIN_AREA 400  // ~20x20 px; below this a black blob isn't "void"
+#define WMAP_VOID_THRESH 0.45f  // void density at which content reaches full black
+                                // (lower -> fade reaches further into content)
+
+// One separable box-blur pass with a clamped sliding window. Three of these per
+// axis approximate a round Gaussian cheaply (O(n) regardless of radius). The
+// window average uses a precomputed reciprocal table (multiply, not a per-pixel
+// integer divide — the divide dominated the per-scroll-frame cost).
+#define WMAP_BLUR_R (WMAP_FEATHER_PX / 3)
+static float wmap_blur_recip[2 * WMAP_BLUR_R + 2];
+static bool wmap_blur_recip_ready;
+
+static void wmap_box_blur_pass(const int* src, int* dst, int w, int h, int r, bool vertical)
+{
+    int i, j;
+    if (!wmap_blur_recip_ready) {
+        for (i = 1; i < (int)(sizeof(wmap_blur_recip) / sizeof(wmap_blur_recip[0])); i++) {
+            wmap_blur_recip[i] = 1.0f / (float)i;
+        }
+        wmap_blur_recip_ready = true;
+    }
+    if (vertical) {
+        for (i = 0; i < w; i++) {
+            int sum = 0, cnt = 0;
+            for (j = 0; j <= r && j < h; j++) { sum += src[j * w + i]; cnt++; }
+            for (j = 0; j < h; j++) {
+                int rem = j - r, add = j + 1 + r;
+                dst[j * w + i] = (int)((float)sum * wmap_blur_recip[cnt] + 0.5f);
+                if (rem >= 0) { sum -= src[rem * w + i]; cnt--; }
+                if (add < h) { sum += src[add * w + i]; cnt++; }
+            }
+        }
+    } else {
+        for (j = 0; j < h; j++) {
+            const int* s = src + j * w;
+            int* d = dst + j * w;
+            int sum = 0, cnt = 0;
+            for (i = 0; i <= r && i < w; i++) { sum += s[i]; cnt++; }
+            for (i = 0; i < w; i++) {
+                int rem = i - r, add = i + 1 + r;
+                d[i] = (int)((float)sum * wmap_blur_recip[cnt] + 0.5f);
+                if (rem >= 0) { sum -= s[rem]; cnt--; }
+                if (add < w) { sum += s[add]; cnt++; }
+            }
+        }
+    }
+}
+
+static void wmap_void_feather(TigRect* dirty)
+{
+    const int BR = WMAP_FEATHER_PX / 3; // 3 box passes -> ~Gaussian of reach WMAP_FEATHER_PX
+    // Read border must cover the larger of the two layers' reaches, or content
+    // near the dirty-rect edge would miss void just outside it and band at seams.
+    const int BORDER = WMAP_FEATHER_PX > WMAP_LOCAL_FEATHER ? WMAP_FEATHER_PX : WMAP_LOCAL_FEATHER;
+    int rx, ry, rw, rh, rn, i, j, pass;
+    uint8_t* black;
+    int* field;
+    int* tmp;
+    int* dist;
+    bool any_void = false;
+    TigVideoBuffer* vb;
+    TigVideoBufferData vbd;
+
+    if (!gamelib_void_edge_fade() || dirty->width <= 0 || dirty->height <= 0) {
+        return;
+    }
+    if (tig_window_vbid_get(wmap_ui_window, &vb) != TIG_OK
+        || tig_video_buffer_lock(vb) != TIG_OK) {
+        return;
+    }
+    if (tig_video_buffer_data(vb, &vbd) != TIG_OK || vbd.pixels == NULL) {
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+
+    // Work region = dirty rect grown by the feather reach (read border, write core).
+    rx = dirty->x - BORDER;
+    ry = dirty->y - BORDER;
+    rw = dirty->width + 2 * BORDER;
+    rh = dirty->height + 2 * BORDER;
+    rn = rw * rh;
+
+    black = (uint8_t*)MALLOC((size_t)rn);
+    field = (int*)MALLOC((size_t)rn * sizeof(int));
+    tmp = (int*)MALLOC((size_t)rn * sizeof(int));
+    dist = (int*)MALLOC((size_t)rn * sizeof(int));
+    if (black == NULL || field == NULL || tmp == NULL || dist == NULL) {
+        if (black != NULL) FREE(black);
+        if (field != NULL) FREE(field);
+        if (tmp != NULL) FREE(tmp);
+        if (dist != NULL) FREE(dist);
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+
+    // Mark exact-black pixels; void field starts empty.
+    for (j = 0; j < rh; j++) {
+        int gy = ry + j;
+        const uint32_t* row = (gy >= 0 && gy < vbd.height)
+            ? (const uint32_t*)((const uint8_t*)vbd.pixels + (size_t)gy * (size_t)vbd.pitch)
+            : NULL;
+        for (i = 0; i < rw; i++) {
+            int gx = rx + i;
+            uint8_t b = 0;
+            if (row != NULL && gx >= 0 && gx < vbd.width) {
+                uint32_t p = row[gx];
+                b = (tig_color_get_red(p) == 0 && tig_color_get_green(p) == 0 && tig_color_get_blue(p) == 0) ? 1 : 0;
+            }
+            black[j * rw + i] = b;
+            field[j * rw + i] = 0;
+        }
+    }
+
+    // Keep contiguous black regions as void (field=255); flood each blob using
+    // `black` as the visited flag and `tmp` as the queue. A blob qualifies if it's
+    // >= WMAP_VOID_MIN_AREA, OR it touches the viewport (dirty-rect) edge — in
+    // which case it's almost certainly a larger void clipped by the view, whose
+    // visible sliver would otherwise fall under the area floor and leave the edge
+    // content unfaded until more of it scrolls in.
+    for (j = 0; j < rh; j++) {
+        for (i = 0; i < rw; i++) {
+            int head, tail, k;
+            bool touches_edge = false;
+            if (black[j * rw + i] == 0) {
+                continue;
+            }
+            head = 0;
+            tail = 0;
+            tmp[tail++] = j * rw + i;
+            black[j * rw + i] = 0;
+            while (head < tail) {
+                int c = tmp[head++];
+                int cx = c % rw;
+                int cy = c / rw;
+                int gx = rx + cx;
+                int gy = ry + cy;
+                if (gx <= dirty->x || gx >= dirty->x + dirty->width - 1
+                    || gy <= dirty->y || gy >= dirty->y + dirty->height - 1) {
+                    touches_edge = true;
+                }
+                if (cx > 0 && black[c - 1]) { black[c - 1] = 0; tmp[tail++] = c - 1; }
+                if (cx < rw - 1 && black[c + 1]) { black[c + 1] = 0; tmp[tail++] = c + 1; }
+                if (cy > 0 && black[c - rw]) { black[c - rw] = 0; tmp[tail++] = c - rw; }
+                if (cy < rh - 1 && black[c + rw]) { black[c + rw] = 0; tmp[tail++] = c + rw; }
+            }
+            if (tail >= WMAP_VOID_MIN_AREA || touches_edge) {
+                any_void = true;
+                for (k = 0; k < tail; k++) {
+                    field[tmp[k]] = 255;
+                }
+            }
+        }
+    }
+
+    if (!any_void) {
+        FREE(black);
+        FREE(field);
+        FREE(tmp);
+        FREE(dist);
+        tig_video_buffer_unlock(vb);
+        return;
+    }
+
+    // Clamp-extend the void field into the work-region border (the part beyond the
+    // viewport): replicate each viewport-edge value outward. Without this the blur
+    // at the viewport edge averages in the non-void frame beyond the clip and a
+    // clipped void fades weakly there; replicating makes a clipped void read as
+    // continuing off-screen, so edge content fades fully and consistently.
+    {
+        int dl = dirty->x, dr = dirty->x + dirty->width - 1;
+        int dt = dirty->y, db = dirty->y + dirty->height - 1;
+        for (j = 0; j < rh; j++) {
+            int gy = ry + j;
+            int cgy = gy < dt ? dt : (gy > db ? db : gy);
+            for (i = 0; i < rw; i++) {
+                int gx = rx + i;
+                int cgx = gx < dl ? dl : (gx > dr ? dr : gx);
+                if (cgx != gx || cgy != gy) {
+                    field[j * rw + i] = field[(cgy - ry) * rw + (cgx - rx)];
+                }
+            }
+        }
+    }
+
+    // Proximity feather: chamfer distance transform from the void (field>=128)
+    // while it's still the binary mask, before the blur overwrites it. Two sweeps
+    // with 3-4 weights (3 orthogonal, 4 diagonal) give ~3 units per pixel; this
+    // darkens content by nearest-void distance, catching thin convex notches the
+    // density blur leaves hard. Result in `dist` (survives the blur of `field`).
+    {
+        const int DBIG = rn * 8; // larger than any reachable chamfer distance
+        for (i = 0; i < rn; i++) {
+            dist[i] = field[i] >= 128 ? 0 : DBIG;
+        }
+        for (j = 0; j < rh; j++) {
+            for (i = 0; i < rw; i++) {
+                int c = j * rw + i, d = dist[c];
+                if (i > 0 && dist[c - 1] + 3 < d) d = dist[c - 1] + 3;
+                if (j > 0) {
+                    if (dist[c - rw] + 3 < d) d = dist[c - rw] + 3;
+                    if (i > 0 && dist[c - rw - 1] + 4 < d) d = dist[c - rw - 1] + 4;
+                    if (i < rw - 1 && dist[c - rw + 1] + 4 < d) d = dist[c - rw + 1] + 4;
+                }
+                dist[c] = d;
+            }
+        }
+        for (j = rh - 1; j >= 0; j--) {
+            for (i = rw - 1; i >= 0; i--) {
+                int c = j * rw + i, d = dist[c];
+                if (i < rw - 1 && dist[c + 1] + 3 < d) d = dist[c + 1] + 3;
+                if (j < rh - 1) {
+                    if (dist[c + rw] + 3 < d) d = dist[c + rw] + 3;
+                    if (i < rw - 1 && dist[c + rw + 1] + 4 < d) d = dist[c + rw + 1] + 4;
+                    if (i > 0 && dist[c + rw - 1] + 4 < d) d = dist[c + rw - 1] + 4;
+                }
+                dist[c] = d;
+            }
+        }
+    }
+
+    // Round the corners: three box-blur passes per axis (~Gaussian) turn the
+    // binary void field into a smooth density 0..255. Result ends in `field`.
+    for (pass = 0; pass < 3; pass++) {
+        wmap_box_blur_pass(field, tmp, rw, rh, BR, false); // horizontal -> tmp
+        wmap_box_blur_pass(tmp, field, rw, rh, BR, true);   // vertical   -> field
+    }
+
+    // De-facet the proximity layer: the chamfer DT's isolines are octagonal and
+    // hug the blocky stepped void boundary, so taking min() with it re-exposes the
+    // 90-degree stepping the density blur smooths away. Convert distance -> a
+    // brightness ramp in place, then box-blur it: the broad spike halo survives
+    // (what rounds the spikes) while the facets/steps wash out to a smooth curve.
+    // Result (smoothed proximity brightness 0..255) ends back in `dist`.
+    for (i = 0; i < rn; i++) {
+        float dpx = (float)dist[i] / 3.0f;          // chamfer units -> px
+        float ft = dpx / (float)WMAP_LOCAL_FEATHER;  // 0 at void .. 1 at reach
+        if (ft < 0.0f) ft = 0.0f;
+        else if (ft > 1.0f) ft = 1.0f;
+        ft = ft * ft * (3.0f - 2.0f * ft);           // smoothstep
+        dist[i] = (int)(ft * 255.0f + 0.5f);
+    }
+    for (pass = 0; pass < 3; pass++) {
+        wmap_box_blur_pass(dist, tmp, rw, rh, WMAP_PROX_SMOOTH, false);
+        wmap_box_blur_pass(tmp, dist, rw, rh, WMAP_PROX_SMOOTH, true);
+    }
+
+    // Darken by blurred void density, only inside the dirty rect (fresh pixels).
+    for (j = 0; j < rh; j++) {
+        int gy = ry + j;
+        uint32_t* row;
+        if (gy < dirty->y || gy >= dirty->y + dirty->height || gy < 0 || gy >= vbd.height) {
+            continue;
+        }
+        row = (uint32_t*)((uint8_t*)vbd.pixels + (size_t)gy * (size_t)vbd.pitch);
+        for (i = 0; i < rw; i++) {
+            int gx = rx + i;
+            float dens, t;
+            int f;
+            uint32_t p;
+            if (gx < dirty->x || gx >= dirty->x + dirty->width || gx < 0 || gx >= vbd.width) {
+                continue;
+            }
+            // Density brightness: void MASS near this pixel (0=black .. 1=clear).
+            dens = (float)field[j * rw + i] / 255.0f; // 0 = no void near .. 1 = void
+            t = (WMAP_VOID_THRESH - dens) / WMAP_VOID_THRESH; // 1 far .. <=0 at/in void
+            if (t < 0.0f) t = 0.0f;
+            else if (t > 1.0f) t = 1.0f;
+            t = t * t * (3.0f - 2.0f * t); // smoothstep
+            {
+                // Proximity brightness: de-faceted distance halo (computed above),
+                // rounds thin convex spikes density misses. Fade = darker of both.
+                float ft = (float)dist[j * rw + i] / 255.0f;
+                if (ft < t) t = ft;
+            }
+            if (t >= 1.0f) {
+                continue; // no void within reach of either layer — unchanged
+            }
+            f = (int)(t * 255.0f + 0.5f);
+            p = row[gx];
+            row[gx] = tig_color_make(
+                tig_color_get_red(p) * f / 255,
+                tig_color_get_green(p) * f / 255,
+                tig_color_get_blue(p) * f / 255);
+        }
+    }
+
+    FREE(black);
+    FREE(field);
+    FREE(tmp);
+    FREE(dist);
+    tig_video_buffer_unlock(vb);
+}
+
 // 0x5657A0
 void wmap_world_refresh_rect(TigRect* rect)
 {
@@ -4441,7 +4814,12 @@ void wmap_world_refresh_rect(TigRect* rect)
             vb_src_rect.width = vb_dst_rect.width;
             vb_src_rect.height = vb_dst_rect.height;
 
-            if (wmTileArtLock(idx)) {
+            // CE: guard against a null src/dst video buffer — a tile whose art
+            // isn't resident yet (or a torn-down window VB mid-teardown) would
+            // otherwise crash inside tig_video_buffer_blit. Skip it; next refresh
+            // redraws once the buffer exists.
+            if (wmTileArtLock(idx) && v2->video_buffer != NULL
+                && vb_blit_info.dst_video_buffer != NULL) {
                 vb_blit_info.src_video_buffer = v2->video_buffer;
                 if (tig_video_buffer_blit(&vb_blit_info) != TIG_OK) {
                     tig_debug_printf("WMapUI: Zoomed Blit: ERROR: Blit FAILED!\n");
@@ -4452,6 +4830,9 @@ void wmap_world_refresh_rect(TigRect* rect)
             }
         }
     }
+
+    // CE: feather map art into any contiguous void it borders, before notes draw.
+    wmap_void_feather(&tmp_rect);
 
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &src_rect;
@@ -4812,6 +5193,9 @@ void wmap_town_refresh_rect(TigRect* rect)
             }
         }
     }
+
+    // CE: feather townmap art into any contiguous void it borders, before notes.
+    wmap_void_feather(&dirty_rect);
 
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &art_src_rect;
