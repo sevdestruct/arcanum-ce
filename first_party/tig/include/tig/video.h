@@ -198,6 +198,16 @@ int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
     uint8_t tint_g,
     uint8_t tint_b,
     uint8_t reveal);
+// CE: world-knockout composite — window pixels matching `key` (RGB) are
+// replaced by the raw underlay (world) pixel, a true untinted cut-out for
+// custom-shaped windows. Separate from the near-black tint. See video.c.
+int tig_video_blit_knockout(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    tig_color_t key);
 int tig_video_fill(const TigRect* rect, tig_color_t color);
 int tig_video_flip(void);
 // Hint the next tig_video_flip to upload only `rect` of the surface to the GPU

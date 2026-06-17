@@ -78,6 +78,15 @@ typedef struct TigWindow {
     uint8_t tint_g;
     uint8_t tint_b;
     tig_window_handle_t tint_underlay;
+    // CE: optional world-knockout pathway. When enabled, the compositor
+    // routes this window's blit through tig_video_blit_knockout, which
+    // replaces pixels matching knockout_key (RGB) with the raw underlay
+    // (game world) pixel — a true untinted cut-out for custom window
+    // shapes. Separate from the near-black tint above; a window uses one
+    // or the other. knockout_underlay is the world source.
+    bool knockout_enabled;
+    tig_color_t knockout_key;
+    tig_window_handle_t knockout_underlay;
     // CE: optional per-window scale + alpha + scale-anchor for the
     // ui_anim spring-driven entrance/exit animations. When
     // transform_active, the compositor blits this window's VB to a
@@ -276,6 +285,9 @@ int tig_window_create(TigWindowData* window_data, tig_window_handle_t* window_ha
     win->tint_g = 0;
     win->tint_b = 0;
     win->tint_underlay = TIG_WINDOW_HANDLE_INVALID;
+    win->knockout_enabled = false;
+    win->knockout_key = 0;
+    win->knockout_underlay = TIG_WINDOW_HANDLE_INVALID;
     // CE: ui_anim transform defaults — inactive, identity scale/alpha,
     // anchor at frame center. Compositor short-circuits the transform
     // path when transform_active is false so unanimated windows are
@@ -897,6 +909,29 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
 
+                        // CE: world-knockout overlay — after the base blit
+                        // (opaque, near-black-tinted, or the scaled
+                        // transform blit) above, punch the key-colour pixels
+                        // through to the raw world. Runs on top so a window
+                        // can combine the near-black see-through with hard
+                        // knockouts. blt_src_rect/blt_dst_rect carry whatever
+                        // the taken branch left (including the scaled
+                        // transform rects), and tig_video_blit_knockout
+                        // samples the source accordingly, so the cut-out
+                        // tracks the panel through its entrance/exit
+                        // animation (no magenta marker flash).
+                        if (dst_video_buffer == NULL && win->knockout_enabled) {
+                            TigVideoBuffer* ko_under = NULL;
+                            int ko_off_x = 0;
+                            int ko_off_y = 0;
+                            ko_under = tig_window_tint_underlay_vb(
+                                win->knockout_underlay, &ko_off_x, &ko_off_y);
+                            tig_video_blit_knockout(src_video_buffer,
+                                &blt_src_rect, &blt_dst_rect,
+                                ko_under, ko_off_x, ko_off_y,
+                                win->knockout_key);
+                        }
+
                         // CE: clip against the EFFECTIVE frame (frame ∩ clip_rect)
                         // so the un-clipped portions of the dirty rect remain in
                         // the list and propagate down the stack to the window
@@ -1036,6 +1071,23 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                 reveal_def);
         } else {
             tig_video_blit(wins[v38]->video_buffer, &blt_src_rect, &blt_dst_rect);
+        }
+
+        // CE: world-knockout overlay — punch key-colour pixels through to
+        // the raw world on top of the base blit, so knockouts compose with
+        // the near-black see-through. Runs through the transform too: the
+        // knockout samples the (scaled) src rect, so the cut-out tracks the
+        // panel and the magenta marker never flashes during the animation.
+        if (dst_video_buffer == NULL && wins[v38]->knockout_enabled) {
+            TigVideoBuffer* ko_under = NULL;
+            int ko_off_x = 0;
+            int ko_off_y = 0;
+            ko_under = tig_window_tint_underlay_vb(
+                wins[v38]->knockout_underlay, &ko_off_x, &ko_off_y);
+            tig_video_blit_knockout(wins[v38]->video_buffer,
+                &blt_src_rect, &blt_dst_rect,
+                ko_under, ko_off_x, ko_off_y,
+                wins[v38]->knockout_key);
         }
 
         v38--;
@@ -2152,6 +2204,39 @@ int tig_window_tint_enable(tig_window_handle_t window_handle,
 
     if (was_enabled != enabled) {
         // Force a recomposite so the new mode applies immediately.
+        tig_window_invalidate_rect(&(win->frame));
+    }
+    return TIG_OK;
+}
+
+// CE: opt a window into the world-knockout composite. While enabled,
+// pixels whose RGB equals `key` are replaced by the raw underlay (world)
+// pixel — a true cut-out for custom window shapes. Pass enabled=false to
+// turn it off. Independent of tig_window_tint_enable (a window uses one
+// path or the other; the compositor checks knockout first).
+int tig_window_knockout_enable(tig_window_handle_t window_handle,
+    bool enabled,
+    tig_window_handle_t underlay_handle,
+    tig_color_t key)
+{
+    int window_index;
+    TigWindow* win;
+
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    if (!tig_window_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    window_index = tig_window_handle_to_index(window_handle);
+    win = &(windows[window_index]);
+
+    bool was_enabled = win->knockout_enabled;
+    win->knockout_enabled = enabled;
+    win->knockout_key = key;
+    win->knockout_underlay = underlay_handle;
+
+    if (was_enabled != enabled) {
         tig_window_invalidate_rect(&(win->frame));
     }
     return TIG_OK;

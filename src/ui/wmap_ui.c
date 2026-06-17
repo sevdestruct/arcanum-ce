@@ -1486,6 +1486,7 @@ void wmap_ui_close(void)
         ambient_lighting_enable();
         intgame_button_destroy(&wmap_ui_navigate_button_info);
         intgame_apply_translucent_black(wmap_ui_window, false);
+        intgame_apply_world_knockout(wmap_ui_window, false);
         // CE: animated close (scale+fade out, gracefully interruptible).
         intgame_big_window_close_animated();
 
@@ -1615,17 +1616,33 @@ bool wmap_ui_create(void)
         exit(EXIT_SUCCESS); // FIXME: Should be EXIT_FAILURE.
     }
 
-    if (!gameuilib_custom_ui_blit(wmap_ui_window,
+    // CE: pre-fill the bg area with the world-knockout key (magenta) BEFORE
+    // the custom bg blits over it. The custom-UI loader chromakeys pure
+    // green to transparent, so wherever the art is painted green the fill
+    // shows through — i.e. green cut-outs end up as the magenta key, which
+    // the knockout composite then turns into the raw game world. Opaque art
+    // pixels overwrite the fill, so only the green-keyed shape regions
+    // become world holes. (Only meaningful when a custom bg is present.)
+    bool wmap_used_custom_bg = false;
+    tig_window_fill(wmap_ui_window, &dst_rect, intgame_world_knockout_key());
+    if (gameuilib_custom_ui_blit(wmap_ui_window,
             &dst_rect,
             &dst_rect,
             wmap_ui_bg_candidates)) {
+        wmap_used_custom_bg = true;
+    } else {
         tig_window_blit_art(wmap_ui_window, &art_blit_info);
     }
 
-    // CE: opt the world-map UI into the optional near-black see-through
-    // alpha so the dark panel regions blend with the iso world below.
-    // Disabled on close so the next big-window user starts opaque.
+    // CE: the world map composes BOTH effects — the near-black see-through
+    // (dark panel regions blend with the iso world) AND world knockouts
+    // (green cut-outs in the custom bg punch clean, untinted holes for
+    // custom rounded corners / outlines). The knockout is an overlay pass
+    // on top of the tint, so they coexist. Both disabled on close so the
+    // next big-window user starts opaque. Knockout only when a custom bg is
+    // present (the stock art has no key regions).
     intgame_apply_translucent_black(wmap_ui_window, true);
+    intgame_apply_world_knockout(wmap_ui_window, wmap_used_custom_bg);
 
     font_desc.flags = TIG_FONT_NO_ALPHA_BLEND | TIG_FONT_SHADOW;
     tig_art_interface_id_create(840, 0, 0, 0, &(font_desc.art_id));

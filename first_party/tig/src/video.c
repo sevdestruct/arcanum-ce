@@ -809,6 +809,117 @@ int tig_video_blit_near_black_tinted(TigVideoBuffer* src_video_buffer,
     return TIG_OK;
 }
 
+// CE: world-knockout OVERLAY pass. For each window pixel whose RGB matches
+// `key` (alpha ignored), write the RAW underlay (game world) pixel — a
+// true, untinted cut-out. All OTHER pixels are left untouched on the
+// destination (they were already written by the base blit: the opaque
+// copy, or the near-black tint). Running it as a key-only overlay AFTER
+// the base pass lets a window combine knockouts with the near-black
+// see-through: near-black regions tint, key regions cut to the world, the
+// rest stays opaque. Used by custom-shaped UI windows (e.g. the world map)
+// where an art region is left as the key colour to punch a clean hole.
+// Scalar (one small window) — no NEON needed.
+int tig_video_blit_knockout(TigVideoBuffer* src_video_buffer,
+    TigRect* src_rect,
+    TigRect* dst_rect,
+    TigVideoBuffer* underlay_video_buffer,
+    int underlay_offset_x,
+    int underlay_offset_y,
+    tig_color_t key)
+{
+    if (!tig_video_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    if (src_video_buffer == NULL || src_video_buffer->surface == NULL
+        || tig_video_state.surface == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+
+    TigRect clamped_dst;
+    int rc = tig_rect_intersection(dst_rect, &stru_610388, &clamped_dst);
+    if (rc != TIG_OK) {
+        return rc;
+    }
+    int dx_off = clamped_dst.x - dst_rect->x;
+    int dy_off = clamped_dst.y - dst_rect->y;
+
+    SDL_Surface* src = src_video_buffer->surface;
+    SDL_Surface* dst = tig_video_state.surface;
+    SDL_Surface* under = (underlay_video_buffer != NULL)
+        ? underlay_video_buffer->surface
+        : NULL;
+
+    if (!SDL_LockSurface(src)) return TIG_ERR_GENERIC;
+    if (!SDL_LockSurface(dst)) { SDL_UnlockSurface(src); return TIG_ERR_GENERIC; }
+    if (under != NULL && !SDL_LockSurface(under)) {
+        SDL_UnlockSurface(dst);
+        SDL_UnlockSurface(src);
+        return TIG_ERR_GENERIC;
+    }
+
+    if (dst_rect->width <= 0 || dst_rect->height <= 0) {
+        if (under != NULL) SDL_UnlockSurface(under);
+        SDL_UnlockSurface(dst);
+        SDL_UnlockSurface(src);
+        return TIG_OK;
+    }
+
+    int src_pitch_px = src->pitch / 4;
+    int dst_pitch_px = dst->pitch / 4;
+    int under_pitch_px = (under != NULL) ? (under->pitch / 4) : 0;
+    uint32_t* src_pixels = (uint32_t*)src->pixels;
+    uint32_t* dst_base = (uint32_t*)dst->pixels
+        + clamped_dst.y * dst_pitch_px
+        + clamped_dst.x;
+    uint32_t* under_base = NULL;
+    if (under != NULL) {
+        int uy = clamped_dst.y + underlay_offset_y;
+        int ux = clamped_dst.x + underlay_offset_x;
+        if (uy < 0 || ux < 0 || uy >= under->h || ux >= under->w) {
+            under = NULL;
+        } else {
+            under_base = (uint32_t*)under->pixels + uy * under_pitch_px + ux;
+        }
+    }
+
+    // CE: map each visible dst pixel back to the source window VB to test
+    // the key colour. The src and dst rects differ in size while a window
+    // animates its scale transform — sample the source nearest-neighbour so
+    // the cut-out tracks the scaled panel and the magenta marker never
+    // shows during the entrance/exit. 1:1 (steady state) reduces to a
+    // straight per-row copy.
+    uint32_t key_rgb = (uint32_t)key & 0x00FFFFFFu;
+    int w = clamped_dst.width;
+    int h = clamped_dst.height;
+    for (int j = 0; j < h; j++) {
+        uint32_t* dp = dst_base + j * dst_pitch_px;
+        uint32_t* up = (under_base != NULL) ? (under_base + j * under_pitch_px) : NULL;
+        if (up == NULL) {
+            continue; // no world to reveal; leave base pass untouched
+        }
+        int srow = src_rect->y + (dy_off + j) * src_rect->height / dst_rect->height;
+        if (srow < 0 || srow >= src->h) {
+            continue;
+        }
+        uint32_t* sp = src_pixels + srow * src_pitch_px;
+        for (int i = 0; i < w; i++) {
+            int scol = src_rect->x + (dx_off + i) * src_rect->width / dst_rect->width;
+            if (scol < 0 || scol >= src->w) {
+                continue;
+            }
+            if ((sp[scol] & 0x00FFFFFFu) == key_rgb) {
+                dp[i] = up[i] | 0xFF000000u; // raw world pixel, opaque
+            }
+            // non-key pixels: leave dst as the base pass drew it
+        }
+    }
+
+    if (under != NULL) SDL_UnlockSurface(under);
+    SDL_UnlockSurface(dst);
+    SDL_UnlockSurface(src);
+    return TIG_OK;
+}
+
 // 0x51F7C0
 int tig_video_fill(const TigRect* rect, tig_color_t color)
 {

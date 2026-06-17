@@ -11194,6 +11194,44 @@ void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool ena
         p.underlay, p.threshold, p.r, p.g, p.b);
 }
 
+// CE: world-knockout key colour — pure magenta. A window opted into
+// knockout shows the raw iso world wherever its pixels are this colour, so
+// custom-shaped panels can punch clean holes to the world. Magenta is
+// distinct from the green chromakey the custom-UI BMP loader consumes, so
+// the two never collide: a knockout-mode window pre-fills magenta, the
+// green chromakey reveals it, and this turns it into the world.
+#define INTGAME_WORLD_KNOCKOUT_KEY tig_color_make(255, 0, 255)
+
+// CE: opt a window into the world-knockout composite (see tig_window_
+// knockout_enable). Reuses the translucent-black underlay picker for the
+// world source; a no-op (disabled) when there's no sensible underlay
+// (e.g. no iso world up). Independent of the TRANSLUCENT_BLACK_UI cfg —
+// custom window shapes aren't the near-black see-through.
+void intgame_apply_world_knockout(tig_window_handle_t window_handle, bool enable)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    if (!enable) {
+        tig_window_knockout_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0);
+        return;
+    }
+    IntgameTintParams p = intgame_translucent_black_pick();
+    if (p.underlay == TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_knockout_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0);
+        return;
+    }
+    tig_window_knockout_enable(window_handle, true, p.underlay,
+        INTGAME_WORLD_KNOCKOUT_KEY);
+}
+
+tig_color_t intgame_world_knockout_key(void)
+{
+    return INTGAME_WORLD_KNOCKOUT_KEY;
+}
+
 // CE: re-pick the modal-dialog auto-tint params based on current
 // UI context. Called whenever the relevant state flips: iso
 // interface create/destroy, mainmenu open/close. Without this hook

@@ -171,6 +171,15 @@ int tig_window_tint_enable(tig_window_handle_t window_handle,
     uint8_t g,
     uint8_t b);
 
+// CE: opt a window into the world-knockout composite — pixels whose RGB
+// equals `key` are replaced by the raw underlay (world) pixel, a true
+// untinted cut-out for custom window shapes. Independent of the near-black
+// tint above (a window uses one path or the other).
+int tig_window_knockout_enable(tig_window_handle_t window_handle,
+    bool enabled,
+    tig_window_handle_t underlay_handle,
+    tig_color_t key);
+
 // CE: globally configure auto-tint on modal dialogs created by
 // tig_window_modal_dialog. Enable when an in-play game session
 // exists (passing the iso window handle as underlay). Disable when

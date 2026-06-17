@@ -328,6 +328,14 @@ int intgame_hud_bottom_slide_offset_get(void);
 // given window. Gated by the TranslucentBlackUI cfg flag — when off
 // (or enable=false), this clears any prior alpha state on the window.
 void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable);
+// CE: opt a window into the world-knockout composite — pixels painted the
+// world-knockout key colour (intgame_world_knockout_key()) show the raw
+// iso world, for custom window shapes / cut-outs. Disabled with enable=
+// false. Independent of the near-black translucent-black tint.
+void intgame_apply_world_knockout(tig_window_handle_t window_handle, bool enable);
+// CE: the magenta key colour a knockout-mode window's art (or pre-fill)
+// uses to mark "cut to the world here".
+tig_color_t intgame_world_knockout_key(void);
 
 // CE: re-evaluate which underlay window the modal-dialog auto-tint
 // should sample (mainmenu backdrop when mainmenu is up, iso world
