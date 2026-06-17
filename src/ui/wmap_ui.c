@@ -283,6 +283,8 @@ static void sub_565170(WmapCoords* coords);
 static void sub_565230(void);
 static void sub_5656B0(int x, int y, WmapCoords* coords);
 static void wmap_world_refresh_rect(TigRect* rect);
+static void wmap_overscan_free(void);
+static bool wmap_fade_buffers_ensure(int rn);
 static bool sub_565CF0(WmapNote* note);
 static void sub_565D00(WmapNote* note, TigRect* a2, TigRect* a3);
 static void wmap_note_vbid_lock(WmapNote* note);
@@ -1492,6 +1494,7 @@ void wmap_ui_close(void)
             tig_font_destroy(wmap_note_type_info[index].font);
         }
         tig_video_buffer_destroy(dword_64E7F4);
+        wmap_overscan_free();
         wmap_ui_created = 0;
         wmap_ui_obj = OBJ_HANDLE_NULL;
         wmap_ui_spell = -1;
@@ -4427,6 +4430,9 @@ void sub_5656B0(int x, int y, WmapCoords* coords)
 #define WMAP_VOID_MIN_AREA 400  // ~20x20 px; below this a black blob isn't "void"
 #define WMAP_VOID_THRESH 0.45f  // void density at which content reaches full black
                                 // (lower -> fade reaches further into content)
+#define WMAP_OVERSCAN WMAP_FEATHER_PX // off-canvas margin (px) of the feather's context buffer;
+                                // must be >= the feather reach so canvas-edge pixels see
+                                // real neighbours instead of a clipped guess (no breathing)
 
 // One separable box-blur pass with a clamped sliding window. Three of these per
 // axis approximate a round Gaussian cheaply (O(n) regardless of radius). The
@@ -4472,77 +4478,79 @@ static void wmap_box_blur_pass(const int* src, int* dst, int w, int h, int r, bo
     }
 }
 
-static void wmap_void_feather(TigRect* dirty)
+// The feather's CPU work buffers, kept persistent (grow-only) so a scroll's
+// stream of refreshes doesn't malloc/free several MB per frame. Capacity is in
+// elements (rn); the int buffers are 4x the bytes of `black`.
+static uint8_t* wmap_fade_black;
+static int* wmap_fade_field;
+static int* wmap_fade_tmp;
+static int* wmap_fade_dist;
+static int wmap_fade_cap;
+
+// Build the void field from `ctx` (an overscan buffer holding the map rendered
+// with a WMAP_OVERSCAN margin around `apply`, canvas content at ctx (M,M)) and
+// apply the darkening IN PLACE to the freshly-rendered window `win` over `apply`.
+// Reading the field from the overscanned context means canvas-edge pixels see
+// real off-canvas neighbours, not a clipped guess — so the fade doesn't reshape
+// at the window edge as you scroll. The window is darkened the same way the
+// original in-place feather did, so the see-through tint compositing is undisturbed.
+static void wmap_void_feather(TigVideoBuffer* ctx, TigVideoBuffer* win, TigRect* apply, int M)
 {
     const int BR = WMAP_FEATHER_PX / 3; // 3 box passes -> ~Gaussian of reach WMAP_FEATHER_PX
-    // Read border must cover the larger of the two layers' reaches, or content
-    // near the dirty-rect edge would miss void just outside it and band at seams.
-    const int BORDER = WMAP_FEATHER_PX > WMAP_LOCAL_FEATHER ? WMAP_FEATHER_PX : WMAP_LOCAL_FEATHER;
-    int rx, ry, rw, rh, rn, i, j, pass;
+    int rw, rh, rn, i, j, pass, cx, cy;
     uint8_t* black;
     int* field;
     int* tmp;
     int* dist;
     bool any_void = false;
-    TigVideoBuffer* vb;
     TigVideoBufferData vbd;
 
-    if (!gamelib_void_edge_fade() || dirty->width <= 0 || dirty->height <= 0) {
-        return;
-    }
-    if (tig_window_vbid_get(wmap_ui_window, &vb) != TIG_OK
-        || tig_video_buffer_lock(vb) != TIG_OK) {
-        return;
-    }
-    if (tig_video_buffer_data(vb, &vbd) != TIG_OK || vbd.pixels == NULL) {
-        tig_video_buffer_unlock(vb);
+    if (!gamelib_void_edge_fade() || ctx == NULL || win == NULL
+        || apply->width <= 0 || apply->height <= 0) {
         return;
     }
 
-    // Work region = dirty rect grown by the feather reach (read border, write core).
-    rx = dirty->x - BORDER;
-    ry = dirty->y - BORDER;
-    rw = dirty->width + 2 * BORDER;
-    rh = dirty->height + 2 * BORDER;
+    // Work buffer == the overscan context: dirty rect grown by the margin M.
+    rw = apply->width + 2 * M;
+    rh = apply->height + 2 * M;
     rn = rw * rh;
 
-    black = (uint8_t*)MALLOC((size_t)rn);
-    field = (int*)MALLOC((size_t)rn * sizeof(int));
-    tmp = (int*)MALLOC((size_t)rn * sizeof(int));
-    dist = (int*)MALLOC((size_t)rn * sizeof(int));
-    if (black == NULL || field == NULL || tmp == NULL || dist == NULL) {
-        if (black != NULL) FREE(black);
-        if (field != NULL) FREE(field);
-        if (tmp != NULL) FREE(tmp);
-        if (dist != NULL) FREE(dist);
-        tig_video_buffer_unlock(vb);
+    if (!wmap_fade_buffers_ensure(rn)) {
         return;
     }
+    black = wmap_fade_black;
+    field = wmap_fade_field;
+    tmp = wmap_fade_tmp;
+    dist = wmap_fade_dist;
 
-    // Mark exact-black pixels; void field starts empty.
+    // Detect exact-black void in the context buffer (read-only; not shown).
+    if (tig_video_buffer_lock(ctx) != TIG_OK) {
+        return;
+    }
+    if (tig_video_buffer_data(ctx, &vbd) != TIG_OK || vbd.pixels == NULL) {
+        tig_video_buffer_unlock(ctx);
+        return;
+    }
     for (j = 0; j < rh; j++) {
-        int gy = ry + j;
-        const uint32_t* row = (gy >= 0 && gy < vbd.height)
-            ? (const uint32_t*)((const uint8_t*)vbd.pixels + (size_t)gy * (size_t)vbd.pitch)
+        const uint32_t* row = (j < vbd.height)
+            ? (const uint32_t*)((const uint8_t*)vbd.pixels + (size_t)j * (size_t)vbd.pitch)
             : NULL;
         for (i = 0; i < rw; i++) {
-            int gx = rx + i;
             uint8_t b = 0;
-            if (row != NULL && gx >= 0 && gx < vbd.width) {
-                uint32_t p = row[gx];
+            if (row != NULL && i < vbd.width) {
+                uint32_t p = row[i];
                 b = (tig_color_get_red(p) == 0 && tig_color_get_green(p) == 0 && tig_color_get_blue(p) == 0) ? 1 : 0;
             }
             black[j * rw + i] = b;
             field[j * rw + i] = 0;
         }
     }
+    tig_video_buffer_unlock(ctx);
 
     // Keep contiguous black regions as void (field=255); flood each blob using
     // `black` as the visited flag and `tmp` as the queue. A blob qualifies if it's
-    // >= WMAP_VOID_MIN_AREA, OR it touches the viewport (dirty-rect) edge — in
-    // which case it's almost certainly a larger void clipped by the view, whose
-    // visible sliver would otherwise fall under the area floor and leave the edge
-    // content unfaded until more of it scrolls in.
+    // >= WMAP_VOID_MIN_AREA, OR it touches the context-buffer edge — in which case
+    // it's a larger void clipped by the overscanned region (continues further off).
     for (j = 0; j < rh; j++) {
         for (i = 0; i < rw; i++) {
             int head, tail, k;
@@ -4556,18 +4564,15 @@ static void wmap_void_feather(TigRect* dirty)
             black[j * rw + i] = 0;
             while (head < tail) {
                 int c = tmp[head++];
-                int cx = c % rw;
-                int cy = c / rw;
-                int gx = rx + cx;
-                int gy = ry + cy;
-                if (gx <= dirty->x || gx >= dirty->x + dirty->width - 1
-                    || gy <= dirty->y || gy >= dirty->y + dirty->height - 1) {
+                int ccx = c % rw;
+                int ccy = c / rw;
+                if (ccx == 0 || ccx == rw - 1 || ccy == 0 || ccy == rh - 1) {
                     touches_edge = true;
                 }
-                if (cx > 0 && black[c - 1]) { black[c - 1] = 0; tmp[tail++] = c - 1; }
-                if (cx < rw - 1 && black[c + 1]) { black[c + 1] = 0; tmp[tail++] = c + 1; }
-                if (cy > 0 && black[c - rw]) { black[c - rw] = 0; tmp[tail++] = c - rw; }
-                if (cy < rh - 1 && black[c + rw]) { black[c + rw] = 0; tmp[tail++] = c + rw; }
+                if (ccx > 0 && black[c - 1]) { black[c - 1] = 0; tmp[tail++] = c - 1; }
+                if (ccx < rw - 1 && black[c + 1]) { black[c + 1] = 0; tmp[tail++] = c + 1; }
+                if (ccy > 0 && black[c - rw]) { black[c - rw] = 0; tmp[tail++] = c - rw; }
+                if (ccy < rh - 1 && black[c + rw]) { black[c + rw] = 0; tmp[tail++] = c + rw; }
             }
             if (tail >= WMAP_VOID_MIN_AREA || touches_edge) {
                 any_void = true;
@@ -4579,34 +4584,11 @@ static void wmap_void_feather(TigRect* dirty)
     }
 
     if (!any_void) {
-        FREE(black);
-        FREE(field);
-        FREE(tmp);
-        FREE(dist);
-        tig_video_buffer_unlock(vb);
         return;
     }
 
-    // Clamp-extend the void field into the work-region border (the part beyond the
-    // viewport): replicate each viewport-edge value outward. Without this the blur
-    // at the viewport edge averages in the non-void frame beyond the clip and a
-    // clipped void fades weakly there; replicating makes a clipped void read as
-    // continuing off-screen, so edge content fades fully and consistently.
-    {
-        int dl = dirty->x, dr = dirty->x + dirty->width - 1;
-        int dt = dirty->y, db = dirty->y + dirty->height - 1;
-        for (j = 0; j < rh; j++) {
-            int gy = ry + j;
-            int cgy = gy < dt ? dt : (gy > db ? db : gy);
-            for (i = 0; i < rw; i++) {
-                int gx = rx + i;
-                int cgx = gx < dl ? dl : (gx > dr ? dr : gx);
-                if (cgx != gx || cgy != gy) {
-                    field[j * rw + i] = field[(cgy - ry) * rw + (cgx - rx)];
-                }
-            }
-        }
-    }
+    // (No clamp-extend needed: the context buffer's margin is real rendered map,
+    // not the off-canvas frame, so there is nothing to replicate.)
 
     // Proximity feather: chamfer distance transform from the void (field>=128)
     // while it's still the binary mask, before the blur overwrites it. Two sweeps
@@ -4670,51 +4652,242 @@ static void wmap_void_feather(TigRect* dirty)
         wmap_box_blur_pass(tmp, dist, rw, rh, WMAP_PROX_SMOOTH, true);
     }
 
-    // Darken by blurred void density, only inside the dirty rect (fresh pixels).
-    for (j = 0; j < rh; j++) {
-        int gy = ry + j;
+    // Darken the freshly-rendered window pixels over `apply`. The field index for
+    // window (apply.x+cx, apply.y+cy) is the context pixel (M+cx, M+cy).
+    if (tig_video_buffer_lock(win) != TIG_OK) {
+        return;
+    }
+    if (tig_video_buffer_data(win, &vbd) != TIG_OK || vbd.pixels == NULL) {
+        tig_video_buffer_unlock(win);
+        return;
+    }
+    for (cy = 0; cy < apply->height; cy++) {
+        int wy = apply->y + cy;
         uint32_t* row;
-        if (gy < dirty->y || gy >= dirty->y + dirty->height || gy < 0 || gy >= vbd.height) {
+        if (wy < 0 || wy >= vbd.height) {
             continue;
         }
-        row = (uint32_t*)((uint8_t*)vbd.pixels + (size_t)gy * (size_t)vbd.pitch);
-        for (i = 0; i < rw; i++) {
-            int gx = rx + i;
-            float dens, t;
+        row = (uint32_t*)((uint8_t*)vbd.pixels + (size_t)wy * (size_t)vbd.pitch);
+        for (cx = 0; cx < apply->width; cx++) {
+            int wx = apply->x + cx;
+            int si = (M + cx) + (M + cy) * rw;
+            float dens, t, ft;
             int f;
             uint32_t p;
-            if (gx < dirty->x || gx >= dirty->x + dirty->width || gx < 0 || gx >= vbd.width) {
+            if (wx < 0 || wx >= vbd.width) {
                 continue;
             }
             // Density brightness: void MASS near this pixel (0=black .. 1=clear).
-            dens = (float)field[j * rw + i] / 255.0f; // 0 = no void near .. 1 = void
+            dens = (float)field[si] / 255.0f; // 0 = no void near .. 1 = void
             t = (WMAP_VOID_THRESH - dens) / WMAP_VOID_THRESH; // 1 far .. <=0 at/in void
             if (t < 0.0f) t = 0.0f;
             else if (t > 1.0f) t = 1.0f;
             t = t * t * (3.0f - 2.0f * t); // smoothstep
-            {
-                // Proximity brightness: de-faceted distance halo (computed above),
-                // rounds thin convex spikes density misses. Fade = darker of both.
-                float ft = (float)dist[j * rw + i] / 255.0f;
-                if (ft < t) t = ft;
-            }
+            // Proximity brightness: de-faceted distance halo (computed above),
+            // rounds thin convex spikes density misses. Fade = darker of both.
+            ft = (float)dist[si] / 255.0f;
+            if (ft < t) t = ft;
             if (t >= 1.0f) {
                 continue; // no void within reach of either layer — unchanged
             }
             f = (int)(t * 255.0f + 0.5f);
-            p = row[gx];
-            row[gx] = tig_color_make(
+            p = row[wx];
+            row[wx] = tig_color_make(
                 tig_color_get_red(p) * f / 255,
                 tig_color_get_green(p) * f / 255,
                 tig_color_get_blue(p) * f / 255);
         }
     }
+    tig_video_buffer_unlock(win);
+}
 
-    FREE(black);
-    FREE(field);
-    FREE(tmp);
-    FREE(dist);
-    tig_video_buffer_unlock(vb);
+// CE: persistent throwaway buffer the feather renders its overscan context into.
+// Sized to the dirty rect + 2*WMAP_OVERSCAN; grows to the largest seen (a full
+// canvas refresh) and is reused for smaller partial refreshes, so it never
+// reallocates per-refresh. It is NEVER blitted to the window — only read to build
+// the void field — so the window's see-through compositing is untouched.
+static TigVideoBuffer* wmap_overscan_vb;
+static int wmap_overscan_w;
+static int wmap_overscan_h;
+
+static TigVideoBuffer* wmap_overscan_get(int w, int h)
+{
+    TigVideoBufferCreateInfo ci;
+    int need_w = w > wmap_overscan_w ? w : wmap_overscan_w;
+    int need_h = h > wmap_overscan_h ? h : wmap_overscan_h;
+    if (wmap_overscan_vb == NULL || wmap_overscan_w < need_w || wmap_overscan_h < need_h) {
+        if (wmap_overscan_vb != NULL) {
+            tig_video_buffer_destroy(wmap_overscan_vb);
+            wmap_overscan_vb = NULL;
+        }
+        ci.flags = TIG_VIDEO_BUFFER_CREATE_SYSTEM_MEMORY;
+        ci.width = need_w;
+        ci.height = need_h;
+        ci.background_color = tig_color_make(0, 0, 0);
+        ci.color_key = 0;
+        if (tig_video_buffer_create(&ci, &wmap_overscan_vb) != TIG_OK) {
+            wmap_overscan_vb = NULL;
+            return NULL;
+        }
+        wmap_overscan_w = need_w;
+        wmap_overscan_h = need_h;
+    }
+    return wmap_overscan_vb;
+}
+
+static bool wmap_fade_buffers_ensure(int rn)
+{
+    if (wmap_fade_black != NULL && rn <= wmap_fade_cap) {
+        return true;
+    }
+    if (wmap_fade_black != NULL) FREE(wmap_fade_black);
+    if (wmap_fade_field != NULL) FREE(wmap_fade_field);
+    if (wmap_fade_tmp != NULL) FREE(wmap_fade_tmp);
+    if (wmap_fade_dist != NULL) FREE(wmap_fade_dist);
+    wmap_fade_black = (uint8_t*)MALLOC((size_t)rn);
+    wmap_fade_field = (int*)MALLOC((size_t)rn * sizeof(int));
+    wmap_fade_tmp = (int*)MALLOC((size_t)rn * sizeof(int));
+    wmap_fade_dist = (int*)MALLOC((size_t)rn * sizeof(int));
+    if (wmap_fade_black == NULL || wmap_fade_field == NULL
+        || wmap_fade_tmp == NULL || wmap_fade_dist == NULL) {
+        if (wmap_fade_black != NULL) { FREE(wmap_fade_black); wmap_fade_black = NULL; }
+        if (wmap_fade_field != NULL) { FREE(wmap_fade_field); wmap_fade_field = NULL; }
+        if (wmap_fade_tmp != NULL) { FREE(wmap_fade_tmp); wmap_fade_tmp = NULL; }
+        if (wmap_fade_dist != NULL) { FREE(wmap_fade_dist); wmap_fade_dist = NULL; }
+        wmap_fade_cap = 0;
+        return false;
+    }
+    wmap_fade_cap = rn;
+    return true;
+}
+
+static void wmap_overscan_free(void)
+{
+    if (wmap_overscan_vb != NULL) {
+        tig_video_buffer_destroy(wmap_overscan_vb);
+        wmap_overscan_vb = NULL;
+        wmap_overscan_w = 0;
+        wmap_overscan_h = 0;
+    }
+    if (wmap_fade_black != NULL) { FREE(wmap_fade_black); wmap_fade_black = NULL; }
+    if (wmap_fade_field != NULL) { FREE(wmap_fade_field); wmap_fade_field = NULL; }
+    if (wmap_fade_tmp != NULL) { FREE(wmap_fade_tmp); wmap_fade_tmp = NULL; }
+    if (wmap_fade_dist != NULL) { FREE(wmap_fade_dist); wmap_fade_dist = NULL; }
+    wmap_fade_cap = 0;
+}
+
+// Render the world-map tiles into `dst` with the canvas origin landing at
+// (base_x, base_y) and clipped to `clip` (both in dst space). Used only to fill
+// the feather's overscan context buffer; the tile range is derived from the clip
+// so the off-canvas margin is rendered too.
+static void wmap_world_blit_tiles(WmapInfo* info, TigVideoBuffer* dst,
+    int base_x, int base_y, const TigRect* clip, int offset_x, int offset_y)
+{
+    TigVideoBufferBlitInfo bi;
+    TigRect src;
+    TigRect dr;
+    int min_x, min_y, max_x, max_y, x, y, idx;
+    WmapTile* v2;
+    int tw = info->tile_width;
+    int th = info->tile_height;
+
+    bi.flags = 0;
+    bi.src_rect = &src;
+    bi.dst_rect = &dr;
+    bi.dst_video_buffer = dst;
+
+    min_x = (offset_x + clip->x - base_x) / tw - 1;
+    if (min_x < 0) min_x = 0;
+    min_y = (offset_y + clip->y - base_y) / th - 1;
+    if (min_y < 0) min_y = 0;
+    max_x = (offset_x + clip->x + clip->width - base_x) / tw + 1;
+    if (max_x > info->num_hor_tiles) max_x = info->num_hor_tiles;
+    max_y = (offset_y + clip->y + clip->height - base_y) / th + 1;
+    if (max_y > info->num_vert_tiles) max_y = info->num_vert_tiles;
+
+    for (y = min_y; y < max_y; y++) {
+        for (x = min_x; x < max_x; x++) {
+            idx = y * info->num_hor_tiles + x;
+            v2 = &(info->tiles[idx]);
+            src.x = base_x + v2->rect.width * x - offset_x;
+            src.y = base_y + v2->rect.height * y - offset_y;
+            src.width = v2->rect.width;
+            src.height = v2->rect.height;
+            if (tig_rect_intersection(&src, clip, &dr) != TIG_OK) {
+                continue;
+            }
+            src.x = dr.x - src.x;
+            src.y = dr.y - src.y;
+            src.width = dr.width;
+            src.height = dr.height;
+            if (wmTileArtLock(idx) && v2->video_buffer != NULL) {
+                bi.src_video_buffer = v2->video_buffer;
+                tig_video_buffer_blit(&bi);
+                wmTileArtUnlock(idx);
+            }
+        }
+    }
+}
+
+// Render the town-map tiles into `dst` (see wmap_world_blit_tiles). Keeps the
+// discovery logic: waitable maps show every tile, else only uncovered tiles blit
+// and the rest fill black (which the feather treats as void).
+static void wmap_town_blit_tiles(WmapInfo* info, TigVideoBuffer* dst,
+    int base_x, int base_y, const TigRect* clip, int offset_x, int offset_y)
+{
+    TigVideoBufferBlitInfo bi;
+    TigRect src;
+    TigRect dr;
+    int min_x, min_y, max_x, max_y, row, col, idx;
+    WmapTile* entry;
+    int tw = info->tile_width;
+    int th = info->tile_height;
+
+    bi.flags = 0;
+    bi.src_rect = &src;
+    bi.dst_rect = &dr;
+    bi.dst_video_buffer = dst;
+
+    min_x = (offset_x + clip->x - base_x) / tw - 1;
+    if (min_x < 0) min_x = 0;
+    min_y = (offset_y + clip->y - base_y) / th - 1;
+    if (min_y < 0) min_y = 0;
+    max_x = (offset_x + clip->x + clip->width - base_x) / tw + 1;
+    if (max_x > info->num_hor_tiles) max_x = info->num_hor_tiles;
+    max_y = (offset_y + clip->y + clip->height - base_y) / th + 1;
+    if (max_y > info->num_vert_tiles) max_y = info->num_vert_tiles;
+
+    for (row = min_y; row < max_y; row++) {
+        for (col = min_x; col < max_x; col++) {
+            idx = col + row * info->num_hor_tiles;
+            entry = &(info->tiles[idx]);
+            src.width = entry->rect.width;
+            src.height = entry->rect.height;
+            src.x = base_x + entry->rect.width * col - offset_x;
+            src.y = base_y + entry->rect.height * row - offset_y;
+            if (tig_rect_intersection(&src, clip, &dr) != TIG_OK) {
+                continue;
+            }
+            src.x = dr.x - src.x;
+            src.y = dr.y - src.y;
+            src.width = dr.width;
+            src.height = dr.height;
+            if (wmTileArtLock(idx)) {
+                if (townmap_is_waitable(wmap_ui_townmap)) {
+                    bi.flags = 0;
+                    bi.src_video_buffer = entry->video_buffer;
+                    tig_video_buffer_blit(&bi);
+                } else if (townmap_tile_blit_info(wmap_ui_townmap, idx, &bi)) {
+                    bi.src_video_buffer = entry->video_buffer;
+                    tig_video_buffer_blit(&bi);
+                    wmTileArtUnlock(idx);
+                } else {
+                    tig_video_buffer_fill(dst, &dr, tig_color_make(0, 0, 0));
+                    wmTileArtUnlock(idx);
+                }
+            }
+        }
+    }
 }
 
 // 0x5657A0
@@ -4832,7 +5005,23 @@ void wmap_world_refresh_rect(TigRect* rect)
     }
 
     // CE: feather map art into any contiguous void it borders, before notes draw.
-    wmap_void_feather(&tmp_rect);
+    // Build the feather's void field from an off-screen overscan render (so edges
+    // near the canvas boundary have real context and don't breathe), then darken
+    // the window in place. The context buffer is never shown.
+    if (gamelib_void_edge_fade()) {
+        int M = WMAP_OVERSCAN;
+        int uw = tmp_rect.width + 2 * M;
+        int uh = tmp_rect.height + 2 * M;
+        TigVideoBuffer* ctx = wmap_overscan_get(uw, uh);
+        if (ctx != NULL) {
+            TigRect used = { 0, 0, uw, uh };
+            tig_video_buffer_fill(ctx, &used, tig_color_make(0, 0, 0));
+            wmap_world_blit_tiles(wmap_info, ctx,
+                M + wmap_info->rect.x - tmp_rect.x, M + wmap_info->rect.y - tmp_rect.y,
+                &used, offset_x, offset_y);
+            wmap_void_feather(ctx, vb_blit_info.dst_video_buffer, &tmp_rect, M);
+        }
+    }
 
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &src_rect;
@@ -5195,7 +5384,23 @@ void wmap_town_refresh_rect(TigRect* rect)
     }
 
     // CE: feather townmap art into any contiguous void it borders, before notes.
-    wmap_void_feather(&dirty_rect);
+    // Field from an off-screen overscan render (no edge breathing), applied in
+    // place to the window. Tiles anchor to `bounds` (the full canvas).
+    if (gamelib_void_edge_fade()) {
+        int M = WMAP_OVERSCAN;
+        int uw = dirty_rect.width + 2 * M;
+        int uh = dirty_rect.height + 2 * M;
+        WmapInfo* town = &wmap_ui_mode_info[WMAP_UI_MODE_TOWN];
+        TigVideoBuffer* ctx = wmap_overscan_get(uw, uh);
+        if (ctx != NULL) {
+            TigRect used = { 0, 0, uw, uh };
+            tig_video_buffer_fill(ctx, &used, tig_color_make(0, 0, 0));
+            wmap_town_blit_tiles(town, ctx,
+                M + bounds.x - dirty_rect.x, M + bounds.y - dirty_rect.y,
+                &used, offset_x, offset_y);
+            wmap_void_feather(ctx, vb_blit_info.dst_video_buffer, &dirty_rect, M);
+        }
+    }
 
     art_blit_info.flags = 0;
     art_blit_info.src_rect = &art_src_rect;
