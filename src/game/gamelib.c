@@ -660,14 +660,14 @@ void gamelib_reset(void)
 static const SettingsDoc gamelib_cfg_docs[] = {
     // Display / video
     { "windowed", "Run in a window instead of fullscreen (0=fullscreen, 1=windowed)." },
-    { "resolution width", "Render width in pixels." },
-    { "resolution height", "Render height in pixels." },
+    { "resolution width", "Render width in pixels (minimum 800).\nNote: with 'aspect snap' on, the game rewrites this on launch to match your display's aspect ratio." },
+    { "resolution height", "Render height in pixels (minimum 600).\nNote: auto-adjusted together with 'resolution width' when 'aspect snap' fits the display aspect ratio." },
     { "vsync mode", "Frame sync: 0=off (tearing, max throughput), 1=on (no tearing), 2=adaptive (no wait on a missed frame)." },
     { "show fps", "Show the FPS counter (0=off, 1=on)." },
     { "tile render path", "Tile rasterizer: software or gpu." },
     { "gpu buffer sanity check", "Validate GPU buffers each frame; debugging aid (0=off, 1=on)." },
     { "macos ignore notch", "Use the full display behind the macOS camera notch (0=avoid notch, 1=use full area)." },
-    { "aspect snap", "Snap the viewport to a clean aspect ratio (0=off, 1=on)." },
+    { "aspect snap", "On launch (fullscreen), snap resolution width/height to the display's aspect ratio and save the adjusted values back here (0=off, 1=on)." },
     { "legacy menu vignette", "Darkened vignette border on the main menu (0=off, 1=on)." },
     { "brightness", "Brightness/gamma offset (0=default)." },
     { "object lighting", "Per-object dynamic lighting (0=off, 1=on)." },
