@@ -212,6 +212,13 @@ int gamelib_cheat_level_get(void);
 void gamelib_cheat_level_set(int level);
 void gamelib_invalidate_rect(TigRect* rect);
 bool gamelib_draw(void);
+// CE: render a 1:1 iso view centred on center_obj's sprite into target_vb
+// (a width x height region), restoring all render state afterwards. Used
+// by the PC lens to show the player even when scrolled/zoomed off the
+// main view. Centres on the sprite's bounding box (not just its tile) so
+// the head isn't clipped. Must be called outside the main draw. Returns
+// false (no render) outside a normal iso game session.
+bool gamelib_render_lens_view(TigVideoBuffer* target_vb, int64_t center_obj, int width, int height);
 void gamelib_renderlock_acquire(void);
 void gamelib_renderlock_release(void);
 void gamelib_clear_screen(void);

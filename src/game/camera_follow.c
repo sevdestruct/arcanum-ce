@@ -289,6 +289,11 @@ void camera_follow_init(void)
     s_last_origin_valid = false;
 }
 
+bool camera_follow_is_enabled(void)
+{
+    return s_follow_enabled;
+}
+
 // Zero all motion state — used by every code path that yields camera
 // motion to user input (scroll, external jump). Keeps "stop fighting
 // the user" consistent. Also invalidates the PC-velocity baseline so
@@ -352,6 +357,24 @@ void camera_follow_note_user_camera_move(void)
     if (s_scroll_note_count >= FOLLOW_SCROLL_NOTE_THRESHOLD) {
         arm_user_override_cooldown();
     }
+}
+
+// CE: announce a deliberate "frame the PC" recenter (UI recenter button,
+// PC lens, wmap travel-close). The game is explicitly choosing PC
+// framing, so any armed user-override cooldown (a stale manual-framing
+// suppression left over from earlier edge-scroll / UI interaction) must
+// be cleared — otherwise follow would stay dead through the recenter and
+// the walk that follows it. Re-baselines the origin tracker so the
+// recenter's own motion isn't later counted as an external jump. No-op
+// when the feature is disabled.
+void camera_follow_note_recenter(void)
+{
+    if (!s_follow_enabled) {
+        return;
+    }
+    s_user_override_armed = false;
+    s_last_origin_valid = false;
+    zero_motion_state();
 }
 
 // Compute the PC's current on-screen pixel coords (accounting for
@@ -525,6 +548,23 @@ void camera_follow_ping(void)
     // safe-zone check inside handle_external_jump still arms cooldown
     // for any subsequent jump that leaves PC outside the safe zone.
     if (dialog_camera_is_animating()) {
+        s_last_origin_valid = false;
+        zero_motion_state();
+        return;
+    }
+
+    // CE: a deliberate camera-origin tween (PC-recenter on overlay/lens,
+    // wmap travel-close, dialog conclusion) owns the view while it plays.
+    // Yield exactly like the dialog case — reset our origin baseline and
+    // motion residual each tick so the tween's per-tick origin shifts
+    // aren't seen by handle_external_jump as a "user framed elsewhere"
+    // jump. That misread is destructive: it would CANCEL the tween
+    // mid-flight (arm_user_override_cooldown cancels any non-dialog
+    // tween) AND arm the 3s cooldown, leaving follow dead for 3s right
+    // as the post-recenter walk begins. When the tween finishes it has
+    // framed the PC (inside the safe zone), so the next tick resumes
+    // tracking cleanly with no cooldown.
+    if (camera_tween_is_active()) {
         s_last_origin_valid = false;
         zero_motion_state();
         return;

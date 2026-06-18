@@ -46,6 +46,12 @@
 
 void camera_follow_init(void);
 
+// True when the "camera follows player" setting is on. Callers that
+// frame the PC themselves (wmap travel-close) use this to decide whether
+// to hand the camera to follow (let it track the walk) or do their own
+// recenter (no follow → nothing else would re-frame the PC).
+bool camera_follow_is_enabled(void);
+
 // Per-tick driver. Cheap when the setting is off or when nothing needs
 // to happen. Called from gamelib_draw alongside the existing
 // iso_zoom_ping / dialog_camera_ping / camera_tween_ping.
@@ -59,5 +65,11 @@ void camera_follow_ping(void);
 // see it — calling here just arms the cooldown immediately on the
 // first scroll input, before any origin change is observed).
 void camera_follow_note_user_camera_move(void);
+
+// CE: announce a deliberate "frame the PC" recenter (UI recenter button,
+// PC lens, wmap travel-close). Clears any armed user-override cooldown so
+// follow resumes tracking through the recenter and the walk that follows.
+// No-op when the feature is disabled.
+void camera_follow_note_recenter(void);
 
 #endif /* ARCANUM_GAME_CAMERA_FOLLOW_H_ */

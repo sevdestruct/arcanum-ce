@@ -120,6 +120,11 @@ void intgame_suppress_overlay_dismiss_once(void);
 // the player" button, so clicking it implies "take me back to the PC"
 // even when the recenter-camera-on-overlay setting is off.
 void intgame_recenter_on_pc(void);
+// CE: smooth (tweened) recenter. duration_ms 0 uses the camera_tween
+// default. _location centres on an arbitrary tile (overlay-open recenter
+// on the overlay's subject); _pc is the local-PC convenience.
+void intgame_recenter_on_location_tween(int64_t location, unsigned int duration_ms);
+void intgame_recenter_on_pc_tween(unsigned int duration_ms);
 void intgame_pc_lens_redraw(void);
 void iso_interface_refresh(void);
 bool sub_5517A0(TigMessage* msg);

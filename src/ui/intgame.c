@@ -3,6 +3,8 @@
 #include <limits.h>
 #include <stdio.h>
 
+#include "game/camera_follow.h"
+#include "game/camera_tween.h"
 #include "game/dialog_camera.h"
 #include "game/iso_zoom.h"
 #include "game/location.h"
@@ -4751,8 +4753,13 @@ void intgame_pc_lens_do(PcLensMode mode, PcLens* pc_lens)
         }
         break;
     case PC_LENS_MODE_PASSTHROUGH:
-        // CE: sub_551A10() snaps the iso viewport back to the PC so the
-        // lens always shows the player's surroundings. Gated on
+        // CE: SNAP the iso viewport back to the PC so the lens shows the
+        // player's surroundings. Must be a snap, NOT a tween: the lens
+        // samples the live iso buffer at screen centre, so the camera has
+        // to be centred on the PC by the time the lens redraws — a tween
+        // would leave the lens looking at the wrong spot until it settled.
+        // (The overlay-EXIT recenter animates instead; there's no lens to
+        // keep in sync once the overlay closes.) Gated on
         // RECENTER_CAMERA_ON_OVERLAY_KEY — default off, the lens just
         // shows whatever's currently centered on screen so the player
         // can pan and still open overlays without losing their scroll.
@@ -4931,40 +4938,55 @@ void intgame_pc_lens_redraw(void)
     TigRect lens_src_rect;
 
     if (intgame_pc_lens_video_buffer != NULL) {
-        // CE: Default is to copy whatever is at screen center — vanilla
-        // behavior, correct when the camera is centered on the PC.
-        lens_src_rect = intgame_pc_lens_dst_rect;
-
-        // CE: PC_LENS_FOLLOWS_PLAYER_KEY: when the camera has been panned
-        // away from the PC (i.e. recenter-camera-on-overlay is off and the
-        // player scrolled before opening an overlay), shift the source rect
-        // so the lens widget still shows the PC. The PC's current screen
-        // position is (center - dx, center - dy) where (dx, dy) is the
-        // scroll vector needed to re-center on the PC. The lens dst rect is
-        // pre-centered on the screen, so subtracting (dx, dy) from its
-        // origin lands the source rect on the PC.
-        if (gamelib_pc_lens_follows_player()) {
-            int64_t pc_obj = player_get_local_pc_obj();
-            if (pc_obj != OBJ_HANDLE_NULL) {
-                int64_t pc_loc;
-                int64_t dx;
-                int64_t dy;
-                pc_loc = obj_field_int64_get(pc_obj, OBJ_F_LOCATION);
-                location_calc_dist_from_screen_center(pc_loc, &dx, &dy);
-                lens_src_rect.x = intgame_pc_lens_dst_rect.x - (int)dx;
-                lens_src_rect.y = intgame_pc_lens_dst_rect.y - (int)dy;
-            }
-        }
-
-        tig_window_copy(intgame_pc_lens.window_handle,
-            intgame_pc_lens.rect,
-            dword_64C52C,
-            &lens_src_rect);
+        bool rendered_to_vb = false;
 
         src_rect.x = 0;
         src_rect.y = 0;
         src_rect.width = intgame_pc_lens.rect->width;
         src_rect.height = intgame_pc_lens.rect->height;
+
+        // CE: PC_LENS_FOLLOWS_PLAYER_KEY. The cheap path below just samples
+        // the already-rendered main view, which can only show the PC while
+        // the PC is on-screen. When the player has scrolled or zoomed the
+        // PC off the view, sampling has nothing to copy — so give the lens
+        // its OWN little 1:1 render centred on the PC instead (works at any
+        // zoom/scroll, and renders only the lens-sized region). See
+        // gamelib_render_lens_view.
+        if (gamelib_pc_lens_follows_player()) {
+            int64_t pc_obj = player_get_local_pc_obj();
+            if (pc_obj != OBJ_HANDLE_NULL) {
+                rendered_to_vb = gamelib_render_lens_view(intgame_pc_lens_video_buffer,
+                    pc_obj, src_rect.width, src_rect.height);
+            }
+        }
+
+        if (rendered_to_vb) {
+            // The lens VB already holds the PC-centred world; show it in
+            // the lens window, then the frame art on top.
+            tig_window_copy_from_vbuffer(intgame_pc_lens.window_handle,
+                intgame_pc_lens.rect, intgame_pc_lens_video_buffer, &src_rect);
+
+            dst_rect = src_rect;
+            dst_rect.x = intgame_pc_lens.rect->x;
+            dst_rect.y = intgame_pc_lens.rect->y;
+
+            blit_info.art_id = intgame_pc_lens.art_id;
+            blit_info.flags = 0;
+            blit_info.src_rect = &src_rect;
+            blit_info.dst_rect = &dst_rect;
+            tig_window_blit_art(intgame_pc_lens.window_handle, &blit_info);
+            return;
+        }
+
+        // Cheap path: copy whatever is at screen center from the rendered
+        // main view — vanilla behavior, correct when the camera is centred
+        // on the PC (e.g. recenter-camera-on-overlay).
+        lens_src_rect = intgame_pc_lens_dst_rect;
+
+        tig_window_copy(intgame_pc_lens.window_handle,
+            intgame_pc_lens.rect,
+            dword_64C52C,
+            &lens_src_rect);
 
         if (tig_window_copy_to_vbuffer(dword_64C52C, &lens_src_rect, intgame_pc_lens_video_buffer, &src_rect) == TIG_OK) {
             dst_rect = src_rect;
@@ -5315,13 +5337,48 @@ IntgameMode intgame_mode_get(void)
     return intgame_mode_stack[intgame_mode_stack_size];
 }
 
-// CE: Public wrapper around sub_551A10 for overlay screens that close on
-// a PC-lens click. The lens widget is a "back to the player" button, so
-// clicking it should always recenter the iso camera on the PC — even when
-// the recenter-camera-on-overlay opt-in is off.
+// CE: Public wrapper for overlay screens that close on a PC-lens click.
+// The lens widget is a "back to the player" button, so clicking it always
+// GLIDES the iso camera to the PC (was a hard snap) — even when the
+// recenter-camera-on-overlay opt-in is off. The animated recenter is the
+// lens's whole point: it returns you to the player as the overlay closes.
 void intgame_recenter_on_pc(void)
 {
-    sub_551A10(player_get_local_pc_obj());
+    intgame_recenter_on_pc_tween(0);
+}
+
+// CE: GLIDE the iso camera so `location` lands at screen center over
+// duration_ms (0 = the camera_tween default) instead of snapping. Same
+// center-on-location math as location_origin_set; the resulting delta is
+// handed to camera_tween_by so the move is a smooth pan. Also clears any
+// stale camera-follow cooldown first so follow picks up cleanly when the
+// tween lands (the tween itself is yielded-to by follow while in flight;
+// this handles a cooldown armed BEFORE the recenter). No-op when already
+// centred or when `location` is invalid.
+void intgame_recenter_on_location_tween(int64_t location, unsigned int duration_ms)
+{
+    int64_t dx;
+    int64_t dy;
+
+    if (location == 0) {
+        return;
+    }
+    camera_follow_note_recenter();
+    location_calc_dist_from_screen_center(location, &dx, &dy);
+    camera_tween_by(dx, dy, duration_ms);
+}
+
+// CE: convenience — tween-recenter on the local PC. See
+// intgame_recenter_on_location_tween.
+void intgame_recenter_on_pc_tween(unsigned int duration_ms)
+{
+    int64_t obj;
+
+    obj = player_get_local_pc_obj();
+    if (obj == OBJ_HANDLE_NULL) {
+        return;
+    }
+    intgame_recenter_on_location_tween(obj_field_int64_get(obj, OBJ_F_LOCATION), duration_ms);
 }
 
 // 0x551A10

@@ -6,6 +6,7 @@
 #include "game/anim.h"
 #include "game/antiteleport.h"
 #include "game/area.h"
+#include "game/camera_follow.h"
 #include "game/critter.h"
 #include "game/gamelib.h"
 #include "game/gsound.h"
@@ -2332,6 +2333,26 @@ bool wmap_ui_message_filter(TigMessage* msg)
 
                             sub_436D20(0x80000, 0);
                             wmap_ui_close();
+
+                            // CE: get the camera back onto the PC after the map
+                            // closes so travel starts framed on the player.
+                            //
+                            // With "camera follows player" ON, DON'T run a
+                            // recenter tween: it would glide to the PC's START
+                            // (a fixed target) while the PC is already walking
+                            // away, and follow would then have to catch up from
+                            // behind — a visible lurch (worst at 1.0 zoom where
+                            // the catch-up gap isn't shrunk by zoom-out). Just
+                            // clear any stale follow cooldown and let follow
+                            // track the moving PC directly — smooth, no handoff.
+                            //
+                            // With follow OFF, nothing else re-frames the PC, so
+                            // glide the viewport onto them once.
+                            if (camera_follow_is_enabled()) {
+                                camera_follow_note_recenter();
+                            } else {
+                                intgame_recenter_on_pc_tween(0);
+                            }
                         }
                     }
                     return true;

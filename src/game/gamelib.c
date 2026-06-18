@@ -3046,6 +3046,134 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
     }
 }
 
+// CE: Render a 1:1 iso view centred on `center_loc` into `target_vb`,
+// covering a (width x height) region, then restore all global render
+// state so the main view is untouched. Only the world passes run
+// (light / tile / object / roof) — no speech bubbles, floating text or
+// combat UI.
+//
+// The PC lens needs this when "pc lens follows player" is on: the lens
+// normally just copies pixels out of the already-rendered main view, but
+// when the PC is scrolled or zoomed off that view there are no such
+// pixels to copy. Here the lens gets its OWN little PC-centred render,
+// rendered at 1:1 regardless of the main camera's zoom/scroll, so it
+// always shows the player.
+//
+// Cheap by construction: the rendered region is only lens-sized, and the
+// caller only invokes this in that one opt-in mode while an overlay is
+// open. Must be called outside the main draw (it swaps the iso window's
+// render target); iso_redraw() does exactly that (draw, then lens).
+//
+// Returns false (rendering nothing) when not in a normal game session.
+bool gamelib_render_lens_view(TigVideoBuffer* target_vb, int64_t center_obj, int width, int height)
+{
+    int64_t saved_ox;
+    int64_t saved_oy;
+    TigRect saved_content;
+    TigRect sprite_rect;
+    int64_t center_x;
+    int64_t center_y;
+    TigRect region;
+    TigRect region_ex;
+    LocRect loc_rect;
+    bool ok = false;
+
+    if (target_vb == NULL
+        || center_obj == OBJ_HANDLE_NULL
+        || gamelib_draw_func != gamelib_draw_game
+        || gamelib_view_options.type != VIEW_TYPE_ISOMETRIC) {
+        return false;
+    }
+
+    location_origin_get(&saved_ox, &saved_oy);
+    saved_content = gamelib_iso_content_rect;
+
+    // Origin so the PC SPRITE's bounding-box centre lands at the lens
+    // centre. Centring on the tile alone frames the feet/base, leaving the
+    // sprite (which rises UP from its tile) to clip its head at the top —
+    // so use the full sprite rect (0x7 = the same extent the dirty-rect
+    // path uses) and centre on its middle. Computed at origin (0, 0); we
+    // then offset origin so that centre maps to the lens centre.
+    location_origin_pixel_set(0, 0);
+    object_get_rect(center_obj, 0x7, &sprite_rect);
+    if (sprite_rect.width > 0 && sprite_rect.height > 0) {
+        center_x = (int64_t)sprite_rect.x + sprite_rect.width / 2;
+        center_y = (int64_t)sprite_rect.y + sprite_rect.height / 2;
+    } else {
+        // Sprite rect unavailable (flagged invisible / off-map) — fall back
+        // to the tile centre (+40/+20 within the iso tile).
+        int64_t fx;
+        int64_t fy;
+        location_xy(obj_field_int64_get(center_obj, OBJ_F_LOCATION), &fx, &fy);
+        center_x = fx + 40;
+        center_y = fy + 20;
+    }
+    location_origin_pixel_set((int64_t)(width / 2) - center_x,
+        (int64_t)(height / 2) - center_y);
+
+    region.x = 0;
+    region.y = 0;
+    region.width = width;
+    region.height = height;
+    // Overdraw margin so tall sprites straddling the edge still draw.
+    region_ex.x = -256;
+    region_ex.y = -256;
+    region_ex.width = width + 512;
+    region_ex.height = height + 512;
+
+    // Redirect the world renderers at the lens VB: tiles via the tile
+    // render target, objects/light/roof via the iso window's VB.
+    tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, target_vb);
+    tile_set_render_target(target_vb);
+    object_set_iso_content_rect(&region);
+    light_set_iso_content_rect(&region);
+
+    // Clear first so void / map-edge gaps don't show stale lens pixels.
+    tig_window_fill(gamelib_init_info.iso_window_handle, &region, tig_color_make(0, 0, 0));
+
+    if (location_screen_rect_to_loc_rect(&region_ex, &loc_rect)) {
+        SectorRect sector_rect;
+        SectorListNode* sectors;
+        TigRectListNode* dirty;
+        GameDrawInfo draw_info;
+
+        sector_rect_from_loc_rect(&loc_rect, &sector_rect);
+        sectors = sector_list_create(&loc_rect);
+
+        dirty = tig_rect_node_create();
+        dirty->rect = region;
+        dirty->next = NULL;
+
+        draw_info.screen_rect = &region_ex;
+        draw_info.loc_rect = &loc_rect;
+        draw_info.sector_rect = &sector_rect;
+        draw_info.sectors = sectors;
+        draw_info.rects = &dirty;
+
+        if (tig_video_3d_begin_scene() == TIG_OK) {
+            light_draw(&draw_info);
+            tile_draw(&draw_info);
+            sub_43C690(&draw_info);
+            object_draw(&draw_info);
+            roof_draw(&draw_info);
+            tig_video_3d_end_scene();
+            ok = true;
+        }
+
+        sector_list_destroy(sectors);
+        tig_rect_node_destroy(dirty);
+    }
+
+    // Restore every piece of render state we touched.
+    object_set_iso_content_rect(&saved_content);
+    light_set_iso_content_rect(&saved_content);
+    tile_set_render_target(gamelib_iso_window_vb);
+    tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+    location_origin_pixel_set(saved_ox, saved_oy);
+
+    return ok;
+}
+
 // 0x404740
 void gamelib_draw_editor(GameDrawInfo* draw_info)
 {
