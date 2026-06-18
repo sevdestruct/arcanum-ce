@@ -730,7 +730,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "violence filter", "Tone down gore (0=off, 1=on)." },
     { "follower skills", "Let followers use their skills automatically (0=off, 1=on)." },
 
-    { NULL, "Perception Fog (Fog of War)" },
+    { NULL, "Perception Fog" },
     { "perception fog", "Fog-of-war master switch (0=off, 1=on)." },
     { "perception fog blur", "Box-blur the fog region (0=solid dark only, 1=blurred+dark)." },
     { "perception fog blur radius", "Box-blur kernel half-width in pixels (0-64; higher=softer)." },
