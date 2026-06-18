@@ -3369,6 +3369,101 @@ void gamelib_splash(tig_window_handle_t window_handle)
     tig_file_list_destroy(&file_list);
 }
 
+// CE: First-run scaffolding for the custom\default override dir. Lays down
+// a few common starter folders + a README so users can see where to drop
+// replacement assets without digging through docs. The README doubles as
+// a sentinel: if it already exists we do nothing — so folders a user
+// deletes stay deleted (we never fight them), and the cost on every later
+// launch is a single stat.
+//
+// Paths are "."-prefixed so tig_file treats them as literal (cwd-relative)
+// and writes into the REAL custom\default the override repository reads
+// from. Bare relative paths now resolve to the data\ write target instead
+// (custom\default is mounted read-only — see TIG_FILE_REPOSITORY_READONLY).
+static void gamelib_scaffold_custom_default(void)
+{
+    static const char* const starter_dirs[] = {
+        ".\\custom\\default\\art",
+        ".\\custom\\default\\art\\interface",
+        ".\\custom\\default\\art\\critter",
+        ".\\custom\\default\\art\\item",
+        ".\\custom\\default\\art\\scenery",
+        ".\\custom\\default\\proto",
+        ".\\custom\\default\\mes",
+        ".\\custom\\default\\sound",
+    };
+    TigFile* readme;
+    size_t i;
+
+    // Sentinel: README present => first-run scaffolding already done.
+    readme = tig_file_fopen(".\\custom\\default\\README.txt", "rb");
+    if (readme != NULL) {
+        tig_file_fclose(readme);
+        return;
+    }
+
+    for (i = 0; i < sizeof(starter_dirs) / sizeof(starter_dirs[0]); i++) {
+        tig_file_mkdir(starter_dirs[i]);
+    }
+
+    readme = tig_file_fopen(".\\custom\\default\\README.txt", "wb");
+    if (readme != NULL) {
+        tig_file_fputs(
+            "Arcanum Community Edition - Custom Asset Overrides\r\n"
+            "==================================================\r\n"
+            "\r\n"
+            "Drop replacement files into the matching folder here and they\r\n"
+            "override the base game (and any module) with no .dat editing.\r\n"
+            "Files are matched BY NAME against the vanilla layout, so keep\r\n"
+            "the original filenames.\r\n"
+            "\r\n"
+            "Precedence (highest first):\r\n"
+            "  custom\\modules\\<ModuleName>\\   per-module overrides\r\n"
+            "  custom\\default\\                <-- this folder: global, always on\r\n"
+            "  the loaded module\r\n"
+            "  loose data\\ files\r\n"
+            "  the base Arcanum*.dat archives\r\n"
+            "\r\n"
+            "FOLDERS (add any you need - the game reads them all):\r\n"
+            "  art\\interface\\   UI art: frames, buttons, backgrounds\r\n"
+            "  art\\critter\\     creature / NPC sprites\r\n"
+            "  art\\item\\        item icons + ground art (i_*, g_*)\r\n"
+            "  art\\scenery\\     props, trees, furniture\r\n"
+            "  art\\tile\\        ground tiles\r\n"
+            "  art\\wall\\        walls\r\n"
+            "  art\\portal\\      doors / portals\r\n"
+            "  art\\monster\\     monster sprites\r\n"
+            "  art\\facade\\      building facades\r\n"
+            "  art\\eye_candy\\   spell / visual effects\r\n"
+            "  art\\container\\   chests, barrels\r\n"
+            "  art\\light\\       light sprites\r\n"
+            "  art\\roof\\        roofs\r\n"
+            "  art\\unique_npc\\  named-NPC art\r\n"
+            "  proto\\           object templates (.pro): stats, flags, behaviour\r\n"
+            "  mes\\             text tables (.mes): names, descriptions, UI text\r\n"
+            "  rules\\           gameplay tables (XP, level progression, ...)\r\n"
+            "  dlg\\             dialogue files (.dlg)\r\n"
+            "  scr\\             compiled scripts (.scr)\r\n"
+            "  sound\\           sound effects\r\n"
+            "  movies\\          cutscene videos\r\n"
+            "  terrain\\         terrain definitions\r\n"
+            "  townmap\\         town-map data\r\n"
+            "  maps\\<mapname>\\  per-map data\r\n"
+            "\r\n"
+            "Only a few common starter folders are created for you; create\r\n"
+            "any others from the list above as needed.\r\n"
+            "\r\n"
+            "Custom UI backgrounds:  art\\interface\\<screen>_bg.bmp\r\n"
+            "  (e.g. mainmenu_bg.bmp). Cutscene movie swaps use a separate\r\n"
+            "  flat folder: custom\\videos\\<name>.\r\n"
+            "\r\n"
+            "This README is recreated only when absent - delete it to\r\n"
+            "regenerate the starter folders on the next launch.\r\n",
+            readme);
+        tig_file_fclose(readme);
+    }
+}
+
 // 0x404A20
 void gamelib_load_data(void)
 {
@@ -3394,6 +3489,10 @@ void gamelib_load_data(void)
     tig_file_mkdir("custom");
     tig_file_mkdir("custom\\default");
     tig_file_repository_add_readonly("custom\\default");
+
+    // CE: first-run starter folders + README so users can see where
+    // override assets go. Idempotent (README sentinel).
+    gamelib_scaffold_custom_default();
 }
 
 // 0x404C10
