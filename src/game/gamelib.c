@@ -3625,7 +3625,16 @@ bool gamelib_load_module_data(const char* module_name)
     path1[end] = '\0';
 
     if (tig_file_is_directory(path1)) {
-        tig_file_repository_add(path1);
+        // CE: a module's loose dir is read-only CONTENT for the game, so
+        // runtime writes (Save\Current, caches) fall through to data\
+        // instead of polluting the module dir and being mistaken for stale
+        // game state on the next module load. The EDITOR authors module
+        // content here, so it stays writable there.
+        if (gamelib_init_info.editor) {
+            tig_file_repository_add(path1);
+        } else {
+            tig_file_repository_add_readonly(path1);
+        }
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }
@@ -3635,9 +3644,10 @@ bool gamelib_load_module_data(const char* module_name)
             if (gamelib_mod_dat_path[0] == '\0') {
                 tig_file_copy_directory(path1, "Module template");
             }
+            tig_file_repository_add(path1);
+        } else {
+            tig_file_repository_add_readonly(path1);
         }
-
-        tig_file_repository_add(path1);
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }
