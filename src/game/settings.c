@@ -144,20 +144,23 @@ void settings_save(Settings* settings)
     settings->flags &= ~SETTINGS_CHANGED;
 }
 
-// CE: look up a setting's documentation comment by key (case-insensitive).
-static const char* settings_doc_lookup(const SettingsDoc* docs, const char* key)
+// CE: true if `key` appears anywhere in the doc table. A doc row with a
+// NULL key is a SECTION HEADER (its comment is the section name); the
+// array is terminated by a {NULL, NULL} row. So iterate until both are
+// NULL, and only match rows that actually carry a key.
+static bool settings_doc_has_key(const SettingsDoc* docs, const char* key)
 {
     const SettingsDoc* doc;
 
     if (docs == NULL) {
-        return NULL;
+        return false;
     }
-    for (doc = docs; doc->key != NULL; doc++) {
-        if (SDL_strcasecmp(doc->key, key) == 0) {
-            return doc->comment;
+    for (doc = docs; doc->key != NULL || doc->comment != NULL; doc++) {
+        if (doc->key != NULL && SDL_strcasecmp(doc->key, key) == 0) {
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
 // CE: emit a comment as one or more "// <line>" lines (splitting on '\n').
@@ -178,9 +181,12 @@ static void settings_write_comment(FILE* stream, const char* comment)
 void settings_save_documented(Settings* settings, const SettingsDoc* docs)
 {
     FILE* stream;
+    const SettingsDoc* doc;
+    const char* pending_header;
+    SettingsEntry* entry;
     SettingsEntry* curr;
-    const char* comment;
     bool first;
+    bool wrote_other;
 
     if (settings->entries == NULL) {
         return;
@@ -195,24 +201,63 @@ void settings_save_documented(Settings* settings, const SettingsDoc* docs)
         return;
     }
 
-    // List order is preserved (== file order on load), so the .cfg keeps
-    // its layout; we only add a comment line above each documented key and
-    // a blank line between entries for readability.
+    // The doc table defines a canonical, grouped layout: rows are written
+    // in table order, a NULL-key row is a "// ===== <name> =====" section
+    // header, and each setting is preceded by its comment. A blank line
+    // separates every block. A header is DEFERRED until the section's first
+    // present setting, so empty sections don't print a stray header. Then
+    // any settings NOT in the table (unknown / legacy / other-branch keys)
+    // are appended under "Other" so nothing is ever dropped.
     first = true;
-    curr = settings->entries;
-    while (curr != NULL) {
+    pending_header = NULL;
+
+    for (doc = docs; doc->key != NULL || doc->comment != NULL; doc++) {
+        if (doc->key == NULL) {
+            // Section header — hold it until a present setting needs it.
+            pending_header = doc->comment;
+            continue;
+        }
+
+        entry = settings_find(settings, doc->key);
+        if (entry == NULL) {
+            // Documented but not present this session — skip.
+            continue;
+        }
+
+        if (pending_header != NULL) {
+            if (!first) {
+                fprintf(stream, "\n");
+            }
+            first = false;
+            fprintf(stream, "// ===== %s =====\n", pending_header);
+            pending_header = NULL;
+        }
+
         if (!first) {
             fprintf(stream, "\n");
         }
         first = false;
-
-        comment = settings_doc_lookup(docs, curr->key);
-        if (comment != NULL) {
-            settings_write_comment(stream, comment);
+        if (doc->comment != NULL) {
+            settings_write_comment(stream, doc->comment);
         }
-        fprintf(stream, "%s=%s\n", curr->key, curr->value);
+        fprintf(stream, "%s=%s\n", entry->key, entry->value);
+    }
 
-        curr = curr->next;
+    // Undocumented entries, preserved verbatim under their own section.
+    wrote_other = false;
+    for (curr = settings->entries; curr != NULL; curr = curr->next) {
+        if (settings_doc_has_key(docs, curr->key)) {
+            continue;
+        }
+        if (!wrote_other) {
+            if (!first) {
+                fprintf(stream, "\n");
+            }
+            first = false;
+            fprintf(stream, "// ===== Other =====\n");
+            wrote_other = true;
+        }
+        fprintf(stream, "\n%s=%s\n", curr->key, curr->value);
     }
 
     fclose(stream);
