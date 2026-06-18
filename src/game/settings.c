@@ -428,9 +428,17 @@ void settings_trim(char* str)
     memmove(str, curr, len + 1); // FIX: Instead of `memcpy`.
 
     // Remove trailing whitespace.
+    //
+    // CE FIX: start at the LAST character (str + len - 1), not the '\0'
+    // terminator (str + len). The original started on the '\0', so
+    // SDL_isspace('\0') was false and the loop never ran — trailing
+    // whitespace (notably the '\n' from fgets) was left on every value.
+    // That stored values as e.g. "1\n", which on save wrote "key=1\n\n"
+    // (a stray blank line after every setting) and broke string-value
+    // comparisons like "software\n" != "software".
     if (len > 0) {
-        curr = str + len;
-        while (SDL_isspace(*curr)) {
+        curr = str + len - 1;
+        while (curr >= str && SDL_isspace((unsigned char)*curr)) {
             *curr-- = '\0';
         }
     }
