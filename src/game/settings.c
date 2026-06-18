@@ -73,6 +73,19 @@ void settings_load(Settings* settings)
     }
 
     while (fgets(buffer, sizeof(buffer), stream) != NULL) {
+        // CE: skip comment lines and blanks. Comments use "//" and often
+        // contain an '=' in their prose (e.g. "0=off, 1=on"), which the
+        // parser below would otherwise mistake for a key=value pair and
+        // store as a junk entry that corrupts the file on the next save.
+        char* line = buffer;
+        while (*line == ' ' || *line == '\t') {
+            line++;
+        }
+        if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r'
+            || (line[0] == '/' && line[1] == '/')) {
+            continue;
+        }
+
         // Find the key-value separator.
         sep = strchr(buffer, '=');
         if (sep != NULL) {
@@ -131,6 +144,82 @@ void settings_save(Settings* settings)
     settings->flags &= ~SETTINGS_CHANGED;
 }
 
+// CE: look up a setting's documentation comment by key (case-insensitive).
+static const char* settings_doc_lookup(const SettingsDoc* docs, const char* key)
+{
+    const SettingsDoc* doc;
+
+    if (docs == NULL) {
+        return NULL;
+    }
+    for (doc = docs; doc->key != NULL; doc++) {
+        if (SDL_strcasecmp(doc->key, key) == 0) {
+            return doc->comment;
+        }
+    }
+    return NULL;
+}
+
+// CE: emit a comment as one or more "// <line>" lines (splitting on '\n').
+static void settings_write_comment(FILE* stream, const char* comment)
+{
+    const char* start = comment;
+    const char* nl;
+
+    while ((nl = strchr(start, '\n')) != NULL) {
+        fprintf(stream, "// %.*s\n", (int)(nl - start), start);
+        start = nl + 1;
+    }
+    if (*start != '\0') {
+        fprintf(stream, "// %s\n", start);
+    }
+}
+
+void settings_save_documented(Settings* settings, const SettingsDoc* docs)
+{
+    FILE* stream;
+    SettingsEntry* curr;
+    const char* comment;
+    bool first;
+
+    if (settings->entries == NULL) {
+        return;
+    }
+
+    if ((settings->flags & SETTINGS_CHANGED) == 0) {
+        return;
+    }
+
+    stream = fopen(settings->path, "wt");
+    if (stream == NULL) {
+        return;
+    }
+
+    // List order is preserved (== file order on load), so the .cfg keeps
+    // its layout; we only add a comment line above each documented key and
+    // a blank line between entries for readability.
+    first = true;
+    curr = settings->entries;
+    while (curr != NULL) {
+        if (!first) {
+            fprintf(stream, "\n");
+        }
+        first = false;
+
+        comment = settings_doc_lookup(docs, curr->key);
+        if (comment != NULL) {
+            settings_write_comment(stream, comment);
+        }
+        fprintf(stream, "%s=%s\n", curr->key, curr->value);
+
+        curr = curr->next;
+    }
+
+    fclose(stream);
+
+    settings->flags &= ~SETTINGS_CHANGED;
+}
+
 /**
  * Registers a new setting with a given key and default value.
  *
@@ -154,8 +243,24 @@ void settings_register(Settings* settings, const char* key, const char* default_
         entry->key = STRDUP(key);
         entry->value = STRDUP(default_value);
         entry->value_changed_func = value_changed_func;
-        entry->next = settings->entries;
-        settings->entries = entry;
+        entry->next = NULL;
+
+        // CE: APPEND, not head-insert. The original head-insert reversed
+        // the list relative to insertion order; since settings_load runs
+        // before the settings_register calls, the file was loaded into the
+        // list reversed, then written back head-first — so the .cfg key
+        // order flipped on every save. Appending makes list order ==
+        // insertion order (== file order on load, then any new defaults at
+        // the end), so saves are stable and the file order is preserved.
+        if (settings->entries == NULL) {
+            settings->entries = entry;
+        } else {
+            SettingsEntry* tail = settings->entries;
+            while (tail->next != NULL) {
+                tail = tail->next;
+            }
+            tail->next = entry;
+        }
     }
 }
 

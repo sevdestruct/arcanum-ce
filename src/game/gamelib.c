@@ -653,10 +653,98 @@ void gamelib_reset(void)
     tig_debug_printf("gamelib_reset(): Done.  Total time: %d ms.\n", duration);
 }
 
+// CE: succinct documentation for every arcanum.cfg setting. Written as a
+// "// ..." line above the key on save (see settings_save_documented).
+// Keys not listed are still saved, just uncommented. Order here is for
+// readability only; the file keeps its own (insertion) order.
+static const SettingsDoc gamelib_cfg_docs[] = {
+    // Display / video
+    { "windowed", "Run in a window instead of fullscreen (0=fullscreen, 1=windowed)." },
+    { "resolution width", "Render width in pixels." },
+    { "resolution height", "Render height in pixels." },
+    { "vsync mode", "Frame sync: 0=off (tearing, max throughput), 1=on (no tearing), 2=adaptive (no wait on a missed frame)." },
+    { "show fps", "Show the FPS counter (0=off, 1=on)." },
+    { "tile render path", "Tile rasterizer: software or gpu." },
+    { "gpu buffer sanity check", "Validate GPU buffers each frame; debugging aid (0=off, 1=on)." },
+    { "macos ignore notch", "Use the full display behind the macOS camera notch (0=avoid notch, 1=use full area)." },
+    { "aspect snap", "Snap the viewport to a clean aspect ratio (0=off, 1=on)." },
+    { "legacy menu vignette", "Darkened vignette border on the main menu (0=off, 1=on)." },
+    { "brightness", "Brightness/gamma offset (0=default)." },
+    { "object lighting", "Per-object dynamic lighting (0=off, 1=on)." },
+    { "shadows", "Object drop shadows (0=off, 1=on)." },
+
+    // Zoom
+    { "zoom enabled", "Allow zooming the isometric view (0=off, 1=on)." },
+    { "min zoom", "Closest zoom-out factor (e.g. 0.5 = half size)." },
+    { "max zoom", "Furthest zoom-in factor (e.g. 1.75)." },
+    { "zoom filter", "Zoom scaling filter: nearest (crisp pixels) or linear (smooth)." },
+
+    // Startup
+    { "intro", "Play the intro movie on launch (0=skip, 1=play)." },
+    { "logos", "Play the publisher logos on launch (0=skip, 1=play)." },
+    { "splash", "Number of splash screens to show on launch (0=none)." },
+    { "show version", "Overlay the build version on screen (0=off, 1=on)." },
+    { "video convert never ask", "Never prompt to convert legacy .bik videos (0=ask, 1=convert silently)." },
+
+    // Scrolling / camera
+    { "scroll dist", "Edge-scroll step size in pixels." },
+    { "scroll fps", "Edge-scroll update rate in frames per second." },
+    { "camera follows player", "Auto-follow the PC as they move (0=off, 1=on)." },
+    { "recenter camera on overlay", "Snap to the PC when opening an overlay window (0=keep current scroll, 1=recenter)." },
+    { "pc lens follows player", "Keep the PC lens on the player even when scrolled/zoomed away (0=off, 1=on)." },
+    { "dialogue camera mode", "Camera framing during dialogue (0=default)." },
+    { "dialogue camera zoom to fit", "Zoom to frame both speakers during dialogue (0=off, 1=on)." },
+    { "dialogue camera tween back", "Glide the camera back to its prior spot when dialogue ends (0=off, 1=on)." },
+
+    // UI
+    { "ui animations", "Animated window open/close transitions (0=off, 1=on)." },
+    { "translucent black ui", "Show the world dimly through near-black UI panels (0=off, 1=on)." },
+    { "translucent black method", "Translucent-black technique (0=snapshot blend, 1=realtime)." },
+    { "void edge fade", "Fade the world-map edge into the void instead of a hard cut (0=off, 1=on)." },
+    { "gold expansion slot priority", "Prefer the gold/coin slot when auto-placing stacks (0=off, 1=on)." },
+
+    // Text floaters / dialogue
+    { "text floaters", "Show floating combat/status text (0=off, 1=on)." },
+    { "text duration", "Seconds a floating-text line stays on screen." },
+    { "float speed", "How fast floating text rises (higher = faster)." },
+    { "dialogue option numbers", "Number the dialogue reply choices (0=off, 1=on)." },
+    { "dialogue emote dim", "Dim the screen during dialogue emotes (0=off, 1=on)." },
+    { "dialogue emote dim choices", "Also dim while reply choices are shown (0=off, 1=on)." },
+    { "dialogue emote dim percent", "How much to dim during emotes (0-100)." },
+
+    // Audio
+    { "music volume", "Music volume (0-10)." },
+    { "voice volume", "Voice/speech volume (0-10)." },
+    { "effects volume", "Sound-effects volume (0-10)." },
+    { "sound async load", "Load sounds on a background thread (0=off, 1=on)." },
+
+    // Gameplay
+    { "difficulty", "Game difficulty (0=easy, 1=normal, 2=hard)." },
+    { "always run", "Move at a run by default (0=walk, 1=run)." },
+    { "auto attack", "Auto-attack the nearest foe when nothing is targeted (0=off, 1=on)." },
+    { "auto switch", "Auto-switch between melee and ranged weapons by range (0=off, 1=on)." },
+    { "combat taunts", "Combatants shout taunts (0=off, 1=on)." },
+    { "turn-based", "Use turn-based combat (0=real-time, 1=turn-based)." },
+    { "fast turn-based", "Speed up turn-based combat animations (0=off, 1=on)." },
+    { "violence filter", "Tone down gore (0=off, 1=on)." },
+    { "follower skills", "Let followers use their skills automatically (0=off, 1=on)." },
+
+    // Perception fog (fog-of-war)
+    { "perception fog", "Fog-of-war master switch (0=off, 1=on)." },
+    { "perception fog blur", "Box-blur the fog region (0=solid dark only, 1=blurred+dark)." },
+    { "perception fog blur radius", "Box-blur kernel half-width in pixels (0-64; higher=softer)." },
+    { "perception fog inner", "Radius in pixels where fog begins." },
+    { "perception fog outer", "Radius in pixels where fog reaches full opacity; must be > inner." },
+    { "perception fog alpha", "Maximum fog opacity (0-100)." },
+    { "perception fog dim", "How much to darken blurred fog pixels (0=black, 100=no dimming)." },
+
+    { NULL, NULL },
+};
+
 // 0x4024D0
 void gamelib_exit(void)
 {
-    settings_save(&settings);
+    settings_save_documented(&settings, gamelib_cfg_docs);
 
     for (int index = MODULE_COUNT - 1; index >= 0; index--) {
         if (gamelib_modules[index].exit_func != NULL) {

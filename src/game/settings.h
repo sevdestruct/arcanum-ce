@@ -22,10 +22,24 @@ typedef struct Settings {
     /* 0008 */ SettingsFlags flags;
 } Settings;
 
+// CE: one row of documentation for the settings file. `comment` is a
+// succinct description written as a "// ..." line above the setting on
+// save (may contain '\n' for multiple lines). The array is terminated by
+// a row whose `key` is NULL. Keys not in the table are still saved, just
+// without a comment.
+typedef struct SettingsDoc {
+    const char* key;
+    const char* comment;
+} SettingsDoc;
+
 void settings_init(Settings* settings, const char* path);
 void settings_exit(Settings* settings);
 void settings_load(Settings* settings);
 void settings_save(Settings* settings);
+// CE: like settings_save, but writes a "// <comment>" line above each
+// setting (looked up by key in `docs`) and a blank line between entries.
+// Order is unchanged (list/insertion order); `docs` only supplies text.
+void settings_save_documented(Settings* settings, const SettingsDoc* docs);
 void settings_register(Settings* settings, const char* key, const char* default_value, SettingsValueChangedFunc value_changed_func);
 void settings_set_value(Settings* settings, const char* key, int value);
 int settings_get_value(Settings* settings, const char* key);
