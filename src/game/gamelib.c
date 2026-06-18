@@ -948,13 +948,13 @@ static void gamelib_mount_custom_overrides(const char* name)
     char base[TIG_MAX_PATH];
     char custom_mod[TIG_MAX_PATH];
 
-    tig_file_repository_add("custom\\default");
+    tig_file_repository_add_readonly("custom\\default");
 
     gamelib_module_basename(name, base, sizeof(base));
     if (base[0] != '\0') {
         snprintf(custom_mod, sizeof(custom_mod), "custom\\modules\\%s", base);
         if (tig_file_is_directory(custom_mod)) {
-            tig_file_repository_add(custom_mod);
+            tig_file_repository_add_readonly(custom_mod);
             strncpy(gamelib_mod_custom_path, custom_mod, TIG_MAX_PATH - 1);
             gamelib_mod_custom_path[TIG_MAX_PATH - 1] = '\0';
         }
@@ -3393,7 +3393,7 @@ void gamelib_load_data(void)
     // Original module > loose > .dat order is otherwise untouched.
     tig_file_mkdir("custom");
     tig_file_mkdir("custom\\default");
-    tig_file_repository_add("custom\\default");
+    tig_file_repository_add_readonly("custom\\default");
 }
 
 // 0x404C10

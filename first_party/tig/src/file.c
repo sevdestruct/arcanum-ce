@@ -33,6 +33,11 @@ typedef struct TigFile {
 
 #define TIG_FILE_REPOSITORY_DATABASE 0x1
 #define TIG_FILE_REPOSITORY_DIRECTORY 0x2
+// CE: directory repo that is searched for reads (so it can shadow lower
+// layers — asset overrides) but is NEVER chosen as the target to write or
+// create into. Keeps runtime data (saves, caches, .dat extractions) out
+// of read-only override dirs like custom\default.
+#define TIG_FILE_REPOSITORY_READONLY 0x4
 
 typedef struct TigFileRepository {
     int type;
@@ -61,7 +66,7 @@ static bool copy_file_path(const char* dst, const char* src);
 static bool copy_file_stream(TigFile* dst_stream, TigFile* src_stream);
 static bool copy_file_stream_size(TigFile* dst_stream, TigFile* src_stream, size_t size);
 static bool tig_file_archive_worker_native(const char* path, TigFile* stream1, TigFile* stream2);
-static bool tig_file_repository_add_native(const char* path);
+static bool tig_file_repository_add_native(const char* path, bool readonly);
 static bool tig_file_repository_remove_native(const char* file_name);
 static int tig_file_mkdir_ex_native(const char* path);
 static int tig_file_rmdir_ex_native(const char* path);
@@ -570,7 +575,7 @@ void tig_file_exit(void)
 }
 
 // 0x52ED40
-bool tig_file_repository_add_native(const char* path)
+bool tig_file_repository_add_native(const char* path, bool readonly)
 {
     TigFileRepository* curr;
     TigFileRepository* prev;
@@ -588,6 +593,11 @@ bool tig_file_repository_add_native(const char* path)
     }
 
     if (curr != NULL) {
+        // CE: read-only is sticky across re-promotion — an override layer
+        // re-mounted on top of a freshly loaded module must stay read-only.
+        if (readonly) {
+            curr->type |= TIG_FILE_REPOSITORY_READONLY;
+        }
         if (prev != NULL) {
             if ((curr->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
                 && curr->next != NULL
@@ -622,6 +632,9 @@ bool tig_file_repository_add_native(const char* path)
 
             repo->path = STRDUP(path);
             repo->type = TIG_FILE_REPOSITORY_DIRECTORY;
+            if (readonly) {
+                repo->type |= TIG_FILE_REPOSITORY_READONLY;
+            }
             repo->next = tig_file_repositories_head;
             tig_file_repositories_head = repo;
 
@@ -756,7 +769,10 @@ int tig_file_mkdir_ex_native(const char* path)
     if (path[0] != '.' && path[0] != '\\' && path[1] != ':' && path[0] != '/') {
         repo = tig_file_repositories_head;
         while (repo != NULL) {
-            if ((repo->type & TIG_FILE_PLAIN) != 0) {
+            // CE: skip read-only override dirs — create into the first
+            // writable directory so new dirs don't land in custom\default.
+            if ((repo->type & TIG_FILE_PLAIN) != 0
+                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                 strcpy(temp_path, repo->path);
                 break;
             }
@@ -789,7 +805,10 @@ int tig_file_rmdir_ex_native(const char* path)
     if (path[0] != '.' && path[0] != '\\' && path[1] != ':' && path[0] != '/') {
         repo = tig_file_repositories_head;
         while (repo != NULL) {
-            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+            // CE: skip read-only override dirs — operate on the first
+            // writable directory.
+            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                 strcpy(temp_path, repo->path);
                 break;
             }
@@ -858,7 +877,11 @@ bool tig_file_extract_native(const char* filename, char* path)
     repo = tig_file_repositories_head;
     while (repo != NULL) {
         if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
-            if (first_directory_repo == NULL) {
+            // CE: the extraction target (where a .dat-backed file is
+            // expanded to disk) must be writable — never a read-only
+            // override dir. The search below still scans read-only dirs.
+            if (first_directory_repo == NULL
+                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                 first_directory_repo = repo;
             }
 
@@ -912,7 +935,8 @@ bool tig_file_extract_native(const char* filename, char* path)
                         // created in the first directory repo, we just need it
                         // to look deeper.
                         while (repo != NULL) {
-                            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+                            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                                 first_directory_repo = repo;
                                 break;
                             }
@@ -1589,7 +1613,10 @@ bool tig_file_lock(const char* filename, const void* owner, size_t size)
     } else {
         repo = tig_file_repositories_head;
         while (repo != NULL) {
-            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+            // CE: lock files belong in a writable dir, not a read-only
+            // override layer.
+            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                 break;
             }
             repo = repo->next;
@@ -1665,7 +1692,10 @@ bool tig_file_locked_by(const char* filename, const void* owner, size_t size)
     } else {
         repo = tig_file_repositories_head;
         while (repo != NULL) {
-            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+            // CE: lock files belong in a writable dir, not a read-only
+            // override layer.
+            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
                 break;
             }
             repo = repo->next;
@@ -1755,7 +1785,12 @@ int tig_file_open_internal_native(const char* path, const char* mode, TigFile* s
                     || mode[0] == 'w') {
                     writeable_repo = tig_file_repositories_head;
                     while (writeable_repo != repo) {
-                        if ((writeable_repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+                        // CE: never EXPAND a .dat-backed file into a read-only
+                        // override dir on write; reads (re-opening an already
+                        // expanded copy) still scan them.
+                        if ((writeable_repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                            && !((writeable_repo->type & TIG_FILE_REPOSITORY_READONLY) != 0
+                                && (mode[0] == 'w' || mode[0] == 'a'))) {
                             compat_join_path(mutable_path, sizeof(mutable_path), writeable_repo->path, path);
                             compat_resolve_path(mutable_path);
 
@@ -1785,7 +1820,12 @@ int tig_file_open_internal_native(const char* path, const char* mode, TigFile* s
             && (ignored & TIG_FILE_PLAIN) == 0) {
             repo = tig_file_repositories_head;
             while (repo != NULL) {
-                if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+                // CE: on WRITE, skip read-only override dirs so new files
+                // land in a writable dir. On READ, scan them too — this is
+                // how loose override files in custom\default are found.
+                if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
+                    && !((repo->type & TIG_FILE_REPOSITORY_READONLY) != 0
+                        && (mode[0] == 'w' || mode[0] == 'a'))) {
                     compat_join_path(mutable_path, sizeof(mutable_path), repo->path, path);
                     compat_resolve_path(mutable_path);
 
@@ -2181,7 +2221,18 @@ bool tig_file_repository_add(const char* path)
     compat_windows_path_to_native(native_path);
     compat_resolve_path(native_path);
 
-    return tig_file_repository_add_native(native_path);
+    return tig_file_repository_add_native(native_path, false);
+}
+
+bool tig_file_repository_add_readonly(const char* path)
+{
+    char native_path[TIG_MAX_PATH];
+
+    strcpy(native_path, path);
+    compat_windows_path_to_native(native_path);
+    compat_resolve_path(native_path);
+
+    return tig_file_repository_add_native(native_path, true);
 }
 
 bool tig_file_repository_remove(const char* path)

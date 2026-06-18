@@ -44,6 +44,14 @@ bool tig_file_unarchive(const char* src, const char* dst);
 int tig_file_init(TigInitInfo* init_info);
 void tig_file_exit(void);
 bool tig_file_repository_add(const char* path);
+// CE: like tig_file_repository_add, but mounts the directory as READ-ONLY:
+// it's still searched for reads (so it can shadow lower layers — asset
+// overrides), but it is skipped when picking a directory to WRITE/create
+// into. Use for override layers (custom\default, custom\modules\<name>)
+// so runtime data (saves, caches, .dat extractions) doesn't get written
+// into them. A repo previously added writable becomes read-only if re-
+// added through this; the flag is sticky across re-promotion.
+bool tig_file_repository_add_readonly(const char* path);
 bool tig_file_repository_remove(const char* path);
 bool tig_file_repository_remove_all(void);
 bool tig_file_repository_guid(const char* path, TigGuid* guid);
