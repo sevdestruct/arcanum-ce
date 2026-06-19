@@ -489,6 +489,14 @@ bool gamelib_init(GameInitInfo* init_info)
     tig_sound_async_set_enabled(settings_get_value(&settings, SOUND_ASYNC_LOAD_KEY) != 0);
 
     settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
+
+    // CE: surface the highres "aspect snap" toggle (default on) as a real
+    // cfg entry so it's visible and switchable. highres_config reads it
+    // straight from the .cfg file; this registration just guarantees the
+    // key is present (otherwise it only appeared via the one-time legacy
+    // config migration, which omitted it for users who migrated earlier).
+    settings_register(&settings, "aspect snap", "1", NULL);
+
     {
         int vsync_setting = settings_get_value(&settings, VSYNC_MODE_KEY);
         int sdl_mode = vsync_setting == 2 ? SDL_RENDERER_VSYNC_ADAPTIVE
