@@ -687,6 +687,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "brightness", "Screen brightness via gamma, 0-9 (0=normal, 9=brightest)." },
     { "object lighting", "Per-object dynamic lighting (0=off, 1=on)." },
     { "shadows", "Object drop shadows (0=off, 1=on)." },
+    { "void edge fade", "Feather terrain/map edges into the black void at the edges of the zoomed-out world view (0=hard edges, 1=on)." },
 
     { NULL, "Zoom" },
     { "zoom enabled", "Allow zooming the isometric view (0=off, 1=on)." },
@@ -715,7 +716,6 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { NULL, "Interface" },
     { "ui animations", "Animated window open/close transitions (0=instant/snap, 1=on)." },
     { "translucent black ui", "Let the world show faintly through near-black UI panels like the HUD bar and inventory (0=off, 1=on)." },
-    { "void edge fade", "Feather terrain/map edges into the black void at the edges of the zoomed-out view (0=hard edges, 1=on)." },
     { "gold expansion slot priority", "When a growing gold pile no longer fits its cells: 0=the pile moves to a free slot, 1=the pile keeps its spot and other items shuffle out." },
 
     { NULL, "Text & Dialogue" },
