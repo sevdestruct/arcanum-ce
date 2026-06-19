@@ -686,6 +686,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "zoom enabled", "Allow zooming the isometric view (0=off, 1=on)." },
     { "min zoom", "Closest zoom-out factor (e.g. 0.5 = half size)." },
     { "max zoom", "Furthest zoom-in factor (e.g. 1.75)." },
+    { "zoom floor", "Cap how far you can zoom out to the character's perception range (0=off, 1=on)." },
     { "zoom filter", "Zoom scaling filter: nearest (crisp pixels) or linear (smooth)." },
 
     { NULL, "Startup" },
@@ -701,7 +702,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "camera follows player", "Auto-follow the PC as they move (0=off, 1=on)." },
     { "recenter camera on overlay", "Snap to the PC when opening an overlay window (0=keep current scroll, 1=recenter)." },
     { "pc lens follows player", "Keep the PC lens on the player even when scrolled/zoomed away (0=off, 1=on)." },
-    { "dialogue camera mode", "Camera framing during dialogue (0=default)." },
+    { "dialogue camera mode", "Camera framing during dialogue: 0=auto (frame the speaker), 1=midpoint of player & NPC, 2=center on NPC, 3=center on player." },
     { "dialogue camera zoom to fit", "Zoom to frame both speakers during dialogue (0=off, 1=on)." },
     { "dialogue camera tween back", "Glide the camera back to its prior spot when dialogue ends (0=off, 1=on)." },
 
