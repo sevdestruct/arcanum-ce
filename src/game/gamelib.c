@@ -745,7 +745,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "follower skills", "Let followers use their skills automatically (0=off, 1=on)." },
 
     { NULL, "Perception Fog" },
-    { "perception fog", "Fog-of-war master switch (0=off, 1=on)." },
+    { "perception fog", "Perception fog master switch (0=off, 1=on)." },
     { "perception fog blur", "Box-blur the fog region (0=solid dark only, 1=blurred+dark)." },
     { "perception fog blur radius", "Box-blur kernel half-width in pixels (0-64; higher=softer)." },
     { "perception fog inner", "Radius in pixels where fog begins." },
