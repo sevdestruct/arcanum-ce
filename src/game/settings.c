@@ -43,6 +43,34 @@ void settings_exit(Settings* settings)
     settings->entries = NULL;
 }
 
+// CE: remove a setting by key, if present. Used to drop deprecated keys
+// loaded from an old .cfg so they don't linger in the file forever. Marks
+// the settings changed so the cleaned file is rewritten on save.
+void settings_remove(Settings* settings, const char* key)
+{
+    SettingsEntry* curr;
+    SettingsEntry* prev;
+
+    prev = NULL;
+    curr = settings->entries;
+    while (curr != NULL) {
+        if (SDL_strcasecmp(curr->key, key) == 0) {
+            if (prev != NULL) {
+                prev->next = curr->next;
+            } else {
+                settings->entries = curr->next;
+            }
+            FREE(curr->key);
+            FREE(curr->value);
+            FREE(curr);
+            settings->flags |= SETTINGS_CHANGED;
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
 /**
  * Loads settings from the associated file.
  *

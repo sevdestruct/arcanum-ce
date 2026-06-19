@@ -41,6 +41,8 @@ void settings_save(Settings* settings);
 // Order is unchanged (list/insertion order); `docs` only supplies text.
 void settings_save_documented(Settings* settings, const SettingsDoc* docs);
 void settings_register(Settings* settings, const char* key, const char* default_value, SettingsValueChangedFunc value_changed_func);
+// CE: remove a setting by key if present (used to prune deprecated keys).
+void settings_remove(Settings* settings, const char* key);
 void settings_set_value(Settings* settings, const char* key, int value);
 int settings_get_value(Settings* settings, const char* key);
 void settings_set_obj_value(Settings* settings, const char* key, ObjectID oid);

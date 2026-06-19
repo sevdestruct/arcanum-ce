@@ -430,6 +430,12 @@ bool gamelib_init(GameInitInfo* init_info)
 
     settings_load(&settings);
 
+    // CE: prune deprecated keys left over in old arcanum.cfg files so they
+    // don't linger. "translucent black method" selected between a snapshot
+    // and a realtime tint path; the snapshot path was removed, leaving only
+    // one method, so the toggle no longer means anything.
+    settings_remove(&settings, "translucent black method");
+
     settings_register(&settings, DIFFICULTY_KEY, "1", difficulty_changed);
     difficulty_changed();
 
