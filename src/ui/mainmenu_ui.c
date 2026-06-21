@@ -2901,6 +2901,18 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
     char* area_name;
     char* story_state_desc;
 
+    // CE: no-op if the menu sub-window is already gone. The window/exit
+    // transition animations set mainmenu_ui_window_handle to INVALID the
+    // instant an exit begins, while the real window lingers ~260ms for its
+    // fade-out before mainmenu_ui_finalize_close destroys it. A refresh
+    // dispatched in that gap — e.g. a redraw message pumped during a save
+    // load while the menu is animating away — would blit/fill an empty
+    // WinID, and the upstream fill-failure path calls exit(EXIT_FAILURE).
+    // There's nothing to draw on a departing window, so bail.
+    if (mainmenu_ui_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+
     window = main_menu_window_info[mainmenu_ui_window_type];
     tig_art_interface_id_create(window->background_art_num, 0, 0, 0, &art_id);
     tig_art_frame_data(art_id, &art_frame_data);
@@ -3665,6 +3677,18 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
     int area;
     char* area_name;
     char* story_state_desc;
+
+    // CE: no-op if the menu sub-window is already gone. The window/exit
+    // transition animations set mainmenu_ui_window_handle to INVALID the
+    // instant an exit begins, while the real window lingers ~260ms for its
+    // fade-out before mainmenu_ui_finalize_close destroys it. A refresh
+    // dispatched in that gap — e.g. a redraw message pumped during a save
+    // load while the menu is animating away — would blit/fill an empty
+    // WinID, and the upstream fill-failure path calls exit(EXIT_FAILURE).
+    // There's nothing to draw on a departing window, so bail.
+    if (mainmenu_ui_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
 
     window = main_menu_window_info[mainmenu_ui_window_type];
     tig_art_interface_id_create(window->background_art_num, 0, 0, 0, &art_id);
