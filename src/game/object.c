@@ -834,6 +834,20 @@ void object_draw(GameDrawInfo* draw_info)
                                                                 sub_443620(obj_flags, scale, (int)loc_x, (int)loc_y, shadow->art_id, &eye_candy_rect);
                                                                 art_blit_info.art_id = shadow->art_id;
                                                                 art_blit_info.color = shadow->color;
+                                                                // CE (feature/perf-gpu-accel): the shadow art's ORIGINAL palette is a
+                                                                // bright silhouette; the engine builds a DIM ramp palette per shadow
+                                                                // (shadow->palette = dword_602E58[i]) meant to be applied at draw time
+                                                                // so the SUB blend only darkens slightly. The decompile dropped this
+                                                                // wiring, so the GPU path (original-palette cache) subtracted the full
+                                                                // bright silhouette -> solid black ellipses. Route through
+                                                                // PALETTE_OVERRIDE so both CPU and GPU use the dim ramp. (Also makes the
+                                                                // GPU dispatch take its in-z-order one-shot path instead of deferring.)
+                                                                art_blit_info.palette = shadow->palette;
+                                                                if (shadow->palette != NULL) {
+                                                                    art_blit_info.flags |= TIG_ART_BLT_PALETTE_OVERRIDE;
+                                                                } else {
+                                                                    art_blit_info.flags &= ~TIG_ART_BLT_PALETTE_OVERRIDE;
+                                                                }
 
                                                                 if ((obj_flags & OF_WADING) != 0) {
                                                                     art_blit_info.color = tig_color_mul(art_blit_info.color, tig_color_make(92, 92, 92));

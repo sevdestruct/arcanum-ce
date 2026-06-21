@@ -94,4 +94,9 @@ bool light_read(TigFile* stream, Light** light_ptr);
 bool light_write(TigFile* stream, Light* light);
 void light_invalidate_rect(TigRect* rect, bool invalidate_objects);
 
+// CE (feature/perf-gpu-accel): resolve the ambient tint the working palette
+// would bake for this art type, so the GPU path can apply it as a runtime
+// COLOR_CONST. Returns false for types the software path leaves untinted.
+bool light_default_tint_for(tig_art_id_t art_id, tig_color_t* out_tint);
+
 #endif /* ARCANUM_GAME_LIGHT_H_ */

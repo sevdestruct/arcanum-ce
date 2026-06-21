@@ -2219,10 +2219,21 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
     } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_MUL) != 0) {
         blend_mode = SDL_BLENDMODE_MUL;
     } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_SUB) != 0) {
-        // dstRGB = dstRGB*ONE - srcRGB*srcAlpha ; dstA = dstA (unchanged).
+        // dstRGB = dstRGB*ONE - srcRGB*srcAlpha. Transparent texels carry
+        // alpha 0, so they subtract nothing -- matching the software SUB blit,
+        // which only touches non-transparent source pixels.
+        //
+        // The alpha channel ALSO uses REV_SUBTRACT (not ADD) deliberately: the
+        // Metal renderer rejects a custom blend mode whose alpha operation
+        // differs from its color operation ("That operation is not supported"),
+        // and SDL_SetTextureBlendMode then silently fails, leaving the texture
+        // at BLENDMODE_BLEND -- which alpha-copies the (opaque) dark shadow
+        // texture straight onto the ground as a SOLID BLACK silhouette. Keeping
+        // the ops matched is what makes SUB actually subtract on GPU. The world
+        // target is read back as RGB only, so the subtracted dst alpha is moot.
         blend_mode = SDL_ComposeCustomBlendMode(
             SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_REV_SUBTRACT,
-            SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
+            SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_REV_SUBTRACT);
     }
     SDL_SetTextureBlendMode(blit_info->src_texture, blend_mode);
 
@@ -2257,7 +2268,11 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
     // (per-vertex color, no per-vertex alpha).
     bool want_color_lerp = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP) != 0;
     bool want_alpha_lerp = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP) != 0;
-    if (want_color_lerp || want_alpha_lerp) {
+    // CE: per-column light field (walls). Sampled per grid vertex by source
+    // column, so the wall vignette flows seamlessly across adjacent walls.
+    bool want_color_array = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_ARRAY) != 0
+        && blit_info->color_array != NULL && blit_info->color_array_count > 0;
+    if (want_color_lerp || want_alpha_lerp || want_color_array) {
         // SDL_RenderGeometry interpolates vertex colors *linearly per triangle*
         // (Gouraud). The software blitter does true *bilinear* interpolation,
         // which carries a u*v cross term a single 2-triangle quad cannot
@@ -2320,7 +2335,17 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         }
 
         int nx, ny;
-        if (color_uniform && alpha_uniform) {
+        if (want_color_array) {
+            // One grid column per dst pixel (capped) so the per-column light
+            // field is reproduced; Gouraud across the fine grid then matches the
+            // software per-pixel blit. Keep a few rows for any co-set alpha
+            // gradient. color is never uniform here (force the grid).
+            color_uniform = false;
+            nx = blit_info->dst_rect->width;
+            if (nx < 1) nx = 1; else if (nx > 64) nx = 64;
+            ny = (blit_info->dst_rect->height + 11) / 12;
+            if (ny < 1) ny = 1; else if (ny > 8) ny = 8;
+        } else if (color_uniform && alpha_uniform) {
             nx = 1;
             ny = 1;
         } else {
@@ -2330,10 +2355,10 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
             if (ny < 1) ny = 1; else if (ny > 8) ny = 8;
         }
 
-        // (nx+1) x (ny+1) vertices, 2 triangles per cell. Max 9x9 verts / 384
-        // indices for the 8x8 cap.
-        SDL_Vertex verts[(8 + 1) * (8 + 1)];
-        int indices[8 * 8 * 6];
+        // (nx+1) x (ny+1) vertices, 2 triangles per cell. Sized for the 64x8
+        // COLOR_ARRAY cap (65*9 verts / 64*8*6 indices); other paths cap at 8x8.
+        SDL_Vertex verts[(64 + 1) * (8 + 1)];
+        int indices[64 * 8 * 6];
         int vi = 0;
         int gx;
         int gy;
@@ -2355,10 +2380,21 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
                 verts[vi].tex_coord.x = tu;
                 verts[vi].tex_coord.y = tv;
 
-                // Per-vertex color (COLOR_LERP bilerp or uniform).
-                tig_color_t vc = want_color_lerp
-                    ? tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, src_xi, src_yi)
-                    : uniform_color;
+                // Per-vertex color: COLOR_ARRAY samples the per-column field by
+                // absolute source column (flip-aware; color_array is screen-
+                // ordered so a flipped sprite reverses the index); COLOR_LERP
+                // bilerps the 4 corners; else uniform.
+                tig_color_t vc;
+                if (want_color_array) {
+                    int col = flip_x ? (blit_info->color_array_count - 1 - src_xi) : src_xi;
+                    if (col < 0) col = 0;
+                    else if (col >= blit_info->color_array_count) col = blit_info->color_array_count - 1;
+                    vc = (tig_color_t)blit_info->color_array[col];
+                } else if (want_color_lerp) {
+                    vc = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, src_xi, src_yi);
+                } else {
+                    vc = uniform_color;
+                }
                 tig_video_buffer_blit_gpu_color_to_fcolor(vc, &verts[vi].color);
 
                 // Per-vertex alpha (ALPHA_LERP bilerp of the 4 corner alphas,

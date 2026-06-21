@@ -2,6 +2,7 @@
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -346,6 +347,56 @@ static void tile_gpu_defer_blit(TigArtBlitInfo* art_info)
 // true if the blit was handled -- drawn on the GPU world target, or queued for
 // CPU replay at tile_gpu_world_end -- and false if the GPU pass is inactive and
 // the caller should perform its own (CPU) blit.
+// CE DEBUG: one-frame dispatch trace. Set ARCANUM_GPU_TRACE=1 in the env, then
+// load the scene; on the first GPU world pass after the env is seen, every
+// dispatch logs its art type / flags / dst rect / path (gpu / oneshot-override /
+// deferred). The trace self-disables after one frame so the log isn't flooded.
+static int tile_gpu_trace_state; // 0 = off, 1 = arm next frame, 2 = tracing now
+static int tile_gpu_trace_order;
+
+// Called from the harness `trace` command. Arms the trace for the NEXT world
+// pass; world_end re-arms across empty (non-rendering) frames until a frame
+// with real content gets logged.
+void tile_gpu_trace_arm(void)
+{
+    if (tile_gpu_trace_state == 0) {
+        tile_gpu_trace_state = 1;
+    }
+}
+
+static const char* tile_gpu_art_type_name(int t)
+{
+    switch (t) {
+    case TIG_ART_TYPE_TILE:        return "TILE";
+    case TIG_ART_TYPE_WALL:        return "WALL";
+    case TIG_ART_TYPE_CRITTER:     return "CRITTER";
+    case TIG_ART_TYPE_PORTAL:      return "PORTAL";
+    case TIG_ART_TYPE_SCENERY:     return "SCENERY";
+    case TIG_ART_TYPE_INTERFACE:   return "INTERFACE";
+    case TIG_ART_TYPE_ITEM:        return "ITEM";
+    case TIG_ART_TYPE_CONTAINER:   return "CONTAINER";
+    case TIG_ART_TYPE_LIGHT:       return "LIGHT";
+    case TIG_ART_TYPE_ROOF:        return "ROOF";
+    case TIG_ART_TYPE_FACADE:      return "FACADE";
+    case TIG_ART_TYPE_MONSTER:     return "MONSTER";
+    case TIG_ART_TYPE_UNIQUE_NPC:  return "UNIQUE_NPC";
+    case TIG_ART_TYPE_EYE_CANDY:   return "EYE_CANDY";
+    case TIG_ART_TYPE_MISC:        return "MISC";
+    default:                       return "?";
+    }
+}
+
+static void tile_gpu_trace_log(const char* path, TigArtBlitInfo* a)
+{
+    int dx = (a->dst_rect != NULL) ? a->dst_rect->x : -1;
+    int dy = (a->dst_rect != NULL) ? a->dst_rect->y : -1;
+    int dw = (a->dst_rect != NULL) ? a->dst_rect->width : -1;
+    int dh = (a->dst_rect != NULL) ? a->dst_rect->height : -1;
+    tig_debug_printf("GPU#%d %-9s %-6s art=0x%08x flags=0x%08x dst=(%d,%d %dx%d)\n",
+        tile_gpu_trace_order++, path, tile_gpu_art_type_name(tig_art_type(a->art_id)),
+        (unsigned int)a->art_id, (unsigned int)a->flags, dx, dy, dw, dh);
+}
+
 bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
 {
     if (!tile_gpu_active) {
@@ -371,6 +422,15 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
 
     SDL_Texture* src_tex = NULL;
     SDL_Texture* oneshot_tex = NULL; // owned here; freed in tile_gpu_world_end
+    // When a blit arrives with NO color intent, it's a plain working-palette
+    // blit -- the software path bakes the ambient tint into art->palette_tbl.
+    // The GPU cache holds the ORIGINAL palette, so we synthesize that same
+    // ambient tint as a runtime COLOR_CONST (see light_default_tint_for).
+    // Without this these blits (walls/scenery in flat-ambient zones) would
+    // defer to the post-readback CPU replay and land on top of the sprites in
+    // front of them -- the wall-over-character bug.
+    tig_color_t implicit_tint = 0;
+    bool implicit_tint_set = false;
     if ((art_info->flags & gpu_reject_blends) == 0) {
         if ((art_info->flags & TIG_ART_BLT_PALETTE_OVERRIDE) != 0 && art_info->palette != NULL) {
             // Recolored object / sign: render the art through its OVERRIDE
@@ -387,11 +447,23 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
             }
         } else if ((art_info->flags & gpu_ok_intent) != 0) {
             src_tex = tig_art_gpu_cache_get(art_info->art_id);
+        } else {
+            // No color/palette intent: plain (or alpha-only) working-palette
+            // blit. Render through the original-palette cache and apply the
+            // ambient tint as COLOR_CONST below.
+            src_tex = tig_art_gpu_cache_get(art_info->art_id);
+            if (src_tex != NULL && light_default_tint_for(art_info->art_id, &implicit_tint)) {
+                implicit_tint_set = true;
+            }
         }
     }
     if (src_tex == NULL) {
+        if (tile_gpu_trace_state == 2) tile_gpu_trace_log("DEFER", art_info);
         tile_gpu_defer_blit(art_info);
         return true;
+    }
+    if (tile_gpu_trace_state == 2) {
+        tile_gpu_trace_log((oneshot_tex != NULL) ? "GPU-OVR" : "GPU", art_info);
     }
 
     // Defer freeing the one-shot texture until after the readback flush.
@@ -477,20 +549,39 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
         gpu_info.lerp_colors[0] = art_info->color;
     } else if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_ARRAY) != 0
         && art_info->field_14 != NULL) {
-        // 2-color horizontal lighting gradient (walls: left = field_14[0],
-        // right = field_14[1]). Render it as a real left->right gradient via
-        // the LERP grid, matching the software path exactly (art.c maps
-        // COLOR_ARRAY -> COLOR_LERP with corners L,R,R,L). The earlier uniform
-        // COLOR_CONST approximation flattened each wall to one tint, so dynamic
-        // light stepped per-wall and exposed seams between adjacent walls
-        // instead of flowing smoothly across them. lerp_rect = src_rect so the
-        // gradient spans the full sprite width (u=0 -> left, u=1 -> right).
-        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
-        gpu_info.lerp_rect = art_info->src_rect;
-        gpu_info.lerp_colors[0] = art_info->field_14[0]; // TL = left
-        gpu_info.lerp_colors[1] = art_info->field_14[1]; // TR = right
-        gpu_info.lerp_colors[2] = art_info->field_14[1]; // BR = right
-        gpu_info.lerp_colors[3] = art_info->field_14[0]; // BL = left
+        // Full per-column light field. field_14[i] is the lit color of screen
+        // column i across the wall's full width; the GPU samples it per grid
+        // column (blit_gpu COLOR_ARRAY path) so the vignette flows smoothly
+        // across the wall AND across adjacent walls -- their shared edge columns
+        // sample the same world position and agree, so no seam.
+        //
+        // light_hardware_accelerated is false in this build, so sub_4DC210
+        // leaves the array un-collapsed (full per-column). The old code read
+        // field_14[0]/[1] as left/right endpoints, but [1] is the SECOND column
+        // (~equal to [0]), which flattened each wall to roughly its left-edge
+        // tint and seamed hard at every tile boundary -- the reported bug.
+        int aw = 0;
+        int ah = 0;
+        if (tig_art_size(art_info->art_id, &aw, &ah) == TIG_OK && aw > 0) {
+            if (aw > 160) {
+                aw = 160; // ObjectRenderColors holds 160 columns
+            }
+            vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_ARRAY;
+            gpu_info.color_array = (const uint32_t*)art_info->field_14;
+            gpu_info.color_array_count = aw;
+        } else {
+            vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
+            gpu_info.lerp_colors[0] = art_info->field_14[0];
+        }
+    }
+    // Implicit ambient tint for plain working-palette blits (no color intent of
+    // their own). Skipped if a color modulation is already set.
+    if (implicit_tint_set
+        && (vb_flags & (TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP
+                | TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST
+                | TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_ARRAY)) == 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
+        gpu_info.lerp_colors[0] = implicit_tint;
     }
     gpu_info.flags = vb_flags;
 
@@ -1182,6 +1273,11 @@ void tile_gpu_world_begin(void)
         } else {
             tile_deferred_blit_count = 0;
             tile_oneshot_tex_count = 0;
+            if (tile_gpu_trace_state == 1) {
+                tile_gpu_trace_state = 2;
+                tile_gpu_trace_order = 0;
+                tig_debug_printf("=== GPU dispatch trace begin (single frame) ===\n");
+            }
         }
     }
 }
@@ -1212,10 +1308,30 @@ void tile_gpu_world_end(void)
 
     if (tile_deferred_blit_count > 0) {
         int di;
+        if (tile_gpu_trace_state == 2) {
+            tig_debug_printf("--- replay (%d deferred, drawn LAST on top of everything) ---\n",
+                tile_deferred_blit_count);
+        }
         for (di = 0; di < tile_deferred_blit_count; di++) {
+            if (tile_gpu_trace_state == 2) {
+                tile_gpu_trace_log("REPLAY", &tile_deferred_blits[di].info);
+            }
             tig_art_blit(&tile_deferred_blits[di].info);
         }
         tile_deferred_blit_count = 0;
+    }
+
+    if (tile_gpu_trace_state == 2) {
+        if (tile_gpu_trace_order == 0) {
+            // Non-rendering frame (tile_draw early-exited on !tile_visible, or
+            // a transition with no dispatches). Re-arm so the next frame with
+            // actual content captures, instead of consuming the user's marker.
+            tig_debug_printf("=== GPU dispatch trace end (0 entries -- re-arming for next world pass) ===\n");
+            tile_gpu_trace_state = 1;
+        } else {
+            tig_debug_printf("=== GPU dispatch trace end (%d entries) ===\n", tile_gpu_trace_order);
+            tile_gpu_trace_state = 0;
+        }
     }
 
     tile_void_edge_scan();

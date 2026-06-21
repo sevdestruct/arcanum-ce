@@ -2046,67 +2046,55 @@ void light_buffers_exit(void)
 }
 
 // 0x4DE0B0
-bool sub_4DE0B0(tig_art_id_t art_id, TigPaletteModifyInfo* modify_info)
+// CE (feature/perf-gpu-accel): the ambient tint sub_4DE0B0 bakes into an art
+// type's WORKING palette, exposed so the GPU dispatch can synthesize the same
+// tint as a runtime COLOR_CONST instead of needing a working-palette texture
+// (the GPU cache holds original-palette textures only). Returns true and the
+// tint for types that get lit; false for types the software path leaves
+// untinted (INTERFACE/MISC/LIGHT/non-ground ITEM -- working palette == original).
+bool light_default_tint_for(tig_art_id_t art_id, tig_color_t* out_tint)
 {
     if (!light_enabled) {
         return false;
     }
 
-    modify_info->flags = TIG_PALETTE_MODIFY_TINT;
     switch (tig_art_type(art_id)) {
     case TIG_ART_TYPE_TILE:
-        if (tig_art_tile_id_type_get(art_id) == 0) {
-            modify_info->tint_color = light_indoor_color;
-        } else {
-            modify_info->tint_color = light_outdoor_color;
-        }
+    case TIG_ART_TYPE_FACADE:
+        *out_tint = (tig_art_tile_id_type_get(art_id) == 0)
+            ? light_indoor_color
+            : light_outdoor_color;
         return true;
     case TIG_ART_TYPE_WALL:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
     case TIG_ART_TYPE_CRITTER:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
     case TIG_ART_TYPE_PORTAL:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
     case TIG_ART_TYPE_SCENERY:
-        modify_info->tint_color = light_outdoor_color;
+    case TIG_ART_TYPE_CONTAINER:
+    case TIG_ART_TYPE_ROOF:
+    case TIG_ART_TYPE_MONSTER:
+    case TIG_ART_TYPE_UNIQUE_NPC:
+        *out_tint = light_outdoor_color;
         return true;
-    case TIG_ART_TYPE_INTERFACE:
-        return false;
     case TIG_ART_TYPE_ITEM:
         if (tig_art_item_id_disposition_get(art_id) == TIG_ART_ITEM_DISPOSITION_GROUND) {
-            modify_info->tint_color = light_outdoor_color;
+            *out_tint = light_outdoor_color;
             return true;
         }
         return false;
-    case TIG_ART_TYPE_CONTAINER:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
-    case TIG_ART_TYPE_MISC:
-        return false;
-    case TIG_ART_TYPE_LIGHT:
-        return false;
-    case TIG_ART_TYPE_ROOF:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
-    case TIG_ART_TYPE_FACADE:
-        if (tig_art_tile_id_type_get(art_id) == 0) {
-            modify_info->tint_color = light_indoor_color;
-        } else {
-            modify_info->tint_color = light_outdoor_color;
-        }
-        return true;
-    case TIG_ART_TYPE_MONSTER:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
-    case TIG_ART_TYPE_UNIQUE_NPC:
-        modify_info->tint_color = light_outdoor_color;
-        return true;
-    default:
+    default: // INTERFACE / MISC / LIGHT / non-ground ITEM
         return false;
     }
+}
+
+bool sub_4DE0B0(tig_art_id_t art_id, TigPaletteModifyInfo* modify_info)
+{
+    tig_color_t tint;
+    if (!light_default_tint_for(art_id, &tint)) {
+        return false;
+    }
+    modify_info->flags = TIG_PALETTE_MODIFY_TINT;
+    modify_info->tint_color = tint;
+    return true;
 }
 
 // 0x4DE200

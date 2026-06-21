@@ -27,6 +27,16 @@ void tile_set_render_target(TigVideoBuffer* vb);
 // Used by the F9 perf log to break down the GPU tile pass cost.
 void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns);
 
+// CE (feature/perf-gpu-accel): dump the current iso world buffer to an absolute
+// BMP path (self-test harness; compares gpu vs software world renders).
+void tile_gpu_test_capture(const char* abs_path);
+
+// CE (feature/perf-gpu-accel): arm the GPU dispatch trace for the next world
+// pass. Self-disables after one frame with real content (re-arms across empty
+// frames). The harness `trace` command calls this directly so it doesn't have
+// to race a file marker against the tile pass timing.
+void tile_gpu_trace_arm(void);
+
 // CE (feature/perf-gpu-accel): shared GPU blit dispatch for the world passes
 // (tile/object/roof). Returns true if the blit was handled -- drawn on the GPU
 // world target, or queued for CPU replay at tile_gpu_world_end -- and false if

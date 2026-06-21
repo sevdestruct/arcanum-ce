@@ -70,6 +70,13 @@ typedef unsigned int TigVideoBufferBlitFlags;
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP 0x0100
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST 0x0200
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP 0x0400
+// CE (feature/perf-gpu-accel): per-column light field (walls). Unlike COLOR_LERP
+// (4 corners), this carries the full per-screen-column color array so the GPU
+// samples color_array[column] across a fine grid -- reproducing the software
+// per-column wall vignette that flows seamlessly across adjacent wall tiles,
+// instead of a 2-endpoint linear gradient that flattens each wall and seams at
+// tile boundaries.
+#define TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_ARRAY 0x0800
 
 // CE: Special case - use linear filtering instead of nearest pixel sampling.
 // This is only required when creating save-game thumbnails. Default nearest
@@ -340,6 +347,11 @@ typedef struct TigVideoBufferBlitGpuInfo {
     // BL -- same corner order as lerp_colors), bilinearly interpolated across
     // the same grid as COLOR_LERP.
     uint8_t alpha[4];
+    // CE: COLOR_ARRAY per-column light field. color_array[i] is the lit color of
+    // screen column i (left to right) of the source sprite; color_array_count is
+    // the number of valid columns. Sampled per grid vertex by source column.
+    const uint32_t* color_array;
+    int color_array_count;
     TigVideoBuffer* dst_video_buffer;
     TigRect* dst_rect;
 } TigVideoBufferBlitGpuInfo;
