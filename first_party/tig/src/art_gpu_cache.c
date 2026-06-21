@@ -181,15 +181,22 @@ SDL_Texture* tig_art_gpu_cache_get(tig_art_id_t art_id)
         }
     }
 
-    // Miss: source the CPU video buffer and upload.
+    // Miss: render the art through its ORIGINAL palette into a scratch CPU
+    // buffer, then upload. Using the original-palette render (rather than the
+    // engine's working-palette surface) keeps the texture matching the
+    // software tile path and stable across ambient/time-of-day tweens -- the
+    // texture never needs invalidation because hdr.palette_tbl is immutable.
+    // We own the scratch buffer and destroy it once the pixels are in the GPU
+    // texture.
     tig_art_gpu_cache_misses++;
 
     TigVideoBuffer* cpu_buf = NULL;
-    if (tig_art_video_buffer_get(art_id, &cpu_buf) != TIG_OK || cpu_buf == NULL) {
+    if (tig_art_render_original_palette(art_id, &cpu_buf) != TIG_OK || cpu_buf == NULL) {
         return NULL;
     }
 
     SDL_Texture* tex = tig_video_buffer_upload_to_texture(cpu_buf);
+    tig_video_buffer_destroy(cpu_buf);
     if (tex == NULL) {
         return NULL;
     }

@@ -578,6 +578,78 @@ int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_
     return art_get_video_buffer(cache_entry_index, art_id, video_buffer_ptr);
 }
 
+// CE (feature/perf-gpu-accel Phase 3 fix): render an art frame through its
+// ORIGINAL, immutable palette into a freshly allocated colorkeyed CPU video
+// buffer. The caller owns the result and must destroy it.
+//
+// Why this exists: tig_art_video_buffer_get returns the engine's *working*
+// materialized surface (art->palette_tbl), which the renderer re-bakes when
+// the ambient/time-of-day palette changes. The software tile path never uses
+// that surface -- it blits with TIG_ART_BLT_PALETTE_ORIGINAL, sampling the
+// immutable hdr.palette_tbl. Uploading the working surface to a GPU texture
+// therefore (a) shows the wrong base palette and (b) goes stale the moment
+// the ambient tween nudges the palette. Rendering through the original
+// palette here makes the GPU texture match the software path exactly and,
+// because hdr.palette_tbl never mutates, the texture is valid for the life
+// of the cache entry -- no per-frame invalidation needed.
+//
+// tig_art_blit also bakes in the flippable-tile mirror (the art_id flag-bit
+// handling in its copy loop), so the resulting texture is already in the
+// correct orientation -- the GPU dispatch must NOT re-apply that mirror.
+int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr)
+{
+    TigVideoBufferCreateInfo vb_create_info;
+    TigArtBlitInfo art_blit_info;
+    TigVideoBuffer* vb;
+    TigRect rect;
+    int width;
+    int height;
+
+    if (video_buffer_ptr == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    *video_buffer_ptr = NULL;
+
+    if (tig_art_size(art_id, &width, &height) != TIG_OK || width <= 0 || height <= 0) {
+        return TIG_ERR_IO;
+    }
+
+    memset(&vb_create_info, 0, sizeof(vb_create_info));
+    vb_create_info.flags = TIG_VIDEO_BUFFER_CREATE_COLOR_KEY | TIG_VIDEO_BUFFER_CREATE_VIDEO_MEMORY;
+    vb_create_info.width = width;
+    vb_create_info.height = height;
+    vb_create_info.color_key = tig_color_make(0, 255, 0);
+    vb_create_info.background_color = vb_create_info.color_key;
+
+    vb = NULL;
+    if (tig_video_buffer_create(&vb_create_info, &vb) != TIG_OK || vb == NULL) {
+        return TIG_ERR_GENERIC;
+    }
+
+    rect.x = 0;
+    rect.y = 0;
+    rect.width = width;
+    rect.height = height;
+
+    // Plain copy through the original palette. The background fill (color key)
+    // shows through where the source is transparent (index 0), so the upload's
+    // SDL_CreateTextureFromSurface turns those into alpha=0.
+    memset(&art_blit_info, 0, sizeof(art_blit_info));
+    art_blit_info.flags = TIG_ART_BLT_PALETTE_ORIGINAL;
+    art_blit_info.art_id = art_id;
+    art_blit_info.src_rect = &rect;
+    art_blit_info.dst_rect = &rect;
+    art_blit_info.dst_video_buffer = vb;
+
+    if (tig_art_blit(&art_blit_info) != TIG_OK) {
+        tig_video_buffer_destroy(vb);
+        return TIG_ERR_GENERIC;
+    }
+
+    *video_buffer_ptr = vb;
+    return TIG_OK;
+}
+
 // 0x502360
 int tig_art_blit(TigArtBlitInfo* blit_info)
 {

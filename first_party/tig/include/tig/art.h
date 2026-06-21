@@ -446,9 +446,17 @@ void tig_art_set_override_resolver(TigArtCompositeResolver func);
 // TigVideoBuffer for an art_id, materializing it through the art cache the
 // same way `tig_art_blit` does. Returns TIG_OK on success and writes the
 // internal video buffer pointer to *video_buffer_ptr; callers must not
-// destroy it (the art cache owns it). Used by `tig_art_gpu_cache_get` to
-// source pixels for GPU texture upload.
+// destroy it (the art cache owns it).
 int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr);
+
+// CE (feature/perf-gpu-accel Phase 3 fix): render an art frame through its
+// ORIGINAL (immutable) palette into a freshly allocated colorkeyed CPU video
+// buffer. Unlike tig_art_video_buffer_get, the returned buffer is owned by the
+// caller and must be destroyed with tig_video_buffer_destroy. Used by
+// tig_art_gpu_cache_get so uploaded textures match the software tile path
+// (which always blits with TIG_ART_BLT_PALETTE_ORIGINAL) and never go stale
+// when the ambient/time-of-day palette tweens.
+int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr);
 int tig_art_type(tig_art_id_t art_id);
 unsigned int tig_art_num_get(tig_art_id_t art_id);
 tig_art_id_t tig_art_num_set(tig_art_id_t art_id, unsigned int value);
