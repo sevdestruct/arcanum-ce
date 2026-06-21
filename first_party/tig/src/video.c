@@ -2147,6 +2147,7 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
 {
     SDL_Renderer* renderer;
     SDL_Texture* prev_target;
+    bool target_switched = false;
     SDL_FRect sdl_src;
     SDL_FRect sdl_dst;
     SDL_FlipMode flip_mode;
@@ -2189,11 +2190,19 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         return TIG_ERR_GENERIC;
     }
 
+    // Only switch render target when it isn't already bound. The hot caller
+    // (tile_draw_iso) binds the GPU world buffer once in tile_gpu_begin_pass
+    // and issues thousands of blits against it per frame; a per-blit
+    // SetRenderTarget save/restore flushed the renderer's command batch on
+    // every call -- a large slice of the GPU tile-pass cost. When the dst is
+    // already the active target we skip the switch (and the restore) entirely.
     prev_target = SDL_GetRenderTarget(renderer);
-
-    if (!SDL_SetRenderTarget(renderer, blit_info->dst_video_buffer->texture)) {
-        tig_debug_printf("tig_video_buffer_blit_gpu: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
-        return TIG_ERR_GENERIC;
+    if (prev_target != blit_info->dst_video_buffer->texture) {
+        if (!SDL_SetRenderTarget(renderer, blit_info->dst_video_buffer->texture)) {
+            tig_debug_printf("tig_video_buffer_blit_gpu: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
+            return TIG_ERR_GENERIC;
+        }
+        target_switched = true;
     }
 
     // Source-side alpha (e.g., from colorkey-converted art) needs blending
@@ -2220,9 +2229,22 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
     }
 
     if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP) != 0) {
-        // 4-vertex quad with per-vertex colors computed from the 4 corners
-        // of src_rect within lerp_rect. SDL_RenderGeometry modulates the
-        // texture sample by the vertex color.
+        // Per-vertex-colored geometry whose vertex colors come from the lerp
+        // grid. SDL_RenderGeometry modulates the texture sample by the vertex
+        // color, but interpolates the vertex colors *linearly per triangle*
+        // (Gouraud). The software blitter this replaces does true *bilinear*
+        // interpolation, which carries a u*v cross term a single 2-triangle
+        // quad cannot reproduce. The mismatch shows as shading creases/seams
+        // wherever the per-corner gradient is diagonal -- common on iso maps,
+        // and exactly what the void-edge fade produces along slanted void
+        // boundaries -- and it also skews void_edge_fade's pixel-readback dark
+        // probe (which assumes the center pixel carries the bilinear-center
+        // light/fade value, marking lit facade tiles as void otherwise).
+        //
+        // Fix: subdivide the quad into an nx*ny grid and assign every grid
+        // vertex its *exact* bilinear color. Gouraud across the fine grid then
+        // matches bilinear to within a fraction of a step. Uniform quads (all
+        // four corners equal -- the common, unlit-gradient case) skip the grid.
         if (blit_info->lerp_rect == NULL) {
             tig_debug_printf("tig_video_buffer_blit_gpu: BLEND_COLOR_LERP requires lerp_rect.\n");
             rc = TIG_ERR_INVALID_PARAM;
@@ -2231,25 +2253,8 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
 
         SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
 
-        // Corner colors interpolated from lerp_colors at the 4 corners of
-        // src_rect (in source-texture coordinates) within lerp_rect.
-        tig_color_t c_tl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
-            blit_info->src_rect->x,
-            blit_info->src_rect->y);
-        tig_color_t c_tr = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
-            blit_info->src_rect->x + blit_info->src_rect->width,
-            blit_info->src_rect->y);
-        tig_color_t c_br = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
-            blit_info->src_rect->x + blit_info->src_rect->width,
-            blit_info->src_rect->y + blit_info->src_rect->height);
-        tig_color_t c_bl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect,
-            blit_info->src_rect->x,
-            blit_info->src_rect->y + blit_info->src_rect->height);
-
-        // SDL_RenderGeometry samples src at tex_coord (0..1 in texture
-        // space). Convert pixel-space src_rect to normalized coords via
-        // SDL_GetTextureSize so we don't have to hand the texture's pixel
-        // dimensions through the API.
+        // SDL_RenderGeometry samples src at tex_coord (0..1 in texture space);
+        // convert pixel-space src coords to normalized via the texture size.
         float tex_w = 0.0f;
         float tex_h = 0.0f;
         if (!SDL_GetTextureSize(blit_info->src_texture, &tex_w, &tex_h) || tex_w <= 0.0f || tex_h <= 0.0f) {
@@ -2258,49 +2263,78 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
             goto restore;
         }
 
-        float u0 = sdl_src.x / tex_w;
-        float v0 = sdl_src.y / tex_h;
-        float u1 = (sdl_src.x + sdl_src.w) / tex_w;
-        float v1 = (sdl_src.y + sdl_src.h) / tex_h;
+        int sx = blit_info->src_rect->x;
+        int sy = blit_info->src_rect->y;
+        int sw = blit_info->src_rect->width;
+        int sh = blit_info->src_rect->height;
+        bool flip_x = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0;
+        bool flip_y = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0;
 
-        // Honor FLIP_X / FLIP_Y by swapping the UV mapping; SDL_RenderGeometry
-        // has no flip parameter.
-        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0) {
-            float t = u0; u0 = u1; u1 = t;
+        // Decide subdivision. Uniform corners -> single quad. Otherwise ~1
+        // grid cell per 12 dst px, capped at 8x8 (quads here are at most a tile
+        // quadrant, ~39x20, so this tops out around 4x2 in practice).
+        tig_color_t c_tl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy);
+        tig_color_t c_tr = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy);
+        tig_color_t c_br = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy + sh);
+        tig_color_t c_bl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy + sh);
+
+        int nx;
+        int ny;
+        if (c_tl == c_tr && c_tl == c_br && c_tl == c_bl) {
+            nx = 1;
+            ny = 1;
+        } else {
+            nx = (blit_info->dst_rect->width + 11) / 12;
+            ny = (blit_info->dst_rect->height + 11) / 12;
+            if (nx < 1) nx = 1; else if (nx > 8) nx = 8;
+            if (ny < 1) ny = 1; else if (ny > 8) ny = 8;
         }
-        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0) {
-            float t = v0; v0 = v1; v1 = t;
+
+        // (nx+1) x (ny+1) vertices, 2 triangles per cell. Max 9x9 verts / 384
+        // indices for the 8x8 cap.
+        SDL_Vertex verts[(8 + 1) * (8 + 1)];
+        int indices[8 * 8 * 6];
+        int vi = 0;
+        int gx;
+        int gy;
+        for (gy = 0; gy <= ny; gy++) {
+            float fy = (float)gy / (float)ny;
+            float src_yf = (float)sy + fy * (float)sh;
+            int src_yi = (int)(src_yf + 0.5f);
+            float pos_y = sdl_dst.y + fy * sdl_dst.h;
+            float tv = (flip_y ? (float)(sy + sh) - (src_yf - (float)sy) : src_yf) / tex_h;
+            for (gx = 0; gx <= nx; gx++) {
+                float fx = (float)gx / (float)nx;
+                float src_xf = (float)sx + fx * (float)sw;
+                int src_xi = (int)(src_xf + 0.5f);
+                float pos_x = sdl_dst.x + fx * sdl_dst.w;
+                float tu = (flip_x ? (float)(sx + sw) - (src_xf - (float)sx) : src_xf) / tex_w;
+
+                verts[vi].position.x = pos_x;
+                verts[vi].position.y = pos_y;
+                verts[vi].tex_coord.x = tu;
+                verts[vi].tex_coord.y = tv;
+                tig_video_buffer_blit_gpu_color_to_fcolor(
+                    tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, src_xi, src_yi),
+                    &verts[vi].color);
+                vi++;
+            }
         }
 
-        SDL_Vertex verts[4];
-        verts[0].position.x = sdl_dst.x;
-        verts[0].position.y = sdl_dst.y;
-        verts[0].tex_coord.x = u0;
-        verts[0].tex_coord.y = v0;
-        tig_video_buffer_blit_gpu_color_to_fcolor(c_tl, &verts[0].color);
+        int ii = 0;
+        int row_stride = nx + 1;
+        for (gy = 0; gy < ny; gy++) {
+            for (gx = 0; gx < nx; gx++) {
+                int i0 = gy * row_stride + gx;
+                int i1 = i0 + 1;
+                int i2 = i0 + row_stride;
+                int i3 = i2 + 1;
+                indices[ii++] = i0; indices[ii++] = i1; indices[ii++] = i3;
+                indices[ii++] = i0; indices[ii++] = i3; indices[ii++] = i2;
+            }
+        }
 
-        verts[1].position.x = sdl_dst.x + sdl_dst.w;
-        verts[1].position.y = sdl_dst.y;
-        verts[1].tex_coord.x = u1;
-        verts[1].tex_coord.y = v0;
-        tig_video_buffer_blit_gpu_color_to_fcolor(c_tr, &verts[1].color);
-
-        verts[2].position.x = sdl_dst.x + sdl_dst.w;
-        verts[2].position.y = sdl_dst.y + sdl_dst.h;
-        verts[2].tex_coord.x = u1;
-        verts[2].tex_coord.y = v1;
-        tig_video_buffer_blit_gpu_color_to_fcolor(c_br, &verts[2].color);
-
-        verts[3].position.x = sdl_dst.x;
-        verts[3].position.y = sdl_dst.y + sdl_dst.h;
-        verts[3].tex_coord.x = u0;
-        verts[3].tex_coord.y = v1;
-        tig_video_buffer_blit_gpu_color_to_fcolor(c_bl, &verts[3].color);
-
-        // Two triangles: (0,1,2) and (0,2,3).
-        static const int indices[6] = { 0, 1, 2, 0, 2, 3 };
-
-        if (!SDL_RenderGeometry(renderer, blit_info->src_texture, verts, 4, indices, 6)) {
+        if (!SDL_RenderGeometry(renderer, blit_info->src_texture, verts, vi, indices, ii)) {
             tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderGeometry failed: %s\n", SDL_GetError());
             rc = TIG_ERR_GENERIC;
         }
@@ -2345,7 +2379,9 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
     }
 
 restore:
-    SDL_SetRenderTarget(renderer, prev_target);
+    if (target_switched) {
+        SDL_SetRenderTarget(renderer, prev_target);
+    }
     return rc;
 }
 
