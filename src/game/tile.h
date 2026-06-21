@@ -33,6 +33,17 @@ void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns);
 // the GPU world pass is inactive and the caller should perform its own blit.
 bool tile_gpu_dispatch(TigArtBlitInfo* art_info);
 
+// CE (feature/perf-gpu-accel): open/close the GPU world render pass.
+// gamelib_draw_game calls begin before the tile pass and end after the last GPU
+// world pass (object/roof); between them tile/object/roof blits route to the
+// shared GPU world target. No-op in software mode.
+void tile_gpu_world_begin(void);
+void tile_gpu_world_end(void);
+
+// CE (feature/perf-gpu-accel): true when the GPU world path is selected, so
+// object_draw emits COLOR_CONST lighting (the hardware path) for GPU tinting.
+bool tile_gpu_world_lighting(void);
+
 #define TILE_X(tile) ((tile) & 0x3F)
 #define TILE_Y(tile) (((tile) >> 6) & 0x3F)
 #define TILE_MAKE(x, y) ((x) | ((y) << 6))

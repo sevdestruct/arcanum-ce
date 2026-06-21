@@ -4604,7 +4604,15 @@ void sub_442D90(int64_t obj, ObjectRenderColors* colors)
     }
 
     if ((render_flags & ORF_20000000) != 0) {
-        if (object_hardware_accelerated || is_composite) {
+        // CE (feature/perf-gpu-accel): when the GPU world pass is active, light
+        // objects the same way the hardware path (and CE composite sprites) do
+        // -- a COLOR_CONST color-multiply at blit time -- instead of baking the
+        // tint into a per-object working palette. The GPU art cache holds only
+        // the original palette, so the COLOR_CONST tint is what the GPU dispatch
+        // applies via SetTextureColorMod; the software fallback handles
+        // COLOR_CONST too (proven by composite sprites), so this is safe in
+        // both modes.
+        if (object_hardware_accelerated || is_composite || tile_gpu_world_lighting()) {
             render_flags |= TIG_ART_BLT_BLEND_COLOR_CONST;
         } else {
             palette_modify_info.flags |= TIG_PALETTE_MODIFY_TINT;
@@ -4903,9 +4911,16 @@ void object_flush_pending_blits(void)
     qsort(object_pending_blits, object_blit_queue_size, sizeof(*object_pending_blits), object_compare_blits);
 
     for (index = 0; index < object_blit_queue_size; index++) {
-        object_pending_blits[index].blit_info.src_rect = &(object_pending_rects[object_pending_blits[index].rect_index].src_rect);
-        object_pending_blits[index].blit_info.dst_rect = &(object_pending_rects[object_pending_blits[index].rect_index].dst_rect);
-        tig_window_blit_art(object_iso_window_handle, &(object_pending_blits[index].blit_info));
+        TigArtBlitInfo* bi = &object_pending_blits[index].blit_info;
+        bi->src_rect = &(object_pending_rects[object_pending_blits[index].rect_index].src_rect);
+        bi->dst_rect = &(object_pending_rects[object_pending_blits[index].rect_index].dst_rect);
+        // CE (feature/perf-gpu-accel): route to the shared GPU world target
+        // when the GPU world pass is open. tile_gpu_dispatch returns false in
+        // software mode (and defers, to CPU replay, any blit it can't draw on
+        // GPU), in which case we fall back to the normal window blit.
+        if (!tile_gpu_dispatch(bi)) {
+            tig_window_blit_art(object_iso_window_handle, bi);
+        }
     }
 
     object_blit_queue_size = 0;

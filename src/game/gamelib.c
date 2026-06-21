@@ -2271,11 +2271,12 @@ bool gamelib_draw(void)
                             tig_debug_printf("%s", passes);
                             gamelib_zoom_perf_log(passes);
 
-                            // CE (feature/perf-gpu-accel): break the GPU tile
-                            // pass into its transfer halves. upload = CPU->GPU
-                            // SDL_UpdateTexture; readback = GPU->CPU
-                            // SDL_RenderReadPixels; blit = the remainder (the
-                            // actual tile draws). All zero in software mode.
+                            // CE (feature/perf-gpu-accel): GPU bridge cost.
+                            // upload = CPU->GPU SDL_UpdateTexture (in the tile
+                            // bucket); readback = GPU->CPU SDL_RenderReadPixels
+                            // (now at world_end, after object -- not in the tile
+                            // bucket); blit = tile bucket minus the upload (the
+                            // tile+facade draws). All zero in software mode.
                             uint64_t up_ns = 0;
                             uint64_t rb_ns = 0;
                             tile_gpu_perf_read_reset(&up_ns, &rb_ns);
@@ -2283,7 +2284,7 @@ bool gamelib_draw(void)
                                 float au = (float)((double)up_ns / n / 1e6);
                                 float arb = (float)((double)rb_ns / n / 1e6);
                                 double blit_ns = (double)gamelib_zoom_perf_pass_tile_total_ns
-                                    - (double)up_ns - (double)rb_ns;
+                                    - (double)up_ns;
                                 if (blit_ns < 0.0) {
                                     blit_ns = 0.0;
                                 }
@@ -3629,6 +3630,10 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
             if (d > gamelib_zoom_perf_pass_light_max_ns) gamelib_zoom_perf_pass_light_max_ns = d;
             t0 = gamelib_zoom_perf_now_ns();
         }
+        // CE (feature/perf-gpu-accel): open the GPU world pass (upload + bind)
+        // before tile, so tile and object both render onto the shared GPU
+        // target. No-op in software mode.
+        tile_gpu_world_begin();
         tile_draw(draw_info);
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
@@ -3644,6 +3649,11 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
             if (d > gamelib_zoom_perf_pass_object_max_ns) gamelib_zoom_perf_pass_object_max_ns = d;
             t0 = gamelib_zoom_perf_now_ns();
         }
+        // CE (feature/perf-gpu-accel): close the GPU world pass after object --
+        // read the GPU target (tiles + objects) back to the CPU surface so roof
+        // (still software) and the UI passes see the expected pixels. Moves to
+        // after roof_draw once roof is on GPU too.
+        tile_gpu_world_end();
         roof_draw(draw_info);
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;

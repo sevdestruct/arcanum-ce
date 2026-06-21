@@ -1021,6 +1021,115 @@ typedef struct {
 static GapScanEntry gap_scan_list[16384];
 static int gap_scan_count;
 
+// CE: facade black-detection scan. Reads back the facade tiles queued during
+// the draw (one VB lock) and marks the pure-black ones void so the void-edge
+// fade feathers from them. Reads dword_602DF0, so it must run after the tiles
+// are on the CPU surface: in software mode at the end of tile_draw_iso; in GPU
+// mode in tile_gpu_world_end, after the readback.
+static void tile_void_edge_scan(void)
+{
+    // Skip while the zoom is animating: the world VB has stale/empty regions
+    // mid-zoom (rendered across frames), so reading it then marks tiles black
+    // at positions only momentarily black. The marks are persistent, so
+    // detecting once the zoom settles is enough.
+    if (void_edge_fade_enabled() && gap_scan_count > 0 && !iso_zoom_is_animating()) {
+        TigVideoBufferData vbd;
+        if (tig_video_buffer_lock(dword_602DF0) == TIG_OK) {
+            if (tig_video_buffer_data(dword_602DF0, &vbd) == TIG_OK && vbd.pixels != NULL) {
+                int i;
+                // Probe offsets within the 80x40 tile diamond around its center.
+                // A tile "renders black" only if EVERY probe is black: true
+                // black.ART chunks pass; good cliff art with a dark crevice at
+                // one probe fails (single-pixel sampling sprayed false blotches).
+                static const int probe_dx[5] = { 0, -14, 14, 0, 0 };
+                static const int probe_dy[5] = { 0, 0, 0, -7, 7 };
+                for (i = 0; i < gap_scan_count; i++) {
+                    int px = gap_scan_list[i].px;
+                    int py = gap_scan_list[i].py;
+                    int ffc = gap_scan_list[i].ff_center;
+                    // Divide the fade back out to recover the pre-fade pixel, so a
+                    // cliff the fade merely dimmed isn't mistaken for black art.
+                    if (px >= 0 && py >= 0 && px < vbd.width && py < vbd.height && ffc >= 16) {
+                        int probes = 0;
+                        int blacks = 0;
+                        int k;
+                        for (k = 0; k < 5; k++) {
+                            int qx = px + probe_dx[k];
+                            int qy = py + probe_dy[k];
+                            if (qx >= 0 && qy >= 0 && qx < vbd.width && qy < vbd.height) {
+                                uint32_t pix = ((uint32_t*)((uint8_t*)vbd.pixels + (size_t)qy * (size_t)vbd.pitch))[qx];
+                                int pr = tig_color_get_red(pix) * 255 / ffc;
+                                int pg = tig_color_get_green(pix) * 255 / ffc;
+                                int pb = tig_color_get_blue(pix) * 255 / ffc;
+                                probes++;
+                                if (pr < 16 && pg < 16 && pb < 16) {
+                                    blacks++;
+                                }
+                            }
+                        }
+                        if (probes >= 3 && blacks == probes) {
+                            void_edge_fade_note_dark(gap_scan_list[i].sec_id, gap_scan_list[i].index);
+                        }
+                    }
+                }
+            }
+            tig_video_buffer_unlock(dword_602DF0);
+        }
+        gap_scan_count = 0;
+    }
+}
+
+// CE (feature/perf-gpu-accel): GPU world-pass bracketing, driven by
+// gamelib_draw_game. begin runs before the first world pass (tile); end runs
+// after the last GPU world pass (object/roof). Between them, tile/object/roof
+// blits route to the GPU world target via tile_gpu_dispatch. No-op (software)
+// unless `tile render path=gpu` is selected and begin_pass succeeds. Other
+// tile_draw callers (zoom render / thumbnails) never call begin, so they stay
+// on the software path (tile_gpu_active is false there).
+void tile_gpu_world_begin(void)
+{
+    tile_gpu_active = tile_should_use_gpu_path();
+    if (tile_gpu_active) {
+        if (!tile_gpu_begin_pass(dword_602DF0)) {
+            tile_gpu_active = false;
+        } else {
+            tile_deferred_blit_count = 0;
+        }
+    }
+}
+
+void tile_gpu_world_end(void)
+{
+    if (!tile_gpu_active) {
+        return;
+    }
+
+    // Read the GPU world target back to the CPU surface, then replay any
+    // deferred (unsupported / cache-miss) blits onto it -- tile_gpu_active is
+    // now false so they take the software path and aren't re-deferred -- then
+    // run the facade scan against the final pixels.
+    tile_gpu_end_pass(dword_602DF0);
+    tile_gpu_active = false;
+
+    if (tile_deferred_blit_count > 0) {
+        int di;
+        for (di = 0; di < tile_deferred_blit_count; di++) {
+            tig_art_blit(&tile_deferred_blits[di].info);
+        }
+        tile_deferred_blit_count = 0;
+    }
+
+    tile_void_edge_scan();
+}
+
+// CE: true when the GPU world path is selected. object_draw consults this to
+// emit COLOR_CONST lighting (the hardware path) so lit objects are tinted on
+// the GPU instead of via a working-palette swap the GPU cache can't follow.
+bool tile_gpu_world_lighting(void)
+{
+    return tile_should_use_gpu_path();
+}
+
 // NOTE: In the original code this function is a part of `tile_draw`, however
 // if `tile_draw_topdown` is definitely there, why `tile_draw_iso` should not?
 void tile_draw_iso(GameDrawInfo* draw_info)
@@ -1077,20 +1186,10 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     light_buffers_lock();
 
-    // CE (feature/perf-gpu-accel Phase 3): if arcanum.cfg requests the GPU
-    // path AND begin_pass succeeds (renderer ready, GPU buffer allocated,
-    // CPU surface uploaded), route tile blits through blit_gpu for this
-    // frame. tile_blit_dispatch reads `tile_gpu_active` to pick the path.
-    tile_gpu_active = tile_should_use_gpu_path();
-    if (tile_gpu_active) {
-        if (!tile_gpu_begin_pass(dword_602DF0)) {
-            tile_gpu_active = false;
-        } else {
-            // Fresh pass: clear any deferred cache-miss blits from last frame
-            // (they're replayed at end_pass, but reset here defensively).
-            tile_deferred_blit_count = 0;
-        }
-    }
+    // CE (feature/perf-gpu-accel): the GPU world pass is opened by gamelib via
+    // tile_gpu_world_begin before tile_draw and closed by tile_gpu_world_end
+    // after the last GPU world pass (so object/roof can draw on the same
+    // target). tile_blit_dispatch just reads `tile_gpu_active` here.
 
     // Pre-compute the bounding rect of all dirty rects so we can fast-
     // reject tiles whose tile_rect can't possibly overlap any of them.
@@ -1391,86 +1490,12 @@ void tile_draw_iso(GameDrawInfo* draw_info)
         }
     }
 
-    // CE (feature/perf-gpu-accel Phase 3): close the GPU pass -- readback
-    // to the CPU dst surface and unbind the render target -- so the rest
-    // of the pipeline (object/roof/UI) keeps reading the expected pixels.
-    // Runs before the void-edge fade scan below so its lock+read sees the
-    // GPU-rendered tile pixels rather than stale pre-pass content.
-    if (tile_gpu_active) {
-        tile_gpu_end_pass(dword_602DF0);
-        tile_gpu_active = false;
-
-        // Replay any deferred cache-miss tiles onto the CPU surface now that
-        // the readback is done. tile_gpu_active is false, so these take the
-        // software path (no re-deferral) and land on the now-current surface
-        // instead of being clobbered.
-        if (tile_deferred_blit_count > 0) {
-            int di;
-            for (di = 0; di < tile_deferred_blit_count; di++) {
-                tig_art_blit(&tile_deferred_blits[di].info);
-            }
-            tile_deferred_blit_count = 0;
-        }
-    }
-
-    // CE: read back the queued facade tiles' rendered pixels in one pass (single VB
-    // lock). Any that blit pure black are the black off-camera scenery — mark them
-    // void so next frame's fade feathers from them. note_dark ignores already-void
-    // tiles, so this settles after the area's first full draw.
-    //
-    // Skip the scan entirely while the zoom is animating: at zoom != 1 the world
-    // VB is rendered across frames and "has stale or empty regions" during a zoom
-    // step (see gamelib draw), so reading it then marks tiles black at positions
-    // that were only momentarily black mid-zoom — leaving fade painted in the
-    // wrong place. The marks are persistent, so detecting once the zoom settles is
-    // enough.
-    if (void_edge_fade_enabled() && gap_scan_count > 0 && !iso_zoom_is_animating()) {
-        TigVideoBufferData vbd;
-        if (tig_video_buffer_lock(dword_602DF0) == TIG_OK) {
-            if (tig_video_buffer_data(dword_602DF0, &vbd) == TIG_OK && vbd.pixels != NULL) {
-                int i;
-                // Probe offsets within the 80x40 tile diamond around its center.
-                // A tile is "renders black" only if EVERY probe is black: true
-                // black.ART chunks pass; good cliff art with a dark crevice at
-                // one probe fails (single-pixel sampling marked those and sprayed
-                // false dark blotches onto lit faces).
-                static const int probe_dx[5] = { 0, -14, 14, 0, 0 };
-                static const int probe_dy[5] = { 0, 0, 0, -7, 7 };
-                for (i = 0; i < gap_scan_count; i++) {
-                    int px = gap_scan_list[i].px;
-                    int py = gap_scan_list[i].py;
-                    int ffc = gap_scan_list[i].ff_center;
-                    // Divide the fade back out to recover the pre-fade pixel, so a
-                    // cliff the fade merely dimmed isn't mistaken for black art.
-                    // Skip the innermost (ffc<16) ring: too faded to tell, and it
-                    // sits right at the void where the fade already exists.
-                    if (px >= 0 && py >= 0 && px < vbd.width && py < vbd.height && ffc >= 16) {
-                        int probes = 0;
-                        int blacks = 0;
-                        int k;
-                        for (k = 0; k < 5; k++) {
-                            int qx = px + probe_dx[k];
-                            int qy = py + probe_dy[k];
-                            if (qx >= 0 && qy >= 0 && qx < vbd.width && qy < vbd.height) {
-                                uint32_t pix = ((uint32_t*)((uint8_t*)vbd.pixels + (size_t)qy * (size_t)vbd.pitch))[qx];
-                                int pr = tig_color_get_red(pix) * 255 / ffc;
-                                int pg = tig_color_get_green(pix) * 255 / ffc;
-                                int pb = tig_color_get_blue(pix) * 255 / ffc;
-                                probes++;
-                                if (pr < 16 && pg < 16 && pb < 16) {
-                                    blacks++;
-                                }
-                            }
-                        }
-                        if (probes >= 3 && blacks == probes) {
-                            void_edge_fade_note_dark(gap_scan_list[i].sec_id, gap_scan_list[i].index);
-                        }
-                    }
-                }
-            }
-            tig_video_buffer_unlock(dword_602DF0);
-        }
-        gap_scan_count = 0;
+    // CE (feature/perf-gpu-accel): in software mode the tiles are on the CPU
+    // surface now, so run the facade black-detection scan here. In GPU mode the
+    // tiles are still on the GPU world target (read back later in
+    // tile_gpu_world_end, after object/roof), so the scan runs there instead.
+    if (!tile_gpu_active) {
+        tile_void_edge_scan();
     }
 
     light_buffers_unlock();
