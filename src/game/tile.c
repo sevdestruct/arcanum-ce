@@ -350,9 +350,10 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
     // palette-override / 2-color-array / alpha-gradient / stipple cases. Any
     // rejected blit (or a cache miss) is deferred to CPU replay.
     const unsigned int gpu_ok_intent = TIG_ART_BLT_BLEND_COLOR_LERP
-        | TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
+        | TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_BLEND_COLOR_ARRAY
+        | TIG_ART_BLT_PALETTE_ORIGINAL;
     const unsigned int gpu_reject = TIG_ART_BLT_PALETTE_OVERRIDE
-        | TIG_ART_BLT_BLEND_COLOR_ARRAY | TIG_ART_BLT_BLEND_ALPHA_AVG
+        | TIG_ART_BLT_BLEND_ALPHA_AVG
         | TIG_ART_BLT_BLEND_ALPHA_SRC | TIG_ART_BLT_BLEND_ALPHA_LERP_X
         | TIG_ART_BLT_BLEND_ALPHA_LERP_Y | TIG_ART_BLT_BLEND_ALPHA_LERP_BOTH
         | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_S | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D;
@@ -404,6 +405,16 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
     } else if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_CONST) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
         gpu_info.lerp_colors[0] = art_info->color;
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_ARRAY) != 0
+        && art_info->field_14 != NULL) {
+        // 2-color horizontal gradient (wall objects: left = field_14[0], right
+        // = field_14[1]). Approximate as a uniform tint by the dominant/left
+        // color -- exactly what tig_art_blit's composite-sprite path does
+        // (art.c). Crucially this draws the wall in z-order on the GPU target
+        // rather than deferring it (deferred blits replay last, so walls drew
+        // over everything in front of them).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
+        gpu_info.lerp_colors[0] = art_info->field_14[0];
     }
     gpu_info.flags = vb_flags;
 
