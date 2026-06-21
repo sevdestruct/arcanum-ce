@@ -2270,6 +2270,31 @@ bool gamelib_draw(void)
                                 al, ml, at, mt, ao, mo, ar, mr);
                             tig_debug_printf("%s", passes);
                             gamelib_zoom_perf_log(passes);
+
+                            // CE (feature/perf-gpu-accel): break the GPU tile
+                            // pass into its transfer halves. upload = CPU->GPU
+                            // SDL_UpdateTexture; readback = GPU->CPU
+                            // SDL_RenderReadPixels; blit = the remainder (the
+                            // actual tile draws). All zero in software mode.
+                            uint64_t up_ns = 0;
+                            uint64_t rb_ns = 0;
+                            tile_gpu_perf_read_reset(&up_ns, &rb_ns);
+                            if (up_ns != 0 || rb_ns != 0) {
+                                float au = (float)((double)up_ns / n / 1e6);
+                                float arb = (float)((double)rb_ns / n / 1e6);
+                                double blit_ns = (double)gamelib_zoom_perf_pass_tile_total_ns
+                                    - (double)up_ns - (double)rb_ns;
+                                if (blit_ns < 0.0) {
+                                    blit_ns = 0.0;
+                                }
+                                float ab = (float)(blit_ns / n / 1e6);
+                                char bridge[256];
+                                snprintf(bridge, sizeof(bridge),
+                                    "[zoom-perf]   gpu-bridge: upload avg %.2fms | blit avg %.2fms | readback avg %.2fms\n",
+                                    au, ab, arb);
+                                tig_debug_printf("%s", bridge);
+                                gamelib_zoom_perf_log(bridge);
+                            }
                         }
                     }
 

@@ -3,6 +3,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #include "tig/art_gpu_cache.h"
 
@@ -87,6 +88,59 @@ static bool tile_gpu_path_disabled;
 // target is bound and tile blits should route through blit_gpu instead
 // of tig_art_blit.
 static bool tile_gpu_active;
+
+// CE (feature/perf-gpu-accel Phase 3 fix): deferred cache-miss blits.
+//
+// During the GPU pass the render target is bound to the GPU world buffer and
+// tile_gpu_end_pass reads it back over the CPU dst surface. A tile that misses
+// the GPU art cache can't simply fall back to tig_art_blit mid-pass -- that
+// draws to the CPU surface, which the readback then overwrites, leaving a
+// black tile-shaped hole. Instead we record the miss here (deep-copying the
+// blit info plus the rects/colors it points at, which are reused stack locals
+// in tile_draw_iso) and replay it with tig_art_blit AFTER the readback, onto
+// the now-current CPU surface. With the original-palette GPU cache fill, real
+// misses are rare, so this list normally stays empty.
+typedef struct TileDeferredBlit {
+    TigArtBlitInfo info;
+    TigRect src_rect;
+    TigRect dst_rect;
+    TigRect lerp_rect;
+    tig_color_t lerp_colors[4];
+} TileDeferredBlit;
+
+#define TILE_DEFERRED_BLIT_MAX 4096
+static TileDeferredBlit tile_deferred_blits[TILE_DEFERRED_BLIT_MAX];
+static int tile_deferred_blit_count;
+
+// CE (feature/perf-gpu-accel): bridge cost instrumentation. The GPU tile pass
+// time (gamelib's "tile" bucket) lumps together the per-frame CPU->GPU upload,
+// the tile blits, and the GPU->CPU readback. These accumulators isolate the
+// two transfer halves so the F9 log can attribute the cost; the blit time is
+// the remainder (tile bucket - upload - readback). Read+reset once per perf
+// window by gamelib via tile_gpu_perf_read_reset.
+static uint64_t tile_gpu_perf_upload_ns;
+static uint64_t tile_gpu_perf_readback_ns;
+
+static uint64_t tile_gpu_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns)
+{
+    if (upload_ns != NULL) {
+        *upload_ns = tile_gpu_perf_upload_ns;
+    }
+    if (readback_ns != NULL) {
+        *readback_ns = tile_gpu_perf_readback_ns;
+    }
+    tile_gpu_perf_upload_ns = 0;
+    tile_gpu_perf_readback_ns = 0;
+}
 
 // CE (feature/perf-gpu-accel Phase 3): return true if arcanum.cfg
 // requests the GPU tile path AND the GPU init didn't previously fail.
@@ -177,7 +231,9 @@ static bool tile_gpu_begin_pass(TigVideoBuffer* dst)
     }
 
     SDL_Rect upload_rect = { 0, 0, dst_data.width, dst_data.height };
+    uint64_t upload_t0 = tile_gpu_now_ns();
     bool upload_ok = SDL_UpdateTexture(gpu_tex, &upload_rect, dst_data.pixels, dst_data.pitch);
+    tile_gpu_perf_upload_ns += tile_gpu_now_ns() - upload_t0;
     tig_video_buffer_unlock(dst);
     if (!upload_ok) {
         tig_debug_printf("tile_gpu_begin_pass: SDL_UpdateTexture failed: %s\n", SDL_GetError());
@@ -208,9 +264,11 @@ static void tile_gpu_end_pass(TigVideoBuffer* dst)
     // ReadPixels reads from the *current* render target; the begin_pass
     // bound the GPU world target so we can read directly.
     SDL_Rect read_rect = { 0, 0, tile_gpu_world_buffer_w, tile_gpu_world_buffer_h };
+    uint64_t readback_t0 = tile_gpu_now_ns();
     SDL_Surface* read_surface = SDL_RenderReadPixels(renderer, &read_rect);
     if (read_surface == NULL) {
         tig_debug_printf("tile_gpu_end_pass: SDL_RenderReadPixels failed: %s\n", SDL_GetError());
+        tile_gpu_perf_readback_ns += tile_gpu_now_ns() - readback_t0;
         SDL_SetRenderTarget(renderer, NULL);
         return;
     }
@@ -231,6 +289,7 @@ static void tile_gpu_end_pass(TigVideoBuffer* dst)
         tig_video_buffer_unlock(dst);
     }
     SDL_DestroySurface(read_surface);
+    tile_gpu_perf_readback_ns += tile_gpu_now_ns() - readback_t0;
     SDL_SetRenderTarget(renderer, NULL);
 }
 
@@ -246,8 +305,36 @@ static int tile_blit_dispatch(TigArtBlitInfo* art_info)
 
     SDL_Texture* src_tex = tig_art_gpu_cache_get(art_info->art_id);
     if (src_tex == NULL) {
-        // Cache miss + upload failure. Fall back to CPU for this one
-        // tile rather than aborting the frame.
+        // Genuine cache miss (art couldn't be sized / rendered / uploaded).
+        // Defer to after the GPU readback instead of drawing to the CPU
+        // surface now -- tile_gpu_end_pass would clobber it. Deep-copy the
+        // blit info and the stack-local rects/colors it references so they
+        // survive until replay.
+        if (tile_deferred_blit_count < TILE_DEFERRED_BLIT_MAX) {
+            TileDeferredBlit* d = &tile_deferred_blits[tile_deferred_blit_count++];
+            d->info = *art_info;
+            d->src_rect = *art_info->src_rect;
+            d->info.src_rect = &d->src_rect;
+            d->dst_rect = *art_info->dst_rect;
+            d->info.dst_rect = &d->dst_rect;
+            // field_14 (corner colors) and field_18 (lerp sub-rect) are only
+            // read by tig_art_blit under COLOR_LERP; copy them only then, when
+            // they're guaranteed valid.
+            if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
+                if (art_info->field_14 != NULL) {
+                    memcpy(d->lerp_colors, art_info->field_14, sizeof(d->lerp_colors));
+                    d->info.field_14 = d->lerp_colors;
+                }
+                if (art_info->field_18 != NULL) {
+                    d->lerp_rect = *art_info->field_18;
+                    d->info.field_18 = &d->lerp_rect;
+                }
+            }
+            return TIG_OK;
+        }
+        // Overflow (only if nearly every tile misses, which the
+        // original-palette cache fill makes very unlikely): draw immediately
+        // and accept that the readback may clobber this one tile.
         return tig_art_blit(art_info);
     }
 
@@ -948,6 +1035,10 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     if (tile_gpu_active) {
         if (!tile_gpu_begin_pass(dword_602DF0)) {
             tile_gpu_active = false;
+        } else {
+            // Fresh pass: clear any deferred cache-miss blits from last frame
+            // (they're replayed at end_pass, but reset here defensively).
+            tile_deferred_blit_count = 0;
         }
     }
 
@@ -1061,6 +1152,23 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                             if (!tile_hardware_accelerated) {
                                                 art_blit_info.flags |= TIG_ART_BLT_PALETTE_ORIGINAL;
                                             }
+                                        } else if (tile_gpu_active) {
+                                            // CE (feature/perf-gpu-accel): the plain (flags=0)
+                                            // software blit relies on the WORKING palette, which
+                                            // sub_4DE0B0 tints by the ambient (light_*_color) via
+                                            // TIG_PALETTE_MODIFY_TINT == tig_color_mul. The GPU art
+                                            // cache holds the ORIGINAL palette (so LERP/CONST tiles,
+                                            // which carry the ambient in their v51 lighting, aren't
+                                            // double-tinted), so a plain GPU blit would drop the
+                                            // ambient entirely and render at full daytime brightness.
+                                            // This branch is only reached when v51[0] == color ==
+                                            // ambient, so emit a CONST modulate by v51[0]: on the GPU
+                                            // that multiplies the original-palette texture by the
+                                            // ambient (== the working-palette tint), and on a cache
+                                            // miss the deferred software replay (CONST | original)
+                                            // computes the same product. Software path unchanged.
+                                            art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
+                                            art_blit_info.color = v51[0];
                                         } else {
                                             art_blit_info.flags = 0;
                                         }
@@ -1241,6 +1349,18 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     if (tile_gpu_active) {
         tile_gpu_end_pass(dword_602DF0);
         tile_gpu_active = false;
+
+        // Replay any deferred cache-miss tiles onto the CPU surface now that
+        // the readback is done. tile_gpu_active is false, so these take the
+        // software path (no re-deferral) and land on the now-current surface
+        // instead of being clobbered.
+        if (tile_deferred_blit_count > 0) {
+            int di;
+            for (di = 0; di < tile_deferred_blit_count; di++) {
+                tig_art_blit(&tile_deferred_blits[di].info);
+            }
+            tile_deferred_blit_count = 0;
+        }
     }
 
     // CE: read back the queued facade tiles' rendered pixels in one pass (single VB
