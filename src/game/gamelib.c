@@ -1051,13 +1051,13 @@ static void gamelib_mount_custom_overrides(const char* name)
     char base[TIG_MAX_PATH];
     char custom_mod[TIG_MAX_PATH];
 
-    tig_file_repository_add("custom\\default");
+    tig_file_repository_add_readonly("custom\\default");
 
     gamelib_module_basename(name, base, sizeof(base));
     if (base[0] != '\0') {
         snprintf(custom_mod, sizeof(custom_mod), "custom\\modules\\%s", base);
         if (tig_file_is_directory(custom_mod)) {
-            tig_file_repository_add(custom_mod);
+            tig_file_repository_add_readonly(custom_mod);
             strncpy(gamelib_mod_custom_path, custom_mod, TIG_MAX_PATH - 1);
             gamelib_mod_custom_path[TIG_MAX_PATH - 1] = '\0';
         }
@@ -3592,7 +3592,7 @@ void gamelib_load_data(void)
     // Original module > loose > .dat order is otherwise untouched.
     tig_file_mkdir("custom");
     tig_file_mkdir("custom\\default");
-    tig_file_repository_add("custom\\default");
+    tig_file_repository_add_readonly("custom\\default");
 
     // CE: first-run starter folders + README so users can see where
     // override assets go. Idempotent (README sentinel).
@@ -3641,7 +3641,16 @@ bool gamelib_load_module_data(const char* module_name)
     path1[end] = '\0';
 
     if (tig_file_is_directory(path1)) {
-        tig_file_repository_add(path1);
+        // CE: in the game, the module's loose dir is read-only CONTENT —
+        // runtime writes (Save\Current, TIGCache\) must fall through to
+        // data\ instead of polluting the module dir (and being mistaken
+        // for stale state on the next module load). The EDITOR authors
+        // module content here, so it stays writable there.
+        if (gamelib_init_info.editor) {
+            tig_file_repository_add(path1);
+        } else {
+            tig_file_repository_add_readonly(path1);
+        }
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }
@@ -3651,9 +3660,10 @@ bool gamelib_load_module_data(const char* module_name)
             if (gamelib_mod_dat_path[0] == '\0') {
                 tig_file_copy_directory(path1, "Module template");
             }
+            tig_file_repository_add(path1);
+        } else {
+            tig_file_repository_add_readonly(path1);
         }
-
-        tig_file_repository_add(path1);
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }

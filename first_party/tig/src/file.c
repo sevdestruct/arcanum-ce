@@ -800,29 +800,34 @@ int tig_file_rmdir_ex_native(const char* path)
     char temp_path[TIG_MAX_PATH];
     TigFileRepository* repo;
 
-    temp_path[0] = '\0';
+    // Absolute / dot-relative / drive-letter path: pass through.
+    if (path[0] == '.' || path[0] == '\\' || path[1] == ':' || path[0] == '/') {
+        strcpy(temp_path, path);
+        return SDL_RemovePath(temp_path) ? 0 : -1;
+    }
 
-    if (path[0] != '.' && path[0] != '\\' && path[1] != ':' && path[0] != '/') {
-        repo = tig_file_repositories_head;
-        while (repo != NULL) {
-            // CE: skip read-only override dirs — operate on the first
-            // writable directory.
-            if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0
-                && (repo->type & TIG_FILE_REPOSITORY_READONLY) == 0) {
-                strcpy(temp_path, repo->path);
-                break;
+    // CE: relative path — try EACH directory repo, head-first, the way
+    // tig_file_remove_native walks for files. The original/vanilla code
+    // picked only the head directory repo, which broke once writes were
+    // redirected (e.g. saves go to data\ but stale dirs from a prior
+    // cascade exist in a higher-priority repo): rmdir would target the
+    // write-side path while the actual dir lived elsewhere, and the
+    // recursive empty_directory cleanup of Save\Current would fail and
+    // abort module load. Walking lets cleanup find the dir wherever it
+    // is. Read-only override repos are eligible too — rmdir of a known-
+    // transient path (Save\Current\maps, TIGCache\*) is the right
+    // semantics regardless of repo readonly-ness; the readonly flag
+    // prevents NEW writes/creates, not cleanup of stale state.
+    for (repo = tig_file_repositories_head; repo != NULL; repo = repo->next) {
+        if ((repo->type & TIG_FILE_REPOSITORY_DIRECTORY) != 0) {
+            compat_join_path(temp_path, sizeof(temp_path), repo->path, path);
+            compat_resolve_path(temp_path);
+            if (SDL_RemovePath(temp_path)) {
+                return 0;
             }
-            repo = repo->next;
         }
     }
-
-    compat_append_path(temp_path, sizeof(temp_path), path);
-
-    if (!SDL_RemovePath(temp_path)) {
-        return -1;
-    }
-
-    return 0;
+    return -1;
 }
 
 // 0x52F370
