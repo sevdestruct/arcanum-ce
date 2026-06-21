@@ -297,45 +297,73 @@ static void tile_gpu_end_pass(TigVideoBuffer* dst)
 // CPU or GPU path based on `tile_gpu_active`. Called from tile_draw_iso
 // at every site that used to call tig_art_blit directly. Software path
 // is bit-identical to the original.
-static int tile_blit_dispatch(TigArtBlitInfo* art_info)
+// Queue a blit that the GPU path can't draw this frame (unsupported blend, or
+// a cache miss) for replay with tig_art_blit *after* the readback, onto the CPU
+// world surface (dword_602DF0). Drawing it now would be clobbered by the
+// readback. Deep-copies the rects (and the LERP corner colors / sub-rect, which
+// are stack locals in tile_draw_iso); other pointers (palette, COLOR_ARRAY
+// field_14) point at persistent per-object storage and stay valid until replay.
+static void tile_gpu_defer_blit(TigArtBlitInfo* art_info)
 {
-    if (!tile_gpu_active) {
-        return tig_art_blit(art_info);
+    if (tile_deferred_blit_count >= TILE_DEFERRED_BLIT_MAX) {
+        // Overflow (shouldn't happen with the original-palette cache): draw
+        // immediately to the CPU surface and accept a possible clobber.
+        TigArtBlitInfo tmp = *art_info;
+        tmp.dst_video_buffer = dword_602DF0;
+        tig_art_blit(&tmp);
+        return;
     }
 
-    SDL_Texture* src_tex = tig_art_gpu_cache_get(art_info->art_id);
-    if (src_tex == NULL) {
-        // Genuine cache miss (art couldn't be sized / rendered / uploaded).
-        // Defer to after the GPU readback instead of drawing to the CPU
-        // surface now -- tile_gpu_end_pass would clobber it. Deep-copy the
-        // blit info and the stack-local rects/colors it references so they
-        // survive until replay.
-        if (tile_deferred_blit_count < TILE_DEFERRED_BLIT_MAX) {
-            TileDeferredBlit* d = &tile_deferred_blits[tile_deferred_blit_count++];
-            d->info = *art_info;
-            d->src_rect = *art_info->src_rect;
-            d->info.src_rect = &d->src_rect;
-            d->dst_rect = *art_info->dst_rect;
-            d->info.dst_rect = &d->dst_rect;
-            // field_14 (corner colors) and field_18 (lerp sub-rect) are only
-            // read by tig_art_blit under COLOR_LERP; copy them only then, when
-            // they're guaranteed valid.
-            if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
-                if (art_info->field_14 != NULL) {
-                    memcpy(d->lerp_colors, art_info->field_14, sizeof(d->lerp_colors));
-                    d->info.field_14 = d->lerp_colors;
-                }
-                if (art_info->field_18 != NULL) {
-                    d->lerp_rect = *art_info->field_18;
-                    d->info.field_18 = &d->lerp_rect;
-                }
-            }
-            return TIG_OK;
+    TileDeferredBlit* d = &tile_deferred_blits[tile_deferred_blit_count++];
+    d->info = *art_info;
+    d->info.dst_video_buffer = dword_602DF0; // objects arrive with dst unset
+    d->src_rect = *art_info->src_rect;
+    d->info.src_rect = &d->src_rect;
+    d->dst_rect = *art_info->dst_rect;
+    d->info.dst_rect = &d->dst_rect;
+    if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
+        if (art_info->field_14 != NULL) {
+            memcpy(d->lerp_colors, art_info->field_14, sizeof(d->lerp_colors));
+            d->info.field_14 = d->lerp_colors;
         }
-        // Overflow (only if nearly every tile misses, which the
-        // original-palette cache fill makes very unlikely): draw immediately
-        // and accept that the readback may clobber this one tile.
-        return tig_art_blit(art_info);
+        if (art_info->field_18 != NULL) {
+            d->lerp_rect = *art_info->field_18;
+            d->info.field_18 = &d->lerp_rect;
+        }
+    }
+}
+
+// Shared GPU blit dispatch for the world passes (tile/object/roof). Returns
+// true if the blit was handled -- drawn on the GPU world target, or queued for
+// CPU replay at tile_gpu_world_end -- and false if the GPU pass is inactive and
+// the caller should perform its own (CPU) blit.
+bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
+{
+    if (!tile_gpu_active) {
+        return false;
+    }
+
+    // The GPU art cache holds only ORIGINAL-palette textures and the blit
+    // primitive covers FLIP / COLOR_LERP / COLOR_CONST / ADD / SUB / MUL /
+    // ALPHA_CONST. Require an original-palette intent flag (else it's a
+    // working-palette blit that would render unlit on GPU), and reject the
+    // palette-override / 2-color-array / alpha-gradient / stipple cases. Any
+    // rejected blit (or a cache miss) is deferred to CPU replay.
+    const unsigned int gpu_ok_intent = TIG_ART_BLT_BLEND_COLOR_LERP
+        | TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
+    const unsigned int gpu_reject = TIG_ART_BLT_PALETTE_OVERRIDE
+        | TIG_ART_BLT_BLEND_COLOR_ARRAY | TIG_ART_BLT_BLEND_ALPHA_AVG
+        | TIG_ART_BLT_BLEND_ALPHA_SRC | TIG_ART_BLT_BLEND_ALPHA_LERP_X
+        | TIG_ART_BLT_BLEND_ALPHA_LERP_Y | TIG_ART_BLT_BLEND_ALPHA_LERP_BOTH
+        | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_S | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D;
+
+    SDL_Texture* src_tex = NULL;
+    if ((art_info->flags & gpu_ok_intent) != 0 && (art_info->flags & gpu_reject) == 0) {
+        src_tex = tig_art_gpu_cache_get(art_info->art_id);
+    }
+    if (src_tex == NULL) {
+        tile_gpu_defer_blit(art_info);
+        return true;
     }
 
     TigVideoBufferBlitGpuInfo gpu_info;
@@ -352,6 +380,18 @@ static int tile_blit_dispatch(TigArtBlitInfo* art_info)
     if ((art_info->flags & TIG_ART_BLT_FLIP_Y) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_FLIP_Y;
     }
+    // Arithmetic blends (object eye-candy / shadows). At most one applies.
+    if ((art_info->flags & TIG_ART_BLT_BLEND_ADD) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ADD;
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_SUB) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_SUB;
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_MUL) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_MUL;
+    }
+    if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_CONST) != 0) {
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST;
+        gpu_info.alpha[0] = art_info->alpha[0];
+    }
     if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
         if (art_info->field_18 != NULL && art_info->field_14 != NULL) {
@@ -367,7 +407,17 @@ static int tile_blit_dispatch(TigArtBlitInfo* art_info)
     }
     gpu_info.flags = vb_flags;
 
-    return tig_video_buffer_blit_gpu(&gpu_info);
+    tig_video_buffer_blit_gpu(&gpu_info);
+    return true;
+}
+
+// Convenience for tile_draw_iso's own blit sites: dispatch to GPU, else CPU.
+static int tile_blit_dispatch(TigArtBlitInfo* art_info)
+{
+    if (tile_gpu_dispatch(art_info)) {
+        return TIG_OK;
+    }
+    return tig_art_blit(art_info);
 }
 
 // 0x4D6840

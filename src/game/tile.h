@@ -27,6 +27,12 @@ void tile_set_render_target(TigVideoBuffer* vb);
 // Used by the F9 perf log to break down the GPU tile pass cost.
 void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns);
 
+// CE (feature/perf-gpu-accel): shared GPU blit dispatch for the world passes
+// (tile/object/roof). Returns true if the blit was handled -- drawn on the GPU
+// world target, or queued for CPU replay at tile_gpu_world_end -- and false if
+// the GPU world pass is inactive and the caller should perform its own blit.
+bool tile_gpu_dispatch(TigArtBlitInfo* art_info);
+
 #define TILE_X(tile) ((tile) & 0x3F)
 #define TILE_Y(tile) (((tile) >> 6) & 0x3F)
 #define TILE_MAKE(x, y) ((x) | ((y) << 6))
