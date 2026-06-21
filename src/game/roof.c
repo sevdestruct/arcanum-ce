@@ -180,9 +180,13 @@ bool roof_init(GameInitInfo* init_info)
     mes_unload(mes_file);
 
     roof_hardware_accelerated = tig_video_3d_check_initialized() == TIG_OK;
-    if (!roof_hardware_accelerated) {
-        roof_blit_flags = TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D;
-    }
+    // CE (feature/perf-gpu-accel): keep the smooth per-corner ALPHA_LERP_BOTH
+    // roof fade even on the "software" path. The original code fell back to a
+    // STIPPLE_D dither when !roof_hardware_accelerated (the SDL3 3D check is
+    // false in this build), but the CE blitter renders ALPHA_LERP_BOTH smoothly
+    // -- the same per-corner alpha the see-through walls use -- so the dither is
+    // obsolete and just looks worse. Leave roof_blit_flags at its ALPHA_CONST
+    // default so the smooth fade branch is taken.
 
     return true;
 }
