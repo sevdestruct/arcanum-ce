@@ -457,6 +457,11 @@ int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_
 // (which always blits with TIG_ART_BLT_PALETTE_ORIGINAL) and never go stale
 // when the ambient/time-of-day palette tweens.
 int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr);
+
+// CE (feature/perf-gpu-accel): render an art frame through an explicit OVERRIDE
+// palette (recolored objects). Caller owns the returned buffer. Lets the GPU
+// dispatch draw PALETTE_OVERRIDE blits in z-order instead of deferring them.
+int tig_art_render_with_palette(tig_art_id_t art_id, TigPalette* palette, TigVideoBuffer** video_buffer_ptr);
 int tig_art_type(tig_art_id_t art_id);
 unsigned int tig_art_num_get(tig_art_id_t art_id);
 tig_art_id_t tig_art_num_set(tig_art_id_t art_id, unsigned int value);

@@ -112,6 +112,15 @@ typedef struct TileDeferredBlit {
 static TileDeferredBlit tile_deferred_blits[TILE_DEFERRED_BLIT_MAX];
 static int tile_deferred_blit_count;
 
+// CE (feature/perf-gpu-accel): one-shot textures for PALETTE_OVERRIDE (recolor)
+// blits rendered in z-order on the GPU target. They can't be destroyed right
+// after the blit_gpu call -- the renderer may still hold the draw in its batch.
+// We collect them and free them in tile_gpu_world_end, after the readback
+// (SDL_RenderReadPixels) has flushed all pending draws.
+#define TILE_ONESHOT_TEX_MAX 512
+static SDL_Texture* tile_oneshot_textures[TILE_ONESHOT_TEX_MAX];
+static int tile_oneshot_tex_count;
+
 // CE (feature/perf-gpu-accel): bridge cost instrumentation. The GPU tile pass
 // time (gamelib's "tile" bucket) lumps together the per-frame CPU->GPU upload,
 // the tile blits, and the GPU->CPU readback. These accumulators isolate the
@@ -343,28 +352,55 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
         return false;
     }
 
-    // The GPU art cache holds only ORIGINAL-palette textures and the blit
-    // primitive covers FLIP / COLOR_LERP / COLOR_CONST / ADD / SUB / MUL /
-    // ALPHA_CONST. Require an original-palette intent flag (else it's a
-    // working-palette blit that would render unlit on GPU), and reject the
-    // palette-override / 2-color-array / alpha-gradient / stipple cases. Any
-    // rejected blit (or a cache miss) is deferred to CPU replay.
-    const unsigned int gpu_ok_intent = TIG_ART_BLT_BLEND_COLOR_LERP
-        | TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_BLEND_COLOR_ARRAY
-        | TIG_ART_BLT_PALETTE_ORIGINAL;
-    const unsigned int gpu_reject = TIG_ART_BLT_PALETTE_OVERRIDE
-        | TIG_ART_BLT_BLEND_ALPHA_AVG
+    // The blit primitive covers FLIP / COLOR_LERP / COLOR_CONST / ADD / SUB /
+    // MUL / ALPHA_CONST. These blend flags it can't reproduce, so any blit
+    // carrying one is deferred to CPU replay.
+    const unsigned int gpu_reject_blends = TIG_ART_BLT_BLEND_ALPHA_AVG
         | TIG_ART_BLT_BLEND_ALPHA_SRC | TIG_ART_BLT_BLEND_ALPHA_LERP_X
         | TIG_ART_BLT_BLEND_ALPHA_LERP_Y | TIG_ART_BLT_BLEND_ALPHA_LERP_BOTH
         | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_S | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D;
+    // Color/palette intents the original-palette art cache can serve. A blit
+    // with none of these (a plain working-palette blit) would render unlit on
+    // GPU, so it's deferred -- except PALETTE_OVERRIDE, handled below.
+    const unsigned int gpu_ok_intent = TIG_ART_BLT_BLEND_COLOR_LERP
+        | TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_BLEND_COLOR_ARRAY
+        | TIG_ART_BLT_PALETTE_ORIGINAL;
 
     SDL_Texture* src_tex = NULL;
-    if ((art_info->flags & gpu_ok_intent) != 0 && (art_info->flags & gpu_reject) == 0) {
-        src_tex = tig_art_gpu_cache_get(art_info->art_id);
+    SDL_Texture* oneshot_tex = NULL; // owned here; freed in tile_gpu_world_end
+    if ((art_info->flags & gpu_reject_blends) == 0) {
+        if ((art_info->flags & TIG_ART_BLT_PALETTE_OVERRIDE) != 0 && art_info->palette != NULL) {
+            // Recolored object / sign: render the art through its OVERRIDE
+            // palette to a one-shot texture and draw it in z-order here, rather
+            // than deferring (deferred blits replay after the readback, so a
+            // recolored wall drew on top of the sprites in front of it). Not
+            // cached: override palettes can change in place and these are rare.
+            TigVideoBuffer* ovr = NULL;
+            if (tig_art_render_with_palette(art_info->art_id, art_info->palette, &ovr) == TIG_OK
+                && ovr != NULL) {
+                oneshot_tex = tig_video_buffer_upload_to_texture(ovr);
+                tig_video_buffer_destroy(ovr);
+                src_tex = oneshot_tex;
+            }
+        } else if ((art_info->flags & gpu_ok_intent) != 0) {
+            src_tex = tig_art_gpu_cache_get(art_info->art_id);
+        }
     }
     if (src_tex == NULL) {
         tile_gpu_defer_blit(art_info);
         return true;
+    }
+
+    // Defer freeing the one-shot texture until after the readback flush.
+    if (oneshot_tex != NULL) {
+        if (tile_oneshot_tex_count < TILE_ONESHOT_TEX_MAX) {
+            tile_oneshot_textures[tile_oneshot_tex_count++] = oneshot_tex;
+        } else {
+            // Overflow (cap is far above any real override count): free now to
+            // avoid a leak. The blit was already issued; this risks a mid-batch
+            // destroy only in the pathological >512-overrides/frame case.
+            SDL_DestroyTexture(oneshot_tex);
+        }
     }
 
     TigVideoBufferBlitGpuInfo gpu_info;
@@ -407,14 +443,20 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
         gpu_info.lerp_colors[0] = art_info->color;
     } else if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_ARRAY) != 0
         && art_info->field_14 != NULL) {
-        // 2-color horizontal gradient (wall objects: left = field_14[0], right
-        // = field_14[1]). Approximate as a uniform tint by the dominant/left
-        // color -- exactly what tig_art_blit's composite-sprite path does
-        // (art.c). Crucially this draws the wall in z-order on the GPU target
-        // rather than deferring it (deferred blits replay last, so walls drew
-        // over everything in front of them).
-        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST;
-        gpu_info.lerp_colors[0] = art_info->field_14[0];
+        // 2-color horizontal lighting gradient (walls: left = field_14[0],
+        // right = field_14[1]). Render it as a real left->right gradient via
+        // the LERP grid, matching the software path exactly (art.c maps
+        // COLOR_ARRAY -> COLOR_LERP with corners L,R,R,L). The earlier uniform
+        // COLOR_CONST approximation flattened each wall to one tint, so dynamic
+        // light stepped per-wall and exposed seams between adjacent walls
+        // instead of flowing smoothly across them. lerp_rect = src_rect so the
+        // gradient spans the full sprite width (u=0 -> left, u=1 -> right).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
+        gpu_info.lerp_rect = art_info->src_rect;
+        gpu_info.lerp_colors[0] = art_info->field_14[0]; // TL = left
+        gpu_info.lerp_colors[1] = art_info->field_14[1]; // TR = right
+        gpu_info.lerp_colors[2] = art_info->field_14[1]; // BR = right
+        gpu_info.lerp_colors[3] = art_info->field_14[0]; // BL = left
     }
     gpu_info.flags = vb_flags;
 
@@ -1105,6 +1147,7 @@ void tile_gpu_world_begin(void)
             tile_gpu_active = false;
         } else {
             tile_deferred_blit_count = 0;
+            tile_oneshot_tex_count = 0;
         }
     }
 }
@@ -1121,6 +1164,17 @@ void tile_gpu_world_end(void)
     // run the facade scan against the final pixels.
     tile_gpu_end_pass(dword_602DF0);
     tile_gpu_active = false;
+
+    // The readback above flushed the renderer, so the one-shot OVERRIDE
+    // textures drawn this frame are no longer referenced by pending draws --
+    // safe to free now.
+    if (tile_oneshot_tex_count > 0) {
+        int ti;
+        for (ti = 0; ti < tile_oneshot_tex_count; ti++) {
+            SDL_DestroyTexture(tile_oneshot_textures[ti]);
+        }
+        tile_oneshot_tex_count = 0;
+    }
 
     if (tile_deferred_blit_count > 0) {
         int di;

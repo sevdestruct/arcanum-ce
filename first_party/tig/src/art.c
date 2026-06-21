@@ -596,7 +596,11 @@ int tig_art_video_buffer_get(tig_art_id_t art_id, TigVideoBuffer** video_buffer_
 // tig_art_blit also bakes in the flippable-tile mirror (the art_id flag-bit
 // handling in its copy loop), so the resulting texture is already in the
 // correct orientation -- the GPU dispatch must NOT re-apply that mirror.
-int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr)
+// Shared GPU-source rasterize: render an art frame into a fresh colorkeyed CPU
+// buffer through either its immutable ORIGINAL palette (palette == NULL) or an
+// explicit OVERRIDE palette (palette != NULL, for recolored objects). Caller
+// owns the returned buffer and must destroy it.
+static int art_render_for_gpu(tig_art_id_t art_id, TigPalette* palette, TigVideoBuffer** video_buffer_ptr)
 {
     TigVideoBufferCreateInfo vb_create_info;
     TigArtBlitInfo art_blit_info;
@@ -631,12 +635,13 @@ int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_
     rect.width = width;
     rect.height = height;
 
-    // Plain copy through the original palette. The background fill (color key)
+    // Plain copy through the chosen palette. The background fill (color key)
     // shows through where the source is transparent (index 0), so the upload's
     // SDL_CreateTextureFromSurface turns those into alpha=0.
     memset(&art_blit_info, 0, sizeof(art_blit_info));
-    art_blit_info.flags = TIG_ART_BLT_PALETTE_ORIGINAL;
+    art_blit_info.flags = (palette != NULL) ? TIG_ART_BLT_PALETTE_OVERRIDE : TIG_ART_BLT_PALETTE_ORIGINAL;
     art_blit_info.art_id = art_id;
+    art_blit_info.palette = palette; // honored only under PALETTE_OVERRIDE
     art_blit_info.src_rect = &rect;
     art_blit_info.dst_rect = &rect;
     art_blit_info.dst_video_buffer = vb;
@@ -648,6 +653,21 @@ int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_
 
     *video_buffer_ptr = vb;
     return TIG_OK;
+}
+
+int tig_art_render_original_palette(tig_art_id_t art_id, TigVideoBuffer** video_buffer_ptr)
+{
+    return art_render_for_gpu(art_id, NULL, video_buffer_ptr);
+}
+
+// CE (feature/perf-gpu-accel): render an art frame through an explicit OVERRIDE
+// palette (recolored objects / signs). Lets the GPU dispatch draw
+// PALETTE_OVERRIDE blits in z-order on the world target instead of deferring
+// them to the post-readback replay -- deferred blits drew last, so a recolored
+// wall landed on top of the sprites in front of it.
+int tig_art_render_with_palette(tig_art_id_t art_id, TigPalette* palette, TigVideoBuffer** video_buffer_ptr)
+{
+    return art_render_for_gpu(art_id, palette, video_buffer_ptr);
 }
 
 // 0x502360
