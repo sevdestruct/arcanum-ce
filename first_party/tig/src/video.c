@@ -2167,19 +2167,17 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         return TIG_ERR_INVALID_PARAM;
     }
 
-    // Reject unsupported flag combinations early. Alpha-blend variants and
-    // arithmetic blends (ADD/MUL/AVG) aren't used by tile_draw_iso; we'll
-    // grow them when callers actually need them.
+    // Reject blends we don't reproduce on the GPU yet: the alpha-gradient
+    // variants (AVG / SRC / LERP) and stipple. Callers (object/roof dispatch)
+    // fall back to software for those. ADD / SUB / MUL / ALPHA_CONST and the
+    // COLOR_CONST/LERP color modulations are handled below.
     {
         TigVideoBufferBlitFlags unsupported_blend =
-            TIG_VIDEO_BUFFER_BLIT_BLEND_ADD
-            | TIG_VIDEO_BUFFER_BLIT_BLEND_MUL
-            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_AVG
-            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST
+            TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_AVG
             | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_SRC
             | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
         if ((blit_info->flags & unsupported_blend) != 0) {
-            tig_debug_printf("tig_video_buffer_blit_gpu: unsupported blend flags 0x%x in Phase 2.\n",
+            tig_debug_printf("tig_video_buffer_blit_gpu: unsupported blend flags 0x%x.\n",
                 blit_info->flags & unsupported_blend);
             return TIG_ERR_GENERIC;
         }
@@ -2205,10 +2203,26 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         target_switched = true;
     }
 
-    // Source-side alpha (e.g., from colorkey-converted art) needs blending
-    // to skip transparent pixels. SDL_BLENDMODE_BLEND is the standard
-    // src_alpha/(1-src_alpha) over-blend.
-    SDL_SetTextureBlendMode(blit_info->src_texture, SDL_BLENDMODE_BLEND);
+    // Pick the SDL blend mode from the arithmetic-blend flags. These mirror
+    // tig_art_blit's COLOR_CONST blend loops exactly:
+    //   default: src over dst                  SDL_BLENDMODE_BLEND
+    //   ADD:     dst = clamp(dst + src)         SDL_BLENDMODE_ADD
+    //   MUL:     dst = src * dst                SDL_BLENDMODE_MUL
+    //   SUB:     dst = max(dst - src, 0)        custom REV_SUBTRACT
+    // Color-keyed texels (alpha 0) contribute nothing in every mode because
+    // each scales src by its alpha (ADD/SUB) or falls back to dst (MUL/BLEND).
+    SDL_BlendMode blend_mode = SDL_BLENDMODE_BLEND;
+    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ADD) != 0) {
+        blend_mode = SDL_BLENDMODE_ADD;
+    } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_MUL) != 0) {
+        blend_mode = SDL_BLENDMODE_MUL;
+    } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_SUB) != 0) {
+        // dstRGB = dstRGB*ONE - srcRGB*srcAlpha ; dstA = dstA (unchanged).
+        blend_mode = SDL_ComposeCustomBlendMode(
+            SDL_BLENDFACTOR_SRC_ALPHA, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_REV_SUBTRACT,
+            SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
+    }
+    SDL_SetTextureBlendMode(blit_info->src_texture, blend_mode);
 
     sdl_src.x = (float)blit_info->src_rect->x;
     sdl_src.y = (float)blit_info->src_rect->y;
@@ -2338,32 +2352,28 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
             tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderGeometry failed: %s\n", SDL_GetError());
             rc = TIG_ERR_GENERIC;
         }
-    } else if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST) != 0) {
-        // Single-color modulation via SDL_SetTextureColorMod, then a normal
-        // textured draw. Reset the mod after the draw so the texture is
-        // safe to reuse from another caller.
-        tig_color_t c = blit_info->lerp_colors[0];
-        SDL_SetTextureColorMod(blit_info->src_texture,
-            (uint8_t)tig_color_get_red(c),
-            (uint8_t)tig_color_get_green(c),
-            (uint8_t)tig_color_get_blue(c));
-
-        if (flip_mode != SDL_FLIP_NONE) {
-            if (!SDL_RenderTextureRotated(renderer, blit_info->src_texture, &sdl_src, &sdl_dst, 0.0, NULL, flip_mode)) {
-                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTextureRotated failed: %s\n", SDL_GetError());
-                rc = TIG_ERR_GENERIC;
-            }
-        } else {
-            if (!SDL_RenderTexture(renderer, blit_info->src_texture, &sdl_src, &sdl_dst)) {
-                tig_debug_printf("tig_video_buffer_blit_gpu: SDL_RenderTexture failed: %s\n", SDL_GetError());
-                rc = TIG_ERR_GENERIC;
-            }
-        }
-
-        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
     } else {
-        // Plain copy with optional flip.
-        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+        // Non-LERP path: plain copy / COLOR_CONST tint / ALPHA_CONST, under
+        // whichever blend mode was selected above (BLEND/ADD/SUB/MUL). The
+        // color mod carries the COLOR_CONST tint (e.g. an object's per-frame
+        // lighting color); the alpha mod carries ALPHA_CONST. Both reset to
+        // neutral afterward so the shared cache texture is clean for the next
+        // caller (textures are reused across blits with different mods).
+        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST) != 0) {
+            tig_color_t c = blit_info->lerp_colors[0];
+            SDL_SetTextureColorMod(blit_info->src_texture,
+                (uint8_t)tig_color_get_red(c),
+                (uint8_t)tig_color_get_green(c),
+                (uint8_t)tig_color_get_blue(c));
+        } else {
+            SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+        }
+
+        if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST) != 0) {
+            SDL_SetTextureAlphaMod(blit_info->src_texture, blit_info->alpha[0]);
+        } else {
+            SDL_SetTextureAlphaMod(blit_info->src_texture, 255);
+        }
 
         if (flip_mode != SDL_FLIP_NONE) {
             if (!SDL_RenderTextureRotated(renderer, blit_info->src_texture, &sdl_src, &sdl_dst, 0.0, NULL, flip_mode)) {
@@ -2376,6 +2386,9 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
                 rc = TIG_ERR_GENERIC;
             }
         }
+
+        SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+        SDL_SetTextureAlphaMod(blit_info->src_texture, 255);
     }
 
 restore:

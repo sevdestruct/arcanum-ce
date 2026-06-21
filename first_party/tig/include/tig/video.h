@@ -59,6 +59,10 @@ typedef unsigned int TigVideoBufferBlitFlags;
 #define TIG_VIDEO_BUFFER_BLIT_FLIP_X 0x0001
 #define TIG_VIDEO_BUFFER_BLIT_FLIP_Y 0x0002
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_ADD 0x0004
+// CE (feature/perf-gpu-accel): subtractive blend for the GPU blit path
+// (object shadows): dst = max(dst - src, 0). tig_art_blit handles SUB in its
+// own loop and never sets a vbuffer SUB flag, so this bit is GPU-path-only.
+#define TIG_VIDEO_BUFFER_BLIT_BLEND_SUB 0x0008
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_MUL 0x0010
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_AVG 0x0020
 #define TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST 0x0040
@@ -320,14 +324,19 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 // Source-texture alpha is honored via SDL_BLENDMODE_BLEND so art uploaded
 // with a colorkey -> alpha=0 conversion renders transparent over the dst.
 //
-// Other TigVideoBufferBlitFlags (ALPHA_*, BLEND_ADD/MUL/AVG/etc) are not
-// supported in Phase 2; the function logs and returns TIG_ERR_GENERIC.
+// Supported blends: plain copy, COLOR_CONST (tint), COLOR_LERP (bilinear grid),
+// ADD, SUB, MUL, and ALPHA_CONST (alpha[0]); these compose (e.g. COLOR_CONST |
+// SUB for object shadows). ALPHA_AVG / ALPHA_SRC / ALPHA_LERP / STIPPLE remain
+// unsupported and return TIG_ERR_GENERIC (callers fall back to software).
 typedef struct TigVideoBufferBlitGpuInfo {
     TigVideoBufferBlitFlags flags;
     SDL_Texture* src_texture;
     TigRect* src_rect;
     TigRect* lerp_rect;
     tig_color_t lerp_colors[4];
+    // Constant alpha for ALPHA_CONST (alpha[0], 0-255). Other entries reserved
+    // for a future ALPHA_LERP grid (per-corner), unused today.
+    uint8_t alpha[4];
     TigVideoBuffer* dst_video_buffer;
     TigRect* dst_rect;
 } TigVideoBufferBlitGpuInfo;
