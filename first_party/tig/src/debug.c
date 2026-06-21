@@ -1,5 +1,6 @@
 #include "tig/debug.h"
 
+#include <stdio.h>
 #include <time.h>
 
 #include "tig/memory.h"
@@ -49,6 +50,22 @@ void tig_debug_printf(const char* format, ...)
     len = SDL_strlcat(buffer, tmp, sizeof(buffer));
     if (len != 0 && (len == sizeof(buffer) - 1 || buffer[len - 1] == '\n')) {
         SDL_Log("%s", buffer);
+
+        // CE: mirror to a file, flushed per line, so debug output (and the
+        // last words before an intermittent crash/hang) survive a normal
+        // Finder launch -- SDL_Log only reaches stderr, which a GUI launch
+        // discards. Truncated once per process so it holds the latest run.
+        static FILE* debug_logf = NULL;
+        static bool debug_logf_tried = false;
+        if (!debug_logf_tried) {
+            debug_logf_tried = true;
+            debug_logf = fopen("/tmp/arcanum-debug.log", "w");
+        }
+        if (debug_logf != NULL) {
+            fputs(buffer, debug_logf);
+            fflush(debug_logf);
+        }
+
         buffer[0] = '\0';
     }
 
