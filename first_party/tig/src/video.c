@@ -2167,15 +2167,17 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         return TIG_ERR_INVALID_PARAM;
     }
 
-    // Reject blends we don't reproduce on the GPU yet: the alpha-gradient
-    // variants (AVG / SRC / LERP) and stipple. Callers (object/roof dispatch)
-    // fall back to software for those. ADD / SUB / MUL / ALPHA_CONST and the
-    // COLOR_CONST/LERP color modulations are handled below.
+    // Reject the alpha-gradient AVG/SRC variants we don't reproduce yet.
+    // Callers fall back to software for those. ADD / SUB / MUL / ALPHA_CONST /
+    // ALPHA_LERP (per-corner alpha via the grid -- wall fades when the PC is
+    // behind, the 12 roof-piece corner-alpha cases) / COLOR_CONST / COLOR_LERP
+    // are all handled below. tig_art_blit translates the ART side's X/Y/BOTH
+    // variants into per-corner alphas under one ALPHA_LERP vbuffer flag, so
+    // accepting that one flag covers all three art variants.
     {
         TigVideoBufferBlitFlags unsupported_blend =
             TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_AVG
-            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_SRC
-            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
+            | TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_SRC;
         if ((blit_info->flags & unsupported_blend) != 0) {
             tig_debug_printf("tig_video_buffer_blit_gpu: unsupported blend flags 0x%x.\n",
                 blit_info->flags & unsupported_blend);
@@ -2242,30 +2244,36 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         flip_mode |= SDL_FLIP_VERTICAL;
     }
 
-    if ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP) != 0) {
-        // Per-vertex-colored geometry whose vertex colors come from the lerp
-        // grid. SDL_RenderGeometry modulates the texture sample by the vertex
-        // color, but interpolates the vertex colors *linearly per triangle*
-        // (Gouraud). The software blitter this replaces does true *bilinear*
-        // interpolation, which carries a u*v cross term a single 2-triangle
-        // quad cannot reproduce. The mismatch shows as shading creases/seams
-        // wherever the per-corner gradient is diagonal -- common on iso maps,
-        // and exactly what the void-edge fade produces along slanted void
-        // boundaries -- and it also skews void_edge_fade's pixel-readback dark
-        // probe (which assumes the center pixel carries the bilinear-center
-        // light/fade value, marking lit facade tiles as void otherwise).
-        //
-        // Fix: subdivide the quad into an nx*ny grid and assign every grid
-        // vertex its *exact* bilinear color. Gouraud across the fine grid then
-        // matches bilinear to within a fraction of a step. Uniform quads (all
-        // four corners equal -- the common, unlit-gradient case) skip the grid.
-        if (blit_info->lerp_rect == NULL) {
+    // Per-vertex modulation grid: triggered if EITHER COLOR_LERP (per-vertex
+    // color from the 4 corner colors) OR ALPHA_LERP (per-vertex alpha from the
+    // 4 corner alphas) is requested. Within the grid each vertex gets:
+    //   color = COLOR_LERP bilerp, else uniform COLOR_CONST (lerp_colors[0]),
+    //           else white (255,255,255)
+    //   alpha = ALPHA_LERP bilerp of alpha[4],
+    //           else uniform ALPHA_CONST (alpha[0]),
+    //           else 255
+    // This covers fading walls (COLOR_CONST + ALPHA_LERP_BOTH), the 12 roof
+    // per-corner alpha cases (ditto), and the existing tile COLOR_LERP path
+    // (per-vertex color, no per-vertex alpha).
+    bool want_color_lerp = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP) != 0;
+    bool want_alpha_lerp = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP) != 0;
+    if (want_color_lerp || want_alpha_lerp) {
+        // SDL_RenderGeometry interpolates vertex colors *linearly per triangle*
+        // (Gouraud). The software blitter does true *bilinear* interpolation,
+        // which carries a u*v cross term a single 2-triangle quad cannot
+        // reproduce. The mismatch shows as shading creases/seams along
+        // diagonal gradients (the void-edge fade, partially-faded walls). Fix:
+        // subdivide into an nx*ny grid and give every grid vertex its exact
+        // bilinear color/alpha. Gouraud across the fine grid then matches
+        // bilinear to within a fraction of a step.
+        if (want_color_lerp && blit_info->lerp_rect == NULL) {
             tig_debug_printf("tig_video_buffer_blit_gpu: BLEND_COLOR_LERP requires lerp_rect.\n");
             rc = TIG_ERR_INVALID_PARAM;
             goto restore;
         }
 
         SDL_SetTextureColorMod(blit_info->src_texture, 255, 255, 255);
+        SDL_SetTextureAlphaMod(blit_info->src_texture, 255);
 
         // SDL_RenderGeometry samples src at tex_coord (0..1 in texture space);
         // convert pixel-space src coords to normalized via the texture size.
@@ -2284,17 +2292,35 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
         bool flip_x = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_X) != 0;
         bool flip_y = (blit_info->flags & TIG_VIDEO_BUFFER_BLIT_FLIP_Y) != 0;
 
-        // Decide subdivision. Uniform corners -> single quad. Otherwise ~1
-        // grid cell per 12 dst px, capped at 8x8 (quads here are at most a tile
-        // quadrant, ~39x20, so this tops out around 4x2 in practice).
-        tig_color_t c_tl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy);
-        tig_color_t c_tr = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy);
-        tig_color_t c_br = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy + sh);
-        tig_color_t c_bl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy + sh);
+        // Resolve uniform color/alpha for when the corresponding LERP isn't set.
+        tig_color_t uniform_color = ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_CONST) != 0)
+            ? blit_info->lerp_colors[0] : tig_color_make(255, 255, 255);
+        uint8_t uniform_alpha = ((blit_info->flags & TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST) != 0)
+            ? blit_info->alpha[0] : 255;
 
-        int nx;
-        int ny;
-        if (c_tl == c_tr && c_tl == c_br && c_tl == c_bl) {
+        // Decide subdivision. Uniform corners (color AND alpha) -> single quad.
+        // Otherwise ~1 grid cell per 12 dst px, capped at 8x8. Wall quadrants
+        // are ~39x20 so this tops out around 4x2 in practice.
+        bool color_uniform = true;
+        bool alpha_uniform = true;
+        tig_color_t c_tl = uniform_color, c_tr = uniform_color, c_br = uniform_color, c_bl = uniform_color;
+        if (want_color_lerp) {
+            c_tl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy);
+            c_tr = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy);
+            c_br = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx + sw, sy + sh);
+            c_bl = tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, sx, sy + sh);
+            color_uniform = (c_tl == c_tr && c_tl == c_br && c_tl == c_bl);
+        }
+        if (want_alpha_lerp) {
+            // Per-vertex alpha corners (TL, TR, BR, BL = alpha[0..3]). Uniform
+            // when all four equal.
+            alpha_uniform = (blit_info->alpha[0] == blit_info->alpha[1]
+                && blit_info->alpha[0] == blit_info->alpha[2]
+                && blit_info->alpha[0] == blit_info->alpha[3]);
+        }
+
+        int nx, ny;
+        if (color_uniform && alpha_uniform) {
             nx = 1;
             ny = 1;
         } else {
@@ -2328,9 +2354,29 @@ int tig_video_buffer_blit_gpu(const TigVideoBufferBlitGpuInfo* blit_info)
                 verts[vi].position.y = pos_y;
                 verts[vi].tex_coord.x = tu;
                 verts[vi].tex_coord.y = tv;
-                tig_video_buffer_blit_gpu_color_to_fcolor(
-                    tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, src_xi, src_yi),
-                    &verts[vi].color);
+
+                // Per-vertex color (COLOR_LERP bilerp or uniform).
+                tig_color_t vc = want_color_lerp
+                    ? tig_video_buffer_blit_gpu_lerp_corner(blit_info->lerp_colors, blit_info->lerp_rect, src_xi, src_yi)
+                    : uniform_color;
+                tig_video_buffer_blit_gpu_color_to_fcolor(vc, &verts[vi].color);
+
+                // Per-vertex alpha (ALPHA_LERP bilerp of the 4 corner alphas,
+                // or uniform). Bilinear: a = TL*(1-u)*(1-v) + TR*u*(1-v) +
+                // BR*u*v + BL*(1-u)*v, with u,v = fx,fy.
+                float va;
+                if (want_alpha_lerp) {
+                    float u = fx, v = fy;
+                    float a = ((float)blit_info->alpha[0]) * (1.0f - u) * (1.0f - v)
+                            + ((float)blit_info->alpha[1]) * u * (1.0f - v)
+                            + ((float)blit_info->alpha[2]) * u * v
+                            + ((float)blit_info->alpha[3]) * (1.0f - u) * v;
+                    if (a < 0.0f) a = 0.0f; else if (a > 255.0f) a = 255.0f;
+                    va = a / 255.0f;
+                } else {
+                    va = (float)uniform_alpha / 255.0f;
+                }
+                verts[vi].color.a = va;
                 vi++;
             }
         }
@@ -2591,6 +2637,25 @@ int tig_video_buffer_replace_near_black_with_color_key(TigVideoBuffer* video_buf
         }
     }
     tig_video_buffer_unlock(video_buffer);
+    return TIG_OK;
+}
+
+// CE (feature/perf-gpu-accel): see header. Raw SDL_SaveBMP to an absolute path.
+int tig_video_buffer_debug_save_bmp(TigVideoBuffer* video_buffer, const char* abs_path)
+{
+    if (video_buffer == NULL || abs_path == NULL) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    if (tig_video_buffer_is_gpu(video_buffer) || video_buffer->surface == NULL) {
+        tig_debug_printf("tig_video_buffer_debug_save_bmp: needs a CPU buffer.\n");
+        return TIG_ERR_GENERIC;
+    }
+    if (!SDL_SaveBMP(video_buffer->surface, abs_path)) {
+        tig_debug_printf("tig_video_buffer_debug_save_bmp: SDL_SaveBMP(%s) failed: %s\n",
+            abs_path, SDL_GetError());
+        return TIG_ERR_GENERIC;
+    }
+    tig_debug_printf("tig_video_buffer_debug_save_bmp: wrote %s\n", abs_path);
     return TIG_OK;
 }
 

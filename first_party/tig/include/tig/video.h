@@ -325,17 +325,20 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 // with a colorkey -> alpha=0 conversion renders transparent over the dst.
 //
 // Supported blends: plain copy, COLOR_CONST (tint), COLOR_LERP (bilinear grid),
-// ADD, SUB, MUL, and ALPHA_CONST (alpha[0]); these compose (e.g. COLOR_CONST |
-// SUB for object shadows). ALPHA_AVG / ALPHA_SRC / ALPHA_LERP / STIPPLE remain
-// unsupported and return TIG_ERR_GENERIC (callers fall back to software).
+// ADD, SUB, MUL, ALPHA_CONST (alpha[0]), and ALPHA_LERP_BOTH (per-corner alpha
+// in the bilinear grid); these compose (e.g. COLOR_CONST | SUB for object
+// shadows; COLOR_CONST | ALPHA_LERP_BOTH for fading walls). ALPHA_AVG /
+// ALPHA_SRC / ALPHA_LERP_X / ALPHA_LERP_Y / STIPPLE remain unsupported and
+// return TIG_ERR_GENERIC (callers fall back to software).
 typedef struct TigVideoBufferBlitGpuInfo {
     TigVideoBufferBlitFlags flags;
     SDL_Texture* src_texture;
     TigRect* src_rect;
     TigRect* lerp_rect;
     tig_color_t lerp_colors[4];
-    // Constant alpha for ALPHA_CONST (alpha[0], 0-255). Other entries reserved
-    // for a future ALPHA_LERP grid (per-corner), unused today.
+    // ALPHA_CONST uses alpha[0] only. ALPHA_LERP_BOTH uses all 4 (TL, TR, BR,
+    // BL -- same corner order as lerp_colors), bilinearly interpolated across
+    // the same grid as COLOR_LERP.
     uint8_t alpha[4];
     TigVideoBuffer* dst_video_buffer;
     TigRect* dst_rect;
@@ -379,6 +382,12 @@ int tig_video_buffer_replace_near_black_with_color_key(TigVideoBuffer* video_buf
     uint8_t threshold);
 int tig_video_buffer_save_to_bmp(TigVideoBufferSaveToBmpInfo* save_info);
 int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_buffer_ptr, unsigned int flags);
+
+// CE (feature/perf-gpu-accel): dump a CPU-backed video buffer to an absolute
+// path via SDL_SaveBMP (raw stdio, not tig file IO -- so /tmp works). For the
+// self-test harness that compares gpu vs software world renders. Returns
+// TIG_ERR_GENERIC for GPU buffers or on write failure.
+int tig_video_buffer_debug_save_bmp(TigVideoBuffer* video_buffer, const char* abs_path);
 
 #if defined(SDL_PLATFORM_MACOS) && SDL_PLATFORM_MACOS
 // Re-apply the macOS borderless-full-display window chrome (NSWindow level

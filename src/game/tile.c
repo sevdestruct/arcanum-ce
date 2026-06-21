@@ -352,13 +352,16 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
         return false;
     }
 
-    // The blit primitive covers FLIP / COLOR_LERP / COLOR_CONST / ADD / SUB /
-    // MUL / ALPHA_CONST. These blend flags it can't reproduce, so any blit
-    // carrying one is deferred to CPU replay.
+    // The blit primitive covers FLIP / COLOR_LERP / COLOR_CONST / COLOR_ARRAY
+    // (mapped to LERP) / ADD / SUB / MUL / ALPHA_CONST / ALPHA_LERP_X/Y/BOTH
+    // (all 3 map to per-corner alphas in the bilinear grid). These flags it
+    // can't reproduce, so any blit carrying one is deferred to CPU replay.
+    // STIPPLE_D would defer wall/roof fades to CPU and break z-order; the
+    // dispatch translates STIPPLE_D into an ALPHA_CONST=128 approximation
+    // below to keep them on the GPU in z-order.
     const unsigned int gpu_reject_blends = TIG_ART_BLT_BLEND_ALPHA_AVG
-        | TIG_ART_BLT_BLEND_ALPHA_SRC | TIG_ART_BLT_BLEND_ALPHA_LERP_X
-        | TIG_ART_BLT_BLEND_ALPHA_LERP_Y | TIG_ART_BLT_BLEND_ALPHA_LERP_BOTH
-        | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_S | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D;
+        | TIG_ART_BLT_BLEND_ALPHA_SRC
+        | TIG_ART_BLT_BLEND_ALPHA_STIPPLE_S;
     // Color/palette intents the original-palette art cache can serve. A blit
     // with none of these (a plain working-palette blit) would render unlit on
     // GPU, so it's deferred -- except PALETTE_OVERRIDE, handled below.
@@ -425,9 +428,40 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
     } else if ((art_info->flags & TIG_ART_BLT_BLEND_MUL) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_MUL;
     }
+    // Alpha modulation. ALPHA_CONST = uniform. ALPHA_LERP_X/Y/BOTH translate
+    // to per-corner alphas under ALPHA_LERP (vbuffer-side), matching the
+    // software art_blit mapping (art.c:802-820). STIPPLE_D is approximated as
+    // ALPHA_CONST=128 -- the visual differs (stipple is dither, alpha is
+    // smooth) but the in-z-order render avoids the deferral-on-top artifact.
     if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_CONST) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST;
         gpu_info.alpha[0] = art_info->alpha[0];
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_LERP_X) != 0) {
+        // X variant: alpha[0]=left, alpha[1]=right -> corners (L,R,R,L).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
+        gpu_info.alpha[0] = art_info->alpha[0];
+        gpu_info.alpha[1] = art_info->alpha[0];
+        gpu_info.alpha[2] = art_info->alpha[1];
+        gpu_info.alpha[3] = art_info->alpha[1];
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_LERP_Y) != 0) {
+        // Y variant: alpha[0]=top, alpha[1]=bottom -> corners (T,T,B,B).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
+        gpu_info.alpha[0] = art_info->alpha[0];
+        gpu_info.alpha[1] = art_info->alpha[0];
+        gpu_info.alpha[2] = art_info->alpha[1];
+        gpu_info.alpha[3] = art_info->alpha[1];
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_LERP_BOTH) != 0) {
+        // BOTH variant: alpha[0..3] are the 4 corners directly (TL,TR,BR,BL).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_LERP;
+        gpu_info.alpha[0] = art_info->alpha[0];
+        gpu_info.alpha[1] = art_info->alpha[1];
+        gpu_info.alpha[2] = art_info->alpha[2];
+        gpu_info.alpha[3] = art_info->alpha[3];
+    } else if ((art_info->flags & TIG_ART_BLT_BLEND_ALPHA_STIPPLE_D) != 0) {
+        // Approximate stipple dither with uniform 50% alpha so the blit stays
+        // in z-order on the GPU instead of deferring (which lands it on top).
+        vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_ALPHA_CONST;
+        gpu_info.alpha[0] = 128;
     }
     if ((art_info->flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
         vb_flags |= TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_LERP;
@@ -1193,6 +1227,17 @@ void tile_gpu_world_end(void)
 bool tile_gpu_world_lighting(void)
 {
     return tile_should_use_gpu_path();
+}
+
+// CE (feature/perf-gpu-accel): dump the current iso world buffer (dword_602DF0,
+// the CPU surface the world is rendered/read-back into) to an absolute BMP path.
+// Used by the self-test harness to capture and compare gpu vs software renders.
+void tile_gpu_test_capture(const char* abs_path)
+{
+    if (dword_602DF0 == NULL || abs_path == NULL) {
+        return;
+    }
+    tig_video_buffer_debug_save_bmp(dword_602DF0, abs_path);
 }
 
 // NOTE: In the original code this function is a part of `tile_draw`, however

@@ -44,6 +44,7 @@
 #include "game/spell.h"
 #include "game/stat.h"
 #include "game/tech.h"
+#include "game/tile.h"
 #include "game/wallcheck.h"
 #include "ui/charedit_ui.h"
 #include "ui/dialog_ui.h"
@@ -103,6 +104,20 @@ int main(int argc, char** argv)
     // Convert args array to WinMain-like lpCmdLine.
     char lpCmdLine[260];
     build_cmd_line(lpCmdLine, sizeof(lpCmdLine), argc, argv);
+
+    // CE (feature/perf-gpu-accel): expose the autonomous test command-channel
+    // file via cmdline arg, so an `open --args -gpucmd:<path>` launch can drive
+    // the harness when env vars don't survive LaunchServices. Maps to the
+    // ARCANUM_GPU_CMD env that gamelib_ping reads each frame.
+    {
+        char* gt = strstr(lpCmdLine, "-gpucmd:");
+        if (gt != NULL) {
+            char path[256];
+            if (sscanf(gt + 8, "%255s", path) == 1) {
+                setenv("ARCANUM_GPU_CMD", path, 1);
+            }
+        }
+    }
 
     highres_config_load();
     highres_config = highres_config_get();

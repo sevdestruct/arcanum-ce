@@ -942,11 +942,113 @@ void gamelib_exit(void)
 }
 
 // 0x402580
+// CE (feature/perf-gpu-accel): autonomous test command channel. Pumped from
+// gamelib_ping below, so it runs every frame -- in the main menu AND in-game --
+// mirroring the multiplayer-restore harness pattern. No-op unless
+// ARCANUM_GPU_CMD names a readable file.
+//
+// Commands:
+//   loadsave <slot>           gamelib_load(slot) -- dismisses the menu naturally
+//   setpath <gpu|software>    flip tile render path live (no relaunch)
+//   wait <N>                  pause the channel for N frames (settle)
+//   capture <abs_path>        dump iso world buffer to BMP at path
+//   scrollto <x> <y>          center camera on tile (x,y)
+//   quit                      tig_message_post(TIG_MESSAGE_QUIT) -> clean exit
+//   # comment                 ignored
+static void gpu_test_channel_tick(void)
+{
+    static const char* cmd_path = NULL;
+    static long cmd_offset = 0;
+    static int wait_frames = 0;
+    static bool inited = false;
+    if (!inited) {
+        inited = true;
+        cmd_path = getenv("ARCANUM_GPU_CMD");
+    }
+    if (cmd_path == NULL || cmd_path[0] == '\0') {
+        return;
+    }
+    if (wait_frames > 0) {
+        wait_frames--;
+        return;
+    }
+
+    FILE* fp = fopen(cmd_path, "r");
+    if (fp == NULL) return;
+    if (fseek(fp, cmd_offset, SEEK_SET) != 0) { fclose(fp); return; }
+
+    char line[512];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t n = strlen(line);
+        if (n == 0 || line[n - 1] != '\n') {
+            break; // partial tail; wait for next tick
+        }
+        cmd_offset += (long)n;
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+            line[--n] = '\0';
+        }
+        if (n == 0 || line[0] == '#') continue;
+
+        char arg[256];
+        int ix, iy;
+        if (sscanf(line, "loadsave %255s", arg) == 1) {
+            tig_debug_printf("[gpu-cmd] loadsave %s\n", arg);
+            if (!gamelib_load(arg)) {
+                tig_debug_printf("[gpu-cmd] loadsave FAILED\n");
+            }
+        } else if (sscanf(line, "setpath %255s", arg) == 1) {
+            settings_set_str_value(&settings, TILE_RENDER_PATH_KEY, arg);
+            // CE harness: a runtime render-path switch must recompute cached
+            // object render flags. The COLOR_CONST-vs-PALETTE_OVERRIDE choice
+            // (object lighting path) depends on the render path, but is cached
+            // per object (ORF_02000000). Without clearing it, switching to
+            // software keeps GPU-style COLOR_CONST flags, which the software
+            // blitter renders through the ambient-darkened WORKING palette
+            // (instead of PALETTE_OVERRIDE's original palette) -> objects come
+            // out too dark, making the software capture an unfaithful reference.
+            // The real game only sets the path at startup so it never hits this.
+            light_invalidate_rect(NULL, true);
+            object_invalidate_rect(NULL);
+            gamelib_invalidate_rect(NULL);
+            tig_debug_printf("[gpu-cmd] setpath %s\n", arg);
+        } else if (sscanf(line, "wait %d", &ix) == 1) {
+            wait_frames = ix;
+            tig_debug_printf("[gpu-cmd] wait %d\n", ix);
+            break; // honour wait immediately
+        } else if (sscanf(line, "capture %255s", arg) == 1) {
+            tile_gpu_test_capture(arg);
+            tig_debug_printf("[gpu-cmd] capture %s\n", arg);
+        } else if (sscanf(line, "scrollto %d %d", &ix, &iy) == 2) {
+            int64_t loc = LOCATION_MAKE(ix, iy);
+            location_origin_set(loc);
+            gamelib_invalidate_rect(NULL);
+            tig_debug_printf("[gpu-cmd] scrollto %d %d\n", ix, iy);
+        } else if (strncmp(line, "trace", 5) == 0) {
+            tile_gpu_trace_arm();
+            tig_debug_printf("[gpu-cmd] trace armed\n");
+        } else if (strncmp(line, "quit", 4) == 0) {
+            tig_debug_printf("[gpu-cmd] quit\n");
+            TigMessage msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.type = TIG_MESSAGE_QUIT;
+            tig_message_enqueue(&msg);
+            break;
+        } else {
+            tig_debug_printf("[gpu-cmd] unknown: %s\n", line);
+        }
+    }
+    fclose(fp);
+}
+
 void gamelib_ping(void)
 {
     int index;
 
     tig_timer_now(&gamelib_ping_time);
+
+    // CE: pump the autonomous test channel before module pings so a loadsave
+    // command takes effect this same frame.
+    gpu_test_channel_tick();
 
     bool perf_on = gamelib_zoom_perf_enabled;
     uint64_t ping_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
