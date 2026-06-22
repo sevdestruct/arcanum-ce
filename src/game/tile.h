@@ -50,6 +50,14 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info);
 void tile_gpu_world_begin(void);
 void tile_gpu_world_end(void);
 
+// CE (step 6): roof present-layer pass (gpu-present only). begin binds a cleared
+// transparent roof texture and returns true if roofs should draw through
+// tile_gpu_dispatch (the caller renders ALL visible roofs); end registers the roof
+// texture as the flip-time layer. Returns false outside gpu-present -- the caller
+// then draws roofs the normal (software) way.
+bool tile_gpu_world_roof_begin(void);
+void tile_gpu_world_roof_end(void);
+
 // CE (feature/perf-gpu-accel): true when the GPU world path is selected, so
 // object_draw emits COLOR_CONST lighting (the hardware path) for GPU tinting.
 bool tile_gpu_world_lighting(void);

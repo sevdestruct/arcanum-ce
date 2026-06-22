@@ -154,6 +154,10 @@ void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect)
 
 // CE (step 6): fill a screen-surface rect with transparent (alpha 0).
 void tig_video_fill_transparent(const TigRect* rect);
+
+// CE (step 6): register the roof present-layer texture, alpha-blended between the
+// world underlay and the framebuffer at flip. Persists each frame; NULL clears.
+void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 
 // CE: blit a window VB to the screen with optional scale (dst.w/h

@@ -3665,6 +3665,16 @@ void gamelib_get_iso_content_rect(TigRect* rect)
     *rect = gamelib_iso_content_rect;
 }
 
+// CE (step 6): true while the zoomed world render is in flight (the world renders
+// to the 2x world-VB and downscale-blits to the CPU iso surface, bypassing the GPU
+// world target). The gpu-present path checks this and falls back to the normal
+// readback/compositor route during zoom -- zoom is transient and the software zoom
+// already works; steady-state keeps the present-time win.
+bool gamelib_zoom_world_pass_is_active(void)
+{
+    return gamelib_zoom_world_pass_active;
+}
+
 // 0x404650
 const char* gamelib_get_locale(void)
 {
@@ -3752,11 +3762,28 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
             t0 = gamelib_zoom_perf_now_ns();
         }
         // CE (feature/perf-gpu-accel): close the GPU world pass after object --
-        // read the GPU target (tiles + objects) back to the CPU surface so roof
-        // (still software) and the UI passes see the expected pixels. Moves to
-        // after roof_draw once roof is on GPU too.
+        // read the GPU target (tiles + objects) back to the CPU surface so the UI
+        // passes see the expected pixels (non-present modes). In gpu-present the
+        // readback is skipped and roofs draw onto their own present-layer texture.
         tile_gpu_world_end();
-        roof_draw(draw_info);
+        // CE (step 6): roof present-layer. In gpu-present, render ALL visible roofs
+        // onto a cleared roof texture (full re-render -> no partial-redraw tearing),
+        // composited between the world and the UI at flip. Otherwise roofs draw the
+        // normal (software) way.
+        if (tile_gpu_world_roof_begin()) {
+            TigRect roof_iso_rect;
+            gamelib_get_iso_content_rect(&roof_iso_rect);
+            TigRectListNode roof_full_node;
+            roof_full_node.rect = roof_iso_rect;
+            roof_full_node.next = NULL;
+            TigRectListNode* roof_full_head = &roof_full_node;
+            GameDrawInfo roof_draw_info = *draw_info;
+            roof_draw_info.rects = &roof_full_head;
+            roof_draw(&roof_draw_info);
+            tile_gpu_world_roof_end();
+        } else {
+            roof_draw(draw_info);
+        }
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
             gamelib_zoom_perf_pass_roof_total_ns += d;

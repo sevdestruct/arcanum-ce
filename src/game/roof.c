@@ -367,7 +367,13 @@ void roof_draw(GameDrawInfo* draw_info)
 
                             art_blit_info.flags |= TIG_ART_BLT_SCRATCH_VALID;
                             art_blit_info.scratch_video_buffer = gamelib_scratch_video_buffer;
-                            tig_window_blit_art(roof_iso_window_handle, &art_blit_info);
+                            // CE (step 6): inside the gpu-present roof pass the
+                            // dispatch routes this onto the roof present-layer
+                            // texture; otherwise (software / gpu mode) it returns
+                            // false and we blit the iso window normally.
+                            if (!tile_gpu_dispatch(&art_blit_info)) {
+                                tig_window_blit_art(roof_iso_window_handle, &art_blit_info);
+                            }
                         }
                         node = node->next;
                     }

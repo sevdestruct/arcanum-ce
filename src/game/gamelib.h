@@ -330,6 +330,11 @@ void gamelib_patch_lvl_set(const char* patch_lvl);
 const char* gamelib_get_locale(void);
 void gamelib_get_iso_content_rect(TigRect* rect);
 
+// CE (step 6): true while the zoomed world render is in flight (renders to the 2x
+// world-VB + downscale-blit, bypassing the GPU world target). gpu-present falls
+// back to the normal route during zoom.
+bool gamelib_zoom_world_pass_is_active(void);
+
 // True when the user has opted into the vanilla "snap camera to PC on
 // overlay open" behavior. See RECENTER_CAMERA_ON_OVERLAY_KEY. Defaults
 // to false.

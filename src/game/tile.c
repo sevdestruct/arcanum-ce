@@ -80,6 +80,17 @@ static TigVideoBuffer* tile_gpu_world_buffer;
 static int tile_gpu_world_buffer_w;
 static int tile_gpu_world_buffer_h;
 
+// CE (step 6): roof present-layer. In gpu-present, roofs render to their own
+// texture (cleared + fully re-rendered every frame -> no partial-redraw tearing /
+// alpha accumulation), composited between the world and the UI at flip.
+static TigVideoBuffer* tile_gpu_roof_buffer;
+static int tile_gpu_roof_buffer_w;
+static int tile_gpu_roof_buffer_h;
+static bool tile_gpu_roof_pass_active;
+// The GPU dispatch's render target: the world buffer during the world pass, the
+// roof buffer during the roof pass.
+static TigVideoBuffer* tile_gpu_target_buffer;
+
 // Sticky failure flag: once any part of the GPU init path fails (cache
 // init, buffer create, etc.), stop attempting it for the rest of the
 // session and fall back to software. Avoids per-frame retries.
@@ -164,6 +175,12 @@ static bool tile_should_use_gpu_path(void)
     if (mode == NULL) {
         return false;
     }
+    // The zoomed world render bypasses the GPU world target (it renders to the 2x
+    // world-VB + downscale-blit), so fall back to the software/readback path while
+    // a zoom render is in flight.
+    if (gamelib_zoom_world_pass_is_active()) {
+        return false;
+    }
     return strcmp(mode, TILE_RENDER_PATH_GPU) == 0
         || strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0;
 }
@@ -172,7 +189,7 @@ static bool tile_should_use_gpu_path(void)
 // the readback) instead of read back to the CPU surface (dword_602DF0).
 static bool tile_gpu_present_path(void)
 {
-    if (tile_gpu_path_disabled) {
+    if (tile_gpu_path_disabled || gamelib_zoom_world_pass_is_active()) {
         return false;
     }
     const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
@@ -219,6 +236,40 @@ static bool tile_gpu_ensure_world_buffer(TigVideoBuffer* dst)
     }
     tile_gpu_world_buffer_w = desired_w;
     tile_gpu_world_buffer_h = desired_h;
+    return true;
+}
+
+// CE (step 6): allocate/resize the roof present-layer texture to match the world
+// buffer. Returns false on failure (the roof pass is then skipped this frame).
+static bool tile_gpu_ensure_roof_buffer(void)
+{
+    int desired_w = tile_gpu_world_buffer_w;
+    int desired_h = tile_gpu_world_buffer_h;
+    if (desired_w <= 0 || desired_h <= 0) {
+        return false;
+    }
+    if (tile_gpu_roof_buffer != NULL
+        && tile_gpu_roof_buffer_w == desired_w
+        && tile_gpu_roof_buffer_h == desired_h) {
+        return true;
+    }
+    if (tile_gpu_roof_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_roof_buffer);
+        tile_gpu_roof_buffer = NULL;
+    }
+    TigVideoBufferCreateInfo info;
+    info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
+    info.width = desired_w;
+    info.height = desired_h;
+    info.color_key = 0;
+    info.background_color = 0;
+    if (tig_video_buffer_create(&info, &tile_gpu_roof_buffer) != TIG_OK
+        || tile_gpu_roof_buffer == NULL) {
+        tile_gpu_roof_buffer = NULL;
+        return false;
+    }
+    tile_gpu_roof_buffer_w = desired_w;
+    tile_gpu_roof_buffer_h = desired_h;
     return true;
 }
 
@@ -276,6 +327,7 @@ static bool tile_gpu_begin_pass(TigVideoBuffer* dst)
         tig_debug_printf("tile_gpu_begin_pass: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
         return false;
     }
+    tile_gpu_target_buffer = tile_gpu_world_buffer; // dispatch draws to the world buffer
     return true;
 }
 
@@ -500,7 +552,9 @@ bool tile_gpu_dispatch(TigArtBlitInfo* art_info)
     memset(&gpu_info, 0, sizeof(gpu_info));
     gpu_info.src_texture = src_tex;
     gpu_info.src_rect = art_info->src_rect;
-    gpu_info.dst_video_buffer = tile_gpu_world_buffer;
+    gpu_info.dst_video_buffer = (tile_gpu_target_buffer != NULL)
+        ? tile_gpu_target_buffer
+        : tile_gpu_world_buffer;
     gpu_info.dst_rect = art_info->dst_rect;
 
     TigVideoBufferBlitFlags vb_flags = 0;
@@ -1296,6 +1350,7 @@ void tile_gpu_world_begin(void)
     // tile_gpu_world_end and persists across UI-only flips.
     if (!present) {
         tig_video_set_world_underlay(NULL, NULL);
+        tig_video_set_roof_underlay(NULL, NULL);
     }
 
     tile_gpu_active = tile_should_use_gpu_path();
@@ -1395,6 +1450,65 @@ void tile_gpu_world_end(void)
     }
 
     tile_void_edge_scan();
+}
+
+// CE (step 6): open the roof present-layer pass. gpu-present only -- binds a
+// freshly-cleared (transparent) roof texture and routes roof_draw's blits onto it
+// via the dispatch. Caller renders ALL visible roofs (not just dirty rects) so the
+// cleared texture is fully repainted, then calls tile_gpu_world_roof_end. Returns
+// true if the pass opened (roofs should be drawn through tile_gpu_dispatch).
+bool tile_gpu_world_roof_begin(void)
+{
+    if (!tile_gpu_present_path() || tile_gpu_path_disabled) {
+        return false;
+    }
+    if (!tile_gpu_ensure_roof_buffer()) {
+        return false;
+    }
+    SDL_Texture* roof_tex = tig_video_buffer_get_sdl_texture(tile_gpu_roof_buffer);
+    SDL_Renderer* renderer = NULL;
+    if (roof_tex == NULL || tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return false;
+    }
+    if (!SDL_SetRenderTarget(renderer, roof_tex)) {
+        return false;
+    }
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    SDL_RenderClear(renderer); // transparent -- only the roofs paint over it
+    tile_gpu_target_buffer = tile_gpu_roof_buffer;
+    tile_oneshot_tex_count = 0;
+    tile_deferred_blit_count = 0;
+    tile_gpu_active = true;
+    tile_gpu_roof_pass_active = true;
+    return true;
+}
+
+// CE (step 6): close the roof pass -- unbind and register the roof texture as the
+// flip-time roof layer (composited between the world and the UI).
+void tile_gpu_world_roof_end(void)
+{
+    if (!tile_gpu_roof_pass_active) {
+        return;
+    }
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) == TIG_OK && renderer != NULL) {
+        SDL_SetRenderTarget(renderer, NULL); // flush the roof-pass batch
+    }
+    SDL_Texture* roof_tex = tig_video_buffer_get_sdl_texture(tile_gpu_roof_buffer);
+    TigRect iso_rect = { 0, 0, tile_gpu_roof_buffer_w, tile_gpu_roof_buffer_h };
+    tig_video_set_roof_underlay(roof_tex, &iso_rect);
+
+    if (tile_oneshot_tex_count > 0) {
+        int ti;
+        for (ti = 0; ti < tile_oneshot_tex_count; ti++) {
+            SDL_DestroyTexture(tile_oneshot_textures[ti]);
+        }
+        tile_oneshot_tex_count = 0;
+    }
+    tile_deferred_blit_count = 0;
+    tile_gpu_target_buffer = tile_gpu_world_buffer;
+    tile_gpu_active = false;
+    tile_gpu_roof_pass_active = false;
 }
 
 // CE: true when the GPU world path is selected. object_draw consults this to

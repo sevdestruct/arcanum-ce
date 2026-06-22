@@ -1002,6 +1002,24 @@ void tig_video_fill_transparent(const TigRect* rect)
     SDL_FillSurfaceRect(tig_video_state.surface, &r, 0x00000000u);
 }
 
+// CE (step 6): roof present-layer texture, composited (alpha-blended) between the
+// world underlay and the framebuffer at flip. Persists across flips like the world
+// underlay; the game passes NULL to clear (outside gpu-present).
+static SDL_Texture* tig_video_roof_under_tex;
+static TigRect tig_video_roof_under_rect;
+static bool tig_video_roof_under_has_rect;
+static bool tig_video_roof_under_valid;
+
+void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
+{
+    tig_video_roof_under_tex = texture;
+    tig_video_roof_under_valid = (texture != NULL);
+    tig_video_roof_under_has_rect = (dst_rect != NULL);
+    if (dst_rect != NULL) {
+        tig_video_roof_under_rect = *dst_rect;
+    }
+}
+
 void tig_video_flip_perf_set_enabled(bool enabled)
 {
     tig_video_flip_perf_enabled = enabled;
@@ -1135,6 +1153,20 @@ int tig_video_flip(void)
         }
         SDL_SetTextureBlendMode(tig_video_world_under_tex, SDL_BLENDMODE_NONE);
         SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, NULL, dstp);
+        // CE (step 6): roof present-layer over the world (alpha-blended), under UI.
+        if (tig_video_roof_under_valid && tig_video_roof_under_tex != NULL) {
+            SDL_FRect rdst;
+            SDL_FRect* rdstp = NULL;
+            if (tig_video_roof_under_has_rect) {
+                rdst.x = (float)tig_video_roof_under_rect.x;
+                rdst.y = (float)tig_video_roof_under_rect.y;
+                rdst.w = (float)tig_video_roof_under_rect.width;
+                rdst.h = (float)tig_video_roof_under_rect.height;
+                rdstp = &rdst;
+            }
+            SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND);
+            SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, NULL, rdstp);
+        }
         SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_BLEND);
         SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
         SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_NONE);
@@ -1383,8 +1415,12 @@ int tig_video_buffer_create(TigVideoBufferCreateInfo* vb_create_info, TigVideoBu
             tig_debug_printf("tig_video_buffer_create: COLOR_KEY ignored on GPU buffer (use blend modes instead).\n");
         }
 
+        // CE (step 6): ARGB (was XRGB) so GPU render targets carry an alpha
+        // channel. The roof present-layer is cleared transparent and alpha-blended
+        // over the world, which needs real alpha; the world buffer is drawn opaque
+        // (BLENDMODE_NONE) at flip so its alpha is ignored -- unaffected.
         video_buffer->texture = SDL_CreateTexture(tig_video_state.renderer,
-            SDL_PIXELFORMAT_XRGB8888,
+            SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_TARGET,
             texture_width,
             texture_height);
