@@ -1785,6 +1785,12 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
     // -> full tint (near-black shows the darkened world); reveal=0 -> no tint (the
     // near-black art stays OPAQUE, e.g. the dialog backdrop / the bar during exit).
     uint32_t inv_reveal = 255u - reveal;
+    // CE (optimize): steady state is reveal==255 (the HUD bar lives here every frame),
+    // where the near-black lerp collapses to the constant (black, alpha=darken). Take
+    // the constant fast path then and skip the per-pixel divides; only fade frames
+    // (entrance/exit, dialog) pay the lerp.
+    bool full_tint = (reveal >= 255u);
+    uint32_t darken_pixel = (uint32_t)darken << 24;
 
     void* dst_pixels = NULL;
     int dst_pitch = 0;
@@ -1815,11 +1821,15 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
                 // near-black: lerp by reveal between opaque art (reveal 0) and the
                 // darkened-world tint (reveal 255 -> alpha=darken, rgb=0). Endpoints
                 // are exact; the brief mid-fade art is slightly dim (acceptable).
-                uint32_t a = 255u - (uint32_t)(255u - darken) * reveal / 255u;
-                uint32_t rr = ((p >> 16) & 0xFFu) * inv_reveal / 255u;
-                uint32_t gg = ((p >> 8) & 0xFFu) * inv_reveal / 255u;
-                uint32_t bb = (p & 0xFFu) * inv_reveal / 255u;
-                dp[x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
+                if (full_tint) {
+                    dp[x] = darken_pixel; // steady-state fast path (no per-pixel lerp)
+                } else {
+                    uint32_t a = 255u - (uint32_t)(255u - darken) * reveal / 255u;
+                    uint32_t rr = ((p >> 16) & 0xFFu) * inv_reveal / 255u;
+                    uint32_t gg = ((p >> 8) & 0xFFu) * inv_reveal / 255u;
+                    uint32_t bb = (p & 0xFFu) * inv_reveal / 255u;
+                    dp[x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
+                }
             } else {
                 dp[x] = 0xFF000000u | rgb; // opaque art
             }
