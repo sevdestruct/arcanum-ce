@@ -252,3 +252,32 @@ present — only in-game eyes + F9 validate step 6).
    `tile_gpu_begin_pass`. Verify `gpu-bridge: upload→0 readback→0`.
 
 Net target: world pass ~0.4 ms (blit only) vs software ~3 ms — the real win.
+
+### Increment B attempted ("gpu-present": present the target, drop both transfers) — FAILED, reverted
+Added a `gpu-present` render-path mode: skip the upload (begin_pass) + readback
+(world_end), register the GPU world target as a flip-time overlay
+(`tig_video_set_world_overlay`) drawn over the framebuffer. Built, didn't crash,
+but in-game it was a **flickering, zoom-garbage mess**. Root cause is decisive and
+kills the shortcut:
+
+**`dword_602DF0` (the CPU world surface) is the world source for everything except
+the GPU world pass.** Specifically:
+- The **zoom renderer is SOFTWARE** — it renders to `dword_602DF0`, never the GPU
+  target (zoom/thumbnail callers don't open the GPU pass). Presenting the target
+  during zoom shows stale pixels → the accumulating garbage.
+- **Non-world-pass frames** (UI-only redraws, mouse) don't run the pass, so the
+  overlay isn't refreshed and the stale framebuffer shows through → the flicker.
+- The compositor, UI knockout, and void-scan all read `dword_602DF0` too.
+
+So the readback is **load-bearing**: it's the one place the GPU world becomes the
+CPU surface that all the other paths consume. You cannot drop it by presenting the
+target — the target only ever holds what the GPU *world pass* drew, which diverges
+from `dword_602DF0` the moment anything else (zoom, UI, software) renders.
+
+**Dropping the readback REQUIRES migrating those consumers off `dword_602DF0`:**
+(1) zoom rendering → GPU target; (2) the final present/compositor → GPU composite
+of the target + UI (repurpose knockout for translucent UI); (3) void-scan → sample
+the target. That is the full present-path migration — large, high-risk, and only
+in-game-validatable. There is no smaller shortcut; the "present the target" idea is
+a dead end. Decision point: do the full migration, or bank the correctness win and
+keep software as the perf-shipping path with GPU correct-but-opt-in.
