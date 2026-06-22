@@ -1049,9 +1049,10 @@ bool tig_video_gpu_ui_is_enabled(void)
 }
 
 // CE (step 6 / full GPU/UI): draw the persistent GPU world target (opaque) and the
-// roof present-layer (alpha) at their iso rects. Shared by the gpu-present flip
-// path (framebuffer on top) and the gpu-ui path (window stack on top).
-static void tig_video_draw_world_roof_underlay(void)
+// roof present-layer (alpha) at their iso rects. gpu-present calls it from the flip
+// (framebuffer on top); gpu-ui calls it from the window walk at the iso window's
+// z-slot (so it respects the iso window's HIDDEN flag like any other window).
+void tig_video_draw_world_roof_underlay(void)
 {
     if (!tig_video_world_under_valid || tig_video_world_under_tex == NULL) {
         return;
@@ -1239,9 +1240,10 @@ int tig_video_flip(void)
 
     SDL_RenderClear(tig_video_state.renderer);
     if (gpu_ui) {
-        // CE (full GPU/UI): world+roof at the iso z-slot (bottom), then the UI
-        // window stack composited directly on the GPU (no CPU framebuffer).
-        tig_video_draw_world_roof_underlay();
+        // CE (full GPU/UI): the UI window stack composites directly on the GPU. The
+        // world+roof underlay is drawn BY the walk at the iso window's z-slot (so it
+        // respects the iso window's HIDDEN flag) rather than unconditionally here —
+        // a hidden iso (main menu, startup) then shows no world, matching software.
         tig_video_ui_composite_func();
     } else if (tig_video_world_under_valid && tig_video_world_under_tex != NULL) {
         // CE (step 6): GPU world UNDER the framebuffer. Draw the world+roof opaque
@@ -1651,7 +1653,7 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer)
 // stale dword_602DF0). reveal<255 (the brief entrance fade) renders at full tint
 // for now. Returns the mirror texture.
 SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
-    uint8_t threshold, uint8_t darken)
+    uint8_t threshold, uint8_t darken, uint32_t knockout_key)
 {
     if (video_buffer == NULL || video_buffer->surface == NULL) {
         return NULL;
@@ -1683,6 +1685,11 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
 
     bool color_key_active = (video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) != 0;
     uint32_t color_key_rgb = video_buffer->color_key & 0x00FFFFFFu;
+    // CE: a window can be BOTH tinted and world-knocked-out (e.g. the wmap modal:
+    // near-black panels darken the world, magenta custom-shape pixels reveal it).
+    // knockout_key == 0xFFFFFFFF means none.
+    bool ko_active = (knockout_key != 0xFFFFFFFFu);
+    uint32_t ko_rgb = knockout_key & 0x00FFFFFFu;
     uint32_t darken_pixel = (uint32_t)darken << 24; // black at alpha=darken
 
     void* dst_pixels = NULL;
@@ -1705,12 +1712,85 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
         for (int x = 0; x < w; x++) {
             uint32_t p = sp[x];
             uint32_t rgb = p & 0x00FFFFFFu;
-            if (color_key_active && rgb == color_key_rgb) {
-                dp[x] = 0x00000000u; // transparent background
+            if ((color_key_active && rgb == color_key_rgb)
+                || (ko_active && rgb == ko_rgb)) {
+                dp[x] = 0x00000000u; // colorkey or knockout-key -> reveal beneath
             } else if ((uint8_t)(p >> 16) <= threshold
                 && (uint8_t)(p >> 8) <= threshold
                 && (uint8_t)p <= threshold) {
                 dp[x] = darken_pixel; // near-black -> darkened world beneath
+            } else {
+                dp[x] = 0xFF000000u | rgb; // opaque art
+            }
+        }
+    }
+
+    SDL_UnlockSurface(surface);
+    SDL_UnlockTexture(video_buffer->gpu_mirror);
+    return video_buffer->gpu_mirror;
+}
+
+// CE (full GPU/UI stage 2): knockout-aware mirror sync for custom-shaped windows.
+// In addition to the window's colorkey, pixels matching knockout_key become
+// transparent, so the GPU walk reveals whatever's beneath (the world / lower
+// windows) through the window's custom shape — reproducing tig_video_blit_knockout
+// for the common case where the knockout underlay is what's directly beneath.
+SDL_Texture* tig_video_buffer_gpu_knockout_mirror_sync(TigVideoBuffer* video_buffer,
+    uint32_t knockout_key)
+{
+    if (video_buffer == NULL || video_buffer->surface == NULL) {
+        return NULL;
+    }
+    SDL_Surface* surface = video_buffer->surface;
+    int w = surface->w;
+    int h = surface->h;
+    if (w <= 0 || h <= 0) {
+        return NULL;
+    }
+
+    if (video_buffer->gpu_mirror == NULL
+        || video_buffer->gpu_mirror_w != w
+        || video_buffer->gpu_mirror_h != h) {
+        if (video_buffer->gpu_mirror != NULL) {
+            SDL_DestroyTexture(video_buffer->gpu_mirror);
+            video_buffer->gpu_mirror = NULL;
+        }
+        video_buffer->gpu_mirror = SDL_CreateTexture(tig_video_state.renderer,
+            SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (video_buffer->gpu_mirror == NULL) {
+            return NULL;
+        }
+        SDL_SetTextureScaleMode(video_buffer->gpu_mirror, SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(video_buffer->gpu_mirror, SDL_BLENDMODE_BLEND);
+        video_buffer->gpu_mirror_w = w;
+        video_buffer->gpu_mirror_h = h;
+    }
+
+    bool color_key_active = (video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) != 0;
+    uint32_t color_key_rgb = video_buffer->color_key & 0x00FFFFFFu;
+    uint32_t ko_rgb = knockout_key & 0x00FFFFFFu;
+
+    void* dst_pixels = NULL;
+    int dst_pitch = 0;
+    if (!SDL_LockTexture(video_buffer->gpu_mirror, NULL, &dst_pixels, &dst_pitch)) {
+        return NULL;
+    }
+    if (!SDL_LockSurface(surface)) {
+        SDL_UnlockTexture(video_buffer->gpu_mirror);
+        return NULL;
+    }
+
+    int src_pitch_px = surface->pitch / 4;
+    int dst_pitch_px = dst_pitch / 4;
+    const uint32_t* src_base = (const uint32_t*)surface->pixels;
+    uint32_t* dst_base = (uint32_t*)dst_pixels;
+    for (int y = 0; y < h; y++) {
+        const uint32_t* sp = src_base + (size_t)y * src_pitch_px;
+        uint32_t* dp = dst_base + (size_t)y * dst_pitch_px;
+        for (int x = 0; x < w; x++) {
+            uint32_t rgb = sp[x] & 0x00FFFFFFu;
+            if ((color_key_active && rgb == color_key_rgb) || rgb == ko_rgb) {
+                dp[x] = 0x00000000u; // colorkey or knockout-key -> reveal beneath
             } else {
                 dp[x] = 0xFF000000u | rgb; // opaque art
             }

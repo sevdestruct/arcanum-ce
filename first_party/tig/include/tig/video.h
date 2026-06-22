@@ -168,7 +168,13 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer);
 // bar — near-black pixels (<= threshold) become black at alpha=darken so that
 // compositing the result (BLEND) over the live GPU world reproduces the CPU tint
 // (world darkened by `darken`); colorkey -> transparent, else opaque art.
-SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer, uint8_t threshold, uint8_t darken);
+// A tint window may also be knocked-out (custom shape) — pass knockout_key, or
+// 0xFFFFFFFF for none.
+SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer, uint8_t threshold, uint8_t darken, uint32_t knockout_key);
+
+// CE (full GPU/UI stage 2): knockout-aware mirror sync for custom-shaped windows —
+// colorkey AND knockout_key pixels become transparent so the walk reveals beneath.
+SDL_Texture* tig_video_buffer_gpu_knockout_mirror_sync(TigVideoBuffer* video_buffer, uint32_t knockout_key);
 
 // CE (full GPU/UI): callback that composites the UI window stack directly on the
 // GPU at flip (registered by the window layer). Called with the render target
@@ -188,6 +194,11 @@ bool tig_video_gpu_ui_is_enabled(void);
 // mirror texture to dst, optionally alpha-modulated (transform fade, 0..1) and
 // clipped (clip=NULL for none). Keeps raw SDL out of the window/mouse layers.
 void tig_video_composite_ui_texture(SDL_Texture* tex, const TigRect* src, const TigRect* dst, float alpha, const TigRect* clip);
+
+// CE (full GPU/UI): draw the registered GPU world + roof underlay at their iso
+// rects. Called by the gpu-ui window walk at the iso window's z-slot so the world
+// respects the iso window's visibility (no draw when the iso window is hidden).
+void tig_video_draw_world_roof_underlay(void);
 
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 

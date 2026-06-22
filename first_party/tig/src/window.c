@@ -575,6 +575,12 @@ int tig_window_display(void)
         return TIG_ERR_NOT_INITIALIZED;
     }
 
+    // CE (full GPU/UI): in gpu-ui the flip composites the whole window stack on the
+    // GPU (tig_window_gpu_composite), so the CPU compositor sub_51D050 below is pure
+    // redundant work — skip it. The dirty-rect loop still runs to free the nodes
+    // (and the present-dirty hint is harmless; the flip ignores it in gpu-ui).
+    bool gpu_ui = tig_video_gpu_ui_is_enabled();
+
     if (tig_window_dirty_rects != NULL) {
         rc = tig_mouse_get_state(&mouse_state);
         if (rc != TIG_OK) {
@@ -611,7 +617,9 @@ int tig_window_display(void)
                 dirty_union.height = y2 - y1;
             }
 
-            sub_51D050(&(node->rect), NULL, 0, 0, TIG_WINDOW_TOP);
+            if (!gpu_ui) {
+                sub_51D050(&(node->rect), NULL, 0, 0, TIG_WINDOW_TOP);
+            }
             tig_rect_node_destroy(node);
 
             node = tig_window_dirty_rects;
@@ -1133,7 +1141,16 @@ static void tig_window_gpu_composite(void)
         if ((win->flags & TIG_WINDOW_HIDDEN) != 0) {
             continue;
         }
-        if (win->gpu_world || win->video_buffer == NULL) {
+        if (win->gpu_world) {
+            // CE (full GPU/UI): the iso window IS the GPU world — draw the world +
+            // roof underlay at its z-slot in the stack. Reached only when the iso
+            // window is visible (HIDDEN checked above), so a hidden iso (main menu,
+            // startup) shows no world — matching software's compositor, which only
+            // blits a window when it's shown. Fixes the startup world flash.
+            tig_video_draw_world_roof_underlay();
+            continue;
+        }
+        if (win->video_buffer == NULL) {
             continue;
         }
 
@@ -1159,10 +1176,19 @@ static void tig_window_gpu_composite(void)
         // CE (full GPU/UI stage 2): translucent-black HUD bar — the tint mirror
         // makes near-black art pixels darken the live GPU world beneath when
         // composited (BLEND), reproducing tig_video_blit_near_black_tinted.
+        // CE (full GPU/UI stage 2): a window can be tinted (near-black panels
+        // darken the world) and/or knocked-out (custom-shape key pixels reveal the
+        // world) — the wmap modal is BOTH. The tint sync also takes the knockout
+        // key so it handles the combined case; knockout-only uses its own sync.
         SDL_Texture* tex;
         if (win->tint_enabled) {
+            uint32_t ko = win->knockout_enabled
+                ? (uint32_t)win->knockout_key : 0xFFFFFFFFu;
             tex = tig_video_buffer_gpu_tint_mirror_sync(win->video_buffer,
-                win->tint_threshold, win->tint_r);
+                win->tint_threshold, win->tint_r, ko);
+        } else if (win->knockout_enabled) {
+            tex = tig_video_buffer_gpu_knockout_mirror_sync(win->video_buffer,
+                (uint32_t)win->knockout_key);
         } else {
             tex = tig_video_buffer_gpu_mirror_sync(win->video_buffer);
         }
