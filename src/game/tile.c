@@ -164,7 +164,19 @@ static bool tile_should_use_gpu_path(void)
     if (mode == NULL) {
         return false;
     }
-    return strcmp(mode, TILE_RENDER_PATH_GPU) == 0;
+    return strcmp(mode, TILE_RENDER_PATH_GPU) == 0
+        || strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0;
+}
+
+// CE (step 6): true when the world target is composited directly at flip (drop
+// the readback) instead of read back to the CPU surface (dword_602DF0).
+static bool tile_gpu_present_path(void)
+{
+    if (tile_gpu_path_disabled) {
+        return false;
+    }
+    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
+    return mode != NULL && strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0;
 }
 
 // Allocate or resize the GPU world target to match `dst`. Returns false
@@ -229,25 +241,31 @@ static bool tile_gpu_begin_pass(TigVideoBuffer* dst)
         return false;
     }
 
-    // Pull CPU pixels from dst. tig_video_buffer_data with no lock returns
-    // pixels=NULL, so we lock here to grab a pointer + pitch, then unlock.
-    if (tig_video_buffer_lock(dst) != TIG_OK) {
-        return false;
-    }
-    TigVideoBufferData dst_data;
-    if (tig_video_buffer_data(dst, &dst_data) != TIG_OK || dst_data.pixels == NULL) {
-        tig_video_buffer_unlock(dst);
-        return false;
-    }
+    // CE (step 6 present mode): the world target is persistent and presented
+    // directly (no readback to re-sync it), so skip the per-frame upload -- it
+    // would overwrite the target with the now-stale CPU surface. The target
+    // retains its own content frame-to-frame.
+    if (!tile_gpu_present_path()) {
+        // Pull CPU pixels from dst. tig_video_buffer_data with no lock returns
+        // pixels=NULL, so we lock here to grab a pointer + pitch, then unlock.
+        if (tig_video_buffer_lock(dst) != TIG_OK) {
+            return false;
+        }
+        TigVideoBufferData dst_data;
+        if (tig_video_buffer_data(dst, &dst_data) != TIG_OK || dst_data.pixels == NULL) {
+            tig_video_buffer_unlock(dst);
+            return false;
+        }
 
-    SDL_Rect upload_rect = { 0, 0, dst_data.width, dst_data.height };
-    uint64_t upload_t0 = tile_gpu_now_ns();
-    bool upload_ok = SDL_UpdateTexture(gpu_tex, &upload_rect, dst_data.pixels, dst_data.pitch);
-    tile_gpu_perf_upload_ns += tile_gpu_now_ns() - upload_t0;
-    tig_video_buffer_unlock(dst);
-    if (!upload_ok) {
-        tig_debug_printf("tile_gpu_begin_pass: SDL_UpdateTexture failed: %s\n", SDL_GetError());
-        return false;
+        SDL_Rect upload_rect = { 0, 0, dst_data.width, dst_data.height };
+        uint64_t upload_t0 = tile_gpu_now_ns();
+        bool upload_ok = SDL_UpdateTexture(gpu_tex, &upload_rect, dst_data.pixels, dst_data.pitch);
+        tile_gpu_perf_upload_ns += tile_gpu_now_ns() - upload_t0;
+        tig_video_buffer_unlock(dst);
+        if (!upload_ok) {
+            tig_debug_printf("tile_gpu_begin_pass: SDL_UpdateTexture failed: %s\n", SDL_GetError());
+            return false;
+        }
     }
 
     SDL_Renderer* renderer = NULL;
@@ -1266,6 +1284,20 @@ static void tile_void_edge_scan(void)
 // on the software path (tile_gpu_active is false there).
 void tile_gpu_world_begin(void)
 {
+    // CE (step 6): mark/unmark the iso window as the GPU-world window so the
+    // compositor paints it transparent in present mode (only re-invalidates on a
+    // state change, so this is cheap to call every frame).
+    bool present = tile_gpu_present_path();
+    if (tile_iso_window_handle != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_set_gpu_world(tile_iso_window_handle, present);
+    }
+    // Outside present mode, clear any persisted world underlay so the flip
+    // presents the framebuffer normally (opaque). In present mode it's (re)set in
+    // tile_gpu_world_end and persists across UI-only flips.
+    if (!present) {
+        tig_video_set_world_underlay(NULL, NULL);
+    }
+
     tile_gpu_active = tile_should_use_gpu_path();
     if (tile_gpu_active) {
         if (!tile_gpu_begin_pass(dword_602DF0)) {
@@ -1285,6 +1317,34 @@ void tile_gpu_world_begin(void)
 void tile_gpu_world_end(void)
 {
     if (!tile_gpu_active) {
+        return;
+    }
+
+    // CE (step 6): present-path -- keep the world on the GPU and register it as
+    // the flip-time underlay instead of reading it back. Unbind the render target
+    // so the UI/present draw to the screen. The compositor paints the iso window
+    // transparent (gpu_world flag), so the framebuffer reveals this world texture
+    // under the UI. (Roofs draw software after this into the now-unused CPU
+    // surface, so they're not yet visible -- a later increment moves them to a
+    // present-time layer.)
+    if (tile_gpu_present_path()) {
+        SDL_Renderer* renderer = NULL;
+        if (tig_video_renderer_get(&renderer) == TIG_OK && renderer != NULL) {
+            SDL_SetRenderTarget(renderer, NULL); // flushes the world-pass batch
+        }
+        SDL_Texture* world_tex = tig_video_buffer_get_sdl_texture(tile_gpu_world_buffer);
+        TigRect iso_rect = { 0, 0, tile_gpu_world_buffer_w, tile_gpu_world_buffer_h };
+        tig_video_set_world_underlay(world_tex, &iso_rect);
+
+        if (tile_oneshot_tex_count > 0) {
+            int ti;
+            for (ti = 0; ti < tile_oneshot_tex_count; ti++) {
+                SDL_DestroyTexture(tile_oneshot_textures[ti]);
+            }
+            tile_oneshot_tex_count = 0;
+        }
+        tile_deferred_blit_count = 0; // deferred replay needs the CPU surface; skip
+        tile_gpu_active = false;
         return;
     }
 

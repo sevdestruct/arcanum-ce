@@ -167,6 +167,12 @@
 #define TILE_RENDER_PATH_KEY "tile render path"
 #define TILE_RENDER_PATH_SOFTWARE "software"
 #define TILE_RENDER_PATH_GPU "gpu"
+// CE (feature/perf-gpu-accel step 6, WIP): like "gpu", but the world target is
+// composited directly at flip (ARGB framebuffer, iso window composites
+// transparent, GPU world drawn under the UI) instead of being read back to the
+// CPU surface -- drops the per-frame upload + readback (~6ms bridge). Opt-in;
+// roofs + zoom rendering still need migrating (known-incomplete).
+#define TILE_RENDER_PATH_GPU_PRESENT "gpu-present"
 
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);

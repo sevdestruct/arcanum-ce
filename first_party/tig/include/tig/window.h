@@ -180,6 +180,11 @@ int tig_window_knockout_enable(tig_window_handle_t window_handle,
     tig_window_handle_t underlay_handle,
     tig_color_t key);
 
+// CE (feature/perf-gpu-accel step 6): mark a window as the GPU-world window so
+// the compositor paints it transparent (the GPU world composites under the
+// framebuffer at flip). Set on the iso window only while "gpu-present" is active.
+int tig_window_set_gpu_world(tig_window_handle_t window_handle, bool enabled);
+
 // CE: globally configure auto-tint on modal dialogs created by
 // tig_window_modal_dialog. Enable when an in-play game session
 // exists (passing the iso window handle as underlay). Disable when

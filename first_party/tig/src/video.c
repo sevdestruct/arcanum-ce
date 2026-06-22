@@ -971,6 +971,37 @@ void tig_video_set_present_dirty_rect(const TigRect* rect)
     tig_video_present_dirty_rect_valid = true;
 }
 
+// CE (feature/perf-gpu-accel step 6): the GPU world texture to composite UNDER
+// the framebuffer at flip ("gpu-present"). Re-registered each frame by the game;
+// drawn opaque at its dst rect, then the (ARGB) framebuffer is alpha-blended on
+// top so transparent iso-region pixels reveal the world and opaque UI sits over.
+static SDL_Texture* tig_video_world_under_tex;
+static TigRect tig_video_world_under_rect;
+static bool tig_video_world_under_has_rect;
+static bool tig_video_world_under_valid;
+
+void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect)
+{
+    tig_video_world_under_tex = texture;
+    tig_video_world_under_valid = (texture != NULL);
+    tig_video_world_under_has_rect = (dst_rect != NULL);
+    if (dst_rect != NULL) {
+        tig_video_world_under_rect = *dst_rect;
+    }
+}
+
+// CE (step 6): fill a screen-surface rect with transparent (alpha 0). The
+// compositor uses this for the GPU-world window so its region reveals the
+// underlay at flip instead of being painted opaque.
+void tig_video_fill_transparent(const TigRect* rect)
+{
+    if (tig_video_state.surface == NULL || rect == NULL) {
+        return;
+    }
+    SDL_Rect r = { rect->x, rect->y, rect->width, rect->height };
+    SDL_FillSurfaceRect(tig_video_state.surface, &r, 0x00000000u);
+}
+
 void tig_video_flip_perf_set_enabled(bool enabled)
 {
     tig_video_flip_perf_enabled = enabled;
@@ -1089,7 +1120,32 @@ int tig_video_flip(void)
     uint64_t flip_t1 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
 
     SDL_RenderClear(tig_video_state.renderer);
-    SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
+    if (tig_video_world_under_valid && tig_video_world_under_tex != NULL) {
+        // CE (step 6): GPU world UNDER the framebuffer. Draw the world opaque at
+        // its iso rect, then alpha-blend the framebuffer (UI opaque, iso region
+        // transparent) on top so the world shows through.
+        SDL_FRect dst;
+        SDL_FRect* dstp = NULL;
+        if (tig_video_world_under_has_rect) {
+            dst.x = (float)tig_video_world_under_rect.x;
+            dst.y = (float)tig_video_world_under_rect.y;
+            dst.w = (float)tig_video_world_under_rect.width;
+            dst.h = (float)tig_video_world_under_rect.height;
+            dstp = &dst;
+        }
+        SDL_SetTextureBlendMode(tig_video_world_under_tex, SDL_BLENDMODE_NONE);
+        SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, NULL, dstp);
+        SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_BLEND);
+        SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
+        SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_NONE);
+    } else {
+        SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
+    }
+    // NOTE: do NOT clear tig_video_world_under_valid here -- the GPU world target
+    // is persistent and must be composited on EVERY flip, including UI/mouse-only
+    // frames that don't re-run the world pass. The game clears it (passes NULL)
+    // when it leaves present mode. Clearing per-flip caused the black-flicker
+    // (frames that drew the framebuffer opaque over a transparent iso region).
 
     if (tig_fade_state.enabled) {
         SDL_BlendMode blend_mode;
@@ -2983,7 +3039,12 @@ bool tig_video_window_create(TigInitInfo* init_info)
         return false;
     }
 
-    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, init_info->width, init_info->height);
+    // CE (feature/perf-gpu-accel step 6): ARGB (was XRGB) so the framebuffer can
+    // carry alpha -- the "gpu-present" path composites the GPU world UNDER the UI
+    // by making the iso region transparent (alpha 0) and the UI opaque (alpha
+    // 255). Other modes are unaffected: opaque content is alpha 255 and the
+    // framebuffer texture presents with BLENDMODE_NONE, identical to XRGB.
+    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, init_info->width, init_info->height);
     if (texture == NULL) {
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);

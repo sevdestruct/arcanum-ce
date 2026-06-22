@@ -144,6 +144,16 @@ void tig_video_exit(void);
 int tig_video_window_get(SDL_Window** window_ptr);
 int tig_video_renderer_get(SDL_Renderer** renderer_ptr);
 void tig_video_display_fps(void);
+
+// CE (feature/perf-gpu-accel step 6): register a GPU world texture to composite
+// UNDER the framebuffer at flip (instead of reading it back). Drawn opaque at
+// dst_rect (NULL = full target), then the ARGB framebuffer alpha-blends on top so
+// transparent iso-region pixels reveal the world. One frame only; re-register each
+// frame; texture=NULL clears.
+void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect);
+
+// CE (step 6): fill a screen-surface rect with transparent (alpha 0).
+void tig_video_fill_transparent(const TigRect* rect);
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 
 // CE: blit a window VB to the screen with optional scale (dst.w/h

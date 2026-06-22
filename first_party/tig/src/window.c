@@ -108,6 +108,11 @@ typedef struct TigWindow {
     // masking the "snap to tinted" pop that would otherwise occur
     // when the transform path clears and tint takes over.
     float tint_reveal;
+    // CE (feature/perf-gpu-accel step 6): when set, the compositor fills this
+    // window's region with transparent (alpha 0) instead of blitting its VB, so
+    // the GPU world drawn under the framebuffer at flip shows through. The game
+    // sets this on the iso window only while "gpu-present" is active.
+    bool gpu_world;
 } TigWindow;
 
 // CE: optional notification when a window is destroyed. ui_anim
@@ -905,6 +910,12 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             uint8_t a = (uint8_t)(win->transform_alpha * 255.0f + 0.5f);
                             tig_video_blit_scaled_alpha(src_video_buffer,
                                 &blt_src_rect, &blt_dst_rect, a);
+                        } else if (win->gpu_world) {
+                            // CE (step 6): the GPU world is composited under the
+                            // framebuffer at flip; paint this window's region
+                            // transparent so it shows through, rather than
+                            // blitting the (now-unused) CPU world surface.
+                            tig_video_fill_transparent(&blt_dst_rect);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
                         }
@@ -2237,6 +2248,31 @@ int tig_window_knockout_enable(tig_window_handle_t window_handle,
     win->knockout_underlay = underlay_handle;
 
     if (was_enabled != enabled) {
+        tig_window_invalidate_rect(&(win->frame));
+    }
+    return TIG_OK;
+}
+
+// CE (feature/perf-gpu-accel step 6): mark/unmark a window as the GPU-world
+// window. While set, the compositor paints its region transparent (the GPU world
+// is composited under the framebuffer at flip). Invalidates the full frame on a
+// state change so the whole region re-composites (transparent vs opaque world).
+int tig_window_set_gpu_world(tig_window_handle_t window_handle, bool enabled)
+{
+    int window_index;
+    TigWindow* win;
+
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return TIG_ERR_INVALID_PARAM;
+    }
+    if (!tig_window_initialized) {
+        return TIG_ERR_NOT_INITIALIZED;
+    }
+    window_index = tig_window_handle_to_index(window_handle);
+    win = &(windows[window_index]);
+
+    if (win->gpu_world != enabled) {
+        win->gpu_world = enabled;
         tig_window_invalidate_rect(&(win->frame));
     }
     return TIG_OK;
