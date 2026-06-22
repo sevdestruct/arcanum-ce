@@ -165,23 +165,26 @@
 // Re-read at the top of each tile_draw_iso call so the user can flip the
 // flag in arcanum.cfg between runs without restarting.
 #define TILE_RENDER_PATH_KEY "tile render path"
+// User-facing render paths: software (CPU) vs hardware (the full GPU + GPU-UI path).
 #define TILE_RENDER_PATH_SOFTWARE "software"
-#define TILE_RENDER_PATH_GPU "gpu"
-// CE (feature/perf-gpu-accel step 6, WIP): like "gpu", but the world target is
-// composited directly at flip (ARGB framebuffer, iso window composites
-// transparent, GPU world drawn under the UI) instead of being read back to the
-// CPU surface -- drops the per-frame upload + readback (~6ms bridge). Opt-in;
-// roofs + zoom rendering still need migrating (known-incomplete).
-#define TILE_RENDER_PATH_GPU_PRESENT "gpu-present"
+// hardware: world + roofs + zoom render on the GPU and present directly at flip (no
+// readback), AND UI windows composite on the GPU (each a GPU texture z-ordered at
+// flip) -- the CPU framebuffer compositor is gone. The full hardware path.
+#define TILE_RENDER_PATH_HARDWARE "hardware"
 
-// CE (feature/perf-gpu-accel, full GPU/UI migration, WIP): builds on gpu-present
-// (all the world/roof present-time compositing) and additionally moves UI window
-// compositing off the CPU framebuffer onto the GPU -- each window becomes a GPU
-// texture composited in z-order at flip, eliminating the CPU SDL_BlitSurface
-// compositor and ultimately the CPU framebuffer itself. Architecture-driven (the
-// big perf cliff is already banked by gpu-present); unifies the present so
-// CPU/GPU seams (e.g. the load fade) vanish. Opt-in; staged + known-incomplete.
-#define TILE_RENDER_PATH_GPU_UI "gpu-ui"
+// Debug-only intermediate paths -- kept for diagnostics, NOT exposed as user options
+// (may be dropped later). The pre-rename config values "gpu" / "gpu-present" / "gpu-ui"
+// are still accepted as aliases (see tile_render_path_canon in tile.c).
+//
+// debug-gpu-readback: world blits run on the GPU but are READ BACK to the CPU surface
+// (the original "bridge" -- net-slower than presenting). Its remaining use is the A/B
+// harness, which pixel-diffs the GPU blits against software (it needs a CPU surface).
+#define TILE_RENDER_PATH_DEBUG_READBACK "debug-gpu-readback"
+//
+// debug-gpu-present: world (+ roofs/zoom) on the GPU, presented at flip with no
+// readback, but UI still composited on the CPU framebuffer -- i.e. "hardware" minus
+// GPU UI compositing. Isolates world-path bugs from UI-path bugs.
+#define TILE_RENDER_PATH_DEBUG_PRESENT "debug-gpu-present"
 
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);

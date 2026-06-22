@@ -190,13 +190,30 @@ void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns)
 // CE (feature/perf-gpu-accel Phase 3): return true if arcanum.cfg
 // requests the GPU tile path AND the GPU init didn't previously fail.
 // Re-read each frame so the user can toggle between runs.
+// Map the configured render-path string to its canonical value, accepting the legacy
+// names (configs written before the software/hardware rename) as aliases. Returns
+// "software" when unset.
+static const char* tile_render_path_canon(void)
+{
+    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
+    if (mode == NULL) {
+        return TILE_RENDER_PATH_SOFTWARE;
+    }
+    if (strcmp(mode, "gpu-ui") == 0) {
+        return TILE_RENDER_PATH_HARDWARE; // legacy alias
+    }
+    if (strcmp(mode, "gpu-present") == 0) {
+        return TILE_RENDER_PATH_DEBUG_PRESENT; // legacy alias
+    }
+    if (strcmp(mode, "gpu") == 0) {
+        return TILE_RENDER_PATH_DEBUG_READBACK; // legacy alias
+    }
+    return mode;
+}
+
 static bool tile_should_use_gpu_path(void)
 {
     if (tile_gpu_path_disabled) {
-        return false;
-    }
-    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
-    if (mode == NULL) {
         return false;
     }
     // The zoomed world render bypasses the GPU world target (it renders to the 2x
@@ -205,9 +222,10 @@ static bool tile_should_use_gpu_path(void)
     if (gamelib_zoom_world_pass_is_active()) {
         return false;
     }
-    return strcmp(mode, TILE_RENDER_PATH_GPU) == 0
-        || strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0
-        || strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0;
+    const char* mode = tile_render_path_canon();
+    return strcmp(mode, TILE_RENDER_PATH_HARDWARE) == 0
+        || strcmp(mode, TILE_RENDER_PATH_DEBUG_PRESENT) == 0
+        || strcmp(mode, TILE_RENDER_PATH_DEBUG_READBACK) == 0;
 }
 
 // CE (step 6): true when the world target is composited directly at flip (drop
@@ -218,10 +236,9 @@ static bool tile_gpu_present_path(void)
     if (tile_gpu_path_disabled || gamelib_zoom_world_pass_is_active()) {
         return false;
     }
-    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
-    return mode != NULL
-        && (strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0
-            || strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0);
+    const char* mode = tile_render_path_canon();
+    return strcmp(mode, TILE_RENDER_PATH_HARDWARE) == 0
+        || strcmp(mode, TILE_RENDER_PATH_DEBUG_PRESENT) == 0;
 }
 
 // CE (full GPU/UI): true when UI windows are composited on the GPU (each window a
@@ -240,8 +257,8 @@ static bool tile_gpu_ui_path(void)
     if (tile_gpu_path_disabled) {
         return false;
     }
-    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
-    return mode != NULL && strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0;
+    // "hardware" is the full path (GPU world + GPU UI compositing).
+    return strcmp(tile_render_path_canon(), TILE_RENDER_PATH_HARDWARE) == 0;
 }
 
 // CE (gpu-ui iso overlay port): public — true when the CPU iso overlays (speech
