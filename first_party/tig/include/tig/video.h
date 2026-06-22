@@ -158,6 +158,37 @@ void tig_video_fill_transparent(const TigRect* rect);
 // CE (step 6): register the roof present-layer texture, alpha-blended between the
 // world underlay and the framebuffer at flip. Persists each frame; NULL clears.
 void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect);
+
+// CE (full GPU/UI): (re)sync + return the GPU mirror texture of a CPU-surface
+// window VB (XRGB -> ARGB, colorkey -> alpha 0), for the gpu-ui per-window
+// compositor to RenderTexture. NULL if the VB has no CPU surface.
+SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer);
+
+// CE (full GPU/UI stage 2): tint-aware mirror sync for the translucent-black HUD
+// bar — near-black pixels (<= threshold) become black at alpha=darken so that
+// compositing the result (BLEND) over the live GPU world reproduces the CPU tint
+// (world darkened by `darken`); colorkey -> transparent, else opaque art.
+SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer, uint8_t threshold, uint8_t darken);
+
+// CE (full GPU/UI): callback that composites the UI window stack directly on the
+// GPU at flip (registered by the window layer). Called with the render target
+// cleared and the world+roof underlay already drawn; it draws the windows on top.
+typedef void (*TigUiCompositeFunc)(void);
+void tig_video_set_ui_composite_func(TigUiCompositeFunc func);
+
+// CE (full GPU/UI): enable/disable gpu-ui mode — when on, the flip skips the CPU
+// framebuffer upload + draw and instead invokes the UI composite callback.
+void tig_video_set_gpu_ui(bool enabled);
+
+// CE (full GPU/UI): true when gpu-ui mode is active and a composite callback is
+// registered (callers gate their CPU-framebuffer draws on this, e.g. the cursor).
+bool tig_video_gpu_ui_is_enabled(void);
+
+// CE (full GPU/UI): composite a src sub-rect (NULL = whole) of a window/cursor
+// mirror texture to dst, optionally alpha-modulated (transform fade, 0..1) and
+// clipped (clip=NULL for none). Keeps raw SDL out of the window/mouse layers.
+void tig_video_composite_ui_texture(SDL_Texture* tex, const TigRect* src, const TigRect* dst, float alpha, const TigRect* clip);
+
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 
 // CE: blit a window VB to the screen with optional scale (dst.w/h

@@ -399,6 +399,42 @@ void tig_mouse_display(void)
         &dst_rect);
 }
 
+// CE (full GPU/UI): composite the cursor on the GPU. gpu-ui doesn't draw the CPU
+// framebuffer that tig_mouse_display blits into, so the gpu-ui window walk calls
+// this at the end to RenderTexture the cursor VB's GPU mirror (src sub-rect ->
+// screen) on top of the window stack. Mirrors tig_mouse_display's src/dst math.
+void tig_mouse_gpu_composite(void)
+{
+    TigRect src_rect;
+    TigRect dst_rect;
+    SDL_Texture* tex;
+
+    if (!tig_mouse_active) {
+        return;
+    }
+    if ((tig_mouse_state.flags & TIG_MOUSE_STATE_HIDDEN) != 0) {
+        return;
+    }
+    if (tig_mouse_cursor_video_buffer == NULL) {
+        return;
+    }
+
+    dst_rect = tig_mouse_state.frame;
+    if (tig_rect_intersection(&dst_rect, &tig_mouse_screen_bounds, &dst_rect) != TIG_OK) {
+        return;
+    }
+    src_rect.x = dst_rect.x - tig_mouse_state.frame.x;
+    src_rect.y = dst_rect.y - tig_mouse_state.frame.y;
+    src_rect.width = dst_rect.width;
+    src_rect.height = dst_rect.height;
+
+    tex = tig_video_buffer_gpu_mirror_sync(tig_mouse_cursor_video_buffer);
+    if (tex == NULL) {
+        return;
+    }
+    tig_video_composite_ui_texture(tex, &src_rect, &dst_rect, 1.0f, NULL);
+}
+
 // 0x4FFB40
 void tig_mouse_cursor_refresh(void)
 {

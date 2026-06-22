@@ -123,6 +123,7 @@ typedef struct TigWindow {
 static void (*tig_window_destroy_notify_func)(tig_window_handle_t) = NULL;
 
 static int tig_window_free_index(void);
+static void tig_window_gpu_composite(void);
 static int tig_window_handle_to_index(tig_window_handle_t window_handle);
 static tig_window_handle_t tig_window_index_to_handle(int window_index);
 static void push_window_stack(tig_window_handle_t window_handle);
@@ -222,6 +223,9 @@ int tig_window_init(TigInitInfo* init_info)
 
     tig_window_ctx_flags = init_info->flags;
     tig_window_initialized = true;
+
+    // CE (full GPU/UI): register the GPU window compositor used by gpu-ui mode.
+    tig_video_set_ui_composite_func(tig_window_gpu_composite);
 
     return TIG_OK;
 }
@@ -616,7 +620,12 @@ int tig_window_display(void)
         if ((mouse_state.flags & TIG_MOUSE_STATE_HIDDEN) == 0) {
             // tig_mouse_display blits the cursor sprite onto the surface at
             // mouse_state.frame, so we must union it into the dirty region.
-            tig_mouse_display();
+            // CE (full GPU/UI): in gpu-ui the framebuffer isn't drawn, so the
+            // cursor is composited on the GPU at the end of the window walk
+            // (tig_mouse_gpu_composite) instead of blitted here.
+            if (!tig_video_gpu_ui_is_enabled()) {
+                tig_mouse_display();
+            }
             if (mouse_state.frame.width > 0 && mouse_state.frame.height > 0) {
                 if (!dirty_union_set) {
                     dirty_union = mouse_state.frame;
@@ -910,11 +919,15 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             uint8_t a = (uint8_t)(win->transform_alpha * 255.0f + 0.5f);
                             tig_video_blit_scaled_alpha(src_video_buffer,
                                 &blt_src_rect, &blt_dst_rect, a);
-                        } else if (win->gpu_world) {
-                            // CE (step 6): the GPU world is composited under the
-                            // framebuffer at flip; paint this window's region
-                            // transparent so it shows through, rather than
-                            // blitting the (now-unused) CPU world surface.
+                        } else if (win->gpu_world && !tig_video_gpu_ui_is_enabled()) {
+                            // CE (step 6): gpu-present composites the GPU world
+                            // UNDER the framebuffer at flip, so paint this region
+                            // transparent to let it show through. In gpu-ui the
+                            // framebuffer isn't drawn (the GPU window walk is), so
+                            // a transparent fill here would cache BLACK behind any
+                            // translucent window — which then shows when zoom falls
+                            // back to the framebuffer. Blit the CPU world instead
+                            // so the cached backdrop is world content, not black.
                             tig_video_fill_transparent(&blt_dst_rect);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);
@@ -1103,6 +1116,80 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
 
         v38--;
     }
+}
+
+// CE (full GPU/UI): composite the UI window stack directly on the GPU. Registered
+// as the gpu-ui UI-composite callback; tig_video_flip invokes it with the render
+// target cleared and the world+roof underlay already drawn. Walks the stack
+// bottom-to-top so transparent / transform windows alpha-blend over whatever is
+// beneath — the dirty-rect + deferred-pass machinery in sub_51D050 exists only
+// for partial CPU compositing and isn't needed for a full-frame GPU recomposite.
+// The gpu_world (iso) window is skipped (its world+roof were drawn by the flip).
+// tint / knockout windows render plain for now (returns in stage 2).
+static void tig_window_gpu_composite(void)
+{
+    int i;
+    for (i = 0; i < tig_window_num_windows; i++) {
+        tig_window_handle_t window_handle = tig_window_stack[i];
+        unsigned int window_index = tig_window_handle_to_index(window_handle);
+        TigWindow* win = &(windows[window_index]);
+
+        if ((win->flags & TIG_WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+        if (win->gpu_world || win->video_buffer == NULL) {
+            continue;
+        }
+
+        // dst rect: scaled (ui_anim transform) or the natural frame.
+        TigRect dst_rect = win->frame;
+        float alpha = 1.0f;
+        if (win->transform_active && !win->has_clip) {
+            int tx, ty, tw, th;
+            tig_window_transform_dst(&win->frame,
+                win->transform_scale_x, win->transform_scale_y,
+                win->transform_anchor_x, win->transform_anchor_y,
+                &tx, &ty, &tw, &th);
+            if (tw <= 0 || th <= 0 || win->transform_alpha <= 0.0f) {
+                continue;
+            }
+            dst_rect.x = tx;
+            dst_rect.y = ty;
+            dst_rect.width = tw;
+            dst_rect.height = th;
+            alpha = win->transform_alpha;
+        }
+
+        // CE (full GPU/UI stage 2): translucent-black HUD bar — the tint mirror
+        // makes near-black art pixels darken the live GPU world beneath when
+        // composited (BLEND), reproducing tig_video_blit_near_black_tinted.
+        SDL_Texture* tex;
+        if (win->tint_enabled) {
+            tex = tig_video_buffer_gpu_tint_mirror_sync(win->video_buffer,
+                win->tint_threshold, win->tint_r);
+        } else {
+            tex = tig_video_buffer_gpu_mirror_sync(win->video_buffer);
+        }
+        if (tex == NULL) {
+            continue;
+        }
+
+        TigRect clip;
+        TigRect* clip_ptr = NULL;
+        if (win->has_clip) {
+            if (tig_rect_intersection(&win->frame, &win->clip_rect, &clip) != TIG_OK) {
+                continue; // fully clipped away
+            }
+            clip_ptr = &clip;
+        }
+
+        tig_video_composite_ui_texture(tex, NULL, &dst_rect, alpha, clip_ptr);
+    }
+
+    // CE (full GPU/UI): the mouse cursor is normally blitted onto the CPU
+    // framebuffer (tig_mouse_display) which gpu-ui doesn't draw — composite it
+    // here on top of the window stack instead.
+    tig_mouse_gpu_composite();
 }
 
 // 0x51D570

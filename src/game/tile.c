@@ -1364,10 +1364,11 @@ void tile_gpu_world_begin(void)
     if (tile_iso_window_handle != TIG_WINDOW_HANDLE_INVALID) {
         tig_window_set_gpu_world(tile_iso_window_handle, present);
     }
-    // CE (full GPU/UI, stage 1 seam): when gpu-ui is active, UI windows composite
-    // on the GPU rather than via the CPU framebuffer. Inert for now — the
-    // per-window-texture compositor wires in here next.
+    // CE (full GPU/UI): when gpu-ui is active, the flip composites UI windows on
+    // the GPU (per-window mirror textures, z-ordered) instead of uploading +
+    // drawing the CPU framebuffer.
     tile_gpu_ui_active = tile_gpu_ui_path();
+    tig_video_set_gpu_ui(tile_gpu_ui_active);
     // Outside present mode, clear any persisted world underlay so the flip
     // presents the framebuffer normally (opaque). In present mode it's (re)set in
     // tile_gpu_world_end and persists across UI-only flips.

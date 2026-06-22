@@ -70,6 +70,11 @@ int tig_mouse_show(void);
 // Renders mouse cursor to screen.
 void tig_mouse_display(void);
 
+// CE (full GPU/UI): composite the cursor on the GPU (gpu-ui skips the CPU
+// framebuffer that tig_mouse_display draws into). Called from the gpu-ui window
+// walk after the window stack so the cursor stays on top.
+void tig_mouse_gpu_composite(void);
+
 // Refreshes internally managed cursor surface.
 //
 // This function does nothing in hardware cursor mode.

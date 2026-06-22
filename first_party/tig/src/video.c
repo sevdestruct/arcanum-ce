@@ -41,6 +41,12 @@ typedef struct TigVideoBuffer {
     SDL_Surface* surface;
     SDL_Texture* texture;
     int lock_count;
+    // CE (full GPU/UI): for CPU-surface UI windows, an optional GPU texture
+    // mirror (XRGB surface -> ARGB texture, colorkey -> alpha 0) used by the
+    // gpu-ui per-window compositor. Lazily created and re-synced from `surface`.
+    SDL_Texture* gpu_mirror;
+    int gpu_mirror_w;
+    int gpu_mirror_h;
 } TigVideoBuffer;
 
 // CE: Phase 1 GPU buffer helper. The TIG_VIDEO_BUFFER_TEXTURE runtime flag
@@ -1020,6 +1026,94 @@ void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
     }
 }
 
+// CE (full GPU/UI): when enabled (gpu-ui mode), the flip composites UI windows
+// directly on the GPU via this callback (registered by the window layer) instead
+// of uploading + drawing the CPU framebuffer. The world+roof underlay still draws
+// first (bottom); the callback draws the window stack on top.
+static TigUiCompositeFunc tig_video_ui_composite_func = NULL;
+static bool tig_video_gpu_ui_enabled = false;
+static bool tig_video_prev_gpu_ui = false;
+
+void tig_video_set_ui_composite_func(TigUiCompositeFunc func)
+{
+    tig_video_ui_composite_func = func;
+}
+
+void tig_video_set_gpu_ui(bool enabled)
+{
+    tig_video_gpu_ui_enabled = enabled;
+}
+
+bool tig_video_gpu_ui_is_enabled(void)
+{
+    return tig_video_gpu_ui_enabled && tig_video_ui_composite_func != NULL;
+}
+
+// CE (step 6 / full GPU/UI): draw the persistent GPU world target (opaque) and the
+// roof present-layer (alpha) at their iso rects. Shared by the gpu-present flip
+// path (framebuffer on top) and the gpu-ui path (window stack on top).
+static void tig_video_draw_world_roof_underlay(void)
+{
+    if (!tig_video_world_under_valid || tig_video_world_under_tex == NULL) {
+        return;
+    }
+    SDL_FRect dst;
+    SDL_FRect* dstp = NULL;
+    if (tig_video_world_under_has_rect) {
+        dst.x = (float)tig_video_world_under_rect.x;
+        dst.y = (float)tig_video_world_under_rect.y;
+        dst.w = (float)tig_video_world_under_rect.width;
+        dst.h = (float)tig_video_world_under_rect.height;
+        dstp = &dst;
+    }
+    SDL_SetTextureBlendMode(tig_video_world_under_tex, SDL_BLENDMODE_NONE);
+    SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, NULL, dstp);
+    if (tig_video_roof_under_valid && tig_video_roof_under_tex != NULL) {
+        SDL_FRect rdst;
+        SDL_FRect* rdstp = NULL;
+        if (tig_video_roof_under_has_rect) {
+            rdst.x = (float)tig_video_roof_under_rect.x;
+            rdst.y = (float)tig_video_roof_under_rect.y;
+            rdst.w = (float)tig_video_roof_under_rect.width;
+            rdst.h = (float)tig_video_roof_under_rect.height;
+            rdstp = &rdst;
+        }
+        SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND);
+        SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, NULL, rdstp);
+    }
+}
+
+// CE (full GPU/UI): RenderTexture one UI window's mirror at dst, optionally
+// alpha-modulated (transform fade) and clipped (window clip rect). Keeps all raw
+// SDL in video.c so the window layer stays SDL-free.
+void tig_video_composite_ui_texture(SDL_Texture* tex, const TigRect* src, const TigRect* dst, float alpha, const TigRect* clip)
+{
+    if (tex == NULL || dst == NULL) {
+        return;
+    }
+    if (clip != NULL) {
+        SDL_Rect cr = { clip->x, clip->y, clip->width, clip->height };
+        SDL_SetRenderClipRect(tig_video_state.renderer, &cr);
+    }
+    Uint8 a = alpha >= 1.0f ? 255 : (alpha <= 0.0f ? 0 : (Uint8)(alpha * 255.0f + 0.5f));
+    SDL_SetTextureAlphaMod(tex, a);
+    SDL_FRect s;
+    SDL_FRect* sp = NULL;
+    if (src != NULL) {
+        s.x = (float)src->x;
+        s.y = (float)src->y;
+        s.w = (float)src->width;
+        s.h = (float)src->height;
+        sp = &s;
+    }
+    SDL_FRect d = { (float)dst->x, (float)dst->y, (float)dst->width, (float)dst->height };
+    SDL_RenderTexture(tig_video_state.renderer, tex, sp, &d);
+    SDL_SetTextureAlphaMod(tex, 255);
+    if (clip != NULL) {
+        SDL_SetRenderClipRect(tig_video_state.renderer, NULL);
+    }
+}
+
 void tig_video_flip_perf_set_enabled(bool enabled)
 {
     tig_video_flip_perf_enabled = enabled;
@@ -1122,7 +1216,19 @@ int tig_video_flip(void)
 
     uint64_t flip_t0 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
 
-    if (partial) {
+    // CE (full GPU/UI): in gpu-ui the CPU framebuffer is not composited — UI
+    // windows draw straight to the GPU via the registered callback — so skip the
+    // framebuffer upload entirely.
+    bool gpu_ui = tig_video_gpu_ui_enabled && tig_video_ui_composite_func != NULL;
+    // CE (full GPU/UI): on the gpu-ui -> framebuffer transition (e.g. zoom drops
+    // to the CPU path), the framebuffer texture is stale because gpu-ui skipped
+    // its uploads — force a full upload that frame to refresh it.
+    bool force_full_upload = (!gpu_ui && tig_video_prev_gpu_ui);
+    tig_video_prev_gpu_ui = gpu_ui;
+
+    if (gpu_ui) {
+        // no framebuffer upload
+    } else if (partial && !force_full_upload) {
         int bpp = tig_video_state.surface->format == SDL_PIXELFORMAT_UNKNOWN
             ? 4
             : (int)SDL_BYTESPERPIXEL(tig_video_state.surface->format);
@@ -1138,35 +1244,16 @@ int tig_video_flip(void)
     uint64_t flip_t1 = tig_video_flip_perf_enabled ? SDL_GetPerformanceCounter() : 0;
 
     SDL_RenderClear(tig_video_state.renderer);
-    if (tig_video_world_under_valid && tig_video_world_under_tex != NULL) {
-        // CE (step 6): GPU world UNDER the framebuffer. Draw the world opaque at
-        // its iso rect, then alpha-blend the framebuffer (UI opaque, iso region
+    if (gpu_ui) {
+        // CE (full GPU/UI): world+roof at the iso z-slot (bottom), then the UI
+        // window stack composited directly on the GPU (no CPU framebuffer).
+        tig_video_draw_world_roof_underlay();
+        tig_video_ui_composite_func();
+    } else if (tig_video_world_under_valid && tig_video_world_under_tex != NULL) {
+        // CE (step 6): GPU world UNDER the framebuffer. Draw the world+roof opaque
+        // at the iso rect, then alpha-blend the framebuffer (UI opaque, iso region
         // transparent) on top so the world shows through.
-        SDL_FRect dst;
-        SDL_FRect* dstp = NULL;
-        if (tig_video_world_under_has_rect) {
-            dst.x = (float)tig_video_world_under_rect.x;
-            dst.y = (float)tig_video_world_under_rect.y;
-            dst.w = (float)tig_video_world_under_rect.width;
-            dst.h = (float)tig_video_world_under_rect.height;
-            dstp = &dst;
-        }
-        SDL_SetTextureBlendMode(tig_video_world_under_tex, SDL_BLENDMODE_NONE);
-        SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, NULL, dstp);
-        // CE (step 6): roof present-layer over the world (alpha-blended), under UI.
-        if (tig_video_roof_under_valid && tig_video_roof_under_tex != NULL) {
-            SDL_FRect rdst;
-            SDL_FRect* rdstp = NULL;
-            if (tig_video_roof_under_has_rect) {
-                rdst.x = (float)tig_video_roof_under_rect.x;
-                rdst.y = (float)tig_video_roof_under_rect.y;
-                rdst.w = (float)tig_video_roof_under_rect.width;
-                rdst.h = (float)tig_video_roof_under_rect.height;
-                rdstp = &rdst;
-            }
-            SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND);
-            SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, NULL, rdstp);
-        }
+        tig_video_draw_world_roof_underlay();
         SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_BLEND);
         SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
         SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_NONE);
@@ -1481,8 +1568,164 @@ int tig_video_buffer_create(TigVideoBufferCreateInfo* vb_create_info, TigVideoBu
     video_buffer->background_color = vb_create_info->background_color;
 
     video_buffer->lock_count = 0;
+    video_buffer->gpu_mirror = NULL;
+    video_buffer->gpu_mirror_w = 0;
+    video_buffer->gpu_mirror_h = 0;
 
     return TIG_OK;
+}
+
+// CE (full GPU/UI): (re)create + refresh the GPU mirror texture of a CPU-surface
+// window VB, converting XRGB pixels to ARGB with the colorkey mapped to alpha 0
+// (transparent). Returns the BLEND-mode mirror texture for the gpu-ui compositor
+// to RenderTexture, or NULL if the VB has no CPU surface. First cut re-syncs
+// every call; a dirty flag can gate this once correctness is confirmed.
+SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer)
+{
+    if (video_buffer == NULL || video_buffer->surface == NULL) {
+        return NULL;
+    }
+    SDL_Surface* surface = video_buffer->surface;
+    int w = surface->w;
+    int h = surface->h;
+    if (w <= 0 || h <= 0) {
+        return NULL;
+    }
+
+    if (video_buffer->gpu_mirror == NULL
+        || video_buffer->gpu_mirror_w != w
+        || video_buffer->gpu_mirror_h != h) {
+        if (video_buffer->gpu_mirror != NULL) {
+            SDL_DestroyTexture(video_buffer->gpu_mirror);
+            video_buffer->gpu_mirror = NULL;
+        }
+        video_buffer->gpu_mirror = SDL_CreateTexture(tig_video_state.renderer,
+            SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (video_buffer->gpu_mirror == NULL) {
+            return NULL;
+        }
+        SDL_SetTextureScaleMode(video_buffer->gpu_mirror, SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(video_buffer->gpu_mirror, SDL_BLENDMODE_BLEND);
+        video_buffer->gpu_mirror_w = w;
+        video_buffer->gpu_mirror_h = h;
+    }
+
+    bool color_key_active = (video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) != 0;
+    uint32_t color_key_rgb = video_buffer->color_key & 0x00FFFFFFu;
+
+    void* dst_pixels = NULL;
+    int dst_pitch = 0;
+    if (!SDL_LockTexture(video_buffer->gpu_mirror, NULL, &dst_pixels, &dst_pitch)) {
+        return NULL;
+    }
+    if (!SDL_LockSurface(surface)) {
+        SDL_UnlockTexture(video_buffer->gpu_mirror);
+        return NULL;
+    }
+
+    int src_pitch_px = surface->pitch / 4;
+    int dst_pitch_px = dst_pitch / 4;
+    const uint32_t* src_base = (const uint32_t*)surface->pixels;
+    uint32_t* dst_base = (uint32_t*)dst_pixels;
+    for (int y = 0; y < h; y++) {
+        const uint32_t* sp = src_base + (size_t)y * src_pitch_px;
+        uint32_t* dp = dst_base + (size_t)y * dst_pitch_px;
+        if (color_key_active) {
+            for (int x = 0; x < w; x++) {
+                uint32_t rgb = sp[x] & 0x00FFFFFFu;
+                dp[x] = (rgb == color_key_rgb) ? 0x00000000u : (0xFF000000u | rgb);
+            }
+        } else {
+            for (int x = 0; x < w; x++) {
+                dp[x] = 0xFF000000u | (sp[x] & 0x00FFFFFFu);
+            }
+        }
+    }
+
+    SDL_UnlockSurface(surface);
+    SDL_UnlockTexture(video_buffer->gpu_mirror);
+    return video_buffer->gpu_mirror;
+}
+
+// CE (full GPU/UI, stage 2): tint-aware mirror sync for the translucent-black HUD
+// bar. Builds the bar's GPU mirror so that compositing it (BLEND) over the live
+// GPU world reproduces tig_video_blit_near_black_tinted EXACTLY for the common
+// reveal=255 case: near-black art pixels (all channels <= threshold) become BLACK
+// at alpha=darken, so dst*(1-darken/255) == world*(255-tint)/255 (the hue-
+// preserving darken, since the tint is grayscale); colorkey -> transparent; all
+// other pixels -> opaque art. Reads the LIVE GPU world (the CPU path read the now-
+// stale dword_602DF0). reveal<255 (the brief entrance fade) renders at full tint
+// for now. Returns the mirror texture.
+SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
+    uint8_t threshold, uint8_t darken)
+{
+    if (video_buffer == NULL || video_buffer->surface == NULL) {
+        return NULL;
+    }
+    SDL_Surface* surface = video_buffer->surface;
+    int w = surface->w;
+    int h = surface->h;
+    if (w <= 0 || h <= 0) {
+        return NULL;
+    }
+
+    if (video_buffer->gpu_mirror == NULL
+        || video_buffer->gpu_mirror_w != w
+        || video_buffer->gpu_mirror_h != h) {
+        if (video_buffer->gpu_mirror != NULL) {
+            SDL_DestroyTexture(video_buffer->gpu_mirror);
+            video_buffer->gpu_mirror = NULL;
+        }
+        video_buffer->gpu_mirror = SDL_CreateTexture(tig_video_state.renderer,
+            SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (video_buffer->gpu_mirror == NULL) {
+            return NULL;
+        }
+        SDL_SetTextureScaleMode(video_buffer->gpu_mirror, SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(video_buffer->gpu_mirror, SDL_BLENDMODE_BLEND);
+        video_buffer->gpu_mirror_w = w;
+        video_buffer->gpu_mirror_h = h;
+    }
+
+    bool color_key_active = (video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) != 0;
+    uint32_t color_key_rgb = video_buffer->color_key & 0x00FFFFFFu;
+    uint32_t darken_pixel = (uint32_t)darken << 24; // black at alpha=darken
+
+    void* dst_pixels = NULL;
+    int dst_pitch = 0;
+    if (!SDL_LockTexture(video_buffer->gpu_mirror, NULL, &dst_pixels, &dst_pitch)) {
+        return NULL;
+    }
+    if (!SDL_LockSurface(surface)) {
+        SDL_UnlockTexture(video_buffer->gpu_mirror);
+        return NULL;
+    }
+
+    int src_pitch_px = surface->pitch / 4;
+    int dst_pitch_px = dst_pitch / 4;
+    const uint32_t* src_base = (const uint32_t*)surface->pixels;
+    uint32_t* dst_base = (uint32_t*)dst_pixels;
+    for (int y = 0; y < h; y++) {
+        const uint32_t* sp = src_base + (size_t)y * src_pitch_px;
+        uint32_t* dp = dst_base + (size_t)y * dst_pitch_px;
+        for (int x = 0; x < w; x++) {
+            uint32_t p = sp[x];
+            uint32_t rgb = p & 0x00FFFFFFu;
+            if (color_key_active && rgb == color_key_rgb) {
+                dp[x] = 0x00000000u; // transparent background
+            } else if ((uint8_t)(p >> 16) <= threshold
+                && (uint8_t)(p >> 8) <= threshold
+                && (uint8_t)p <= threshold) {
+                dp[x] = darken_pixel; // near-black -> darkened world beneath
+            } else {
+                dp[x] = 0xFF000000u | rgb; // opaque art
+            }
+        }
+    }
+
+    SDL_UnlockSurface(surface);
+    SDL_UnlockTexture(video_buffer->gpu_mirror);
+    return video_buffer->gpu_mirror;
 }
 
 // 0x520390
@@ -1490,6 +1733,10 @@ int tig_video_buffer_destroy(TigVideoBuffer* video_buffer)
 {
     if (video_buffer == NULL) {
         return TIG_ERR_GENERIC;
+    }
+    if (video_buffer->gpu_mirror != NULL) {
+        SDL_DestroyTexture(video_buffer->gpu_mirror);
+        video_buffer->gpu_mirror = NULL;
     }
 
     // CE: GPU and CPU buffers are mutually exclusive at create time, but
