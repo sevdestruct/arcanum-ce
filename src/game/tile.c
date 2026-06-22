@@ -100,6 +100,9 @@ static bool tile_gpu_path_disabled;
 // target is bound and tile blits should route through blit_gpu instead
 // of tig_art_blit.
 static bool tile_gpu_active;
+// CE (full GPU/UI): true while gpu-ui mode composites UI windows on the GPU.
+// Set in tile_gpu_world_begin; read by the (incoming) per-window GPU compositor.
+static bool tile_gpu_ui_active;
 
 // CE (feature/perf-gpu-accel Phase 3 fix): deferred cache-miss blits.
 //
@@ -182,18 +185,34 @@ static bool tile_should_use_gpu_path(void)
         return false;
     }
     return strcmp(mode, TILE_RENDER_PATH_GPU) == 0
-        || strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0;
+        || strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0
+        || strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0;
 }
 
 // CE (step 6): true when the world target is composited directly at flip (drop
-// the readback) instead of read back to the CPU surface (dword_602DF0).
+// the readback) instead of read back to the CPU surface (dword_602DF0). gpu-ui
+// builds on this — it adds GPU UI compositing on top of the present-time world.
 static bool tile_gpu_present_path(void)
 {
     if (tile_gpu_path_disabled || gamelib_zoom_world_pass_is_active()) {
         return false;
     }
     const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
-    return mode != NULL && strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0;
+    return mode != NULL
+        && (strcmp(mode, TILE_RENDER_PATH_GPU_PRESENT) == 0
+            || strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0);
+}
+
+// CE (full GPU/UI): true when UI windows are composited on the GPU (each window a
+// GPU texture, z-ordered at flip) instead of CPU-blitted into the framebuffer.
+// Implies tile_gpu_present_path(). Stage 1 hook — UI compositing hangs off this.
+static bool tile_gpu_ui_path(void)
+{
+    if (tile_gpu_path_disabled || gamelib_zoom_world_pass_is_active()) {
+        return false;
+    }
+    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
+    return mode != NULL && strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0;
 }
 
 // Allocate or resize the GPU world target to match `dst`. Returns false
@@ -1345,6 +1364,10 @@ void tile_gpu_world_begin(void)
     if (tile_iso_window_handle != TIG_WINDOW_HANDLE_INVALID) {
         tig_window_set_gpu_world(tile_iso_window_handle, present);
     }
+    // CE (full GPU/UI, stage 1 seam): when gpu-ui is active, UI windows composite
+    // on the GPU rather than via the CPU framebuffer. Inert for now — the
+    // per-window-texture compositor wires in here next.
+    tile_gpu_ui_active = tile_gpu_ui_path();
     // Outside present mode, clear any persisted world underlay so the flip
     // presents the framebuffer normally (opaque). In present mode it's (re)set in
     // tile_gpu_world_end and persists across UI-only flips.

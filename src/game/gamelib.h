@@ -174,6 +174,15 @@
 // roofs + zoom rendering still need migrating (known-incomplete).
 #define TILE_RENDER_PATH_GPU_PRESENT "gpu-present"
 
+// CE (feature/perf-gpu-accel, full GPU/UI migration, WIP): builds on gpu-present
+// (all the world/roof present-time compositing) and additionally moves UI window
+// compositing off the CPU framebuffer onto the GPU -- each window becomes a GPU
+// texture composited in z-order at flip, eliminating the CPU SDL_BlitSurface
+// compositor and ultimately the CPU framebuffer itself. Architecture-driven (the
+// big perf cliff is already banked by gpu-present); unifies the present so
+// CPU/GPU seams (e.g. the load fade) vanish. Opt-in; staged + known-incomplete.
+#define TILE_RENDER_PATH_GPU_UI "gpu-ui"
+
 typedef bool (*GameExtraSaveFunc)(void);
 typedef bool (*GameExtraLoadFunc)(void);
 
