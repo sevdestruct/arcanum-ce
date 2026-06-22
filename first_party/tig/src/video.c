@@ -1032,7 +1032,6 @@ void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
 // first (bottom); the callback draws the window stack on top.
 static TigUiCompositeFunc tig_video_ui_composite_func = NULL;
 static bool tig_video_gpu_ui_enabled = false;
-static bool tig_video_prev_gpu_ui = false;
 
 void tig_video_set_ui_composite_func(TigUiCompositeFunc func)
 {
@@ -1220,15 +1219,10 @@ int tig_video_flip(void)
     // windows draw straight to the GPU via the registered callback — so skip the
     // framebuffer upload entirely.
     bool gpu_ui = tig_video_gpu_ui_enabled && tig_video_ui_composite_func != NULL;
-    // CE (full GPU/UI): on the gpu-ui -> framebuffer transition (e.g. zoom drops
-    // to the CPU path), the framebuffer texture is stale because gpu-ui skipped
-    // its uploads — force a full upload that frame to refresh it.
-    bool force_full_upload = (!gpu_ui && tig_video_prev_gpu_ui);
-    tig_video_prev_gpu_ui = gpu_ui;
 
     if (gpu_ui) {
         // no framebuffer upload
-    } else if (partial && !force_full_upload) {
+    } else if (partial) {
         int bpp = tig_video_state.surface->format == SDL_PIXELFORMAT_UNKNOWN
             ? 4
             : (int)SDL_BYTESPERPIXEL(tig_video_state.surface->format);

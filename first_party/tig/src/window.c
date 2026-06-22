@@ -919,15 +919,11 @@ void sub_51D050(TigRect* src_rect, TigVideoBuffer* dst_video_buffer, int dx, int
                             uint8_t a = (uint8_t)(win->transform_alpha * 255.0f + 0.5f);
                             tig_video_blit_scaled_alpha(src_video_buffer,
                                 &blt_src_rect, &blt_dst_rect, a);
-                        } else if (win->gpu_world && !tig_video_gpu_ui_is_enabled()) {
-                            // CE (step 6): gpu-present composites the GPU world
-                            // UNDER the framebuffer at flip, so paint this region
-                            // transparent to let it show through. In gpu-ui the
-                            // framebuffer isn't drawn (the GPU window walk is), so
-                            // a transparent fill here would cache BLACK behind any
-                            // translucent window — which then shows when zoom falls
-                            // back to the framebuffer. Blit the CPU world instead
-                            // so the cached backdrop is world content, not black.
+                        } else if (win->gpu_world) {
+                            // CE (step 6): the GPU world is composited under the
+                            // framebuffer at flip; paint this window's region
+                            // transparent so it shows through, rather than
+                            // blitting the (now-unused) CPU world surface.
                             tig_video_fill_transparent(&blt_dst_rect);
                         } else {
                             tig_video_blit(src_video_buffer, &blt_src_rect, &blt_dst_rect);

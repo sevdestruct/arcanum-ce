@@ -205,10 +205,18 @@ static bool tile_gpu_present_path(void)
 
 // CE (full GPU/UI): true when UI windows are composited on the GPU (each window a
 // GPU texture, z-ordered at flip) instead of CPU-blitted into the framebuffer.
-// Implies tile_gpu_present_path(). Stage 1 hook — UI compositing hangs off this.
+// Deliberately NOT gated on zoom (unlike should_use_gpu_path / present_path):
+// during zoom the world still renders CPU into the iso window's VB (dword_602DF0),
+// but keeping gpu-ui ACTIVE lets the GPU window walk composite that iso VB through
+// its fresh per-frame mirror (gpu_world is off during zoom so the walk treats the
+// iso like a normal window), alongside the UI windows' mirrors. So zoom presents
+// entirely through the walk's fresh mirrors instead of the stale CPU framebuffer
+// — which is what turned dynamic UI (portraits, gold stacks, the wmap) black at
+// non-1.0 zoom. The world+roof underlay is cleared during zoom (present_path is
+// off); the iso mirror carries the downscaled world instead.
 static bool tile_gpu_ui_path(void)
 {
-    if (tile_gpu_path_disabled || gamelib_zoom_world_pass_is_active()) {
+    if (tile_gpu_path_disabled) {
         return false;
     }
     const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
