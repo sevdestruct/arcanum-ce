@@ -1025,8 +1025,14 @@ static SDL_Texture* tig_video_roof_under_tex;
 static TigRect tig_video_roof_under_rect;
 static bool tig_video_roof_under_has_rect;
 static bool tig_video_roof_under_valid;
+// CE (zoom roof layer): src crop + linear, mirroring the world underlay, so the zoom
+// roof buffer (2x) can be centered-cropped + bilinear-downscaled to the iso rect just
+// like the world buffer. At 1.0 the present-layer passes no src (whole texture, NEAREST).
+static TigRect tig_video_roof_under_src;
+static bool tig_video_roof_under_has_src;
+static bool tig_video_roof_under_linear;
 
-void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
+void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect, const TigRect* src_rect, bool linear)
 {
     tig_video_roof_under_tex = texture;
     tig_video_roof_under_valid = (texture != NULL);
@@ -1034,6 +1040,11 @@ void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
     if (dst_rect != NULL) {
         tig_video_roof_under_rect = *dst_rect;
     }
+    tig_video_roof_under_has_src = (src_rect != NULL);
+    if (src_rect != NULL) {
+        tig_video_roof_under_src = *src_rect;
+    }
+    tig_video_roof_under_linear = linear;
 }
 
 // CE (full GPU/UI): when enabled (gpu-ui mode), the flip composites UI windows
@@ -1115,6 +1126,21 @@ void tig_video_draw_world_roof_underlay(void)
             rdst.h = (float)tig_video_roof_under_rect.height;
             rdstp = &rdst;
         }
+        // CE (zoom roof layer): centered crop of the 2x roof buffer, bilinear-
+        // downscaled to the iso rect -- the SAME crop the world underlay uses, so the
+        // roof aligns with the world. At 1.0 the present-layer has no crop (whole
+        // texture, NEAREST).
+        SDL_FRect rsrc;
+        SDL_FRect* rsrcp = NULL;
+        if (tig_video_roof_under_has_src) {
+            rsrc.x = (float)tig_video_roof_under_src.x;
+            rsrc.y = (float)tig_video_roof_under_src.y;
+            rsrc.w = (float)tig_video_roof_under_src.width;
+            rsrc.h = (float)tig_video_roof_under_src.height;
+            rsrcp = &rsrc;
+        }
+        SDL_SetTextureScaleMode(tig_video_roof_under_tex,
+            tig_video_roof_under_linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
         // CE: the roof layer was rendered onto a cleared-transparent target, so a
         // partly-transparent (fade) roof pixel ends up PREMULTIPLIED in the texture
         // (roof_rgb*a, a). Compositing with straight BLEND would apply alpha again
@@ -1124,7 +1150,7 @@ void tig_video_draw_world_roof_underlay(void)
         // Premultiplied compositing gives roof*a + world*(1-a), matching them. Opaque
         // roofs (a=1) are unaffected.
         SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-        SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, NULL, rdstp);
+        SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, rsrcp, rdstp);
     }
 }
 

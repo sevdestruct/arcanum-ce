@@ -1901,18 +1901,13 @@ bool gamelib_draw(void)
         location_origin_get(&cur_ox, &cur_oy);
         bool zoom_step = (z != gamelib_prev_zoom);
         bool camera_moved = (cur_ox != gamelib_prev_ox || cur_oy != gamelib_prev_oy);
-        bool gpu_zoom_active = zoom_active && tile_gpu_zoom_is_enabled();
-        // CE: GPU zoom renders the world+roofs into the persistent 2x zoom buffer, and
-        // fade roofs alpha-blend INTO it. A partial re-render lets that fade blend
-        // ACCUMULATE on un-redrawn pixels as the fade region tracks the walking PC (the
-        // camera has a follow deadzone, so it's often static while the PC moves) -- the
-        // streaks / "blit errors" under transparent roofs, at non-1.0 zoom only (at 1.0
-        // the roof is a fresh, fully re-rendered present-layer, so no accumulation).
-        // Force a full re-render EVERY GPU-zoom frame so the opaque world overwrites the
-        // previous roof before the new fade roof blends. The 1.0 present target (and the
-        // CPU zoom path) only need a full re-render on camera move / zoom step.
-        if (gpu_zoom_active
-            || ((zoom_active || tile_gpu_present_active()) && (zoom_step || camera_moved))) {
+        // The persistent world target (zoom 2x buffer, and the 1.0 GPU present target)
+        // is incremental; the hardware scroll shifts only the CPU iso surface, not the
+        // GPU target, so a camera move / zoom step leaves stale regions a partial render
+        // won't refresh. Force a full re-render in those cases. (The fade-roof
+        // accumulation that used to also need a PC-under-roof full re-render is gone:
+        // roofs now render on their own cleared layer, never in this incremental buffer.)
+        if ((zoom_active || tile_gpu_present_active()) && (zoom_step || camera_moved)) {
             gamelib_invalidate_rect(NULL);
         }
         gamelib_prev_zoom = z;
@@ -3826,13 +3821,26 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         // passes see the expected pixels (non-present modes). In gpu-present the
         // readback is skipped and roofs draw onto their own present-layer texture.
         if (zoom_pass_open) {
-            // CE (zoom->GPU): roofs render into the SAME 2x zoom target (the pass is
-            // still open) so they downscale together with the world -- mirroring the
-            // CPU zoom (roofs in the same 2x VB, one downscale). Then close the pass
-            // and register the underlay: centered crop -> bilinear downscale to the
-            // iso rect. (The roof full-re-render trick isn't needed: zoom already
-            // does Phase-A incremental + full-invalidate-on-move for the whole frame.)
-            roof_draw(draw_info);
+            // CE (zoom roof layer): render roofs into their OWN cleared 2x buffer (full
+            // re-render, exactly like the 1.0 roof present-layer) rather than baking them
+            // into the incremental world buffer. The alpha fade roof therefore never
+            // re-blends over un-cleared pixels -> no accumulation/streaks, and no
+            // PC-under-roof heuristic. tile_gpu_zoom_end composites it over the
+            // downscaled world. Fallback (roof pass can't open): bake into the world
+            // buffer the old way.
+            if (tile_gpu_zoom_roof_begin()) {
+                TigRect roof_iso_rect;
+                gamelib_get_iso_content_rect(&roof_iso_rect);
+                TigRectListNode roof_full_node;
+                roof_full_node.rect = roof_iso_rect;
+                roof_full_node.next = NULL;
+                TigRectListNode* roof_full_head = &roof_full_node;
+                GameDrawInfo roof_draw_info = *draw_info;
+                roof_draw_info.rects = &roof_full_head;
+                roof_draw(&roof_draw_info);
+            } else {
+                roof_draw(draw_info);
+            }
             float zf = iso_zoom_current();
             int zw = gamelib_zoom_orig_content.width;
             int zh = gamelib_zoom_orig_content.height;

@@ -679,6 +679,10 @@ void tb_gpu_composite(void)
     if (tb_view_options.type != VIEW_TYPE_ISOMETRIC) {
         return;
     }
+    // Called every gpu-ui walk frame; skip the rect-resolve when nothing's on screen.
+    if (!tb_any_active()) {
+        return;
+    }
 
     tb_collect_resolved_rects(rects, anchor_ys, placement_flags);
 

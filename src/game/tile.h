@@ -65,6 +65,11 @@ void tile_gpu_world_roof_end(void);
 // downscaled (linear) to the iso rect (dst). Returns false -> CPU zoom fallback.
 bool tile_gpu_zoom_is_enabled(void);
 bool tile_gpu_zoom_begin(void);
+// CE (zoom roof layer): open the zoom roof pass (after the world pass) -- binds a
+// cleared 2x roof buffer so roof_draw paints roofs there (full re-render), kept out of
+// the incremental world buffer. tile_gpu_zoom_end composites it over the downscaled
+// world. Returns false -> caller bakes roofs into the world buffer (fallback).
+bool tile_gpu_zoom_roof_begin(void);
 void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool linear);
 
 // CE (gpu-ui iso overlay port): true when CPU iso overlays (speech bubbles, floating

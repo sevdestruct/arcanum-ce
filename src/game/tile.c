@@ -102,6 +102,16 @@ static int tile_gpu_zoom_buffer_w;
 static int tile_gpu_zoom_buffer_h;
 static bool tile_gpu_zoom_disabled;
 
+// CE (zoom roof layer): the zoom-pass roofs render into their OWN 2x buffer (cleared
+// each frame), composited over the downscaled zoom world buffer -- exactly like the
+// 1.0 roof present-layer over the world target. Keeps the alpha-blended fade roof out
+// of the incremental zoom world buffer, so it can't accumulate (no streaks), with no
+// PC-under-roof heuristic. Sized to match tile_gpu_zoom_buffer (2x screen).
+static TigVideoBuffer* tile_gpu_zoom_roof_buffer;
+static int tile_gpu_zoom_roof_buffer_w;
+static int tile_gpu_zoom_roof_buffer_h;
+static bool tile_gpu_zoom_roof_active; // true between zoom_roof_begin and zoom_end
+
 // Sticky failure flag: once any part of the GPU init path fails (cache
 // init, buffer create, etc.), stop attempting it for the rest of the
 // session and fall back to software. Avoids per-frame retries.
@@ -362,6 +372,40 @@ static bool tile_gpu_ensure_zoom_buffer(int w, int h)
     }
     tile_gpu_zoom_buffer_w = w;
     tile_gpu_zoom_buffer_h = h;
+    return true;
+}
+
+// CE (zoom roof layer): allocate/resize the 2x zoom roof buffer (matches the zoom
+// world buffer). Returns false on create failure (the caller then bakes roofs into the
+// world buffer as before -- the old behavior, just without the no-accumulation win).
+static bool tile_gpu_ensure_zoom_roof_buffer(int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    if (tile_gpu_zoom_roof_buffer != NULL
+        && tile_gpu_zoom_roof_buffer_w == w
+        && tile_gpu_zoom_roof_buffer_h == h) {
+        return true;
+    }
+    if (tile_gpu_zoom_roof_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_zoom_roof_buffer);
+        tile_gpu_zoom_roof_buffer = NULL;
+    }
+    TigVideoBufferCreateInfo info;
+    info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
+    info.width = w;
+    info.height = h;
+    info.color_key = 0;
+    info.background_color = 0;
+    if (tig_video_buffer_create(&info, &tile_gpu_zoom_roof_buffer) != TIG_OK
+        || tile_gpu_zoom_roof_buffer == NULL) {
+        tig_debug_printf("tile: GPU zoom roof buffer create (%dx%d) failed -- roofs bake into the zoom world buffer.\n", w, h);
+        tile_gpu_zoom_roof_buffer = NULL;
+        return false;
+    }
+    tile_gpu_zoom_roof_buffer_w = w;
+    tile_gpu_zoom_roof_buffer_h = h;
     return true;
 }
 
@@ -829,6 +873,13 @@ void tile_exit(void)
         tile_gpu_zoom_buffer_w = 0;
         tile_gpu_zoom_buffer_h = 0;
     }
+    if (tile_gpu_zoom_roof_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_zoom_roof_buffer);
+        tile_gpu_zoom_roof_buffer = NULL;
+        tile_gpu_zoom_roof_buffer_w = 0;
+        tile_gpu_zoom_roof_buffer_h = 0;
+    }
+    tile_gpu_zoom_roof_active = false;
     tile_gpu_zoom_disabled = false;
     tig_art_gpu_cache_exit();
     tile_gpu_path_disabled = false;
@@ -1473,7 +1524,7 @@ void tile_gpu_world_begin(void)
     // tile_gpu_world_end and persists across UI-only flips.
     if (!present) {
         tig_video_set_world_underlay(NULL, NULL, NULL, false);
-        tig_video_set_roof_underlay(NULL, NULL);
+        tig_video_set_roof_underlay(NULL, NULL, NULL, false);
     }
 
     tile_gpu_active = tile_should_use_gpu_path();
@@ -1614,10 +1665,39 @@ bool tile_gpu_zoom_begin(void)
     return true;
 }
 
+// CE (zoom roof layer): after the zoom WORLD pass (tile_gpu_zoom_begin + tile/object),
+// switch the render target to the cleared 2x zoom roof buffer so roof_draw paints the
+// roofs there (full re-render) instead of into the incremental world buffer.
+// tile_gpu_zoom_end then composites it over the downscaled world. Returns false ->
+// caller bakes roofs into the world buffer (old behavior, fade roof can accumulate).
+bool tile_gpu_zoom_roof_begin(void)
+{
+    if (!tile_gpu_active || tile_gpu_zoom_buffer == NULL) {
+        return false; // the zoom world pass must be open
+    }
+    if (!tile_gpu_ensure_zoom_roof_buffer(tile_gpu_zoom_buffer_w, tile_gpu_zoom_buffer_h)) {
+        return false;
+    }
+    SDL_Texture* roof_tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_roof_buffer);
+    SDL_Renderer* renderer = NULL;
+    if (roof_tex == NULL || tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return false;
+    }
+    if (!SDL_SetRenderTarget(renderer, roof_tex)) {
+        return false;
+    }
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
+    SDL_RenderClear(renderer); // transparent -- only the roofs paint over it
+    tile_gpu_target_buffer = tile_gpu_zoom_roof_buffer; // dispatch now draws roofs here
+    tile_gpu_zoom_roof_active = true;
+    return true;
+}
+
 // CE (zoom->GPU): close the zoom pass. Unbinds the render target and registers the
-// zoom buffer as the world underlay: the centered crop (src) bilinear-downscaled
-// (linear) to the iso rect (dst). Roofs are baked into the zoom buffer, so the
-// separate roof present-layer is cleared.
+// zoom world buffer as the world underlay + the separate zoom roof buffer as the roof
+// underlay: both use the same centered crop (src) bilinear-downscaled (linear) to the
+// iso rect (dst), so the roof composites over the world at flip (the roof never lives
+// in the incremental world buffer -> no fade-roof accumulation).
 void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool linear)
 {
     if (!tile_gpu_active) {
@@ -1629,7 +1709,18 @@ void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool li
     }
     SDL_Texture* tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_buffer);
     tig_video_set_world_underlay(tex, dst_rect, src_rect, linear);
-    tig_video_set_roof_underlay(NULL, NULL);
+    // CE (zoom roof layer): composite the SEPARATE zoom roof buffer over the world with
+    // the SAME centered crop + downscale, so the alpha fade roof blends over the world
+    // at flip (premultiplied) -- never inside the incremental world buffer, so it can't
+    // accumulate (no streaks), with no PC-under-roof heuristic. If the roof pass didn't
+    // open, roofs baked into the world buffer (fallback) so clear the roof underlay.
+    if (tile_gpu_zoom_roof_active && tile_gpu_zoom_roof_buffer != NULL) {
+        SDL_Texture* roof_tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_roof_buffer);
+        tig_video_set_roof_underlay(roof_tex, dst_rect, src_rect, linear);
+    } else {
+        tig_video_set_roof_underlay(NULL, NULL, NULL, false);
+    }
+    tile_gpu_zoom_roof_active = false;
     if (tile_oneshot_tex_count > 0) {
         int ti;
         for (ti = 0; ti < tile_oneshot_tex_count; ti++) {
@@ -1686,7 +1777,7 @@ void tile_gpu_world_roof_end(void)
     }
     SDL_Texture* roof_tex = tig_video_buffer_get_sdl_texture(tile_gpu_roof_buffer);
     TigRect iso_rect = { 0, 0, tile_gpu_roof_buffer_w, tile_gpu_roof_buffer_h };
-    tig_video_set_roof_underlay(roof_tex, &iso_rect);
+    tig_video_set_roof_underlay(roof_tex, &iso_rect, NULL, false); // 1.0: whole texture, NEAREST
 
     if (tile_oneshot_tex_count > 0) {
         int ti;

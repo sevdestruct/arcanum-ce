@@ -160,7 +160,7 @@ void tig_video_fill_transparent(const TigRect* rect);
 
 // CE (step 6): register the roof present-layer texture, alpha-blended between the
 // world underlay and the framebuffer at flip. Persists each frame; NULL clears.
-void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect);
+void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect, const TigRect* src_rect, bool linear);
 
 // CE (full GPU/UI): (re)sync + return the GPU mirror texture of a CPU-surface
 // window VB (XRGB -> ARGB, colorkey -> alpha 0), for the gpu-ui per-window
