@@ -209,3 +209,46 @@ live in the world pass at all — composite it as a **present-time layer** in st
 partial-redraw/readback interaction. That folds 5a into the step-6 present rework
 rather than fighting the bridge. Opaque (fully-shown, outside) roofs could go on
 the target fine; only the faded case is hard.
+
+## Step 6 design — investigated (the core present path)
+
+Present chain today: `sub_51D050` (window.c, the compositor) blits every window —
+iso world (`dword_602DF0`) + all UI — into `tig_video_state.surface` (a single
+**XRGB8888** CPU framebuffer, no alpha); `tig_video_flip` (video.c:1041) uploads
+that surface to one streaming texture and `SDL_RenderTexture(NULL,NULL)` blits it
+to the screen. So EVERYTHING goes through one CPU framebuffer. The readback exists
+to get the GPU world into that framebuffer.
+
+**Existing infrastructure to leverage — the "knockout" compositor** (window.c:81-89):
+a window can set `knockout_enabled` + `knockout_key` (RGB) + `knockout_underlay`
+(a world source window); `sub_51D050` routes that window's blit through
+`tig_video_blit_knockout`, replacing key-colored pixels with the underlay. This is
+already the world-through-translucent-UI path. (It's a CPU blit, so today it still
+needs the world as CPU pixels — i.e. the readback. Understanding/repurposing this
+is central to dropping the readback cleanly.)
+
+**Why there's no trivial increment:** the framebuffer is XRGB (no alpha), so you
+can't just leave the iso region transparent and draw the GPU world behind it. The
+clean options all touch the core path: (a) make the iso region a colorkey and have
+`tig_video_flip` present GPU-world-then-framebuffer-with-colorkey-transparent (needs
+CreateTextureFromSurface-with-colorkey or a shader each frame); (b) move the whole
+final composite onto the renderer (draw GPU world tex at the iso screen rect, then
+the UI on top), repurposing the knockout path so translucent UI samples the GPU
+world; (c) make the framebuffer ARGB and clear the iso region to alpha 0. All are
+broad and **harness-blind** (the harness captures `dword_602DF0`, not the screen
+present — only in-game eyes + F9 validate step 6).
+
+**Increment order for a focused session:**
+1. Make `tile_gpu_world_buffer` persistent + expose its SDL texture + the iso
+   screen rect (`tile_iso_window_handle`).
+2. In `tig_video_flip`, behind a flag, present the GPU world tex at the iso rect,
+   and make the framebuffer's iso region show it through (colorkey or knockout).
+3. Faded roof as a present-time layer over the GPU world tex (fixes 5a).
+4. Translucent UI that samples the world → via the knockout underlay = GPU world
+   (or a small partial readback only of UI-covered regions).
+5. Rework `tile_void_edge_scan` (reads `dword_602DF0`) to sample the GPU target
+   region or a cached subset.
+6. Drop the readback in `tile_gpu_world_end` + the per-frame upload in
+   `tile_gpu_begin_pass`. Verify `gpu-bridge: upload→0 readback→0`.
+
+Net target: world pass ~0.4 ms (blit only) vs software ~3 ms — the real win.
