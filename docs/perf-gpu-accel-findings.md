@@ -253,6 +253,37 @@ present — only in-game eyes + F9 validate step 6).
 
 Net target: world pass ~0.4 ms (blit only) vs software ~3 ms — the real win.
 
+## Step 6 — DONE (opt-in `tile render path = gpu-present`). The win is real.
+
+After increment B failed (see below), the proper present-time composite shipped and
+works in-game. Measured (F9, M3 Max): **tile ~0.2ms, object ~0.2ms, roof ~0.4ms; no
+upload, no readback** — the world pass went from ~10ms (3.5 tile + ~4 upload + ~4
+readback) to **<1ms**, i.e. GPU is now well under software's ~3ms. Commits
+`224ce890` (foundation) + `380c3f83` (roofs + ARGB + zoom).
+
+How it works:
+- Framebuffer + all GPU render targets are **ARGB** (carry alpha).
+- The compositor paints the iso window **transparent** (new `gpu_world` window flag,
+  `tig_window_set_gpu_world`) so the GPU world shows through under the UI.
+- `tig_video_flip` composites three layers: **GPU world target (opaque) → roof
+  present-layer (alpha) → framebuffer/UI (alpha)**. The world + roof underlays
+  PERSIST across flips (`tig_video_set_world_underlay`/`set_roof_underlay`) so
+  UI-only frames don't flash black; the game clears them when leaving the mode.
+- `begin_pass` skips the upload, `world_end` skips the readback.
+- **Roofs**: their own ARGB texture, cleared transparent + fully re-rendered every
+  frame (no partial-redraw tearing / alpha accumulation), composited at flip.
+- **Zoom**: the zoomed world render bypasses the GPU target (renders to the 2x
+  world-VB + downscale-blit), so gpu-present falls back to the normal route while
+  `gamelib_zoom_world_pass_is_active()` — steady-state keeps the win.
+
+Confirmed in-game: world + roofs accurate, zoom works, near-black translucent UI
+clean, no roof-pass stutter. Remaining polish (minor): a brief black during the
+post-load fade-in (the GPU world target isn't populated while the fade plays).
+gpu / software paths are fully unaffected (gated). Default stays `software`.
+
+---
+(Historical: the earlier failed shortcut.)
+
 ### Increment B attempted ("gpu-present": present the target, drop both transfers) — FAILED, reverted
 Added a `gpu-present` render-path mode: skip the upload (begin_pass) + readback
 (world_end), register the GPU world target as a flip-time overlay
