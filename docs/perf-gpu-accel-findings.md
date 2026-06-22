@@ -113,3 +113,99 @@ end):
    UI-covered regions, or GPU-side blend. **This is the step that wins.**
 
 The `gpu-bridge:` instrumentation is in place to verify each step.
+
+## Update — resumed; visual correctness done, steps 1–4 complete
+
+The migration was resumed and the GPU world path is now **visually correct** for
+tiles, objects, AND roofs (validated by an autonomous software-vs-GPU A/B harness,
+`tools/gpu_test/run.sh <Slot>` + `diff_bmp.py`). The three visual bugs that had
+blocked the object pass are fixed (see commit `f1148fed` and memory
+`gpu_three_bug_root_causes`):
+
+- **Object lighting did NOT require the feared multi-round color disaster.** The
+  fix: blits arriving with no color intent synthesize the working-palette ambient
+  tint as a runtime `COLOR_CONST` (`light_default_tint_for`, light.c) over the
+  original-palette cache; per-column wall light ships as a real `COLOR_ARRAY`
+  (new `TIG_VIDEO_BUFFER_BLIT_BLEND_COLOR_ARRAY` flag, blit_gpu samples
+  `color_array[col]` over a fine grid). GPU matches software within ~1–3 lsb.
+- **Shadows:** `PALETTE_OVERRIDE` with the dim shadow palette + the Metal SUB
+  blend-op fix (REV_SUBTRACT for both color AND alpha — Metal silently rejects
+  mismatched ops; see memory `gpu_metal_sub_blend_op_match`).
+- **Z-order:** plain/COLOR_ARRAY blits now draw in-pass on the GPU target instead
+  of deferring to the post-readback CPU replay. **Deferrals are now ~0/frame**
+  (only true STIPPLE_S/ALPHA_AVG remain), which matters for step 5 below.
+
+So original steps **1–4 are DONE**. Remaining: **5 (drop upload)** and
+**6 (drop readback — the step that wins)**.
+
+### Current bridge (exact code)
+- Upload: `tile_gpu_begin_pass` (tile.c:221) → `SDL_UpdateTexture(gpu_tex, full, dst)` (tile.c:245), full-frame every frame.
+- Readback: `tile_gpu_end_pass` (tile.c:267) → `SDL_RenderReadPixels` (tile.c:278) → blit into `dword_602DF0`, full-frame every frame.
+- Bracketed by `tile_gpu_world_begin`/`tile_gpu_world_end` (tile.c:1267/1285).
+
+### Readback consumers (what must be handled to drop it — step 6)
+1. **Deferred-blit replay** (tile.c:1309) — replays leftover blits via `tig_art_blit` onto the CPU surface AFTER readback. Now ~0/frame; the few remaining could draw on the GPU target or be accepted.
+2. **Void-edge facade scan** (`tile_void_edge_scan`, tile.c:1207) — locks + reads `dword_602DF0` to detect pure-black facades. Would need to read the GPU target (region `RenderReadPixels`) instead, or run on a cached subset.
+3. **Present / UI compositing** — `dword_602DF0` is blitted to the window framebuffer; translucent-black UI panels read the world beneath them. The hard part: with the world GPU-resident, those UI reads need a partial readback of UI-covered regions OR a GPU-side blend at present.
+
+### Step 5 (drop upload) — ATTEMPTED, reverted; has a prerequisite
+Implemented persistent-target upload-skip; static A/B passed but it **broke roofs
+under zoom/scroll** (roofs disappear, tear/repeat in the void area, flicker while
+scrolling; ground/walls fine). Root cause found in `gamelib_draw_game`
+(gamelib.c:3398-3399):
+
+```
+tile_gpu_world_end();   // readback GPU target -> dword_602DF0
+roof_draw(draw_info);   // roofs draw AFTER, software, onto the CPU surface
+```
+
+**Roofs are NOT on the GPU target** — they're software-drawn onto `dword_602DF0`
+*after* the readback (the existing comment there literally says "after roof_draw
+once roof is on GPU too"). The per-frame upload was silently carrying last frame's
+roofs back into the GPU target; skipping it lets the readback wipe roofs from the
+target, and only the dirty roof rects get repainted -> flicker/tear. Ground/walls
+survive because they genuinely live on the target.
+
+**So the corrected order is:**
+- **5a. Move `roof_draw` onto the GPU target** (inside the pass, before
+  `tile_gpu_world_end`; route roof blits through `tile_gpu_dispatch`). This is the
+  unfinished half of original step 3, and it's the prerequisite for BOTH the upload
+  and readback elimination (you can't drop the readback while roofs depend on the
+  post-readback CPU surface). Validatable with the static A/B harness (roof
+  correctness) + scroll-test.
+- **5b. Drop the upload** (the persistent-target skip — code is in git history;
+  re-seed on create/resize/resume/deferred). With roofs on the target it works.
+- **6. Drop the readback** via present-time GPU composite. The win.
+
+Saves ~3 ms (upload) at 5b, ~3.6 ms (readback) at 6.
+
+### Measured again (F9, user's M3 Max, GPU mode, both Town day + night)
+```
+gpu-bridge: upload avg 3.5-4.9 ms | blit avg 0.02-0.10 ms | readback avg 3.3-4.9 ms
+passes:     tile avg 3.5-5.0 ms | object avg 0.1-0.2 ms | roof avg 0.01 ms
+```
+Blit is **0.02-0.10 ms** (30-100x faster than software's ~3 ms). The bridge
+(~8 ms upload+readback) is the entire GPU cost. The transfer size is the iso
+window buffer (constant with zoom), so the bridge doesn't scale with zoom.
+
+### 5a attempt (roofs on GPU target) — done + REVERTED
+Routed `roof_draw` blits through `tile_gpu_dispatch` and moved it inside the pass
+(before the readback). **Static rendering was correct** (roofs match software).
+But two MOTION regressions appeared and it was reverted:
+- **Tearing through FADED (transparent) roofs.** When the player/an NPC is under a
+  roof (roof alpha-faded so you see through it), the interior behind the roof
+  doesn't refresh consistently outside the moving sprite's dirty rect — you see a
+  dirty-rect-shaped tear and stale see-through content. The alpha-fade roof
+  composited on the GPU target does not survive the partial-redraw + upload/
+  readback round-trip the way the persistent CPU surface does. (roof_draw DOES
+  clip to dirty rects, roof.c:263 — so it's not overdraw; it's the alpha compose.)
+- **Stutter when zoomed far out** — per-roof-piece dispatch + the ALPHA_LERP grid
+  subdivision (the smooth fade) add CPU/geometry overhead that bites with many
+  roof pieces on screen.
+
+**Insight for the resume:** the faded roof is the crux. It probably should NOT
+live in the world pass at all — composite it as a **present-time layer** in step 6
+(GPU world texture, then the faded roof over it, then UI), where there's no
+partial-redraw/readback interaction. That folds 5a into the step-6 present rework
+rather than fighting the bridge. Opaque (fully-shown, outside) roofs could go on
+the target fine; only the faded case is hard.
