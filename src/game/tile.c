@@ -91,6 +91,17 @@ static bool tile_gpu_roof_pass_active;
 // roof buffer during the roof pass.
 static TigVideoBuffer* tile_gpu_target_buffer;
 
+// CE (zoom->GPU): a dedicated 2x-screen GPU render target for the zoomed world.
+// The zoom renders the world 1:1 (world-VB coords) into it -- like the fixed 2x CPU
+// gamelib_world_video_buffer it replaces -- then the centered (ww/z x wh/z) crop is
+// bilinear-downscaled to the iso rect via the world underlay. Persistent (sized
+// once to 2x screen) so it isn't recreated on zoom toggle. Zoom-specific failure
+// flag so a create failure falls back to CPU zoom without disabling all GPU.
+static TigVideoBuffer* tile_gpu_zoom_buffer;
+static int tile_gpu_zoom_buffer_w;
+static int tile_gpu_zoom_buffer_h;
+static bool tile_gpu_zoom_disabled;
+
 // Sticky failure flag: once any part of the GPU init path fails (cache
 // init, buffer create, etc.), stop attempting it for the rest of the
 // session and fall back to software. Avoids per-frame retries.
@@ -223,6 +234,26 @@ static bool tile_gpu_ui_path(void)
     return mode != NULL && strcmp(mode, TILE_RENDER_PATH_GPU_UI) == 0;
 }
 
+// CE (gpu-ui iso overlay port): public — true when the CPU iso overlays (speech
+// bubbles, floating text, dialogue) composite over the GPU world via the window walk
+// (gpu-ui active). gamelib gates skipping the legacy iso-surface overlay draws on
+// this so the walk's GPU composite is authoritative.
+bool tile_gpu_iso_overlay_path(void)
+{
+    return tile_gpu_ui_path();
+}
+
+// CE (gpu present): public -- true when the GPU world target is the persistent,
+// present-time target (gpu-present or gpu-ui, outside the zoom pass). The target is
+// NOT cleared/re-uploaded per frame, so a camera move (scroll) leaves its un-redrawn
+// regions stale/misaligned; gamelib uses this to force a full world re-render on
+// camera move (the same fix the zoom path already does), keeping the world fresh
+// under fade roofs (which reveal it).
+bool tile_gpu_present_active(void)
+{
+    return tile_gpu_present_path();
+}
+
 // Allocate or resize the GPU world target to match `dst`. Returns false
 // on hard failure (and trips tile_gpu_path_disabled so we don't retry).
 static bool tile_gpu_ensure_world_buffer(TigVideoBuffer* dst)
@@ -298,6 +329,59 @@ static bool tile_gpu_ensure_roof_buffer(void)
     tile_gpu_roof_buffer_w = desired_w;
     tile_gpu_roof_buffer_h = desired_h;
     return true;
+}
+
+// CE (zoom->GPU): allocate/resize the 2x zoom target to (w, h). On failure, trips
+// tile_gpu_zoom_disabled (zoom stays on the CPU path) WITHOUT disabling all GPU.
+static bool tile_gpu_ensure_zoom_buffer(int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    if (tile_gpu_zoom_buffer != NULL
+        && tile_gpu_zoom_buffer_w == w
+        && tile_gpu_zoom_buffer_h == h) {
+        return true;
+    }
+    if (tile_gpu_zoom_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_zoom_buffer);
+        tile_gpu_zoom_buffer = NULL;
+    }
+    TigVideoBufferCreateInfo info;
+    info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
+    info.width = w;
+    info.height = h;
+    info.color_key = 0;
+    info.background_color = 0;
+    if (tig_video_buffer_create(&info, &tile_gpu_zoom_buffer) != TIG_OK
+        || tile_gpu_zoom_buffer == NULL) {
+        tig_debug_printf("tile: GPU zoom buffer create (%dx%d) failed -- zoom stays on CPU path.\n", w, h);
+        tile_gpu_zoom_buffer = NULL;
+        tile_gpu_zoom_disabled = true;
+        return false;
+    }
+    tile_gpu_zoom_buffer_w = w;
+    tile_gpu_zoom_buffer_h = h;
+    return true;
+}
+
+// CE (zoom->GPU): true when the zoomed world should render on the GPU (gpu-ui only).
+// Ensures the 2x buffer (sized to 2x the screen-sized world buffer) so the caller
+// can commit to the GPU zoom path; returns false -> caller uses the CPU zoom path.
+bool tile_gpu_zoom_is_enabled(void)
+{
+    if (tile_gpu_path_disabled || tile_gpu_zoom_disabled) {
+        return false;
+    }
+    if (!tile_gpu_ui_path()) {
+        return false;
+    }
+    // 2x the screen-sized world buffer. That buffer is established by the zoom-1.0
+    // GPU pass; before any 1.0 pass we can't size the zoom buffer, so stay on CPU.
+    if (tile_gpu_world_buffer_w <= 0 || tile_gpu_world_buffer_h <= 0) {
+        return false;
+    }
+    return tile_gpu_ensure_zoom_buffer(tile_gpu_world_buffer_w * 2, tile_gpu_world_buffer_h * 2);
 }
 
 // Upload the current CPU dst surface into the GPU world target and bind
@@ -739,6 +823,13 @@ void tile_exit(void)
         tile_gpu_world_buffer_w = 0;
         tile_gpu_world_buffer_h = 0;
     }
+    if (tile_gpu_zoom_buffer != NULL) {
+        tig_video_buffer_destroy(tile_gpu_zoom_buffer);
+        tile_gpu_zoom_buffer = NULL;
+        tile_gpu_zoom_buffer_w = 0;
+        tile_gpu_zoom_buffer_h = 0;
+    }
+    tile_gpu_zoom_disabled = false;
     tig_art_gpu_cache_exit();
     tile_gpu_path_disabled = false;
 }
@@ -1381,7 +1472,7 @@ void tile_gpu_world_begin(void)
     // presents the framebuffer normally (opaque). In present mode it's (re)set in
     // tile_gpu_world_end and persists across UI-only flips.
     if (!present) {
-        tig_video_set_world_underlay(NULL, NULL);
+        tig_video_set_world_underlay(NULL, NULL, NULL, false);
         tig_video_set_roof_underlay(NULL, NULL);
     }
 
@@ -1421,7 +1512,7 @@ void tile_gpu_world_end(void)
         }
         SDL_Texture* world_tex = tig_video_buffer_get_sdl_texture(tile_gpu_world_buffer);
         TigRect iso_rect = { 0, 0, tile_gpu_world_buffer_w, tile_gpu_world_buffer_h };
-        tig_video_set_world_underlay(world_tex, &iso_rect);
+        tig_video_set_world_underlay(world_tex, &iso_rect, NULL, false);
 
         if (tile_oneshot_tex_count > 0) {
             int ti;
@@ -1482,6 +1573,73 @@ void tile_gpu_world_end(void)
     }
 
     tile_void_edge_scan();
+}
+
+// CE (zoom->GPU): open the zoomed-world GPU pass (gpu-ui only). Binds the 2x zoom
+// target; the world (and roofs, kept open across roof_draw) blit onto it via the
+// dispatch -- the zoom math already produces world-VB-space dst rects, so the
+// dispatch needs no changes. Phase A: does NOT clear the target (previous-frame
+// pixels stay valid until a camera move / scroll forces a full invalidate -- same
+// incremental model as the CPU 2x VB). Returns false -> caller falls back to
+// tile_gpu_world_begin (which is a no-op during zoom, i.e. CPU zoom).
+bool tile_gpu_zoom_begin(void)
+{
+    if (!tile_gpu_zoom_is_enabled()) {
+        return false;
+    }
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return false;
+    }
+    SDL_Texture* tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_buffer);
+    if (tex == NULL) {
+        return false;
+    }
+    if (!SDL_SetRenderTarget(renderer, tex)) {
+        return false;
+    }
+    tile_gpu_target_buffer = tile_gpu_zoom_buffer;
+    tile_gpu_active = true;
+    tile_deferred_blit_count = 0;
+    tile_oneshot_tex_count = 0;
+    // Keep the iso window the GPU-world window so the gpu-ui walk draws the world
+    // underlay at its z-slot (not the now-unwritten iso CPU VB mirror), and keep
+    // gpu-ui active so the walk composites. (tile_gpu_world_begin -- which normally
+    // sets these -- is bypassed during the GPU zoom pass.)
+    tile_gpu_ui_active = true;
+    tig_video_set_gpu_ui(true);
+    if (tile_iso_window_handle != TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_set_gpu_world(tile_iso_window_handle, true);
+    }
+    return true;
+}
+
+// CE (zoom->GPU): close the zoom pass. Unbinds the render target and registers the
+// zoom buffer as the world underlay: the centered crop (src) bilinear-downscaled
+// (linear) to the iso rect (dst). Roofs are baked into the zoom buffer, so the
+// separate roof present-layer is cleared.
+void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool linear)
+{
+    if (!tile_gpu_active) {
+        return;
+    }
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) == TIG_OK && renderer != NULL) {
+        SDL_SetRenderTarget(renderer, NULL); // flush the zoom-pass batch + unbind
+    }
+    SDL_Texture* tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_buffer);
+    tig_video_set_world_underlay(tex, dst_rect, src_rect, linear);
+    tig_video_set_roof_underlay(NULL, NULL);
+    if (tile_oneshot_tex_count > 0) {
+        int ti;
+        for (ti = 0; ti < tile_oneshot_tex_count; ti++) {
+            SDL_DestroyTexture(tile_oneshot_textures[ti]);
+        }
+        tile_oneshot_tex_count = 0;
+    }
+    tile_deferred_blit_count = 0; // deferred replay needs a CPU surface; skip (as present)
+    tile_gpu_active = false;
+    tile_gpu_target_buffer = tile_gpu_world_buffer;
 }
 
 // CE (step 6): open the roof present-layer pass. gpu-present only -- binds a

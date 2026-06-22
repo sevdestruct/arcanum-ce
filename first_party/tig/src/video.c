@@ -985,8 +985,13 @@ static SDL_Texture* tig_video_world_under_tex;
 static TigRect tig_video_world_under_rect;
 static bool tig_video_world_under_has_rect;
 static bool tig_video_world_under_valid;
+// CE (zoom->GPU): optional source sub-rect (the centered crop when zoomed) and
+// linear sampling (bilinear downscale). Zoom 1.0 / non-zoom pass NULL,false.
+static TigRect tig_video_world_under_src;
+static bool tig_video_world_under_has_src;
+static bool tig_video_world_under_linear;
 
-void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect)
+void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect, const TigRect* src_rect, bool linear)
 {
     tig_video_world_under_tex = texture;
     tig_video_world_under_valid = (texture != NULL);
@@ -994,6 +999,11 @@ void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect)
     if (dst_rect != NULL) {
         tig_video_world_under_rect = *dst_rect;
     }
+    tig_video_world_under_has_src = (src_rect != NULL);
+    if (src_rect != NULL) {
+        tig_video_world_under_src = *src_rect;
+    }
+    tig_video_world_under_linear = linear;
 }
 
 // CE (step 6): fill a screen-surface rect with transparent (alpha 0). The
@@ -1032,10 +1042,23 @@ void tig_video_set_roof_underlay(SDL_Texture* texture, const TigRect* dst_rect)
 // first (bottom); the callback draws the window stack on top.
 static TigUiCompositeFunc tig_video_ui_composite_func = NULL;
 static bool tig_video_gpu_ui_enabled = false;
+static TigIsoOverlayCompositeFunc tig_video_iso_overlay_composite_func_ptr = NULL;
 
 void tig_video_set_ui_composite_func(TigUiCompositeFunc func)
 {
     tig_video_ui_composite_func = func;
+}
+
+void tig_video_set_iso_overlay_composite_func(TigIsoOverlayCompositeFunc func)
+{
+    tig_video_iso_overlay_composite_func_ptr = func;
+}
+
+void tig_video_iso_overlay_composite(void)
+{
+    if (tig_video_iso_overlay_composite_func_ptr != NULL) {
+        tig_video_iso_overlay_composite_func_ptr();
+    }
 }
 
 void tig_video_set_gpu_ui(bool enabled)
@@ -1066,8 +1089,22 @@ void tig_video_draw_world_roof_underlay(void)
         dst.h = (float)tig_video_world_under_rect.height;
         dstp = &dst;
     }
+    // CE (zoom->GPU): when zoomed, sample a centered crop of the (2x) world target
+    // and bilinear-downscale it to the iso rect; non-zoom draws the whole texture
+    // NEAREST (pixel-perfect). Reset per-draw so the same machinery serves both.
+    SDL_FRect src;
+    SDL_FRect* srcp = NULL;
+    if (tig_video_world_under_has_src) {
+        src.x = (float)tig_video_world_under_src.x;
+        src.y = (float)tig_video_world_under_src.y;
+        src.w = (float)tig_video_world_under_src.width;
+        src.h = (float)tig_video_world_under_src.height;
+        srcp = &src;
+    }
+    SDL_SetTextureScaleMode(tig_video_world_under_tex,
+        tig_video_world_under_linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
     SDL_SetTextureBlendMode(tig_video_world_under_tex, SDL_BLENDMODE_NONE);
-    SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, NULL, dstp);
+    SDL_RenderTexture(tig_video_state.renderer, tig_video_world_under_tex, srcp, dstp);
     if (tig_video_roof_under_valid && tig_video_roof_under_tex != NULL) {
         SDL_FRect rdst;
         SDL_FRect* rdstp = NULL;
@@ -1078,7 +1115,15 @@ void tig_video_draw_world_roof_underlay(void)
             rdst.h = (float)tig_video_roof_under_rect.height;
             rdstp = &rdst;
         }
-        SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND);
+        // CE: the roof layer was rendered onto a cleared-transparent target, so a
+        // partly-transparent (fade) roof pixel ends up PREMULTIPLIED in the texture
+        // (roof_rgb*a, a). Compositing with straight BLEND would apply alpha again
+        // (roof*a^2 + world*(1-a)) -- short the roof's energy by a*(1-a), darkening the
+        // result. That's why GPU zoom-1.0 fade roofs looked darker than software / the
+        // GPU zoom buffer (both blend the roof DIRECTLY over the world, a single blend).
+        // Premultiplied compositing gives roof*a + world*(1-a), matching them. Opaque
+        // roofs (a=1) are unaffected.
+        SDL_SetTextureBlendMode(tig_video_roof_under_tex, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
         SDL_RenderTexture(tig_video_state.renderer, tig_video_roof_under_tex, NULL, rdstp);
     }
 }
@@ -1109,6 +1154,25 @@ void tig_video_composite_ui_texture(SDL_Texture* tex, const TigRect* src, const 
     SDL_FRect d = { (float)dst->x, (float)dst->y, (float)dst->width, (float)dst->height };
     SDL_RenderTexture(tig_video_state.renderer, tex, sp, &d);
     SDL_SetTextureAlphaMod(tex, 255);
+    if (clip != NULL) {
+        SDL_SetRenderClipRect(tig_video_state.renderer, NULL);
+    }
+}
+
+void tig_video_composite_fill(int r, int g, int b, float alpha, const TigRect* dst, const TigRect* clip)
+{
+    if (dst == NULL) {
+        return;
+    }
+    if (clip != NULL) {
+        SDL_Rect cr = { clip->x, clip->y, clip->width, clip->height };
+        SDL_SetRenderClipRect(tig_video_state.renderer, &cr);
+    }
+    Uint8 a = alpha >= 1.0f ? 255 : (alpha <= 0.0f ? 0 : (Uint8)(alpha * 255.0f + 0.5f));
+    SDL_SetRenderDrawBlendMode(tig_video_state.renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(tig_video_state.renderer, (Uint8)r, (Uint8)g, (Uint8)b, a);
+    SDL_FRect d = { (float)dst->x, (float)dst->y, (float)dst->width, (float)dst->height };
+    SDL_RenderFillRect(tig_video_state.renderer, &d);
     if (clip != NULL) {
         SDL_SetRenderClipRect(tig_video_state.renderer, NULL);
     }
@@ -1653,7 +1717,7 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer)
 // stale dword_602DF0). reveal<255 (the brief entrance fade) renders at full tint
 // for now. Returns the mirror texture.
 SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
-    uint8_t threshold, uint8_t darken, uint32_t knockout_key)
+    uint8_t threshold, uint8_t darken, uint32_t knockout_key, uint8_t reveal)
 {
     if (video_buffer == NULL || video_buffer->surface == NULL) {
         return NULL;
@@ -1690,7 +1754,11 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
     // knockout_key == 0xFFFFFFFF means none.
     bool ko_active = (knockout_key != 0xFFFFFFFFu);
     uint32_t ko_rgb = knockout_key & 0x00FFFFFFu;
-    uint32_t darken_pixel = (uint32_t)darken << 24; // black at alpha=darken
+    // CE: reveal (0..255) is the tint fade modulator (driven by ui_anim on window
+    // entrance/exit and by dialog mode), matching the CPU tint's reveal. reveal=255
+    // -> full tint (near-black shows the darkened world); reveal=0 -> no tint (the
+    // near-black art stays OPAQUE, e.g. the dialog backdrop / the bar during exit).
+    uint32_t inv_reveal = 255u - reveal;
 
     void* dst_pixels = NULL;
     int dst_pitch = 0;
@@ -1718,7 +1786,14 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
             } else if ((uint8_t)(p >> 16) <= threshold
                 && (uint8_t)(p >> 8) <= threshold
                 && (uint8_t)p <= threshold) {
-                dp[x] = darken_pixel; // near-black -> darkened world beneath
+                // near-black: lerp by reveal between opaque art (reveal 0) and the
+                // darkened-world tint (reveal 255 -> alpha=darken, rgb=0). Endpoints
+                // are exact; the brief mid-fade art is slightly dim (acceptable).
+                uint32_t a = 255u - (uint32_t)(255u - darken) * reveal / 255u;
+                uint32_t rr = ((p >> 16) & 0xFFu) * inv_reveal / 255u;
+                uint32_t gg = ((p >> 8) & 0xFFu) * inv_reveal / 255u;
+                uint32_t bb = (p & 0xFFu) * inv_reveal / 255u;
+                dp[x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
             } else {
                 dp[x] = 0xFF000000u | rgb; // opaque art
             }

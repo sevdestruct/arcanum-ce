@@ -345,6 +345,10 @@ TigVideoBuffer* gamelib_scratch_video_buffer;
 static TigVideoBuffer* gamelib_world_video_buffer = NULL;
 static TigVideoBuffer* gamelib_iso_window_vb = NULL;
 static bool gamelib_zoom_world_pass_active = false;
+// CE (zoom->GPU): the original (zoom-1.0) iso content rect, stashed during the zoom
+// setup so gamelib_draw_game can compute the downscale crop+dst (it only sees the
+// active 2x region in gamelib_iso_content_rect during the pass).
+static TigRect gamelib_zoom_orig_content;
 
 // Zoom-out draw perf counter. See gamelib_zoom_perf_toggle().
 static bool gamelib_zoom_perf_enabled = false;
@@ -423,6 +427,17 @@ static uint64_t gamelib_zoom_perf_pass_roof_total_ns = 0;
 static uint64_t gamelib_zoom_perf_pass_roof_max_ns = 0;
 static int gamelib_zoom_perf_pass_samples = 0;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
+
+// CE (gpu-ui iso overlay port): composite the CPU iso overlays over the live GPU
+// world, in software draw order (bubbles, then floating text, then the dialogue
+// conversation on top). Registered with tig_video so the window walk invokes it at
+// the iso window's z-slot (over the world, under the UI windows).
+static void gamelib_iso_overlay_composite(void)
+{
+    tb_gpu_composite();
+    tf_gpu_composite();
+    tc_gpu_composite();
+}
 
 // 0x4020F0
 bool gamelib_init(GameInitInfo* init_info)
@@ -584,6 +599,11 @@ bool gamelib_init(GameInitInfo* init_info)
     }
 
     tig_window_vbid_get(init_info->iso_window_handle, &gamelib_iso_window_vb);
+
+    // CE (gpu-ui iso overlay port): register the GPU iso-overlay compositor so the
+    // window walk draws speech bubbles / floating text / dialogue directly over the
+    // live GPU world (the iso surface they normally blend into is bypassed in gpu-ui).
+    tig_video_set_iso_overlay_composite_func(gamelib_iso_overlay_composite);
 
     if (!init_info->editor) {
         TigVideoBufferCreateInfo world_vb_info;
@@ -1848,6 +1868,10 @@ bool gamelib_draw(void)
     zoom_active = (z != 1.0f)
         && (gamelib_world_video_buffer != NULL)
         && (gamelib_draw_func == gamelib_draw_game);
+    // CE (zoom->GPU): when gpu-ui is active, render the zoomed world on the GPU (into
+    // a 2x GPU target) and bilinear-downscale at present, instead of the CPU 2x VB +
+    // downscale-blit. false -> the existing CPU zoom path runs unchanged.
+    bool zoom_gpu = zoom_active && tile_gpu_zoom_is_enabled();
 
     // Start the zoom-active-total timer BEFORE the camera-move detection
     // block (which queues a full-invalidate on scroll). This captures the
@@ -1858,12 +1882,16 @@ bool gamelib_draw(void)
         perf_zoom_start_ns_outer = gamelib_zoom_perf_now_ns();
     }
 
-    // Phase A: world-VB content is built up across frames (we don't clear
-    // it). If zoom_active just turned on, OR the zoom level lerped this
-    // frame, OR the camera origin moved without a scroll-style invalidate,
-    // the world VB has stale or empty regions that partial-render alone
-    // won't refresh. Force a full screen invalidate in those cases so the
-    // dirty rect translation downstream produces a full world-VB rect.
+    // Phase A: the world target content is built up across frames (we don't clear
+    // it). This applies to the zoom 2x target AND -- since step 6 -- the persistent
+    // GPU present world target at zoom 1.0 (gpu-present / gpu-ui): both keep content
+    // frame-to-frame and are never re-uploaded. If zoom_active just turned on, OR the
+    // zoom level lerped, OR the camera origin moved, those targets have stale /
+    // misaligned regions that partial-render alone won't refresh -- the hardware
+    // scroll shifts only the CPU iso surface, not the GPU target. Force a full screen
+    // invalidate so the dirty-rect translation downstream produces a full world rect
+    // and the target re-renders fresh. Without this at zoom 1.0, walking left stale
+    // world pixels around the moving sprite -- visible as the fade roof reveals them.
     {
         static float gamelib_prev_zoom = 1.0f;
         static int64_t gamelib_prev_ox = 0;
@@ -1873,7 +1901,18 @@ bool gamelib_draw(void)
         location_origin_get(&cur_ox, &cur_oy);
         bool zoom_step = (z != gamelib_prev_zoom);
         bool camera_moved = (cur_ox != gamelib_prev_ox || cur_oy != gamelib_prev_oy);
-        if (zoom_active && (zoom_step || camera_moved)) {
+        bool gpu_zoom_active = zoom_active && tile_gpu_zoom_is_enabled();
+        // CE: GPU zoom renders the world+roofs into the persistent 2x zoom buffer, and
+        // fade roofs alpha-blend INTO it. A partial re-render lets that fade blend
+        // ACCUMULATE on un-redrawn pixels as the fade region tracks the walking PC (the
+        // camera has a follow deadzone, so it's often static while the PC moves) -- the
+        // streaks / "blit errors" under transparent roofs, at non-1.0 zoom only (at 1.0
+        // the roof is a fresh, fully re-rendered present-layer, so no accumulation).
+        // Force a full re-render EVERY GPU-zoom frame so the opaque world overwrites the
+        // previous roof before the new fade roof blends. The 1.0 present target (and the
+        // CPU zoom path) only need a full re-render on camera move / zoom step.
+        if (gpu_zoom_active
+            || ((zoom_active || tile_gpu_present_active()) && (zoom_step || camera_moved))) {
             gamelib_invalidate_rect(NULL);
         }
         gamelib_prev_zoom = z;
@@ -1898,6 +1937,7 @@ bool gamelib_draw(void)
     if (zoom_active) {
         orig_content_rect = gamelib_iso_content_rect;
         orig_content_rect_ex = gamelib_iso_content_rect_ex;
+        gamelib_zoom_orig_content = orig_content_rect; // for gamelib_draw_game (GPU zoom crop)
         location_origin_get(&orig_ox, &orig_oy);
         ww = orig_content_rect.width;
         wh = orig_content_rect.height;
@@ -1921,8 +1961,13 @@ bool gamelib_draw(void)
 
         location_origin_pixel_set(orig_ox + ww / 2, orig_oy + wh / 2);
 
-        tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_world_video_buffer);
-        tile_set_render_target(gamelib_world_video_buffer);
+        // CE (zoom->GPU): in GPU zoom the world renders into the 2x GPU target (bound
+        // by tile_gpu_zoom_begin), not the CPU 2x VB — so leave the iso window VB /
+        // render target alone.
+        if (!zoom_gpu) {
+            tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_world_video_buffer);
+            tile_set_render_target(gamelib_world_video_buffer);
+        }
 
         // Phase A: do NOT clear the world VB. Previous-frame pixels stay
         // valid as long as the camera hasn't moved (scrolling forces a
@@ -2026,8 +2071,12 @@ bool gamelib_draw(void)
             TigRect dst;
             TigVideoBufferBlitInfo blit = { 0 };
 
-            tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
-            tile_set_render_target(gamelib_iso_window_vb);
+            // CE (zoom->GPU): only the CPU zoom path swapped the iso VB / render
+            // target to the 2x CPU VB, so restore them only there.
+            if (!zoom_gpu) {
+                tig_window_set_video_buffer(gamelib_init_info.iso_window_handle, gamelib_iso_window_vb);
+                tile_set_render_target(gamelib_iso_window_vb);
+            }
             gamelib_iso_content_rect = orig_content_rect;
             gamelib_iso_content_rect_ex = orig_content_rect_ex;
             location_origin_pixel_set(orig_ox, orig_oy);
@@ -2064,7 +2113,12 @@ bool gamelib_draw(void)
             if (gamelib_zoom_perf_enabled) {
                 perf_blit_start_ns = gamelib_zoom_perf_now_ns();
             }
-            tig_video_buffer_blit(&blit);
+            // CE (zoom->GPU): the GPU path already registered the world underlay
+            // (centered crop -> bilinear downscale at present) in tile_gpu_zoom_end;
+            // only the CPU path does the downscale blit here.
+            if (!zoom_gpu) {
+                tig_video_buffer_blit(&blit);
+            }
 
             if (gamelib_zoom_perf_enabled) {
                 perf_frame_blit_ns = gamelib_zoom_perf_now_ns() - perf_blit_start_ns;
@@ -3745,7 +3799,13 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         // CE (feature/perf-gpu-accel): open the GPU world pass (upload + bind)
         // before tile, so tile and object both render onto the shared GPU
         // target. No-op in software mode.
-        tile_gpu_world_begin();
+        // CE (zoom->GPU): during zoom (gpu-ui) render the world + roofs into the 2x
+        // GPU zoom target instead; falls back to the normal pass if it can't open.
+        bool zoom_gpu_pass = gamelib_zoom_world_pass_active && tile_gpu_zoom_is_enabled();
+        bool zoom_pass_open = zoom_gpu_pass && tile_gpu_zoom_begin();
+        if (!zoom_pass_open) {
+            tile_gpu_world_begin();
+        }
         tile_draw(draw_info);
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
@@ -3765,24 +3825,42 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         // read the GPU target (tiles + objects) back to the CPU surface so the UI
         // passes see the expected pixels (non-present modes). In gpu-present the
         // readback is skipped and roofs draw onto their own present-layer texture.
-        tile_gpu_world_end();
-        // CE (step 6): roof present-layer. In gpu-present, render ALL visible roofs
-        // onto a cleared roof texture (full re-render -> no partial-redraw tearing),
-        // composited between the world and the UI at flip. Otherwise roofs draw the
-        // normal (software) way.
-        if (tile_gpu_world_roof_begin()) {
-            TigRect roof_iso_rect;
-            gamelib_get_iso_content_rect(&roof_iso_rect);
-            TigRectListNode roof_full_node;
-            roof_full_node.rect = roof_iso_rect;
-            roof_full_node.next = NULL;
-            TigRectListNode* roof_full_head = &roof_full_node;
-            GameDrawInfo roof_draw_info = *draw_info;
-            roof_draw_info.rects = &roof_full_head;
-            roof_draw(&roof_draw_info);
-            tile_gpu_world_roof_end();
-        } else {
+        if (zoom_pass_open) {
+            // CE (zoom->GPU): roofs render into the SAME 2x zoom target (the pass is
+            // still open) so they downscale together with the world -- mirroring the
+            // CPU zoom (roofs in the same 2x VB, one downscale). Then close the pass
+            // and register the underlay: centered crop -> bilinear downscale to the
+            // iso rect. (The roof full-re-render trick isn't needed: zoom already
+            // does Phase-A incremental + full-invalidate-on-move for the whole frame.)
             roof_draw(draw_info);
+            float zf = iso_zoom_current();
+            int zw = gamelib_zoom_orig_content.width;
+            int zh = gamelib_zoom_orig_content.height;
+            int sw = (int)roundf((float)zw / zf);
+            int sh = (int)roundf((float)zh / zf);
+            TigRect zsrc = { zw - sw / 2, zh - sh / 2, sw, sh };
+            TigRect zdst = { 0, 0, zw, zh };
+            tile_gpu_zoom_end(&zdst, &zsrc, zf < 1.0f);
+        } else {
+            tile_gpu_world_end();
+            // CE (step 6): roof present-layer. In gpu-present, render ALL visible roofs
+            // onto a cleared roof texture (full re-render -> no partial-redraw tearing),
+            // composited between the world and the UI at flip. Otherwise roofs draw the
+            // normal (software) way.
+            if (tile_gpu_world_roof_begin()) {
+                TigRect roof_iso_rect;
+                gamelib_get_iso_content_rect(&roof_iso_rect);
+                TigRectListNode roof_full_node;
+                roof_full_node.rect = roof_iso_rect;
+                roof_full_node.next = NULL;
+                TigRectListNode* roof_full_head = &roof_full_node;
+                GameDrawInfo roof_draw_info = *draw_info;
+                roof_draw_info.rects = &roof_full_head;
+                roof_draw(&roof_draw_info);
+                tile_gpu_world_roof_end();
+            } else {
+                roof_draw(draw_info);
+            }
         }
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
@@ -3791,9 +3869,16 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
             gamelib_zoom_perf_pass_samples++;
         }
         if (!gamelib_zoom_world_pass_active) {
-            tb_draw(draw_info);
-            tf_draw(draw_info);
-            tc_draw(draw_info);
+            // CE (gpu-ui iso overlay port): in gpu-ui these CPU overlays composite over
+            // the LIVE GPU world via the window walk (gamelib_iso_overlay_composite), so
+            // skip the legacy draws into the iso surface -- it's bypassed (the world is
+            // on the GPU, no readback), so they'd be invisible. software / gpu-present
+            // still draw them the normal way (world IS in the surface there).
+            if (!tile_gpu_iso_overlay_path()) {
+                tb_draw(draw_info);
+                tf_draw(draw_info);
+                tc_draw(draw_info);
+            }
         }
         tig_video_3d_end_scene();
     }

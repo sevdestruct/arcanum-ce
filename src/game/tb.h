@@ -23,6 +23,7 @@ void tb_map_close(void);
 void tb_toggle(void);
 void tb_ping(tig_timestamp_t time);
 void tb_draw(GameDrawInfo* draw_info);
+void tb_gpu_composite(void);
 void tb_add(int64_t obj, int type, const char* str);
 void tb_expire_in(int64_t obj, int seconds);
 void tb_notify_moved(int64_t obj, int64_t loc, int offset_x, int offset_y);

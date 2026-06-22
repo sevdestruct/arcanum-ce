@@ -7,6 +7,7 @@ bool tc_init(GameInitInfo* init_info);
 void tc_exit(void);
 void tc_resize(GameResizeInfo* resize_info);
 void tc_draw(GameDrawInfo* draw_info);
+void tc_gpu_composite(void);
 void tc_scroll(int dx, int dy);
 void tc_show(void);
 void tc_hide(void);

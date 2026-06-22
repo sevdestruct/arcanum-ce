@@ -8956,6 +8956,14 @@ static void intgame_big_window_teardown(void)
 {
     tig_window_button_destroy(intgame_big_window_handle);
     tig_window_message_filter_set(intgame_big_window_handle, intgame_big_window_message_filter);
+    // CE (gpu-ui): reset the translucent-black tint + world-knockout HERE, after the
+    // exit animation has settled -- not in the per-caller close. Disabling them before
+    // the exit made the gpu-ui walk fall back to the regular mirror, which renders the
+    // near-black backdrop OPAQUE (a one-frame black flash at the start of the close)
+    // and the knockout key opaque. Deferring keeps the close translucent; the shared
+    // window is still reset opaque for the next big-window user.
+    intgame_apply_translucent_black(intgame_big_window_handle, false);
+    intgame_apply_world_knockout(intgame_big_window_handle, false);
     tig_window_hide(intgame_big_window_handle);
 }
 

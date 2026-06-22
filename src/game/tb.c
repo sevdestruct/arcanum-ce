@@ -660,6 +660,63 @@ void tb_draw(GameDrawInfo* draw_info)
     }
 }
 
+// CE (gpu-ui iso overlay port): composite each active bubble directly over the live
+// GPU world at its fade alpha. Replaces tb_draw's blend-into-the-iso-surface (which
+// is bypassed when the world renders on the GPU). Called by the iso overlay composite
+// callback at the iso z-slot. Each bubble VB is blue-keyed, so its GPU mirror keys
+// the background transparent and the bubble fades against the real GPU world — same
+// visual result as tb_draw, just over the GPU world instead of the CPU surface.
+void tb_gpu_composite(void)
+{
+    int idx;
+    TigRect rects[MAX_TEXT_BUBBLES];
+    int anchor_ys[MAX_TEXT_BUBBLES];
+    TextBubblePlacementFlags placement_flags[MAX_TEXT_BUBBLES];
+
+    if (!tb_enabled) {
+        return;
+    }
+    if (tb_view_options.type != VIEW_TYPE_ISOMETRIC) {
+        return;
+    }
+
+    tb_collect_resolved_rects(rects, anchor_ys, placement_flags);
+
+    for (idx = 0; idx < MAX_TEXT_BUBBLES; idx++) {
+        tb_prev_resolved[idx] = rects[idx];
+
+        if ((tb_text_bubbles[idx].flags & TEXT_BUBBLE_IN_USE) == 0) {
+            continue;
+        }
+
+        TigRect* tb_rect = &rects[idx];
+        if (tb_rect->width == 0 || tb_rect->height == 0) {
+            continue;
+        }
+
+        int a = tb_alpha[idx];
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        if (a == 0) {
+            continue;
+        }
+
+        SDL_Texture* tex = tig_video_buffer_gpu_mirror_sync(tb_text_bubbles[idx].video_buffer);
+        if (tex == NULL) {
+            continue;
+        }
+
+        // src: the bubble's content within its VB; dst: the resolved screen rect.
+        TigRect src;
+        src.x = tb_text_bubbles[idx].rect.x;
+        src.y = tb_text_bubbles[idx].rect.y;
+        src.width = tb_rect->width;
+        src.height = tb_rect->height;
+
+        tig_video_composite_ui_texture(tex, &src, tb_rect, (float)a / 255.0f, NULL);
+    }
+}
+
 /**
  * Adds a new text bubble for a game object.
  *

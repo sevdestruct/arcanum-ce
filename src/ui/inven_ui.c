@@ -1169,10 +1169,9 @@ void inven_ui_destroy(void)
 
     intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
     inven_ui_target_inventory_scrollbar_destroy();
-    // CE: drop the near-black alpha before unlocking so the next
-    // big-window user (e.g. worldmap) starts opaque.
-    intgame_apply_translucent_black(inven_ui_window_handle, false);
-    // CE: animated close (scale+fade out, gracefully interruptible).
+    // CE: animated close (scale+fade out, gracefully interruptible). The near-black
+    // tint is reset in the big-window teardown AFTER the exit settles -- dropping it
+    // here (before the exit) made gpu-ui flash one opaque-black frame on close.
     intgame_big_window_close_animated();
     iso_interface_refresh();
     mode = intgame_mode_get();

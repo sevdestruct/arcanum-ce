@@ -58,6 +58,26 @@ void tile_gpu_world_end(void);
 bool tile_gpu_world_roof_begin(void);
 void tile_gpu_world_roof_end(void);
 
+// CE (zoom->GPU): the zoomed-world GPU pass (gpu-ui only). tile_gpu_zoom_is_enabled
+// reports whether zoom should render on the GPU (and ensures the 2x target).
+// begin binds the 2x target (world + roofs render into it via the dispatch); end
+// registers it as the world underlay with the centered crop (src) bilinear-
+// downscaled (linear) to the iso rect (dst). Returns false -> CPU zoom fallback.
+bool tile_gpu_zoom_is_enabled(void);
+bool tile_gpu_zoom_begin(void);
+void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool linear);
+
+// CE (gpu-ui iso overlay port): true when CPU iso overlays (speech bubbles, floating
+// text, dialogue) composite over the GPU world via the window walk (gpu-ui active).
+// gamelib skips the legacy iso-surface overlay draws when this is true.
+bool tile_gpu_iso_overlay_path(void);
+
+// CE (gpu present): true when the GPU world target is the persistent present-time
+// target (gpu-present / gpu-ui, outside the zoom pass). gamelib forces a full world
+// re-render on camera move when this is set, since the persistent target isn't
+// re-uploaded per frame and would otherwise go stale/misaligned on scroll.
+bool tile_gpu_present_active(void);
+
 // CE (feature/perf-gpu-accel): true when the GPU world path is selected, so
 // object_draw emits COLOR_CONST lighting (the hardware path) for GPU tinting.
 bool tile_gpu_world_lighting(void);

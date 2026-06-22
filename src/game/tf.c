@@ -339,6 +339,13 @@ int tf_level_get(void)
     return tf_level;
 }
 
+// CE (gpu-ui iso overlay layer): true when any floating text is on screen, so the
+// renderer knows to composite the iso overlay layer over the GPU world.
+bool tf_any_active(void)
+{
+    return tf_list_head != NULL;
+}
+
 /**
  * Called every frame.
  *
@@ -509,6 +516,53 @@ void tf_draw(GameDrawInfo* draw_info)
                 // Blit the affected entry rect to the window.
                 tig_window_blit(&window_blit_info);
             }
+        }
+    }
+}
+
+// CE (gpu-ui iso overlay port): composite each active floater directly over the live
+// GPU world at its opacity. Replaces tf_draw's blend-into-the-iso-surface (bypassed
+// when the world is on the GPU). Called by the iso overlay composite callback at the
+// iso z-slot. Each floater VB is color-keyed, so its GPU mirror keys the background
+// transparent and the floater fades against the real GPU world. The walk recomposites
+// fresh each frame, so there are no dirty rects -- every active entry is drawn.
+void tf_gpu_composite(void)
+{
+    TextFloaterList* list;
+    TextFloaterEntry* entry;
+    TigRect list_rect;
+    TigRect entry_rect;
+    TigRect src_rect;
+
+    if (tf_level == TF_LEVEL_NEVER) {
+        return;
+    }
+    if (text_floater_view_options.type != VIEW_TYPE_ISOMETRIC) {
+        return;
+    }
+
+    for (list = tf_list_head; list != NULL; list = list->next) {
+        tf_list_get_rect(list, &list_rect);
+
+        for (entry = list->head; entry != NULL; entry = entry->next) {
+            tf_entry_get_rect_constrained_to(&list_rect, entry, &entry_rect);
+
+            if (entry_rect.width == 0 || entry_rect.height == 0) {
+                continue;
+            }
+
+            SDL_Texture* tex = tig_video_buffer_gpu_mirror_sync(entry->video_buffer);
+            if (tex == NULL) {
+                continue;
+            }
+
+            src_rect.x = 0;
+            src_rect.y = 0;
+            src_rect.width = entry_rect.width;
+            src_rect.height = entry_rect.height;
+
+            tig_video_composite_ui_texture(tex, &src_rect, &entry_rect,
+                (float)entry->opacity / 255.0f, NULL);
         }
     }
 }

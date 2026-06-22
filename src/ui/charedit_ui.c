@@ -1400,7 +1400,8 @@ void charedit_close(void)
             object_hp_damage_set(charedit_obj, 0);
             critter_fatigue_damage_set(charedit_obj, 0);
         }
-        intgame_apply_translucent_black(charedit_window_handle, false);
+        // CE: near-black tint reset deferred to the big-window teardown (after the
+        // exit settles) -- dropping it here flashed one opaque-black frame in gpu-ui.
         // CE: animated close. The parent (big window) scales+fades out via
         // close_animated; the active subwindow plays the same exit and
         // hides all four on settle (deferred so the panel doesn't vanish

@@ -924,3 +924,51 @@ void tc_render_internal(TigRectListNode* node)
         tmp_head = tmp_node;
     }
 }
+
+// CE (gpu-ui iso overlay port): recreate the dialogue conversation directly over the
+// live GPU world. tc_render_internal darkens the world by READING it out of the iso
+// surface (MUL 128 ~= 50% retain) then lays the choices text over it -- but in gpu-ui
+// the world is on the GPU, not in the surface, so that read finds nothing. Instead:
+//   1. darken the GPU world behind the choices with a translucent-black fill (black @
+//      0.5 BLEND == world*0.5, the same visual amount as the MUL-128 tint), and
+//   2. composite the choices text (tc_scratch_video_buffer, black-keyed) over it.
+// Called by the iso overlay composite callback at the iso z-slot. (The cosmetic
+// corner chamfer from tc_render_internal is omitted -- square corners.)
+void tc_gpu_composite(void)
+{
+    if (tc_editor) {
+        return;
+    }
+    if (!tc_active) {
+        return;
+    }
+
+    // Chamfered darken: skip a 3-2-1 stair-step at each corner so the world shows
+    // through there (rounded corners) -- mirrors tc_render_internal's corner un-tint.
+    static const int corner_chamfer[] = { 3, 2, 1 };
+    int n_chamfer = (int)(sizeof(corner_chamfer) / sizeof(corner_chamfer[0]));
+    const TigRect r = tc_content_rect;
+    if (r.width > 2 * n_chamfer && r.height > 2 * n_chamfer) {
+        TigRect body = { r.x, r.y + n_chamfer, r.width, r.height - 2 * n_chamfer };
+        tig_video_composite_fill(0, 0, 0, 0.5f, &body, NULL);
+        for (int i = 0; i < n_chamfer; i++) {
+            int inset = corner_chamfer[i];
+            TigRect top = { r.x + inset, r.y + i, r.width - 2 * inset, 1 };
+            TigRect bot = { r.x + inset, r.y + r.height - 1 - i, r.width - 2 * inset, 1 };
+            tig_video_composite_fill(0, 0, 0, 0.5f, &top, NULL);
+            tig_video_composite_fill(0, 0, 0, 0.5f, &bot, NULL);
+        }
+    } else {
+        tig_video_composite_fill(0, 0, 0, 0.5f, &r, NULL);
+    }
+
+    SDL_Texture* tex = tig_video_buffer_gpu_mirror_sync(tc_scratch_video_buffer);
+    if (tex != NULL) {
+        TigRect src;
+        src.x = 0;
+        src.y = 0;
+        src.width = tc_content_rect.width;
+        src.height = tc_content_rect.height;
+        tig_video_composite_ui_texture(tex, &src, &tc_content_rect, 1.0f, NULL);
+    }
+}

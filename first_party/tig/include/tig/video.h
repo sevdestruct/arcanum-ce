@@ -150,7 +150,10 @@ void tig_video_display_fps(void);
 // dst_rect (NULL = full target), then the ARGB framebuffer alpha-blends on top so
 // transparent iso-region pixels reveal the world. One frame only; re-register each
 // frame; texture=NULL clears.
-void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect);
+// CE (zoom->GPU): src_rect = optional source sub-rect to sample (the centered crop
+// when zoomed; NULL = whole texture); linear = bilinear sampling (downscale). Zoom
+// 1.0 / non-zoom pass (dst, NULL, false).
+void tig_video_set_world_underlay(SDL_Texture* texture, const TigRect* dst_rect, const TigRect* src_rect, bool linear);
 
 // CE (step 6): fill a screen-surface rect with transparent (alpha 0).
 void tig_video_fill_transparent(const TigRect* rect);
@@ -170,7 +173,7 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer);
 // (world darkened by `darken`); colorkey -> transparent, else opaque art.
 // A tint window may also be knocked-out (custom shape) — pass knockout_key, or
 // 0xFFFFFFFF for none.
-SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer, uint8_t threshold, uint8_t darken, uint32_t knockout_key);
+SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer, uint8_t threshold, uint8_t darken, uint32_t knockout_key, uint8_t reveal);
 
 // CE (full GPU/UI stage 2): knockout-aware mirror sync for custom-shaped windows —
 // colorkey AND knockout_key pixels become transparent so the walk reveals beneath.
@@ -199,6 +202,21 @@ void tig_video_composite_ui_texture(SDL_Texture* tex, const TigRect* src, const 
 // rects. Called by the gpu-ui window walk at the iso window's z-slot so the world
 // respects the iso window's visibility (no draw when the iso window is hidden).
 void tig_video_draw_world_roof_underlay(void);
+
+// CE (gpu-ui iso overlay port): callback that composites the CPU iso overlays
+// (speech bubbles, floating text, dialogue backdrop) directly over the LIVE GPU
+// world. The window walk calls it at the iso window's z-slot (right after the
+// world+roof underlay, before the UI windows) so overlays land over the world and
+// under the UI, fading against / darkening the real GPU world instead of the
+// bypassed CPU iso surface. Registered by the game (gamelib).
+typedef void (*TigIsoOverlayCompositeFunc)(void);
+void tig_video_set_iso_overlay_composite_func(TigIsoOverlayCompositeFunc func);
+void tig_video_iso_overlay_composite(void);
+
+// CE (gpu-ui iso overlay port): fill dst with a solid color at `alpha` (0..1) over
+// the current render target (BLEND). Used to recreate the dialogue backdrop's
+// translucent-black darken over the GPU world. clip=NULL for none.
+void tig_video_composite_fill(int r, int g, int b, float alpha, const TigRect* dst, const TigRect* clip);
 
 int tig_video_blit(TigVideoBuffer* src_video_buffer, TigRect* src_rect, TigRect* dst_rect);
 

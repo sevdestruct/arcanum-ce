@@ -1486,8 +1486,9 @@ void wmap_ui_close(void)
         intgame_pc_lens_do(PC_LENS_MODE_NONE, NULL);
         ambient_lighting_enable();
         intgame_button_destroy(&wmap_ui_navigate_button_info);
-        intgame_apply_translucent_black(wmap_ui_window, false);
-        intgame_apply_world_knockout(wmap_ui_window, false);
+        // CE: near-black tint + world-knockout reset deferred to the big-window
+        // teardown (after the exit settles) -- dropping them here (before the exit)
+        // flashed one opaque-black / opaque-magenta frame on close in gpu-ui.
         // CE: animated close (scale+fade out, gracefully interruptible).
         intgame_big_window_close_animated();
 

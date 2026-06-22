@@ -1148,6 +1148,12 @@ static void tig_window_gpu_composite(void)
             // startup) shows no world — matching software's compositor, which only
             // blits a window when it's shown. Fixes the startup world flash.
             tig_video_draw_world_roof_underlay();
+            // CE (gpu-ui iso overlay port): composite the CPU iso overlays (speech
+            // bubbles, floating text, dialogue backdrop) directly over the live GPU
+            // world just drawn, at the iso z-slot (over world, under UI). They fade
+            // against / darken the real GPU world (the bypassed CPU iso surface has
+            // no world). Self-gating + cheap when nothing is on screen.
+            tig_video_iso_overlay_composite();
             continue;
         }
         if (win->video_buffer == NULL) {
@@ -1184,8 +1190,15 @@ static void tig_window_gpu_composite(void)
         if (win->tint_enabled) {
             uint32_t ko = win->knockout_enabled
                 ? (uint32_t)win->knockout_key : 0xFFFFFFFFu;
+            // CE: pass the tint reveal (fade modulator, driven by ui_anim on
+            // entrance/exit and by dialog mode) so the GPU tint fades like the CPU
+            // tint instead of being frozen at full.
+            float rv = win->tint_reveal;
+            if (rv < 0.0f) rv = 0.0f;
+            if (rv > 1.0f) rv = 1.0f;
+            uint8_t rev = (uint8_t)(rv * 255.0f + 0.5f);
             tex = tig_video_buffer_gpu_tint_mirror_sync(win->video_buffer,
-                win->tint_threshold, win->tint_r, ko);
+                win->tint_threshold, win->tint_r, ko, rev);
         } else if (win->knockout_enabled) {
             tex = tig_video_buffer_gpu_knockout_mirror_sync(win->video_buffer,
                 (uint32_t)win->knockout_key);
