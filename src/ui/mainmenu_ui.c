@@ -2759,8 +2759,27 @@ bool mainmenu_ui_load_game_execute(int btn)
 
     (void)btn;
 
+    // CE: a queued mouse-up — the second click of a rapid double-click, or
+    // input buffered during the multi-second load of the previous save —
+    // can dispatch here AFTER an earlier load already completed and tore the
+    // Load Game menu down. Teardown runs the window's exit_func
+    // (mainmenu_ui_load_game_destroy -> gamelib_savelist_destroy), which
+    // frees mainmenu_ui_gsl.names and zeroes count, while the menu window
+    // lingers ~260ms through its exit animation so the stale event still
+    // reaches us. window->selected_index survives in the static window
+    // struct and is non-negative, so the legacy `index == -1` check passes —
+    // and mainmenu_ui_gsl.names[index] then dereferences the freed NULL array
+    // (faulting at names(NULL) + index*8). Same class as commit aa876684:
+    // bail when the menu is gone, or when the selection is out of range for
+    // the current list.
+    if (mainmenu_ui_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return false;
+    }
+
     index = main_menu_window_info[mainmenu_ui_window_type]->selected_index;
-    if (index == -1) {
+    if (index < 0
+        || mainmenu_ui_gsl.names == NULL
+        || (unsigned int)index >= mainmenu_ui_gsl.count) {
         return false;
     }
 
@@ -2846,6 +2865,17 @@ void mainmenu_ui_load_game_mouse_up(int x, int y)
     bool double_click;
 
     (void)x;
+
+    // CE: ignore clicks once the Load Game menu has begun tearing down. The
+    // window lingers ~260ms through its exit animation (handle already
+    // INVALID) but queued mouse-ups still dispatch here — and the savelist
+    // they index (mainmenu_ui_gsl) has already been freed by the window's
+    // exit_func, so selecting a row (sub_542560) or confirming it (sub_5480C0
+    // -> mainmenu_ui_load_game_execute) would deref a NULL names array. Same
+    // guard idiom as mainmenu_ui_load_game_refresh.
+    if (mainmenu_ui_window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
 
     window = main_menu_window_info[mainmenu_ui_window_type];
     row = window->top_index + y / 20;
