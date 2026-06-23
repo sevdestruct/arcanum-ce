@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tig/art.h"
@@ -14,7 +15,15 @@
 
 #define TIG_ART_GPU_CACHE_NUM_BUCKETS 512u  // power of two
 #define TIG_ART_GPU_CACHE_BUCKET_MASK (TIG_ART_GPU_CACHE_NUM_BUCKETS - 1u)
-#define TIG_ART_GPU_CACHE_DEFAULT_BUDGET ((size_t)12 * 1024 * 1024)
+// CE (perf): 96 MB. The original 12 MB thrashed at zoom-out (a z=0.5 view's ~600-880-sprite
+// working set, ~40-60MB, didn't fit -> constant LRU re-upload, 120-166ms stutters). But 256 MB
+// OVERSHOT and REGRESSED z=1.0: a full-re-render scroll around big building facades references
+// hundreds of large textures from a huge resident set every frame, and on a tiled GPU (Apple
+// Silicon) the per-frame residency/resolve cost -- plus any mid-batch SDL_DestroyTexture
+// eviction sync -- scales with the resident set, pushing iso_redraw to 60-120ms ("dogshit"
+// scroll at z=1.0). 96 MB holds the zoom-out working set (no thrash) while keeping the resident
+// set small enough to avoid the z=1.0 cost. Override live with ARCANUM_ART_CACHE_MB to A/B.
+#define TIG_ART_GPU_CACHE_DEFAULT_BUDGET ((size_t)96 * 1024 * 1024)
 
 typedef struct TigArtGpuCacheEntry {
     tig_art_id_t art_id;
@@ -117,6 +126,17 @@ static void tig_art_gpu_cache_make_room(size_t incoming_bytes)
 
 bool tig_art_gpu_cache_init(size_t budget_bytes)
 {
+    if (budget_bytes == 0) {
+        // CE (perf): live A/B override so the budget can be tuned without a rebuild while
+        // we lock the z=1.0-vs-zoom-out sweet spot. e.g. ARCANUM_ART_CACHE_MB=64.
+        const char* env = getenv("ARCANUM_ART_CACHE_MB");
+        if (env != NULL) {
+            long mb = strtol(env, NULL, 10);
+            if (mb > 0) {
+                budget_bytes = (size_t)mb * 1024 * 1024;
+            }
+        }
+    }
     if (budget_bytes == 0) {
         budget_bytes = TIG_ART_GPU_CACHE_DEFAULT_BUDGET;
     }

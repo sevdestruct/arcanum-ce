@@ -163,8 +163,9 @@
 //                          remove it by moving those passes to the GPU
 //                          target too.
 // Re-read at the top of each tile_draw_iso call so the user can flip the
-// flag in arcanum.cfg between runs without restarting.
-#define TILE_RENDER_PATH_KEY "tile render path"
+// flag in arcanum.cfg between runs without restarting. The path is now whole-
+// pipeline (world + roofs + UI), not tile-specific, so the key is just "render path".
+#define RENDER_PATH_KEY "render path"
 // User-facing render paths: software (CPU) vs hardware (the full GPU + GPU-UI path).
 #define TILE_RENDER_PATH_SOFTWARE "software"
 // hardware: world + roofs + zoom render on the GPU and present directly at flip (no
@@ -173,8 +174,7 @@
 #define TILE_RENDER_PATH_HARDWARE "hardware"
 
 // Debug-only intermediate paths -- kept for diagnostics, NOT exposed as user options
-// (may be dropped later). The pre-rename config values "gpu" / "gpu-present" / "gpu-ui"
-// are still accepted as aliases (see tile_render_path_canon in tile.c).
+// (may be dropped later).
 //
 // debug-gpu-readback: world blits run on the GPU but are READ BACK to the CPU surface
 // (the original "bridge" -- net-slower than presenting). Its remaining use is the A/B

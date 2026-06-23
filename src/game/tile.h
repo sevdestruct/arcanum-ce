@@ -72,6 +72,11 @@ bool tile_gpu_zoom_begin(void);
 bool tile_gpu_zoom_roof_begin(void);
 void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool linear);
 
+// CE (zoom idle-time preload): warm the GPU zoom render targets off-screen (once) so
+// the first real zoom doesn't pay the driver's one-time first-render pipeline setup
+// (~70ms). Self-gating no-op until the hardware zoom path is ready; call per-frame.
+void tile_gpu_zoom_prewarm(void);
+
 // CE (gpu-ui iso overlay port): true when CPU iso overlays (speech bubbles, floating
 // text, dialogue) composite over the GPU world via the window walk (gpu-ui active).
 // gamelib skips the legacy iso-surface overlay draws when this is true.

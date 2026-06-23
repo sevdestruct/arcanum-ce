@@ -2,6 +2,7 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if SDL_PLATFORM_MACOS
 #include <objc/message.h>
@@ -47,6 +48,21 @@ typedef struct TigVideoBuffer {
     SDL_Texture* gpu_mirror;
     int gpu_mirror_w;
     int gpu_mirror_h;
+    // CE (perf §6A): per-window mirror dirty-gate. Every surface mutator sets
+    // gpu_mirror_dirty; a sync that actually re-uploads clears it. Lets the gpu-ui
+    // compositor SKIP the per-pixel lock+convert+upload for static windows (HUD chrome,
+    // steady tint bar, idle panels) -- the deferred win_display TODO. variant tags which
+    // sync built the current mirror (plain/tint/knockout share one texture but write
+    // different pixels), so a mode flip on an unchanged surface still forces a rebuild;
+    // the tint signature caches (threshold,darken,reveal,ko) so only a real param change
+    // re-syncs. Starts dirty so the first sync uploads.
+    bool gpu_mirror_dirty;
+    uint8_t gpu_mirror_variant; // 0=none/plain, 1=tint, 2=knockout
+    uint8_t gpu_mirror_tint_threshold;
+    uint8_t gpu_mirror_tint_darken;
+    uint8_t gpu_mirror_tint_reveal;
+    uint32_t gpu_mirror_tint_ko; // tint variant's knockout_key, 0xFFFFFFFF == none
+    uint32_t gpu_mirror_ko_key;  // knockout variant's key
 } TigVideoBuffer;
 
 // CE: Phase 1 GPU buffer helper. The TIG_VIDEO_BUFFER_TEXTURE runtime flag
@@ -1657,6 +1673,13 @@ int tig_video_buffer_create(TigVideoBufferCreateInfo* vb_create_info, TigVideoBu
     video_buffer->gpu_mirror = NULL;
     video_buffer->gpu_mirror_w = 0;
     video_buffer->gpu_mirror_h = 0;
+    video_buffer->gpu_mirror_dirty = true; // first sync must upload
+    video_buffer->gpu_mirror_variant = 0;
+    video_buffer->gpu_mirror_tint_threshold = 0;
+    video_buffer->gpu_mirror_tint_darken = 0;
+    video_buffer->gpu_mirror_tint_reveal = 0;
+    video_buffer->gpu_mirror_tint_ko = 0xFFFFFFFFu;
+    video_buffer->gpu_mirror_ko_key = 0xFFFFFFFFu;
 
     return TIG_OK;
 }
@@ -1676,6 +1699,16 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer)
     int h = surface->h;
     if (w <= 0 || h <= 0) {
         return NULL;
+    }
+
+    // §6A: reuse the cached mirror if it exists at the right size, is clean, and was
+    // built by this (plain) variant -- skips the lock + per-pixel convert + upload.
+    if (video_buffer->gpu_mirror != NULL
+        && video_buffer->gpu_mirror_w == w
+        && video_buffer->gpu_mirror_h == h
+        && !video_buffer->gpu_mirror_dirty
+        && video_buffer->gpu_mirror_variant == 0) {
+        return video_buffer->gpu_mirror;
     }
 
     if (video_buffer->gpu_mirror == NULL
@@ -1730,6 +1763,8 @@ SDL_Texture* tig_video_buffer_gpu_mirror_sync(TigVideoBuffer* video_buffer)
 
     SDL_UnlockSurface(surface);
     SDL_UnlockTexture(video_buffer->gpu_mirror);
+    video_buffer->gpu_mirror_dirty = false; // §6A: clear ONLY after a successful upload
+    video_buffer->gpu_mirror_variant = 0;
     return video_buffer->gpu_mirror;
 }
 
@@ -1753,6 +1788,24 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
     int h = surface->h;
     if (w <= 0 || h <= 0) {
         return NULL;
+    }
+
+    // §6A: reuse the cached mirror only if clean, same size, built by the tint variant,
+    // AND every tint param matches (a param change with no pixel change still needs a
+    // re-sync). The HUD bar sits at reveal=255 every frame -> once clean, the whole
+    // lock+loop+upload is skipped; entrance/exit fades change reveal -> re-sync each
+    // fade frame (intended). The tint loop reads ONLY the surface (not the live world),
+    // so a clean mirror stays valid as the world moves -- safe to cache.
+    if (video_buffer->gpu_mirror != NULL
+        && video_buffer->gpu_mirror_w == w
+        && video_buffer->gpu_mirror_h == h
+        && !video_buffer->gpu_mirror_dirty
+        && video_buffer->gpu_mirror_variant == 1
+        && video_buffer->gpu_mirror_tint_threshold == threshold
+        && video_buffer->gpu_mirror_tint_darken == darken
+        && video_buffer->gpu_mirror_tint_reveal == reveal
+        && video_buffer->gpu_mirror_tint_ko == knockout_key) {
+        return video_buffer->gpu_mirror;
     }
 
     if (video_buffer->gpu_mirror == NULL
@@ -1838,6 +1891,12 @@ SDL_Texture* tig_video_buffer_gpu_tint_mirror_sync(TigVideoBuffer* video_buffer,
 
     SDL_UnlockSurface(surface);
     SDL_UnlockTexture(video_buffer->gpu_mirror);
+    video_buffer->gpu_mirror_dirty = false; // §6A: clear ONLY after a successful upload
+    video_buffer->gpu_mirror_variant = 1;
+    video_buffer->gpu_mirror_tint_threshold = threshold;
+    video_buffer->gpu_mirror_tint_darken = darken;
+    video_buffer->gpu_mirror_tint_reveal = reveal;
+    video_buffer->gpu_mirror_tint_ko = knockout_key;
     return video_buffer->gpu_mirror;
 }
 
@@ -1857,6 +1916,17 @@ SDL_Texture* tig_video_buffer_gpu_knockout_mirror_sync(TigVideoBuffer* video_buf
     int h = surface->h;
     if (w <= 0 || h <= 0) {
         return NULL;
+    }
+
+    // §6A: reuse the cached mirror if clean, same size, built by the knockout variant,
+    // and the same knockout key.
+    if (video_buffer->gpu_mirror != NULL
+        && video_buffer->gpu_mirror_w == w
+        && video_buffer->gpu_mirror_h == h
+        && !video_buffer->gpu_mirror_dirty
+        && video_buffer->gpu_mirror_variant == 2
+        && video_buffer->gpu_mirror_ko_key == knockout_key) {
+        return video_buffer->gpu_mirror;
     }
 
     if (video_buffer->gpu_mirror == NULL
@@ -1910,6 +1980,9 @@ SDL_Texture* tig_video_buffer_gpu_knockout_mirror_sync(TigVideoBuffer* video_buf
 
     SDL_UnlockSurface(surface);
     SDL_UnlockTexture(video_buffer->gpu_mirror);
+    video_buffer->gpu_mirror_dirty = false; // §6A: clear ONLY after a successful upload
+    video_buffer->gpu_mirror_variant = 2;
+    video_buffer->gpu_mirror_ko_key = knockout_key;
     return video_buffer->gpu_mirror;
 }
 
@@ -1989,6 +2062,7 @@ int tig_video_buffer_set_color_key(TigVideoBuffer* video_buffer, int color_key)
 
     video_buffer->flags |= TIG_VIDEO_BUFFER_COLOR_KEY;
     video_buffer->color_key = color_key;
+    video_buffer->gpu_mirror_dirty = true; // §6A: colorkey->alpha mapping changed
 
     return TIG_OK;
 }
@@ -2029,6 +2103,13 @@ int tig_video_buffer_unlock(TigVideoBuffer* video_buffer)
     if (video_buffer->lock_count == 1) {
         SDL_UnlockSurface(video_buffer->surface);
         video_buffer->flags &= ~TIG_VIDEO_BUFFER_LOCKED;
+        // §6A: universal choke point -- every locked raw-pixel writer (line/tint/
+        // replace_near_black + all external lock+pixels writers across the tree)
+        // releases here. A lock implies write intent; a spurious dirty costs one
+        // upload, a missed one costs a stale frame, so flag unconditionally on the
+        // final release. (The mirror syncs use SDL_LockSurface directly, NOT this
+        // wrapper, so they never self-dirty.)
+        video_buffer->gpu_mirror_dirty = true;
     }
 
     video_buffer->lock_count--;
@@ -2103,6 +2184,7 @@ int tig_video_buffer_fill(TigVideoBuffer* video_buffer, TigRect* rect, tig_color
     if (!SDL_FillSurfaceRect(video_buffer->surface, rect != NULL ? &native_rect : NULL, color)) {
         return TIG_ERR_GENERIC;
     }
+    video_buffer->gpu_mirror_dirty = true; // §6A
 
     return TIG_OK;
 }
@@ -2605,6 +2687,12 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
 
     if (!ok) {
         return TIG_ERR_GENERIC;
+    }
+    // §6A: mark the destination's mirror stale. Covers the COLOR_LERP direct-write
+    // path (no lock/unlock), the stretched + normal blits, and therefore every
+    // tig_window blit/scroll/copy* and tig_font_write glyph blit routed through here.
+    if (blit_info->dst_video_buffer != NULL) {
+        blit_info->dst_video_buffer->gpu_mirror_dirty = true;
     }
 
     return TIG_OK;
@@ -3374,6 +3462,7 @@ int tig_video_buffer_load_from_bmp(const char* filename, TigVideoBuffer** video_
     }
 
     SDL_DestroySurface(surface);
+    (*video_buffer_ptr)->gpu_mirror_dirty = true; // §6A
 
     return TIG_OK;
 }

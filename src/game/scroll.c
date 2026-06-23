@@ -1,6 +1,7 @@
 #include "game/scroll.h"
 
 #include <math.h>
+#include <stdlib.h>
 
 #include "game/gamelib.h"
 #include "game/iso_zoom.h"
@@ -12,6 +13,7 @@
 #include "game/player.h"
 #include "game/stat.h"
 #include "game/tc.h"
+#include "game/tile.h"
 #include "game/ui.h"
 
 #define SCROLL_DIAG_X 4
@@ -38,7 +40,7 @@
 // to a dead stop. Bigger = longer, softer settle into the edge.
 #define SCROLL_LEASH_SPRING_END_TAPER 28
 
-static void scroll_by(int64_t dx, int64_t dy);
+void scroll_by(int64_t dx, int64_t dy); // non-static: exported in scroll.h for the harness
 static void scroll_origin_changed(int64_t loc);
 static void scroll_speed_changed(void);
 static bool scroll_cursor_art_set(tig_art_id_t art_id);
@@ -642,70 +644,11 @@ void scroll_by(int64_t dx, int64_t dy)
     dx = new_origin_x - old_origin_x;
     dy = new_origin_y - old_origin_y;
 
-    // CE: Force full-redraw on every scroll, regardless of zoom.
-    //
-    // The legacy hardware-scroll path at zoom=1.0 (the `else` branch
-    // below) uses tig_window_scroll, which does a tig_video_buffer_blit
-    // from the iso_window's video buffer to itself with overlapping
-    // src/dst rects. SDL_BlitSurface's behavior on overlapping
-    // same-surface blits is undefined — depending on copy direction,
-    // pixels can be duplicated rather than cleanly shifted, producing
-    // sprite ghosts that trail at the scroll edge until the affected
-    // tiles get re-invalidated by some other event (PC walking
-    // through, etc.).
-    //
-    // Verified on UI-improvements branch: wolf-corpse-duplicates-at-
-    // scroll-edge artifact, present only at zoom=1.0 where this
-    // branch was reached. Forcing the full-redraw path on all zoom
-    // levels eliminates the artifact at the cost of one extra
-    // redraw per scroll frame (cheaper than fighting SDL's overlap
-    // semantics, and zoom=1.0 has no Phase A/C scaling overhead).
-    //
-    // The legacy hardware-scroll branch is preserved below (dead)
-    // for reference; a future cleaner fix could route the scroll
-    // through a scratch video buffer to avoid the overlapping blit.
-    if (true) {
-        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
-    } else if (z != 1.0f || tb_any_active()) {
-        // At non-unity zoom, or when speech bubbles are visible, the hardware
-        // scroll optimization leaves stale bubble pixels. Force a full redraw.
-        scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
-    } else {
-        // Redraw the view to prepare for the hardware pixel-copy scroll below.
-        scroll_init_info.draw_func();
-
-        // Scroll the window content.
-        tig_window_scroll(scroll_init_info.iso_window_handle, (int)dx, (int)dy);
-
-        // Invalidate newly revealed areas (horizontal scroll).
-        if (dx > 0) {
-            rect = scroll_iso_content_rect;
-            rect.width = (int)dx;
-            scroll_init_info.invalidate_rect_func(&rect);
-        } else if (dx < 0) {
-            rect = scroll_iso_content_rect;
-            rect.x = rect.width + (int)dx;
-            rect.width = -((int)dx);
-            scroll_init_info.invalidate_rect_func(&rect);
-        }
-
-        // Force redraw when scrolling in both directions.
-        if (dx != 0 && dy != 0) {
-            scroll_init_info.draw_func();
-        }
-
-        // Invalidate newly revealed areas (vertical scroll).
-        if (dy < 0) {
-            rect = scroll_iso_content_rect;
-            rect.y += rect.height + (int)dy;
-            rect.height = -(int)dy;
-            scroll_init_info.invalidate_rect_func(&rect);
-        } else if (dy > 0) {
-            rect = scroll_iso_content_rect;
-            rect.height = (int)dy;
-            scroll_init_info.invalidate_rect_func(&rect);
-        }
-    }
+    // Always invalidate the iso view on a scroll. This is load-bearing: it sets
+    // gamelib_dirty so gamelib_draw doesn't early-return before its camera-move
+    // re-render. (A prior "skip and let gamelib full-invalidate" experiment janked
+    // badly -- the full-invalidate lives AFTER the !gamelib_dirty early-return.)
+    scroll_init_info.invalidate_rect_func(&scroll_iso_content_rect);
 
     // Notify text conversation system of the scroll, so it can update it's
     // dimming overlay.

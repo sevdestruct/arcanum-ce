@@ -72,6 +72,7 @@
 #include "game/rumor.h"
 #include "game/script.h"
 #include "game/script_name.h"
+#include "game/scroll.h"
 #include "game/sector.h"
 #include "game/sector_script.h"
 #include "game/skill.h"
@@ -426,7 +427,46 @@ static uint64_t gamelib_zoom_perf_pass_object_max_ns = 0;
 static uint64_t gamelib_zoom_perf_pass_roof_total_ns = 0;
 static uint64_t gamelib_zoom_perf_pass_roof_max_ns = 0;
 static int gamelib_zoom_perf_pass_samples = 0;
+// CE (perf roadmap §1A): correlated worst-frame trace. Captures the single zoom-active
+// frame per 60-frame interval with the largest zoom-total, with its render/blit/other
+// split + GPU-art-cache-miss delta (upload burst) + active extent + full-invalidate flag,
+// so the ~80ms first-zoom spike attributes itself instead of vanishing into the aggregate.
+static uint64_t gamelib_zoom_perf_worst_zoom_ns = 0;
+static uint64_t gamelib_zoom_perf_worst_render_ns = 0;
+static uint64_t gamelib_zoom_perf_worst_blit_ns = 0;
+static uint64_t gamelib_zoom_perf_worst_other_ns = 0;
+static uint64_t gamelib_zoom_perf_worst_cache_misses = 0;
+static float gamelib_zoom_perf_worst_z = 0.0f;
+static int gamelib_zoom_perf_worst_active_w = 0;
+static int gamelib_zoom_perf_worst_active_h = 0;
+static bool gamelib_zoom_perf_worst_full_inval = false;
 #define GAMELIB_ZOOM_PERF_INTERVAL 60
+
+// CE (live incremental zoom): high-water mark of the active render area already
+// painted into the persistent 2x zoom buffer at the current camera position. The
+// zoom-out animation grows the active area every frame; instead of re-rendering the
+// whole area each step (the old per-zoom-step full invalidate -> ~50fps), we re-render
+// only the newly-revealed ring beyond this high-water and reuse the rest. Reset to 0 on
+// a camera move (buffer content shifts) or when not zooming. Animated objects stay live
+// independently via their own dirty rects, so the world does NOT freeze.
+static int gamelib_zoom_hw_w = 0;
+static int gamelib_zoom_hw_h = 0;
+
+// Add a world-VB-space dirty rect to the zoom dirty list (create-first-else-merge,
+// matching the object-translation loop; ignores empty rects).
+static void gamelib_zoom_dirty_add(TigRectListNode** head, const TigRect* rect)
+{
+    if (rect->width <= 0 || rect->height <= 0) {
+        return;
+    }
+    if (*head == NULL) {
+        *head = tig_rect_node_create();
+        (*head)->rect = *rect;
+        (*head)->next = NULL;
+    } else {
+        sub_52D480(head, rect);
+    }
+}
 
 // CE (gpu-ui iso overlay port): composite the CPU iso overlays over the live GPU
 // world, in software draw order (bubbles, then floating text, then the dialogue
@@ -530,7 +570,7 @@ bool gamelib_init(GameInitInfo* init_info)
     // CE (feature/perf-gpu-accel Phase 3): tile-pass render path selector.
     // Read by tile_draw_iso each frame; cache is initialized lazily in
     // tile_init based on the same setting.
-    settings_register(&settings, TILE_RENDER_PATH_KEY, TILE_RENDER_PATH_SOFTWARE, NULL);
+    settings_register(&settings, RENDER_PATH_KEY, TILE_RENDER_PATH_SOFTWARE, NULL);
 
     settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
 
@@ -843,7 +883,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "aspect snap", "On launch (fullscreen), snap resolution width/height to the display's aspect ratio and save the adjusted values back here (0=off, 1=on)." },
     { "vsync mode", "Frame pacing: 0=off (tearing, max throughput), 1=on (wait for vblank, no tearing), 2=adaptive (sync, but tear one frame instead of waiting on a miss)." },
     { "show fps", "Show the FPS counter (0=off, 1=on)." },
-    { "tile render path", "Tile rasterizer backend: 'software' or 'gpu'." },
+    { "render path", "Renderer backend: 'software' or 'hardware'." },
     { "gpu buffer sanity check", "Validate GPU buffers each frame; debugging aid (0=off, 1=on)." },
     { "macos ignore notch", "Use the full macOS display behind the camera notch (0=stay below the notch, 1=use the whole screen)." },
     { "legacy menu vignette", "Add a cinematic vignette to the legacy 800x600 menu/pause/splash art; no effect when custom-UI backgrounds are loaded (0=off, 1=on)." },
@@ -1011,13 +1051,14 @@ static void gpu_test_channel_tick(void)
 
         char arg[256];
         int ix, iy;
+        float fz;
         if (sscanf(line, "loadsave %255s", arg) == 1) {
             tig_debug_printf("[gpu-cmd] loadsave %s\n", arg);
             if (!gamelib_load(arg)) {
                 tig_debug_printf("[gpu-cmd] loadsave FAILED\n");
             }
         } else if (sscanf(line, "setpath %255s", arg) == 1) {
-            settings_set_str_value(&settings, TILE_RENDER_PATH_KEY, arg);
+            settings_set_str_value(&settings, RENDER_PATH_KEY, arg);
             // CE harness: a runtime render-path switch must recompute cached
             // object render flags. The COLOR_CONST-vs-PALETTE_OVERRIDE choice
             // (object lighting path) depends on the render path, but is cached
@@ -1043,6 +1084,42 @@ static void gpu_test_channel_tick(void)
             location_origin_set(loc);
             gamelib_invalidate_rect(NULL);
             tig_debug_printf("[gpu-cmd] scrollto %d %d\n", ix, iy);
+        } else if (sscanf(line, "scrollby %d %d", &ix, &iy) == 2) {
+            // profiling §4: RELATIVE scroll -> drives scroll_by, the actual edge-strip /
+            // GPU-world-translate path (scrollto/location_origin_set is absolute and
+            // bypasses scroll_by). Wake the render with a TINY (non-full) invalidate so
+            // the camera-move block runs without masking the translate behind a full
+            // re-render (gamelib_invalidate_rect(NULL) would force exactly that).
+            scroll_by(ix, iy);
+            TigRect wake = { 0, 0, 1, 1 };
+            gamelib_invalidate_rect(&wake);
+            tig_debug_printf("[gpu-cmd] scrollby %d %d\n", ix, iy);
+        } else if (sscanf(line, "setzoom %f", &fz) == 1) {
+            // profiling: drive the zoom animation toward a target (1.0 = in, 0.5 = out).
+            // Force availability so it engages regardless of freshly-loaded harness state
+            // (set_target resets to 1.0 when zoom isn't available).
+            iso_zoom_set_available(true);
+            iso_zoom_set_target(fz);
+            // iso_zoom_ping (the lerp) is gated on gamelib_dirty; the idle harness is
+            // clean, so wake the render to start (and sustain) the zoom animation.
+            gamelib_invalidate_rect(NULL);
+            tig_debug_printf("[gpu-cmd] setzoom %f (cur=%.3f avail=%d)\n",
+                (double)fz, (double)iso_zoom_current(), iso_zoom_is_available());
+        } else if (strncmp(line, "perf", 4) == 0) {
+            // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
+            // periodically to the debug log).
+            gamelib_zoom_perf_toggle();
+            // Skip the warmup gate so the per-pass timings (perf_on = enabled &&
+            // warmed_up) capture immediately -- the harness loop doesn't drive the
+            // record_tig_ping warmup counter.
+            if (gamelib_zoom_perf_is_enabled()) {
+                gamelib_zoom_perf_warmed_up = true;
+            }
+            tig_debug_printf("[gpu-cmd] perf toggled\n");
+        } else if (strncmp(line, "zoomlog", 7) == 0) {
+            tig_debug_printf("[gpu-cmd] zoomlog cur=%.3f target=%.3f animating=%d avail=%d\n",
+                (double)iso_zoom_current(), (double)iso_zoom_target(),
+                iso_zoom_is_animating(), iso_zoom_is_available());
         } else if (strncmp(line, "trace", 5) == 0) {
             tile_gpu_trace_arm();
             tig_debug_printf("[gpu-cmd] trace armed\n");
@@ -1488,18 +1565,28 @@ uint64_t gamelib_perf_now_ns(void)
 
 // Threshold above which a single loop-step measurement is treated as a
 // megahitch and logged inline (rather than being averaged into the
-// 60-frame aggregate). 100ms is ~12x the typical loop budget on a
-// 120Hz display — catches real perceptible pauses (e.g. save flush,
-// sector load, art cache eviction) without spamming on routine vsync
-// misses.
-#define GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS 100000000ull
+// 60-frame aggregate). Lowered from 100ms -> 30ms (CE perf roadmap §1A): the
+// ~80ms first-zoom spike sits UNDER 100ms, so the old threshold swallowed it
+// entirely (it surfaced only as an unattributed `max` in the aggregate). 30ms
+// is still ~3.6x the 8.3ms 120Hz vsync budget and above the ~20ms zoom-step
+// frames, so routine play and steady zoom don't spam -- only real hitches log.
+#define GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS 30000000ull
 
 static void gamelib_perf_log_megahitch(const char* bucket, uint64_t ns)
 {
-    char line[256];
+    // CE (perf): append live GPU-art-cache state. For the z=1.0 iso_redraw spikes, reading
+    // the resident MB + the evictions/misses climb between consecutive megahitch lines
+    // disambiguates the regression sub-mechanism: a fast eviction climb => mid-batch
+    // SDL_DestroyTexture sync; a full resident set with flat evictions => per-frame
+    // residency/resolve cost. Both scale with the cache budget (now A/B-tunable).
+    TigArtGpuCacheStats cs;
+    tig_art_gpu_cache_stats(&cs);
+    char line[320];
     snprintf(line, sizeof(line),
-        "[megahitch] %s took %.1fms (%.2fs) — single iteration\n",
-        bucket, (double)ns / 1e6, (double)ns / 1e9);
+        "[megahitch] %s took %.1fms (%.2fs) | gpu-cache: %.0fMB %d entries, %llu evict, %llu miss\n",
+        bucket, (double)ns / 1e6, (double)ns / 1e9,
+        (double)cs.bytes / (1024.0 * 1024.0), cs.entries,
+        (unsigned long long)cs.evictions, (unsigned long long)cs.misses);
     tig_debug_printf("%s", line);
     gamelib_zoom_perf_log(line);
 }
@@ -1594,7 +1681,11 @@ void gamelib_perf_log_event(const char* context, uint64_t ns)
 // 50ms is about 3 missed vsync slots on a 120Hz display. Below the
 // per-bucket megahitch threshold (100ms) so we catch cumulative
 // slowness that no single call would trip on its own.
-#define GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS 50000000ull
+// Lowered 50ms -> 33ms (sub-30fps) to catch sustained "lag" frames whose cost is in
+// UNTIMED main-loop work (AI/scripts/present/sector load) -- where render, win_display,
+// and ping are all healthy but the loop iteration is still slow. The line now reports
+// the untimed gap = total - sum(buckets) so such a lag attributes itself.
+#define GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS 33000000ull
 
 void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
     uint64_t tig_ping_ns, uint64_t key_repeat_ns,
@@ -1605,9 +1696,11 @@ void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
     if (total_ns <= GAMELIB_PERF_SLOW_LOOP_THRESHOLD_NS) return;
 
     // Suppress if any single bucket already tripped the per-bucket
-    // megahitch logger (>=100ms) — avoid duplicate noise for the
+    // megahitch logger (>=30ms) — avoid duplicate noise for the
     // same slow iteration. (The per-bucket logger already named
-    // the culprit; the loop-total line would add nothing.)
+    // the culprit; the loop-total line would add nothing.) An UNTIMED
+    // lag (no bucket over threshold, but total still slow) is NOT
+    // suppressed -- that is the case this line exists to catch.
     if (tig_ping_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
         || key_repeat_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
         || iso_redraw_ns > GAMELIB_PERF_MEGAHITCH_THRESHOLD_NS
@@ -1616,15 +1709,25 @@ void gamelib_perf_record_loop_iteration_ns(uint64_t total_ns,
         return;
     }
 
+    // Untimed gap = total minus all timed buckets. If this dominates a slow
+    // iteration, the cost is in main-loop work no bucket measures (AI/scripts/
+    // sector load / present-wait) -- the prime suspect for the "lag that lets
+    // up on zoom" with a healthy render.
+    uint64_t timed_ns = tig_ping_ns + key_repeat_ns + iso_redraw_ns
+        + win_display_ns + event_dispatch_ns;
+    double untimed_ms = total_ns > timed_ns
+        ? (double)(total_ns - timed_ns) / 1e6 : 0.0;
+
     char line[384];
     snprintf(line, sizeof(line),
-        "[slow-loop] total %.1fms — tig_ping %.2f, key_repeat %.2f, iso_redraw %.2f, win_display %.2f, event_dispatch %.2f (ms)\n",
+        "[slow-loop] total %.1fms — tig_ping %.2f, key_repeat %.2f, iso_redraw %.2f, win_display %.2f, event_dispatch %.2f, UNTIMED %.2f (ms)\n",
         (double)total_ns / 1e6,
         (double)tig_ping_ns / 1e6,
         (double)key_repeat_ns / 1e6,
         (double)iso_redraw_ns / 1e6,
         (double)win_display_ns / 1e6,
-        (double)event_dispatch_ns / 1e6);
+        (double)event_dispatch_ns / 1e6,
+        untimed_ms);
     tig_debug_printf("%s", line);
     gamelib_zoom_perf_log(line);
 }
@@ -1777,6 +1880,51 @@ void gamelib_invalidate_rect(TigRect* rect)
     }
 }
 
+// CE (zoom idle preload): the first zoom-OUT renders a ~2x-wider extent than the 1.0
+// view, loading sectors the 1.0 view never touched -- a one-time ~80ms cold-render
+// stutter ("a little stutter on the first zoom-out, not new"). Pre-load those sectors
+// during post-load idle so the first zoom-out's render is already warm. Runs once.
+static bool gamelib_zoom_sectors_preloaded = false;
+static void gamelib_zoom_sector_preload(void)
+{
+    if (gamelib_zoom_sectors_preloaded) {
+        return;
+    }
+    if (!iso_zoom_is_available()) {
+        return; // zoom not available yet -- retry next idle frame
+    }
+    // The deepest zoom (z=0.5) shows ~2x the 1.0 content area, centred on the PC. Build
+    // that wider screen extent (+ the render's overdraw margin) and resolve the sectors
+    // it covers, then lock/unlock each cold one to pull it into the sector cache.
+    TigRect wide = gamelib_iso_content_rect;
+    int cx = wide.x + wide.width / 2;
+    int cy = wide.y + wide.height / 2;
+    wide.width *= 2;
+    wide.height *= 2;
+    wide.x = cx - wide.width / 2;
+    wide.y = cy - wide.height / 2;
+    TigRect wide_ex = { wide.x - 256, wide.y - 256, wide.width + 512, wide.height + 512 };
+
+    LocRect loc_rect;
+    if (!location_screen_rect_to_loc_rect(&wide_ex, &loc_rect)) {
+        return;
+    }
+    SectorListNode* sectors = sector_list_create(&loc_rect);
+    int loaded = 0;
+    for (SectorListNode* node = sectors; node != NULL; node = node->next) {
+        if (sector_exists((uint64_t)node->sec) && !sector_loaded(node->sec)) {
+            Sector* s;
+            if (sector_lock(node->sec, &s)) {
+                sector_unlock(node->sec);
+                loaded++;
+            }
+        }
+    }
+    sector_list_destroy(sectors);
+    gamelib_zoom_sectors_preloaded = true;
+    tig_debug_printf("[zoom-preload] pre-loaded %d cold wider-extent sectors\n", loaded);
+}
+
 // 0x402E50
 bool gamelib_draw(void)
 {
@@ -1812,6 +1960,11 @@ bool gamelib_draw(void)
     // picks up tig's own invalidations from transform_set and
     // composites the new frame.
     ui_anim_ping();
+
+    // CE (zoom idle preload): pre-load the wider zoom-out extent's sectors on a post-load
+    // idle frame (before the gamelib_dirty early-return) so the first zoom-out's cold
+    // render is already warm. Env toggle kept for A/B profiling.
+    gamelib_zoom_sector_preload();
 
     // CE: HUD bar slide must run BEFORE the gamelib_dirty early-
     // return — ui_anim_ping just integrated the slide offsets, but
@@ -1878,8 +2031,14 @@ bool gamelib_draw(void)
     // full setup/teardown cost of the zoom-active path including any
     // sub_52D480 merges from camera-move-triggered invalidates.
     uint64_t perf_zoom_start_ns_outer = 0;
-    if (gamelib_zoom_perf_enabled && zoom_active) {
+    uint64_t perf_cache_misses_start = 0; // CE: GPU art-cache misses at frame start (upload-burst probe)
+    // CE (perf): capture z=1.0 (present path) too, not just zoom -- the z=1.0 full
+    // re-render lag around big facades is invisible to a zoom-active-only perf gate.
+    if (gamelib_zoom_perf_enabled && (zoom_active || tile_gpu_present_active())) {
         perf_zoom_start_ns_outer = gamelib_zoom_perf_now_ns();
+        TigArtGpuCacheStats perf_cs_start;
+        tig_art_gpu_cache_stats(&perf_cs_start);
+        perf_cache_misses_start = perf_cs_start.misses;
     }
 
     // Phase A: the world target content is built up across frames (we don't clear
@@ -1892,25 +2051,32 @@ bool gamelib_draw(void)
     // invalidate so the dirty-rect translation downstream produces a full world rect
     // and the target re-renders fresh. Without this at zoom 1.0, walking left stale
     // world pixels around the moving sprite -- visible as the fade roof reveals them.
+    // CE (live incremental zoom): full_inval means the WHOLE active area must re-render
+    // -- only on a camera move (the 2x buffer / 1.0 GPU present target content shifts and
+    // a partial render leaves stale regions). A steady zoom STEP no longer full-
+    // invalidates: the active area just grew, so only the newly-revealed ring re-renders
+    // (see below), and animated objects stay live via their own dirty rects. This drops
+    // the zoom animation off the per-frame full-redraw path. (The fade-roof accumulation
+    // that once needed a PC-under-roof full re-render is gone: roofs render on their own
+    // cleared layer now, never in this incremental buffer.)
+    bool gamelib_zoom_full_inval = false;
     {
-        static float gamelib_prev_zoom = 1.0f;
         static int64_t gamelib_prev_ox = 0;
         static int64_t gamelib_prev_oy = 0;
         int64_t cur_ox;
         int64_t cur_oy;
         location_origin_get(&cur_ox, &cur_oy);
-        bool zoom_step = (z != gamelib_prev_zoom);
         bool camera_moved = (cur_ox != gamelib_prev_ox || cur_oy != gamelib_prev_oy);
-        // The persistent world target (zoom 2x buffer, and the 1.0 GPU present target)
-        // is incremental; the hardware scroll shifts only the CPU iso surface, not the
-        // GPU target, so a camera move / zoom step leaves stale regions a partial render
-        // won't refresh. Force a full re-render in those cases. (The fade-roof
-        // accumulation that used to also need a PC-under-roof full re-render is gone:
-        // roofs now render on their own cleared layer, never in this incremental buffer.)
-        if ((zoom_active || tile_gpu_present_active()) && (zoom_step || camera_moved)) {
+        gamelib_zoom_full_inval = (zoom_active || tile_gpu_present_active()) && camera_moved;
+        if (gamelib_zoom_full_inval) {
             gamelib_invalidate_rect(NULL);
         }
-        gamelib_prev_zoom = z;
+        // The rendered-extent high-water is only valid while the camera is still; reset it
+        // on a camera move or when zoom is off so the next zoom repaints from scratch.
+        if (camera_moved || !zoom_active) {
+            gamelib_zoom_hw_w = 0;
+            gamelib_zoom_hw_h = 0;
+        }
         gamelib_prev_ox = cur_ox;
         gamelib_prev_oy = cur_oy;
     }
@@ -2029,13 +2195,37 @@ bool gamelib_draw(void)
                 }
                 node = next;
             }
+            // CE (live incremental zoom): the active render area grew this frame (zoom
+            // lerping out). Re-render only the ring beyond the high-water already painted
+            // into the 2x buffer -- left/right widen by (active_w-hw_w)/2, top/bottom by
+            // (active_h-hw_h)/2 (corner overlap is harmless). The interior is reused as-is;
+            // animated objects already queued their own dirty rects above, so the world
+            // stays live. full_inval frames (camera move) re-render everything -> skip.
+            if (!gamelib_zoom_full_inval) {
+                if (active_w > gamelib_zoom_hw_w) {
+                    int dw = (active_w - gamelib_zoom_hw_w) / 2;
+                    TigRect left = { active_x, active_y, dw, active_h };
+                    TigRect right = { active_x + active_w - dw, active_y, dw, active_h };
+                    gamelib_zoom_dirty_add(&gamelib_dirty_rects_head, &left);
+                    gamelib_zoom_dirty_add(&gamelib_dirty_rects_head, &right);
+                }
+                if (active_h > gamelib_zoom_hw_h) {
+                    int dh = (active_h - gamelib_zoom_hw_h) / 2;
+                    TigRect top = { active_x, active_y, active_w, dh };
+                    TigRect bottom = { active_x, active_y + active_h - dh, active_w, dh };
+                    gamelib_zoom_dirty_add(&gamelib_dirty_rects_head, &top);
+                    gamelib_zoom_dirty_add(&gamelib_dirty_rects_head, &bottom);
+                }
+            }
+            if (active_w > gamelib_zoom_hw_w) gamelib_zoom_hw_w = active_w;
+            if (active_h > gamelib_zoom_hw_h) gamelib_zoom_hw_h = active_h;
             tig_window_set_invalidate_suppressed(true);
             gamelib_zoom_world_pass_active = true;
             TigRect zoom_content_rect = { active_x, active_y, active_w, active_h };
             object_set_iso_content_rect(&zoom_content_rect);
             light_set_iso_content_rect(&zoom_content_rect);
         }
-        if (gamelib_zoom_perf_enabled && zoom_active) {
+        if (gamelib_zoom_perf_enabled && (zoom_active || tile_gpu_present_active())) {
             // Snapshot the area the renderer is about to touch. After
             // Phase C, the "full" reference is the active render area,
             // not the whole 2x world VB.
@@ -2047,9 +2237,22 @@ bool gamelib_draw(void)
             perf_render_start_ns = gamelib_zoom_perf_now_ns();
         }
         gamelib_draw_func(&draw_info);
-        if (gamelib_zoom_perf_enabled && zoom_active) {
+        if (gamelib_zoom_perf_enabled && (zoom_active || tile_gpu_present_active())) {
             perf_frame_render_ns = gamelib_zoom_perf_now_ns() - perf_render_start_ns;
             gamelib_zoom_perf_total_render_ns += perf_frame_render_ns;
+            // CE (perf): pinpoint the z=1.0 big-facade lag. The zoom-perf worst-frame
+            // trace can't reach the present (z=1.0) path -- its accumulation lives in the
+            // zoom-downscale block -- so log any slow render frame here with the art-upload
+            // delta. If uploads dominate a 60-119ms z=1.0 frame, the lag is first-access
+            // facade uploads (cache misses), and the fix is pre-touch, not a bigger cache.
+            if (perf_frame_render_ns > 30000000ull) {
+                TigArtGpuCacheStats perf_cs_now;
+                tig_art_gpu_cache_stats(&perf_cs_now);
+                tig_debug_printf("[iso-slow] z=%.3f render %.1fms art-uploads %llu active %dx%d\n",
+                    (double)z, (double)perf_frame_render_ns / 1e6,
+                    (unsigned long long)(perf_cs_now.misses - perf_cache_misses_start),
+                    active_w, active_h);
+            }
         }
         if (zoom_active) {
             gamelib_zoom_world_pass_active = false;
@@ -2139,6 +2342,22 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_max_other_ns = other_ns;
                 }
 
+                // CE (perf roadmap §1A): record the worst (largest zoom-total) frame's
+                // full correlated breakdown for the dump, incl. the GPU-art upload delta.
+                if (zoom_total_ns > gamelib_zoom_perf_worst_zoom_ns) {
+                    TigArtGpuCacheStats perf_cs_end;
+                    tig_art_gpu_cache_stats(&perf_cs_end);
+                    gamelib_zoom_perf_worst_zoom_ns = zoom_total_ns;
+                    gamelib_zoom_perf_worst_render_ns = perf_frame_render_ns;
+                    gamelib_zoom_perf_worst_blit_ns = perf_frame_blit_ns;
+                    gamelib_zoom_perf_worst_other_ns = other_ns;
+                    gamelib_zoom_perf_worst_cache_misses = perf_cs_end.misses - perf_cache_misses_start;
+                    gamelib_zoom_perf_worst_z = z;
+                    gamelib_zoom_perf_worst_active_w = active_w;
+                    gamelib_zoom_perf_worst_active_h = active_h;
+                    gamelib_zoom_perf_worst_full_inval = gamelib_zoom_full_inval;
+                }
+
                 // Wall-clock frame interval: time from previous zoom-active
                 // draw to this one. Captures the TOTAL frame cost (render +
                 // AI + scripts + present), not just our render bucket. The
@@ -2208,6 +2427,27 @@ bool gamelib_draw(void)
                     tig_debug_printf("%s", line);
                     gamelib_zoom_perf_log(line);
 
+                    // CE (perf roadmap §1A): worst-frame trace -- the single frame this
+                    // interval with the largest zoom-total, fully split. This is where the
+                    // ~80ms first-zoom spike surfaces: read render vs OTHER (driver/zoom
+                    // begin/end) vs cache (art uploads) to attribute it without guessing.
+                    {
+                        char wline[320];
+                        snprintf(wline, sizeof(wline),
+                            "[zoom-perf]   WORST frame: zoom-total %.2fms = render %.2f + blit %.2f + OTHER %.2f | art-uploads %llu | z=%.3f active %dx%d full-inval=%d\n",
+                            (double)gamelib_zoom_perf_worst_zoom_ns / 1e6,
+                            (double)gamelib_zoom_perf_worst_render_ns / 1e6,
+                            (double)gamelib_zoom_perf_worst_blit_ns / 1e6,
+                            (double)gamelib_zoom_perf_worst_other_ns / 1e6,
+                            (unsigned long long)gamelib_zoom_perf_worst_cache_misses,
+                            (double)gamelib_zoom_perf_worst_z,
+                            gamelib_zoom_perf_worst_active_w,
+                            gamelib_zoom_perf_worst_active_h,
+                            gamelib_zoom_perf_worst_full_inval ? 1 : 0);
+                        tig_debug_printf("%s", wline);
+                        gamelib_zoom_perf_log(wline);
+                    }
+
                     // Second line: per-subsystem ping breakdown. Total ping
                     // avg/max for the same window, then the top 3 hottest
                     // modules by accumulated time. Helps identify which
@@ -2268,6 +2508,7 @@ bool gamelib_draw(void)
                     gamelib_zoom_perf_max_zoom_ns = 0;
                     gamelib_zoom_perf_total_other_ns = 0;
                     gamelib_zoom_perf_max_other_ns = 0;
+                    gamelib_zoom_perf_worst_zoom_ns = 0; // reset: next frame becomes the new worst
                     // Third line: main-loop bucket breakdown (tig_ping,
                     // iso_redraw, tig_window_display) + intra-flip split
                     // (SDL_UpdateTexture vs SDL_RenderPresent). After
@@ -3777,7 +4018,10 @@ bool gamelib_void_edge_fade(void)
 // 0x4046F0
 void gamelib_draw_game(GameDrawInfo* draw_info)
 {
-    if (tig_video_3d_begin_scene() == TIG_OK) {
+    uint64_t spk_b = gamelib_zoom_perf_now_ns();
+    bool scene_ok = tig_video_3d_begin_scene() == TIG_OK;
+    { uint64_t spkd = gamelib_zoom_perf_now_ns() - spk_b; if (spkd > 10000000ull) tig_debug_printf("[zoom-spike] 3d_begin_scene = %.1fms\n", (double)spkd / 1e6); }
+    if (scene_ok) {
         // Gate pass timing on warmup too — same cold-cache outlier
         // applies to the very first render after F9 on.
         bool perf_on = gamelib_zoom_perf_enabled && gamelib_zoom_perf_warmed_up;
@@ -3807,7 +4051,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
             gamelib_zoom_perf_pass_tile_total_ns += d;
             if (d > gamelib_zoom_perf_pass_tile_max_ns) gamelib_zoom_perf_pass_tile_max_ns = d;
         }
-        sub_43C690(draw_info);  // bucketed in 'tile' bucket above-or-below if we cared; here it falls between
+        { uint64_t spk = gamelib_zoom_perf_now_ns(); sub_43C690(draw_info); uint64_t spkd = gamelib_zoom_perf_now_ns() - spk; if (spkd > 10000000ull) tig_debug_printf("[zoom-spike] sub_43C690 = %.1fms\n", (double)spkd / 1e6); }  // bucketed in 'tile' bucket above-or-below if we cared; here it falls between
         if (perf_on) t0 = gamelib_zoom_perf_now_ns();
         object_draw(draw_info);
         if (perf_on) {
@@ -3888,7 +4132,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
                 tc_draw(draw_info);
             }
         }
-        tig_video_3d_end_scene();
+        { uint64_t spk = gamelib_zoom_perf_now_ns(); tig_video_3d_end_scene(); uint64_t spkd = gamelib_zoom_perf_now_ns() - spk; if (spkd > 10000000ull) tig_debug_printf("[zoom-spike] 3d_end_scene = %.1fms\n", (double)spkd / 1e6); }
     }
 }
 

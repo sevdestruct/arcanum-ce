@@ -101,6 +101,10 @@ static TigVideoBuffer* tile_gpu_zoom_buffer;
 static int tile_gpu_zoom_buffer_w;
 static int tile_gpu_zoom_buffer_h;
 static bool tile_gpu_zoom_disabled;
+// CE (zoom idle-time preload): set once the zoom render targets have been warmed
+// off-screen so the first real zoom skips the GPU's one-time first-render pipeline
+// setup (~70ms). Reset when the zoom buffer is (re)created so a resize re-warms.
+static bool tile_gpu_zoom_warmed;
 
 // CE (zoom roof layer): the zoom-pass roofs render into their OWN 2x buffer (cleared
 // each frame), composited over the downscaled zoom world buffer -- exactly like the
@@ -190,25 +194,14 @@ void tile_gpu_perf_read_reset(uint64_t* upload_ns, uint64_t* readback_ns)
 // CE (feature/perf-gpu-accel Phase 3): return true if arcanum.cfg
 // requests the GPU tile path AND the GPU init didn't previously fail.
 // Re-read each frame so the user can toggle between runs.
-// Map the configured render-path string to its canonical value, accepting the legacy
-// names (configs written before the software/hardware rename) as aliases. Returns
-// "software" when unset.
+// Return the configured render-path string, or "software" when unset. The pre-rename
+// values "gpu" / "gpu-present" / "gpu-ui" are no longer accepted -- old configs must be
+// updated to software / hardware / debug-gpu-present / debug-gpu-readback (an unknown
+// value falls through to the software path).
 static const char* tile_render_path_canon(void)
 {
-    const char* mode = settings_get_str_value(&settings, TILE_RENDER_PATH_KEY);
-    if (mode == NULL) {
-        return TILE_RENDER_PATH_SOFTWARE;
-    }
-    if (strcmp(mode, "gpu-ui") == 0) {
-        return TILE_RENDER_PATH_HARDWARE; // legacy alias
-    }
-    if (strcmp(mode, "gpu-present") == 0) {
-        return TILE_RENDER_PATH_DEBUG_PRESENT; // legacy alias
-    }
-    if (strcmp(mode, "gpu") == 0) {
-        return TILE_RENDER_PATH_DEBUG_READBACK; // legacy alias
-    }
-    return mode;
+    const char* mode = settings_get_str_value(&settings, RENDER_PATH_KEY);
+    return mode != NULL ? mode : TILE_RENDER_PATH_SOFTWARE;
 }
 
 static bool tile_should_use_gpu_path(void)
@@ -374,12 +367,14 @@ static bool tile_gpu_ensure_zoom_buffer(int w, int h)
         tig_video_buffer_destroy(tile_gpu_zoom_buffer);
         tile_gpu_zoom_buffer = NULL;
     }
+    tile_gpu_zoom_warmed = false; // a (re)created target needs warming again
     TigVideoBufferCreateInfo info;
     info.flags = TIG_VIDEO_BUFFER_CREATE_TEXTURE;
     info.width = w;
     info.height = h;
     info.color_key = 0;
     info.background_color = 0;
+    uint64_t alloc_t0 = tile_gpu_now_ns();
     if (tig_video_buffer_create(&info, &tile_gpu_zoom_buffer) != TIG_OK
         || tile_gpu_zoom_buffer == NULL) {
         tig_debug_printf("tile: GPU zoom buffer create (%dx%d) failed -- zoom stays on CPU path.\n", w, h);
@@ -389,6 +384,8 @@ static bool tile_gpu_ensure_zoom_buffer(int w, int h)
     }
     tile_gpu_zoom_buffer_w = w;
     tile_gpu_zoom_buffer_h = h;
+    tig_debug_printf("[zoom-alloc] GPU zoom buffer %dx%d created in %.2fms\n",
+        w, h, (double)(tile_gpu_now_ns() - alloc_t0) / 1e6);
     return true;
 }
 
@@ -443,6 +440,57 @@ bool tile_gpu_zoom_is_enabled(void)
         return false;
     }
     return tile_gpu_ensure_zoom_buffer(tile_gpu_world_buffer_w * 2, tile_gpu_world_buffer_h * 2);
+}
+
+// CE (zoom idle-time preload): the GPU driver sets up its render-to-texture pipeline
+// on the FIRST render to a fresh render target -- a one-time ~70ms hitch the first time
+// the player zooms (the passes themselves are sub-millisecond; the alloc is 0.2ms). To
+// hide it, warm both zoom targets (world + roof) off-screen on an idle frame after load
+// so the first real zoom hits an already-warm pipeline. Self-gating: runs once, only on
+// the hardware zoom path, only when no world/zoom render is in flight, and only once the
+// world buffer exists (to use as a representative blit source). Called per-frame from
+// gamelib_draw before the dirty early-return, so it fires during post-load idle.
+void tile_gpu_zoom_prewarm(void)
+{
+    if (tile_gpu_zoom_warmed || tile_gpu_zoom_disabled || tile_gpu_active) {
+        return;
+    }
+    if (!tile_gpu_zoom_is_enabled()) {
+        return; // not the hardware zoom path, or the world buffer isn't sized yet
+    }
+    // tile_gpu_zoom_is_enabled ensured the world zoom buffer; ensure the roof one too.
+    tile_gpu_ensure_zoom_roof_buffer(tile_gpu_world_buffer_w * 2, tile_gpu_world_buffer_h * 2);
+
+    SDL_Texture* src = tile_gpu_world_buffer != NULL
+        ? tig_video_buffer_get_sdl_texture(tile_gpu_world_buffer)
+        : NULL;
+    if (src == NULL) {
+        return; // need a source texture to exercise the texture->target blit pipeline
+    }
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return;
+    }
+    SDL_Texture* targets[2] = {
+        tig_video_buffer_get_sdl_texture(tile_gpu_zoom_buffer),
+        tile_gpu_zoom_roof_buffer != NULL
+            ? tig_video_buffer_get_sdl_texture(tile_gpu_zoom_roof_buffer)
+            : NULL,
+    };
+    SDL_Texture* prev = SDL_GetRenderTarget(renderer);
+    uint64_t t0 = tile_gpu_now_ns();
+    for (int i = 0; i < 2; i++) {
+        if (targets[i] == NULL) {
+            continue;
+        }
+        if (SDL_SetRenderTarget(renderer, targets[i])) {
+            SDL_RenderTexture(renderer, src, NULL, NULL); // first render -> pipeline warm
+        }
+    }
+    SDL_SetRenderTarget(renderer, prev); // restore the target + flush the warm batch
+    tile_gpu_zoom_warmed = true;
+    tig_debug_printf("[zoom-prewarm] warmed world+roof zoom targets in %.2fms\n",
+        (double)(tile_gpu_now_ns() - t0) / 1e6);
 }
 
 // Upload the current CPU dst surface into the GPU world target and bind
