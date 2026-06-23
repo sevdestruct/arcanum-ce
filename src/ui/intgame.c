@@ -4447,6 +4447,21 @@ void iso_interface_window_set(RotatingWindowType window_type)
     }
 
     intgame_rotwin_step = MAX_INTERFACE_WINDOW_ROTATION_STEPS;
+
+    // CE: HUD-crop coupling — pop the crop BEFORE the swap.
+    // MINI silently pins SKILLS (the slim-row hack), and
+    // iso_interface_window_swap refuses any swap away from SKILLS while
+    // MINI is up. So an intentional rotwin change invoked from MINI/HIDDEN
+    // (M/spells, a magic-tech weapon, the ammo/gold/trade QUANTITY slider,
+    // a map note, an MP broadcast) must first pop MINI/HIDDEN -> MEDIUM;
+    // only then is the swap allowed through. Previously this ran AFTER the
+    // swap, so the swap was blocked and the page stayed stuck on SKILLS.
+    // The prior stage is stashed so dismissing the rotwin (-> MSG) returns
+    // to it (e.g. back to MINI cropped-skills) via the restore below.
+    if (effective != ROTWIN_TYPE_MSG && effective != ROTWIN_TYPE_INVALID) {
+        intgame_hud_auto_pop_for_rotwin();
+    }
+
     if (toggled_off) {
         dword_64C6AC = ROTWIN_TYPE_MSG;
         iso_interface_window_swap(ROTWIN_TYPE_MSG);
@@ -4455,17 +4470,12 @@ void iso_interface_window_set(RotatingWindowType window_type)
         iso_interface_window_swap(window_type);
     }
 
-    // CE: HUD-crop coupling.
-    // - Real rotwin (skills/spells/magictech-weapon/etc.) invoked from
-    //   MINI/HIDDEN: pop to MEDIUM and stash the prior stage.
-    // - Result is MSG (toggle-off or explicit dismiss): restore the
-    //   stashed stage so the user returns to where they were.
+    // CE: result is MSG (toggle-off or explicit dismiss) — restore the
+    // stashed pre-rotwin stage so the user returns to where they were.
     // Auto-reverts that route through iso_interface_window_swap directly
     // (cursor leaving the bar, mode exits) bypass this entirely.
     if (effective == ROTWIN_TYPE_MSG) {
         intgame_hud_restore_after_rotwin();
-    } else if (effective != ROTWIN_TYPE_INVALID) {
-        intgame_hud_auto_pop_for_rotwin();
     }
 }
 
