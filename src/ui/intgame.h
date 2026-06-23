@@ -75,6 +75,10 @@ void intgame_resize(GameResizeInfo* resize_info);
 void intgame_exit(void);
 bool intgame_save(TigFile* stream);
 bool intgame_load(GameLoadInfo* load_info);
+// CE: apply a rotating-window page restore queued by intgame_load
+// (ROTWIN_RESTORE_KEY). Call once the post-load enter-world path has shown
+// the interface; no-op when nothing is queued.
+void intgame_apply_rotwin_restore(void);
 void iso_interface_create(tig_window_handle_t window_handle);
 void iso_interface_destroy(void);
 void sub_54AA30(void);

@@ -953,6 +953,14 @@ static TigRect stru_64C698;
 // 0x64C6A8
 static RotatingWindowType intgame_iso_window_type;
 
+// CE: rotating-window page saved by intgame_load to restore once the
+// post-load "enter world" sequence has settled (ROTWIN_RESTORE_KEY).
+// Restoring inside intgame_load is too early — the load completion path
+// re-runs message/interface refreshes that force the window back to MSG,
+// clobbering an in-load swap. intgame_apply_rotwin_restore() applies this
+// as the last step of that path. ROTWIN_TYPE_INVALID = nothing pending.
+static RotatingWindowType intgame_rotwin_restore_pending = ROTWIN_TYPE_INVALID;
+
 // 0x64C6AC
 static RotatingWindowType dword_64C6AC;
 
@@ -1094,6 +1102,10 @@ void intgame_reset(void)
     int index;
 
     dword_64C6D8 = 0;
+    // CE: drop any rotwin-restore queued by a prior (failed) load so it
+    // can't fire on a later unrelated menu-close. A real load re-queues it
+    // after this reset runs. See intgame_apply_rotwin_restore().
+    intgame_rotwin_restore_pending = ROTWIN_TYPE_INVALID;
     intgame_refresh_cursor();
     hotkey_ui_reset_recent_actions();
     intgame_clock_process_callback(NULL);
@@ -1207,8 +1219,24 @@ bool intgame_load(GameLoadInfo* load_info)
     if (tig_file_fread(&v1, sizeof(v1), 1, load_info->stream) != 1) return false;
     if (tig_file_fread(&dword_64C530, sizeof(dword_64C530), 1, load_info->stream) != 1) return false;
 
-    if (intgame_iso_window_type == ROTWIN_TYPE_SPELLS) {
-        tig_button_state_change(intgame_college_buttons[dword_64C530].button_handle, TIG_BUTTON_STATE_PRESSED);
+    // CE: ROTWIN_RESTORE_KEY (default off). intgame_save writes the active
+    // rotating-window page (intgame_iso_window_type) as its first field,
+    // but the original load read it into a local and discarded it, so a
+    // load always dropped back to the default Messages page. When enabled,
+    // remember the saved page and re-open it once the load finishes — see
+    // intgame_apply_rotwin_restore(). It cannot be applied here: this runs
+    // mid-load (gameuilib_reset already swapped the window to MSG, and the
+    // post-load enter-world path re-forces MSG via the message refresh), so
+    // an in-load swap is immediately clobbered.
+    //
+    // Only the persistent, user-toggled pages (SPELLS / SKILLS) are
+    // restored. MAGICTECH and the transient pages (dialogue, quantity, ...)
+    // are bound to per-interaction context (e.g. qword_64C688, the examined
+    // magic/tech item) that does not survive a load, so restoring them
+    // would show a blank page — leave those at the default.
+    if (settings_get_value(&settings, ROTWIN_RESTORE_KEY)
+        && (v1 == ROTWIN_TYPE_SPELLS || v1 == ROTWIN_TYPE_SKILLS)) {
+        intgame_rotwin_restore_pending = (RotatingWindowType)v1;
     }
 
     if (!hotkey_ui_load(load_info)) return false;
@@ -1232,6 +1260,45 @@ bool intgame_load(GameLoadInfo* load_info)
     }
 
     return true;
+}
+
+// CE: apply a rotating-window page restore queued by intgame_load
+// (ROTWIN_RESTORE_KEY). Called at the tail of the post-load enter-world
+// path (mainmenu sub_5412E0), after the interface is shown and every
+// MSG-forcing refresh has run, so the swap is the last word. No-op unless
+// a load queued a page (so it is harmless on new-game / menu-resume).
+void intgame_apply_rotwin_restore(void)
+{
+    RotatingWindowType window_type;
+
+    if (intgame_rotwin_restore_pending == ROTWIN_TYPE_INVALID) {
+        return;
+    }
+
+    window_type = intgame_rotwin_restore_pending;
+    intgame_rotwin_restore_pending = ROTWIN_TYPE_INVALID;
+
+    if (!intgame_iso_interface_created) {
+        return;
+    }
+
+    // CE: drive the SAME path a real spellbook/skills click takes, not a
+    // bare iso_interface_window_swap. The toggle latches the secondary
+    // button PRESSED and calls intgame_force_fullscreen — without that the
+    // page paints once but the button looks up and the next world-hover
+    // takes over the rotwin and never returns. At this point (post-load,
+    // fresh reset) the buttons are RELEASED, so the toggle runs its
+    // activate branch, exactly reproducing a user click.
+    switch (window_type) {
+    case ROTWIN_TYPE_SPELLS:
+        intgame_secondary_button_toggle(INTGAME_SECONDARY_BUTTON_SPELLS, ROTWIN_TYPE_SPELLS);
+        break;
+    case ROTWIN_TYPE_SKILLS:
+        intgame_secondary_button_toggle(INTGAME_SECONDARY_BUTTON_SKILLS, ROTWIN_TYPE_SKILLS);
+        break;
+    default:
+        break;
+    }
 }
 
 // 0x54A330

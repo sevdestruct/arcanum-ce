@@ -124,6 +124,16 @@
 // are shuffled out to other free slots.
 #define GOLD_EXPANSION_SLOT_PRIORITY_KEY "gold expansion slot priority"
 
+// CE: restore the rotating bottom-bar window page (Spells / Skills) that
+// was open when the game was saved. The original load read the saved page
+// but threw it away, so a load always snapped the window back to the
+// default Messages page. Default 0 (vanilla: always reopen on Messages);
+// set to 1 to reopen on the saved page. Only the persistent, user-toggled
+// pages are restored — transient/context-bound pages (Magick & Tech,
+// dialogue, quantity, ...) are left on Messages since their context no
+// longer exists after a load.
+#define ROTWIN_RESTORE_KEY "restore rotating window"
+
 // CE: feather terrain/cliff edges into the black void the zoomed-out camera
 // exposes (vignette at map edges, feather around black off-area facades).
 // Default 1; set to 0 for vanilla hard edges (also skips the fade's

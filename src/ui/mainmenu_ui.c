@@ -1988,6 +1988,12 @@ void sub_5412E0(bool a1)
 
     // CE: Restore main interface to its normal state.
     intgame_show();
+
+    // CE: re-open the rotating-window page that was active at save time
+    // (ROTWIN_RESTORE_KEY). Done here, as the last step of the enter-world
+    // path, so it lands after intgame_show and every MSG-forcing refresh.
+    // No-op unless a load queued a page.
+    intgame_apply_rotwin_restore();
 }
 
 // 0x541590

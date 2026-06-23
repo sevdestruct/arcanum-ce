@@ -479,6 +479,11 @@ bool gamelib_init(GameInitInfo* init_info)
     // are shuffled out to other free slots.
     settings_register(&settings, GOLD_EXPANSION_SLOT_PRIORITY_KEY, "0", NULL);
 
+    // CE: restore the rotating bottom-bar window page (Spells / Skills) that
+    // was open at save time instead of always reopening on the default
+    // Messages page. Default off. See ROTWIN_RESTORE_KEY.
+    settings_register(&settings, ROTWIN_RESTORE_KEY, "0", NULL);
+
     // CE: void-edge fade — feather terrain/cliff edges into the black void
     // exposed by the zoomed-out camera (vignette at map edges, feather around
     // black off-area facades). Default on; set to "0" for vanilla hard edges.
@@ -717,6 +722,7 @@ static const SettingsDoc gamelib_cfg_docs[] = {
     { "ui animations", "Animated window open/close transitions (0=instant/snap, 1=on)." },
     { "translucent black ui", "Let the world show faintly through near-black UI panels like the HUD bar and inventory (0=off, 1=on)." },
     { "gold expansion slot priority", "When a growing gold pile no longer fits its cells: 0=the pile moves to a free slot, 1=the pile keeps its spot and other items shuffle out." },
+    { "restore rotating window", "On load, reopen the rotating bottom-bar window on the page (Spells/Skills) that was open when you saved, instead of the default Messages page (0=always Messages, 1=restore saved page)." },
 
     { NULL, "Text & Dialogue" },
     { "text floaters", "Show floating combat/status text above characters (0=off, 1=on)." },
