@@ -19,6 +19,7 @@
 #include "ui/fate_ui.h"
 #include "ui/follower_ui.h"
 #include "ui/intgame.h"
+#include "ui/mainmenu_ui.h"
 #include "ui/sleep_ui.h"
 #include "ui/ui_anim.h"
 
@@ -1058,6 +1059,14 @@ static void gpu_test_channel_tick(void)
             tig_debug_printf("[gpu-cmd] loadsave %s\n", arg);
             if (!gamelib_load(arg)) {
                 tig_debug_printf("[gpu-cmd] loadsave FAILED\n");
+            } else if (mainmenu_ui_is_active()) {
+                // The real menu load flow (mainmenu_ui sub_5432B0) calls sub_5412D0()
+                // after gamelib_load to dismiss the menu and enter the game. The harness
+                // skipped that, so the world rendered UNDER the still-open main menu --
+                // the menu stayed on top (invisible game). Run the same transition so the
+                // harness is actually watchable.
+                sub_5412D0();
+                tig_debug_printf("[gpu-cmd] dismissed mainmenu -> in-game\n");
             }
         } else if (sscanf(line, "setpath %255s", arg) == 1) {
             settings_set_str_value(&settings, RENDER_PATH_KEY, arg);
