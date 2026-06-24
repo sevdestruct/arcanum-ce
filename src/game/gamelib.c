@@ -1105,6 +1105,20 @@ static void gpu_test_channel_tick(void)
             TigRect wake = { 0, 0, 1, 1 };
             gamelib_invalidate_rect(&wake);
             tig_debug_printf("[gpu-cmd] scrollby %d %d\n", ix, iy);
+        } else if (sscanf(line, "walkby %d %d", &ix, &iy) == 2) {
+            // harness: make the PC actually WALK dx,dy tiles from its current loc. With
+            // camera-follow on, the camera then scrolls naturally as it walks -- real
+            // movement + scrolling, not a camera snap.
+            int64_t pc = player_get_local_pc_obj();
+            if (pc != OBJ_HANDLE_NULL) {
+                int64_t loc = obj_field_int64_get(pc, OBJ_F_LOCATION);
+                int64_t tgt = LOCATION_MAKE(LOCATION_GET_X(loc) + ix, LOCATION_GET_Y(loc) + iy);
+                anim_goal_run_to_tile(pc, tgt);
+                tig_debug_printf("[gpu-cmd] walkby %d %d -> (%lld,%lld)\n", ix, iy,
+                    (long long)LOCATION_GET_X(tgt), (long long)LOCATION_GET_Y(tgt));
+            } else {
+                tig_debug_printf("[gpu-cmd] walkby: no PC\n");
+            }
         } else if (sscanf(line, "setzoom %f", &fz) == 1) {
             // profiling: drive the zoom animation toward a target (1.0 = in, 0.5 = out).
             // Force availability so it engages regardless of freshly-loaded harness state

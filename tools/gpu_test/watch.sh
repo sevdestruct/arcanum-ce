@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 #
-# VISIBLE harness — launches the (Perf GPU Accel) build in the FOREGROUND and
-# drives it through the gpucmd channel so you can WATCH it work: the loadsave
-# dismisses the main menu, then it zooms out and scrolls around on its own.
+# VISIBLE smooth-scroll + zoom demo. Launches the (Perf GPU Accel) build in the
+# FOREGROUND and drives a watchable scene: it SMOOTHLY scrolls (many small steps,
+# not a teleport) at z=1.0, z=0.5, and z=2.0, with zoom in/out transitions between.
 #
-# (The measurement harness, run.sh, launches with `open -g` = background/no-focus,
-#  which leaves the menu on top from the viewer's side. This one foregrounds it.)
+# (run.sh = headless measurement harness, `open -g` background. This one foregrounds
+#  it and dismisses the menu so you can actually watch.)
 #
 # Usage:
 #   tools/gpu_test/watch.sh [SAVE] [VOIDFADE]
-#     SAVE      save slot to load (default Slot0015 = Town-Outdoor-Nighttime)
-#     VOIDFADE  1 = enable the void-edge-fade dedup opt (ARCANUM_OPT_VOIDFADE)
+#     SAVE      save slot (default Slot0015 = Town-Outdoor-Nighttime)
+#     VOIDFADE  1 = ARCANUM_OPT_VOIDFADE (near-zero void-fade cost)
 #
-# Town saves available: Slot0013 (Town), Slot0015 (Town night, many lights),
-#   Slot0014 (Town indoor day), Slot0012 (Blimp).
+# Towns: Slot0015 (night, many lights), Slot0013 (Town), Slot0014 (indoor day).
 set -uo pipefail
 
 SAVE="${1:-Slot0015}"
@@ -22,34 +21,38 @@ APP="${APP:-$HOME/Applications/Arcanum/Arcanum Community Edition (Perf GPU Accel
 BIN="$APP/Contents/MacOS/arcanum-ce"
 CMD=/tmp/arcanum-watch-cmd.txt
 DBG=/tmp/arcanum-debug.log
-
 [[ -x "$BIN" ]] || { echo "ERROR: not built/deployed: $BIN" >&2; exit 2; }
+
+# smooth DX DY STEPS : emit STEPS small scrollby's (DX/DY px each, ~1 frame apart)
+# so the camera glides instead of teleporting. ~20px/frame ≈ real edge-scroll speed.
+smooth() { local n; for ((n = 0; n < $3; n++)); do echo "scrollby $1 $2"; echo "wait 1"; done; }
+
+gen_cmd() {
+  echo "loadsave $SAVE"; echo "wait 150"
+  # --- smooth scroll at z=1.0 ---
+  smooth 20 0 36; smooth 0 20 30; smooth -20 -12 36
+  echo "setzoom 0.5"; echo "wait 120"
+  # --- smooth scroll at z=0.5 (the dense zoomed-out case) ---
+  smooth 22 0 40; smooth 0 22 34; smooth -22 12 40; smooth 14 -14 30
+  echo "setzoom 1.0"; echo "wait 80"
+  echo "setzoom 2.0"; echo "wait 90"
+  # --- smooth scroll at z=2.0 (zoomed in) ---
+  smooth 18 0 30; smooth 0 -18 26; smooth -18 14 30
+  echo "setzoom 1.0"; echo "wait 90"
+  echo "quit"
+}
 
 pkill -9 -f "Perf GPU Accel" 2>/dev/null || true
 sleep 1
 rm -f "$DBG"
+gen_cmd > "$CMD"
 
-# Slow, watchable pacing (waits are in frames; ~60fps). Each step is visible.
-{
-  echo "loadsave $SAVE"; echo "wait 150"        # menu dismisses, town loads (~2.5s)
-  echo "setzoom 0.5";    echo "wait 150"        # zoom all the way out
-  echo "scrollby 450 0"; echo "wait 80"         # scroll right into fresh area
-  echo "scrollby 0 450"; echo "wait 80"         # scroll down
-  echo "scrollby 650 650"; echo "wait 80"       # scroll diagonally
-  echo "scrollby -700 -200"; echo "wait 80"
-  echo "setzoom 1.0";    echo "wait 150"        # zoom back in
-  echo "quit"
-} > "$CMD"
-
-echo "==> watching: $SAVE   voidfade=${VF:-off}"
-echo "    (the Arcanum window will come to the front; it drives itself, then quits)"
-if [[ -n "$VF" ]]; then export ARCANUM_OPT_VOIDFADE="$VF"; fi
-
-# Foreground launch (no -g) so the window is visible + focused (not app-napped).
+echo "==> watch (smooth scroll + zoom): $SAVE   voidfade=${VF:-off}"
+echo "    window comes to the front; scrolls smoothly at z=1.0 / 0.5 / 2.0, then quits"
+[[ -n "$VF" ]] && export ARCANUM_OPT_VOIDFADE="$VF"
 ARCANUM_GPU_CMD="$CMD" open "$APP" --args -window -gpucmd:"$CMD"
 
-# Wait for it to finish on its own (the script ends with `quit`).
-for i in $(seq 1 90); do
+for i in $(seq 1 120); do
   pgrep -f "Perf GPU Accel" >/dev/null || { echo "    done after ${i}s"; break; }
   sleep 1
 done
