@@ -2249,6 +2249,26 @@ void sector_precache_art(Sector* sector)
 {
     int index;
 
+    // CE: on the GPU render path this eager per-sector CPU-art precache is redundant on
+    // the load critical path -- it was the remaining cold-sector-load cost (~14-86ms/sector
+    // after the void-fade fix). The world renders from the GPU texture cache, warmed by the
+    // idle art pre-touch (gamelib_gpu_art_pretouch), whose decode (art_render_for_gpu ->
+    // tig_art_blit) goes through the SAME CPU art cache (sub_51AA90) this would warm -- so
+    // the pre-touch + on-demand GPU get cover it off the interaction frame. Skip on the GPU
+    // path; the software path keeps it (its blits read this CPU cache directly, no pre-touch).
+    // ARCANUM_OPT_PRECACHE=1 forces it back on (escape hatch).
+    static int force = -1;
+    if (force < 0) {
+        const char* e = getenv("ARCANUM_OPT_PRECACHE");
+        force = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    // tile_gpu_iso_overlay_path() == the full GPU/hardware path is active. Use it (NOT
+    // present/world_lighting, which go false during the zoom pass and so missed exactly
+    // the z=0.5 sector loads -- the main hitch case); this stays true across zoom.
+    if (!force && tile_gpu_iso_overlay_path()) {
+        return;
+    }
+
     if (sector_art_cache_state > 0) {
         li_update();
         sector_list_tile_precache_art(&(sector->tiles));
