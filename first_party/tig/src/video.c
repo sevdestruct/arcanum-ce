@@ -1360,6 +1360,14 @@ int tig_video_flip(void)
         SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
         SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_NONE);
     } else {
+        // CE: the framebuffer texture is ARGB8888 (so gpu-present can alpha-blend it
+        // over the GPU world). SDL defaults an alpha-format texture to BLENDMODE_BLEND,
+        // so without forcing NONE here the software path presents the framebuffer
+        // alpha-blended -- and any alpha-0 region (e.g. the wmap after its scale-in
+        // settles) goes transparent -> black. Force NONE so the opaque RGB shows,
+        // matching the pre-ARGB (XRGB) behavior. (The gpu-present branch above manages
+        // its own blend mode and resets to NONE.)
+        SDL_SetTextureBlendMode(tig_video_state.texture, SDL_BLENDMODE_NONE);
         SDL_RenderTexture(tig_video_state.renderer, tig_video_state.texture, NULL, NULL);
     }
     // NOTE: do NOT clear tig_video_world_under_valid here -- the GPU world target
