@@ -16,6 +16,9 @@ void wmap_ui_open(void);
 void wmap_ui_select(int64_t obj, int spell);
 void wmap_ui_close(void);
 int wmap_ui_is_created(void);
+void wmap_ui_scroll_test(int dx, int dy); // CE (harness): drive the void-fade feather
+void wmap_ui_capture_test(const char* path); // CE (harness): dump wmap window to BMP
+void wmap_ui_set_halfres(int on); // CE (harness): runtime full/half-res feather toggle
 void wmap_ui_scroll(int direction);
 void sub_564000(int a1);
 void wmap_ui_mark_townmap(int64_t obj);

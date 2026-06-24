@@ -20,6 +20,7 @@
 #include "ui/follower_ui.h"
 #include "ui/intgame.h"
 #include "ui/mainmenu_ui.h"
+#include "ui/wmap_ui.h"
 #include "ui/sleep_ui.h"
 #include "ui/ui_anim.h"
 
@@ -1119,6 +1120,30 @@ static void gpu_test_channel_tick(void)
             } else {
                 tig_debug_printf("[gpu-cmd] walkby: no PC\n");
             }
+        } else if (sscanf(line, "wmapscroll %d %d", &ix, &iy) == 2) {
+            // harness: scroll the OPEN travel map by dx,dy (drives wmap_void_feather
+            // each step) so the wmap fade can be measured/A-B'd like the iso path.
+            if (wmap_ui_is_created()) {
+                wmap_ui_scroll_test(ix, iy);
+                tig_debug_printf("[gpu-cmd] wmapscroll %d %d\n", ix, iy);
+            } else {
+                tig_debug_printf("[gpu-cmd] wmapscroll: wmap not open\n");
+            }
+        } else if (strncmp(line, "wmapclose", 9) == 0) {
+            wmap_ui_close();
+            tig_debug_printf("[gpu-cmd] wmap close\n");
+        } else if (sscanf(line, "wmapcap %255s", arg) == 1) {
+            // harness: dump the wmap window to a BMP for full-res-vs-optimized diff.
+            wmap_ui_capture_test(arg);
+            tig_debug_printf("[gpu-cmd] wmapcap %s\n", arg);
+        } else if (sscanf(line, "wmaphalf %d", &ix) == 1) {
+            // harness: toggle the half-res feather at runtime (one launch A/Bs both).
+            wmap_ui_set_halfres(ix);
+            tig_debug_printf("[gpu-cmd] wmaphalf %d\n", ix);
+        } else if (strncmp(line, "wmap", 4) == 0) {
+            // harness: open the travel/world map (to drive + measure the feather).
+            wmap_ui_open();
+            tig_debug_printf("[gpu-cmd] wmap open (created=%d)\n", wmap_ui_is_created());
         } else if (sscanf(line, "setzoom %f", &fz) == 1) {
             // profiling: drive the zoom animation toward a target (1.0 = in, 0.5 = out).
             // Force availability so it engages regardless of freshly-loaded harness state
