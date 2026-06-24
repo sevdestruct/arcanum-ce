@@ -17,8 +17,10 @@
 
 // Direct-mapped memo of tig_art_exists() results, keyed by a hash of the art id.
 // Sector loads scan 4096 tiles; without this every scan would re-stat the art
-// files. Tiles share art ids heavily, so a small cache has a high hit rate.
-#define GAP_EXISTS_MEMO_BITS 12
+// files (~46us each across the override tiers). Tiles share art ids heavily. The
+// table must hold a town's whole unique-tile-art set or it thrashes across sector
+// loads (re-stats the same arts) -- 16 bits (65536) covers it; 12 bits did not.
+#define GAP_EXISTS_MEMO_BITS 16
 #define GAP_EXISTS_MEMO_SIZE (1 << GAP_EXISTS_MEMO_BITS)
 #define GAP_EXISTS_MEMO_MASK (GAP_EXISTS_MEMO_SIZE - 1)
 
@@ -101,8 +103,24 @@ static bool gap_renderable(tig_art_id_t aid)
 
 // A gap is anything that would render black: missing art, the terrain_fill
 // placeholder, or an authored void tile.
+//
+// ARCANUM_OPT_VOIDFADE=1 (aggressive mode) skips the !gap_renderable() check, whose
+// gap_art_exists_cached()->tig_art_exists() does a ~46us file stat across the asset
+// override tiers -- the dominant cost of a cold sector load (gap_vmask_store scans all
+// 4096 tiles). For a normal install ALL tile art exists, so that check never actually
+// finds a gap; the real void edges are the bit-checkable placeholder/void-black tiles.
+// Skipping it makes the per-sector void scan ~free. Tradeoff: a genuinely missing-art
+// tile (corrupt install / a mod that omits art) renders black but no longer feathers.
 static bool gap_is_gap(tig_art_id_t aid)
 {
+    static int skip_exist = -1;
+    if (skip_exist < 0) {
+        const char* e = getenv("ARCANUM_OPT_VOIDFADE");
+        skip_exist = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (skip_exist) {
+        return gap_is_placeholder(aid) || gap_is_void_black(aid);
+    }
     return !gap_renderable(aid) || gap_is_placeholder(aid) || gap_is_void_black(aid);
 }
 
@@ -340,8 +358,44 @@ static void gap_vmask_store(int64_t id, Sector* sector)
     // off-area regions flood in from the void's own perimeter and merge into one
     // density bulk, while isolated black content — burnt wrecks, cave shadows,
     // dark art — can never join and never drags the fade into the scene).
+    // ARCANUM_OPT_VOIDFADE=1: per-sector dedup of gap_is_gap(). A sector's 4096 tiles
+    // repeat only a few hundred unique arts, but gap_is_gap()->tig_art_exists() costs
+    // ~46us (file-existence across the asset override tiers) and the 12-bit direct-
+    // mapped global existence memo thrashes on a sector's art set, so the repeats
+    // aren't collapsed -> ~4096 file checks ~= 190ms per cold sector load. Checking each
+    // UNIQUE art once cuts that ~20x. Correctness-neutral (gap_is_gap is per-art-id
+    // deterministic); gated default-off so it can be A/B'd against the baseline.
+    static int gvs_dedup = -1;
+    if (gvs_dedup < 0) {
+        const char* e = getenv("ARCANUM_OPT_VOIDFADE");
+        gvs_dedup = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    static tig_art_id_t gvs_dk[8192];
+    static int8_t gvs_dv[8192]; // -1 empty, 0 not-gap, 1 gap
+    if (gvs_dedup) {
+        memset(gvs_dv, -1, sizeof(gvs_dv));
+    }
     for (i = 0; i < GAP_TILES_PER_SECTOR; i++) {
-        uint8_t cls = (gap_is_gap(a[i]) || (dark != NULL && gap_dark_bit(dark, i))) ? 1 : 0;
+        int g;
+        if (gvs_dedup) {
+            tig_art_id_t aid = a[i];
+            unsigned int s = (unsigned int)(aid * 2654435761u) & 8191u;
+            int pr = 0;
+            while (gvs_dv[s] >= 0 && gvs_dk[s] != aid && pr < 48) {
+                s = (s + 1) & 8191u;
+                pr++;
+            }
+            if (gvs_dv[s] >= 0 && gvs_dk[s] == aid) {
+                g = gvs_dv[s];
+            } else {
+                g = gap_is_gap(aid) ? 1 : 0;
+                gvs_dk[s] = aid;
+                gvs_dv[s] = (int8_t)g;
+            }
+        } else {
+            g = gap_is_gap(a[i]) ? 1 : 0;
+        }
+        uint8_t cls = (g || (dark != NULL && gap_dark_bit(dark, i))) ? 1 : 0;
         // Roof-covered void is not "edge to nothing": the all-maps audit found
         // small void regions under the roofs of non-enterable town buildings
         // (15 building footprints on the worldmap). The roof hides them fully,
