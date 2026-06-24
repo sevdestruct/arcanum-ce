@@ -1770,7 +1770,12 @@ void tile_gpu_zoom_end(const TigRect* dst_rect, const TigRect* src_rect, bool li
     }
     SDL_Renderer* renderer = NULL;
     if (tig_video_renderer_get(&renderer) == TIG_OK && renderer != NULL) {
+        uint64_t flush_t0 = tile_gpu_now_ns();
         SDL_SetRenderTarget(renderer, NULL); // flush the zoom-pass batch + unbind
+        double flush_ms = (double)(tile_gpu_now_ns() - flush_t0) / 1e6;
+        if (flush_ms > 25.0) {
+            tig_debug_printf("[zoom-end] flush/resolve %.1fms\n", flush_ms);
+        }
     }
     SDL_Texture* tex = tig_video_buffer_get_sdl_texture(tile_gpu_zoom_buffer);
     tig_video_set_world_underlay(tex, dst_rect, src_rect, linear);

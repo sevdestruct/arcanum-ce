@@ -959,10 +959,16 @@ bool sector_lock(int64_t id, Sector** sector_ptr)
         cache_entry = &(sector_cache_entries[index]);
         cache_entry->sector.datetime = datetime;
 
+        extern uint64_t gamelib_perf_now_ns(void);
+        uint64_t sector_load_t0 = gamelib_perf_now_ns();
         if (!sector_load_func(id, &(cache_entry->sector))) {
             tig_debug_printf("Error: attempt to lock sector %I64u in cache failed due to error in load.  This is bad.  Help.\n", id);
             in_sector_lock = false;
             return false;
+        }
+        double sector_load_ms = (double)(gamelib_perf_now_ns() - sector_load_t0) / 1e6;
+        if (sector_load_ms > 5.0) {
+            tig_debug_printf("[sector-load] cold sector %llu in %.1fms\n", (unsigned long long)id, sector_load_ms);
         }
 
         memmove(&(sector_cache_indexes[dword_60182C + 1]),
@@ -1472,6 +1478,10 @@ bool sector_load_game(int64_t id, Sector* sector)
     TigFile* dif_stream;
     int placeholder;
 
+    extern uint64_t gamelib_perf_now_ns(void);
+    uint64_t sl_t0 = gamelib_perf_now_ns();
+    uint64_t sl_obj_a = 0, sl_obj_ns = 0;
+
     if (sector_check_demo_limits(id)) {
         strcpy(sec_path, sector_base_path);
         strcat(sec_path, "\\");
@@ -1701,6 +1711,7 @@ bool sector_load_game(int64_t id, Sector* sector)
             }
         }
 
+        sl_obj_a = gamelib_perf_now_ns();
         li_update();
         if ((dif_flags & DIF_HAVE_OBJ_LIST) != 0) {
             if (!objlist_load_with_difs(&(sector->objects), sec_stream, dif_stream, v2)) {
@@ -1721,20 +1732,37 @@ bool sector_load_game(int64_t id, Sector* sector)
         if (dif_flags != 0) {
             tig_file_fclose(dif_stream);
         }
+        sl_obj_ns = gamelib_perf_now_ns() - sl_obj_a;
     }
 
     sector_validate_game("sector post-load (pre-fold)");
+    uint64_t sl_va = gamelib_perf_now_ns();
     void_edge_fade_sector(id, sector);
+    uint64_t sl_void_ns = gamelib_perf_now_ns() - sl_va;
     li_update();
+    uint64_t sl_fa = gamelib_perf_now_ns();
     objlist_fold(&(sector->objects), id, sub_45A9B0(&(sector->datetime), 3000));
+    uint64_t sl_objfold_ns = gamelib_perf_now_ns() - sl_fa;
     li_update();
+    uint64_t sl_la = gamelib_perf_now_ns();
     sector_light_list_fold(&(sector->lights), id, &(sector->tiles));
+    uint64_t sl_lightfold_ns = gamelib_perf_now_ns() - sl_la;
     sector_validate_game("sector post-fold");
 
+    uint64_t sl_pa = gamelib_perf_now_ns();
     if (sector->townmap_info != 0) {
         sector_precache_art(sector);
     }
+    uint64_t sl_precache_ns = gamelib_perf_now_ns() - sl_pa;
 
+    {
+        double tot = (double)(gamelib_perf_now_ns() - sl_t0) / 1e6;
+        if (tot > 20.0) {
+            tig_debug_printf("[sl-phase] %.0fms total | objload %.0f void %.0f objfold %.0f lightfold %.0f precache %.0f\n",
+                tot, (double)sl_obj_ns / 1e6, (double)sl_void_ns / 1e6, (double)sl_objfold_ns / 1e6,
+                (double)sl_lightfold_ns / 1e6, (double)sl_precache_ns / 1e6);
+        }
+    }
     return true;
 }
 

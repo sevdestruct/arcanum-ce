@@ -2169,6 +2169,12 @@ bool gamelib_draw(void)
     // first scroll/zoom into a fresh area doesn't pay the cold per-sprite upload hitch.
     gamelib_gpu_art_pretouch();
 
+    // CE: warm the GPU zoom render targets off-screen on a post-load idle frame so the
+    // first zoom-out (and the first zoom after a reload, which recreates the targets)
+    // doesn't pay the driver's one-time render-to-target pipeline setup (~70-160ms hitch).
+    // Self-gating no-op once warmed / off the hardware zoom path.
+    tile_gpu_zoom_prewarm();
+
     // CE: HUD bar slide must run BEFORE the gamelib_dirty early-
     // return — ui_anim_ping just integrated the slide offsets, but
     // they're not applied to the bar's tig position until
@@ -4231,7 +4237,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         uint64_t t0;
 
         t0 = perf_on ? gamelib_zoom_perf_now_ns() : 0;
-        light_draw(draw_info);
+        { uint64_t pb = gamelib_zoom_perf_now_ns(); light_draw(draw_info); uint64_t pd = gamelib_zoom_perf_now_ns() - pb; if (pd > 30000000ull) tig_debug_printf("[pass-spike] light = %.1fms\n", (double)pd / 1e6); }
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
             gamelib_zoom_perf_pass_light_total_ns += d;
@@ -4248,7 +4254,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         if (!zoom_pass_open) {
             tile_gpu_world_begin();
         }
-        tile_draw(draw_info);
+        { uint64_t pb = gamelib_zoom_perf_now_ns(); tile_draw(draw_info); uint64_t pd = gamelib_zoom_perf_now_ns() - pb; if (pd > 30000000ull) tig_debug_printf("[pass-spike] tile = %.1fms\n", (double)pd / 1e6); }
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
             gamelib_zoom_perf_pass_tile_total_ns += d;
@@ -4256,7 +4262,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
         }
         { uint64_t spk = gamelib_zoom_perf_now_ns(); sub_43C690(draw_info); uint64_t spkd = gamelib_zoom_perf_now_ns() - spk; if (spkd > 10000000ull) tig_debug_printf("[zoom-spike] sub_43C690 = %.1fms\n", (double)spkd / 1e6); }  // bucketed in 'tile' bucket above-or-below if we cared; here it falls between
         if (perf_on) t0 = gamelib_zoom_perf_now_ns();
-        object_draw(draw_info);
+        { uint64_t pb = gamelib_zoom_perf_now_ns(); object_draw(draw_info); uint64_t pd = gamelib_zoom_perf_now_ns() - pb; if (pd > 30000000ull) tig_debug_printf("[pass-spike] object = %.1fms\n", (double)pd / 1e6); }
         if (perf_on) {
             uint64_t d = gamelib_zoom_perf_now_ns() - t0;
             gamelib_zoom_perf_pass_object_total_ns += d;
@@ -4284,7 +4290,7 @@ void gamelib_draw_game(GameDrawInfo* draw_info)
                 TigRectListNode* roof_full_head = &roof_full_node;
                 GameDrawInfo roof_draw_info = *draw_info;
                 roof_draw_info.rects = &roof_full_head;
-                roof_draw(&roof_draw_info);
+                { uint64_t pb = gamelib_zoom_perf_now_ns(); roof_draw(&roof_draw_info); uint64_t pd = gamelib_zoom_perf_now_ns() - pb; if (pd > 30000000ull) tig_debug_printf("[pass-spike] roof(zoom) = %.1fms\n", (double)pd / 1e6); }
             } else {
                 roof_draw(draw_info);
             }

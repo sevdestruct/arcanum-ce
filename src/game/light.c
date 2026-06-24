@@ -2390,8 +2390,13 @@ void light_render_internal(GameDrawInfo* draw_info)
     int64_t loc_x;
     int64_t loc_y;
 
+    extern uint64_t gamelib_perf_now_ns(void);
+    uint64_t lr_t0 = gamelib_perf_now_ns();
+    int lr_lights = 0;
+    long lr_splats = 0;
     tig_video_buffer_fill(lighter_vb, NULL, 0);
     tig_video_buffer_fill(darker_vb, NULL, 0);
+    uint64_t lr_clear_ns = gamelib_perf_now_ns() - lr_t0;
     light_buffers_lock();
 
     indoor_color = light_get_indoor_color();
@@ -2418,6 +2423,7 @@ void light_render_internal(GameDrawInfo* draw_info)
             while (light_node != NULL) {
                 light = (Light*)light_node->data;
                 if ((light->flags & LF_OFF) == 0) {
+                    lr_lights++;
                     light_get_rect_internal(light, &tmp_rect);
 
                     art_anim_data_loaded = false;
@@ -2487,6 +2493,7 @@ void light_render_internal(GameDrawInfo* draw_info)
                                                     }
 
                                                     dst[idx] = tig_color_add(color, dst[idx]);
+                                                    lr_splats++;
                                                 }
                                             }
                                         }
@@ -2510,6 +2517,13 @@ void light_render_internal(GameDrawInfo* draw_info)
         head = rect_node;
     }
 
+    {
+        double lr_ms = (double)(gamelib_perf_now_ns() - lr_t0) / 1e6;
+        if (lr_ms > 30.0) {
+            tig_debug_printf("[light-prof] %.1fms total (clear %.1fms) | %d lights, %ld splats\n",
+                lr_ms, (double)lr_clear_ns / 1e6, lr_lights, lr_splats);
+        }
+    }
     light_buffers_unlock();
 }
 
