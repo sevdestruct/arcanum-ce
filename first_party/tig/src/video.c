@@ -2396,6 +2396,19 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags)
 }
 
 // 0x521000
+// CE: ARCANUM_OPT_SIMD_BLIT gate for the NEON per-pixel lighting blit fast
+// path (the COLOR_LERP branch below). Default on; set =0 to restore the scalar
+// tig_color_mul (64KB multiply-table) path for A/B comparison or as a fallback.
+static bool video_simd_blit_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("ARCANUM_OPT_SIMD_BLIT");
+        v = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
 {
     bool stretched;
@@ -2538,6 +2551,86 @@ int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
         uint32_t* dst = (uint32_t*)((uint8_t*)blit_info->dst_video_buffer->surface->pixels
             + blit_info->dst_video_buffer->surface->pitch * blit_dst_rect.y
             + 4 * blit_dst_rect.x);
+
+#if TIG_HAVE_NEON
+        // CE: NEON fast path for the per-pixel lighting multiply. The scalar
+        // loop below does tig_color_mul() -> three 64KB-table lookups per pixel
+        // (memory-latency bound); this processes 4 px/iter and replaces the
+        // table with the exact integer /255 ((n + 1 + (n>>8)) >> 8, verified
+        // == n/255 for all products in [0,65025]). The lerp gradient + ARGB
+        // pack stay scalar so the float accumulation order and (uint8_t) casts
+        // match the scalar path EXACTLY -> output is byte-identical. Pixel
+        // format is ARGB8888 (same as the tint-blit NEON path above).
+        // ARCANUM_OPT_SIMD_BLIT=0 restores the scalar table path.
+        if (video_simd_blit_enabled()) {
+            const bool has_key =
+                (blit_info->src_video_buffer->flags & TIG_VIDEO_BUFFER_COLOR_KEY) != 0;
+            const uint32_t color_key = blit_info->src_video_buffer->color_key;
+            const uint32x4_t key_v = vdupq_n_u32(color_key);
+            const uint32x4_t rgb_mask = vdupq_n_u32(0x00FFFFFFu);
+            const uint32x4_t alpha_set = vdupq_n_u32(0xFF000000u);
+            const uint16x8_t one = vdupq_n_u16(1);
+            int sx, sy;
+            for (sy = 0; sy < blit_dst_rect.height; ++sy) {
+                float hor_step_r = (vert_end_r - vert_start_r) / blit_info->lerp_rect->width;
+                float hor_step_g = (vert_end_g - vert_start_g) / blit_info->lerp_rect->width;
+                float hor_step_b = (vert_end_b - vert_start_b) / blit_info->lerp_rect->width;
+                float r = vert_start_r + hor_step_r * (blit_src_rect.x - blit_info->lerp_rect->x);
+                float g = vert_start_g + hor_step_g * (blit_src_rect.x - blit_info->lerp_rect->x);
+                float b = vert_start_b + hor_step_b * (blit_src_rect.x - blit_info->lerp_rect->x);
+                sx = 0;
+                for (; sx + 4 <= blit_dst_rect.width; sx += 4) {
+                    uint32_t lerp4[4];
+                    int k;
+                    for (k = 0; k < 4; ++k) {
+                        lerp4[k] = 0xFF000000u
+                            | ((uint32_t)(uint8_t)r << 16)
+                            | ((uint32_t)(uint8_t)g << 8)
+                            | (uint32_t)(uint8_t)b;
+                        r += hor_step_r;
+                        g += hor_step_g;
+                        b += hor_step_b;
+                    }
+                    uint32x4_t s4 = vld1q_u32(src + sx);
+                    uint8x16_t s_b = vreinterpretq_u8_u32(s4);
+                    uint8x16_t l_b = vreinterpretq_u8_u32(vld1q_u32(lerp4));
+                    uint16x8_t plo = vmull_u8(vget_low_u8(s_b), vget_low_u8(l_b));
+                    uint16x8_t phi = vmull_u8(vget_high_u8(s_b), vget_high_u8(l_b));
+                    plo = vaddq_u16(plo, vaddq_u16(vshrq_n_u16(plo, 8), one));
+                    phi = vaddq_u16(phi, vaddq_u16(vshrq_n_u16(phi, 8), one));
+                    uint8x16_t mul8 = vcombine_u8(vshrn_n_u16(plo, 8), vshrn_n_u16(phi, 8));
+                    uint32x4_t mul = vreinterpretq_u32_u8(mul8);
+                    mul = vorrq_u32(vandq_u32(mul, rgb_mask), alpha_set);
+                    uint32x4_t out;
+                    if (has_key) {
+                        uint32x4_t km = vceqq_u32(s4, key_v);
+                        out = vbslq_u32(km, vld1q_u32(dst + sx), mul);
+                    } else {
+                        out = mul;
+                    }
+                    vst1q_u32(dst + sx, out);
+                }
+                for (; sx < blit_dst_rect.width; ++sx) {
+                    if (!has_key || src[sx] != color_key) {
+                        dst[sx] = tig_color_mul(src[sx],
+                            tig_color_make((uint8_t)r, (uint8_t)g, (uint8_t)b));
+                    }
+                    r += hor_step_r;
+                    g += hor_step_g;
+                    b += hor_step_b;
+                }
+                vert_start_r += vert_start_step_r;
+                vert_end_r += vert_end_step_r;
+                vert_start_g += vert_start_step_g;
+                vert_end_g += vert_end_step_g;
+                vert_start_b += vert_start_step_b;
+                vert_end_b += vert_end_step_b;
+                src = (uint32_t*)((uint8_t*)src + blit_info->src_video_buffer->surface->pitch - 4 * blit_src_rect.width);
+                dst = (uint32_t*)((uint8_t*)dst + blit_info->dst_video_buffer->surface->pitch - 4 * blit_dst_rect.width);
+            }
+            return TIG_OK;
+        }
+#endif
 
         for (y = 0; y < blit_dst_rect.height; ++y) {
             float hor_step_r = (vert_end_r - vert_start_r) / blit_info->lerp_rect->width;
