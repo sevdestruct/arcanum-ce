@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -61,6 +62,7 @@
 #include "game/multiplayer.h"
 #include "game/name.h"
 #include "game/newspaper.h"
+#include "game/obj.h"
 #include "game/party.h"
 #include "game/player.h"
 #include "game/portrait.h"
@@ -1880,49 +1882,250 @@ void gamelib_invalidate_rect(TigRect* rect)
     }
 }
 
-// CE (zoom idle preload): the first zoom-OUT renders a ~2x-wider extent than the 1.0
-// view, loading sectors the 1.0 view never touched -- a one-time ~80ms cold-render
-// stutter ("a little stutter on the first zoom-out, not new"). Pre-load those sectors
-// during post-load idle so the first zoom-out's render is already warm. Runs once.
-static bool gamelib_zoom_sectors_preloaded = false;
-static void gamelib_zoom_sector_preload(void)
-{
-    if (gamelib_zoom_sectors_preloaded) {
-        return;
-    }
-    if (!iso_zoom_is_available()) {
-        return; // zoom not available yet -- retry next idle frame
-    }
-    // The deepest zoom (z=0.5) shows ~2x the 1.0 content area, centred on the PC. Build
-    // that wider screen extent (+ the render's overdraw margin) and resolve the sectors
-    // it covers, then lock/unlock each cold one to pull it into the sector cache.
-    TigRect wide = gamelib_iso_content_rect;
-    int cx = wide.x + wide.width / 2;
-    int cy = wide.y + wide.height / 2;
-    wide.width *= 2;
-    wide.height *= 2;
-    wide.x = cx - wide.width / 2;
-    wide.y = cy - wide.height / 2;
-    TigRect wide_ex = { wide.x - 256, wide.y - 256, wide.width + 512, wide.height + 512 };
+// CE (step 8: GPU art pre-touch): warm the GPU art cache for the wider zoom-out /
+// scroll-leading extent during idle frames, so the first scroll/zoom into a fresh area
+// doesn't pay the cold per-sprite GPU upload (~180ms hitch -- the last felt stutter
+// after the 96MB art-cache fix). On (re-)arm we enumerate the wide extent's
+// tile/object/roof art into a deduped work queue; locking each sector also pulls cold
+// ones into the sector cache, so this subsumes the old once-only zoom sector preload.
+// Each idle frame drains the queue capped at miss_cap UPLOADS (cache misses) plus a call
+// cap, so the pre-touch itself never hitches. We re-arm when the camera center moves past
+// a hysteresis distance (not every sector crossing -- that thrashed near boundaries), so
+// map loads and exploration stay warm. A/B knobs:
+// ARCANUM_GPU_PRETOUCH=0 disables; ARCANUM_PRETOUCH_MISS_CAP=N sets the per-frame budget.
+#define GAMELIB_PRETOUCH_CALL_CAP 8192   // max cache_get lookups per idle frame (hit-walk bound)
+#define GAMELIB_PRETOUCH_SEEN_SLOTS 8192 // dedup-set size (pow2); >> any real unique-art count
+#define GAMELIB_PRETOUCH_REARM_TILES 16  // hysteresis: re-arm only after the camera center moves this far (loc tiles)
+#define GAMELIB_PRETOUCH_MARGIN_TILES 24 // world-space scroll/zoom lookahead margin around the extent
+#define GAMELIB_PRETOUCH_MAX_SPAN_TILES 768 // per-axis span cap; sector_list_create's boundary buffer holds 151 sectors
+static int64_t gamelib_pretouch_cx = 0;             // armed extent center (loc x)
+static int64_t gamelib_pretouch_cy = 0;             // armed extent center (loc y)
+static bool gamelib_pretouch_armed = false;         // false until the first arm
+static bool gamelib_pretouch_cold_pending = false;  // extent may have not-yet-resident sectors to warm on idle
+static tig_art_id_t* gamelib_pretouch_queue = NULL; // deduped art_ids to warm
+static int gamelib_pretouch_size = 0;               // valid entries in the queue
+static int gamelib_pretouch_cap = 0;                // allocated entries
+static int gamelib_pretouch_cursor = 0;             // next entry to drain
+static int gamelib_pretouch_miss_cap = 6;           // uploads warmed per idle frame
+static bool gamelib_pretouch_disabled = false;      // ARCANUM_GPU_PRETOUCH=0 kill switch
+static bool gamelib_pretouch_env_read = false;
+static tig_art_id_t gamelib_pretouch_seen[GAMELIB_PRETOUCH_SEEN_SLOTS]; // dedup, sentinel = INVALID
 
-    LocRect loc_rect;
-    if (!location_screen_rect_to_loc_rect(&wide_ex, &loc_rect)) {
-        return;
+// Queue art_id for warming if it's valid and not already queued this arm. Dedups via a
+// small open-addressing set (sentinel = INVALID) so the queue stays at the unique-art
+// count and re-arm drains stay cheap when the area is already warm.
+static void gamelib_pretouch_push(tig_art_id_t art_id)
+{
+    if (art_id == TIG_ART_ID_INVALID) {
+        return; // empty slot (esp. roofs); cache_get would burn a wasted "miss" on it
     }
-    SectorListNode* sectors = sector_list_create(&loc_rect);
-    int loaded = 0;
-    for (SectorListNode* node = sectors; node != NULL; node = node->next) {
-        if (sector_exists((uint64_t)node->sec) && !sector_loaded(node->sec)) {
-            Sector* s;
-            if (sector_lock(node->sec, &s)) {
-                sector_unlock(node->sec);
-                loaded++;
+    uint32_t slot = (uint32_t)art_id & (GAMELIB_PRETOUCH_SEEN_SLOTS - 1);
+    int probes = 0;
+    while (gamelib_pretouch_seen[slot] != TIG_ART_ID_INVALID) {
+        if (gamelib_pretouch_seen[slot] == art_id) {
+            return; // already queued this arm
+        }
+        slot = (slot + 1) & (GAMELIB_PRETOUCH_SEEN_SLOTS - 1);
+        if (++probes >= 64) {
+            break; // set saturated (pathological extent); queue undeduped rather than spin
+        }
+    }
+    if (probes < 64) {
+        gamelib_pretouch_seen[slot] = art_id;
+    }
+    if (gamelib_pretouch_size == gamelib_pretouch_cap) {
+        int ncap = gamelib_pretouch_cap != 0 ? gamelib_pretouch_cap * 2 : 2048;
+        tig_art_id_t* nq = (tig_art_id_t*)realloc(gamelib_pretouch_queue, (size_t)ncap * sizeof(*nq));
+        if (nq == NULL) {
+            return; // OOM: pre-touch is best-effort, drop this art_id
+        }
+        gamelib_pretouch_queue = nq;
+        gamelib_pretouch_cap = ncap;
+    }
+    gamelib_pretouch_queue[gamelib_pretouch_size++] = art_id;
+}
+
+// Enumerate one resident sector's tile/object/roof art into the pre-touch queue.
+static void gamelib_pretouch_enum_sector(Sector* s)
+{
+    for (int i = 0; i < 4096; i++) {
+        gamelib_pretouch_push(s->tiles.art_ids[i]);
+        for (ObjectNode* on = s->objects.heads[i]; on != NULL; on = on->next) {
+            gamelib_pretouch_push((tig_art_id_t)obj_field_int32_get(on->obj, OBJ_F_CURRENT_AID));
+        }
+    }
+    for (int i = 0; i < SECTOR_ROOF_LIST_SIZE; i++) {
+        gamelib_pretouch_push(s->roofs.art_ids[i]);
+    }
+}
+
+static void gamelib_gpu_art_pretouch(void)
+{
+    if (!gamelib_pretouch_env_read) {
+        gamelib_pretouch_env_read = true;
+        const char* dis = getenv("ARCANUM_GPU_PRETOUCH");
+        if (dis != NULL && dis[0] == '0') {
+            gamelib_pretouch_disabled = true;
+        }
+        const char* cap = getenv("ARCANUM_PRETOUCH_MISS_CAP");
+        if (cap != NULL) {
+            int v = atoi(cap);
+            if (v > 0 && v < 1000) {
+                gamelib_pretouch_miss_cap = v;
             }
         }
     }
-    sector_list_destroy(sectors);
-    gamelib_zoom_sectors_preloaded = true;
-    tig_debug_printf("[zoom-preload] pre-loaded %d cold wider-extent sectors\n", loaded);
+    if (gamelib_pretouch_disabled) {
+        return;
+    }
+    if (!tile_gpu_present_active()) {
+        return; // GPU art cache only matters on the hardware render path
+    }
+    if (!iso_zoom_is_available()) {
+        return; // iso view not ready yet -- retry next idle frame
+    }
+
+    // Target the MAX zoom-out (z=0.5) world extent regardless of current zoom: widen the
+    // screen rect by 2*current_zoom so the screen->loc conversion always yields the same
+    // ~z=0.5 world coverage. A flat 2x widen (the first cut) ballooned to 4x the area when
+    // ALREADY zoomed out -- ~7000 art_ids and a heavy per-rearm enumeration hitch. This
+    // keeps the enumeration cost constant across zoom and pre-warms the zoom-out view even
+    // while zoomed in.
+    float z_cur = iso_zoom_current();
+    if (!(z_cur >= 0.1f && z_cur <= 4.0f)) {
+        z_cur = 1.0f; // guard against a bogus/zero/NaN/huge zoom before the view settles
+    }
+    TigRect wide = gamelib_iso_content_rect;
+    int cx = wide.x + wide.width / 2;
+    int cy = wide.y + wide.height / 2;
+    wide.width = (int)(wide.width * 2.0f * z_cur);
+    wide.height = (int)(wide.height * 2.0f * z_cur);
+    wide.x = cx - wide.width / 2;
+    wide.y = cy - wide.height / 2;
+    LocRect loc_rect;
+    if (!location_screen_rect_to_loc_rect(&wide, &loc_rect)) {
+        return;
+    }
+    // Constant world-space lookahead margin (scroll/zoom). Clamp the low edge; the high
+    // edge is bounded by sector_exists during enumeration.
+    loc_rect.x1 -= GAMELIB_PRETOUCH_MARGIN_TILES;
+    loc_rect.y1 -= GAMELIB_PRETOUCH_MARGIN_TILES;
+    loc_rect.x2 += GAMELIB_PRETOUCH_MARGIN_TILES;
+    loc_rect.y2 += GAMELIB_PRETOUCH_MARGIN_TILES;
+    if (loc_rect.x1 < 0) {
+        loc_rect.x1 = 0;
+    }
+    if (loc_rect.y1 < 0) {
+        loc_rect.y1 = 0;
+    }
+    // Hard span cap: sector_list_create writes sector boundaries into a fixed 151-entry
+    // buffer, so a span over ~150 sectors overruns it (corruption/hang). Real extents are
+    // a handful of sectors; clamp defensively against a pathological zoom/extent.
+    if (loc_rect.x2 - loc_rect.x1 > GAMELIB_PRETOUCH_MAX_SPAN_TILES) {
+        loc_rect.x2 = loc_rect.x1 + GAMELIB_PRETOUCH_MAX_SPAN_TILES;
+    }
+    if (loc_rect.y2 - loc_rect.y1 > GAMELIB_PRETOUCH_MAX_SPAN_TILES) {
+        loc_rect.y2 = loc_rect.y1 + GAMELIB_PRETOUCH_MAX_SPAN_TILES;
+    }
+
+    // Re-arm only when the camera center moves past a hysteresis distance -- re-arming on
+    // every sector-boundary crossing thrashed the heavy enumeration when the camera sat
+    // near a boundary. A still/slow camera re-uses the existing queue.
+    int64_t cur_cx = (loc_rect.x1 + loc_rect.x2) / 2;
+    int64_t cur_cy = (loc_rect.y1 + loc_rect.y2) / 2;
+    int64_t dcx = cur_cx - gamelib_pretouch_cx;
+    int64_t dcy = cur_cy - gamelib_pretouch_cy;
+    if (dcx < 0) {
+        dcx = -dcx;
+    }
+    if (dcy < 0) {
+        dcy = -dcy;
+    }
+    if (!gamelib_pretouch_armed
+        || dcx > GAMELIB_PRETOUCH_REARM_TILES
+        || dcy > GAMELIB_PRETOUCH_REARM_TILES) {
+        uint64_t arm_t0 = gamelib_zoom_perf_now_ns();
+        gamelib_pretouch_armed = true;
+        gamelib_pretouch_cold_pending = true;
+        gamelib_pretouch_cx = cur_cx;
+        gamelib_pretouch_cy = cur_cy;
+        gamelib_pretouch_size = 0;
+        gamelib_pretouch_cursor = 0;
+        for (int i = 0; i < GAMELIB_PRETOUCH_SEEN_SLOTS; i++) {
+            gamelib_pretouch_seen[i] = TIG_ART_ID_INVALID;
+        }
+        int nsec = 0;
+        SectorListNode* sectors = sector_list_create(&loc_rect);
+        for (SectorListNode* node = sectors; node != NULL; node = node->next) {
+            // Only pre-touch ALREADY-LOADED sectors. Locking a cold sector blocks on disk
+            // I/O (~50ms each) and would freeze this (often interaction) frame -- which was
+            // the felt hitch. The game's own streaming loads sectors as the PC approaches;
+            // we warm their art on the next re-arm once they're resident.
+            if (!sector_exists((uint64_t)node->sec) || !sector_loaded(node->sec)) {
+                continue;
+            }
+            Sector* s;
+            if (sector_lock(node->sec, &s)) {
+                gamelib_pretouch_enum_sector(s);
+                sector_unlock(node->sec);
+                nsec++;
+            }
+        }
+        sector_list_destroy(sectors);
+        double arm_ms = (double)(gamelib_zoom_perf_now_ns() - arm_t0) / 1e6;
+        if (arm_ms > 8.0) {
+            // Normally silent -- warm re-arms are ~2-4ms. Flag only a slow arm (would mean
+            // the loaded-sector enumeration regressed) so it stands out in the F9 log.
+            tig_debug_printf("[gpu-pretouch] SLOW arm: %d art_ids, %d sectors, %.1fms (z=%.2f)\n",
+                             gamelib_pretouch_size, nsec, arm_ms, (double)z_cur);
+        }
+    }
+
+    // Idle cold-sector warming: while the world is static (not scrolling/animating), pull
+    // ONE not-yet-resident extent sector into memory and enumerate its art. This spreads
+    // the sector-load disk cost (~50ms each) over idle frames -- invisible while nothing is
+    // moving -- so the first zoom/scroll into the area finds the sectors AND their art warm.
+    // Force-loading on a dirty (interaction) frame is exactly what made the arm stutter, so
+    // this is strictly idle-gated.
+    if (gamelib_pretouch_armed && gamelib_pretouch_cold_pending && !gamelib_dirty) {
+        SectorListNode* cold = sector_list_create(&loc_rect);
+        bool warmed = false;
+        for (SectorListNode* node = cold; node != NULL; node = node->next) {
+            if (!sector_exists((uint64_t)node->sec) || sector_loaded(node->sec)) {
+                continue;
+            }
+            Sector* s;
+            if (sector_lock(node->sec, &s)) {
+                gamelib_pretouch_enum_sector(s);
+                sector_unlock(node->sec);
+                warmed = true;
+            }
+            break; // one cold sector per idle frame -- spread the disk cost
+        }
+        sector_list_destroy(cold);
+        if (!warmed) {
+            gamelib_pretouch_cold_pending = false; // extent fully resident; stop scanning until re-arm
+        }
+    }
+
+    // Drain: warm up to miss_cap UPLOADS (and call_cap lookups) this frame, then resume
+    // next idle frame. Capping on uploads -- not raw calls -- bounds the real cost, since a
+    // cached hit is ~free; the call cap bounds the hit-walk once the area is already warm.
+    if (gamelib_pretouch_cursor >= gamelib_pretouch_size) {
+        return; // fully warm
+    }
+    TigArtGpuCacheStats st;
+    tig_art_gpu_cache_stats(&st);
+    uint64_t misses0 = st.misses;
+    int calls = 0;
+    while (gamelib_pretouch_cursor < gamelib_pretouch_size && calls < GAMELIB_PRETOUCH_CALL_CAP) {
+        tig_art_gpu_cache_get(gamelib_pretouch_queue[gamelib_pretouch_cursor++]);
+        calls++;
+        tig_art_gpu_cache_stats(&st);
+        if (st.misses - misses0 >= (uint64_t)gamelib_pretouch_miss_cap) {
+            break;
+        }
+    }
 }
 
 // 0x402E50
@@ -1961,10 +2164,10 @@ bool gamelib_draw(void)
     // composites the new frame.
     ui_anim_ping();
 
-    // CE (zoom idle preload): pre-load the wider zoom-out extent's sectors on a post-load
-    // idle frame (before the gamelib_dirty early-return) so the first zoom-out's cold
-    // render is already warm. Env toggle kept for A/B profiling.
-    gamelib_zoom_sector_preload();
+    // CE (step 8: GPU art pre-touch): warm the GPU art cache for the wider zoom-out /
+    // scroll-leading extent on idle frames (before the gamelib_dirty early-return) so the
+    // first scroll/zoom into a fresh area doesn't pay the cold per-sprite upload hitch.
+    gamelib_gpu_art_pretouch();
 
     // CE: HUD bar slide must run BEFORE the gamelib_dirty early-
     // return — ui_anim_ping just integrated the slide offsets, but
