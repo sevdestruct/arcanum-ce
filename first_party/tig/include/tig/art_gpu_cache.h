@@ -53,6 +53,11 @@ void tig_art_gpu_cache_flush(void);
 // next eviction or flush.
 SDL_Texture* tig_art_gpu_cache_get(tig_art_id_t art_id);
 
+// CE: enable/disable the single-slot (art_id -> texture) resolve memo that skips
+// the hash+bucket-walk+LRU surgery on the immediate-repeat lookup (the 4-quad
+// terrain LERP). gpucmd "gpucachememo" / env ARCANUM_OPT_GPU_CACHE_MEMO.
+void tig_art_gpu_cache_memo_set(int on);
+
 void tig_art_gpu_cache_stats(TigArtGpuCacheStats* out);
 
 #ifdef __cplusplus

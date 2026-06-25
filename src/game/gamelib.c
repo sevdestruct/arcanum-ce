@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "tig/art_gpu_cache.h"
 #include "tig/font.h"
 
 #include "game/camera_follow.h"
@@ -1242,6 +1243,10 @@ static void gpu_test_channel_tick(void)
             // profiling: runtime toggle for the 2-thread tile pass (same-launch A/B).
             tile_threads_set(ix);
             tig_debug_printf("[gpu-cmd] tilethreads %d\n", ix);
+        } else if (sscanf(line, "gpucachememo %d", &ix) == 1) {
+            // profiling: runtime toggle for the GPU-cache resolve memo (same-launch A/B).
+            tig_art_gpu_cache_memo_set(ix);
+            tig_debug_printf("[gpu-cmd] gpucachememo %d\n", ix);
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).

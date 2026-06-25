@@ -49,6 +49,36 @@ static uint64_t tig_art_gpu_cache_hits;
 static uint64_t tig_art_gpu_cache_misses;
 static uint64_t tig_art_gpu_cache_evictions;
 
+// CE (resolve-once analog for the GPU path): a single-slot (art_id -> texture)
+// memo. The 4-quad terrain LERP asks tig_art_gpu_cache_get for the SAME art_id 4x
+// in a row; the memo skips the hash + bucket-walk + LRU pointer surgery on the
+// immediate repeat. Single-threaded (the GPU world pass is not threaded -- tile
+// threading is software-only). Invalidated in tig_art_gpu_cache_evict whenever any
+// texture is freed, so the cached pointer can never dangle. Gated for clean A/B.
+static tig_art_id_t gpu_cache_memo_art_id;
+static SDL_Texture* gpu_cache_memo_tex;
+static bool gpu_cache_memo_valid;
+static int gpu_cache_memo_override = -1; // gpucmd "gpucachememo" / env; -1 = unset
+static bool gpu_cache_memo_enabled(void)
+{
+    if (gpu_cache_memo_override >= 0) {
+        return gpu_cache_memo_override != 0;
+    }
+    static int env = -2;
+    if (env == -2) {
+        const char* e = getenv("ARCANUM_OPT_GPU_CACHE_MEMO");
+        env = (e != NULL) ? (e[0] == '1' ? 1 : 0) : -1;
+    }
+    if (env >= 0) {
+        return env != 0;
+    }
+    return false; // default OFF (speculative; the GPU world pass is already <1ms)
+}
+void tig_art_gpu_cache_memo_set(int on)
+{
+    gpu_cache_memo_override = on;
+}
+
 // Bit-mixing hash for the 32-bit packed art_id. Arcanum's tile arts cluster
 // in a small numeric range so simple modulo would collide a lot; this
 // spreads them across the buckets.
@@ -93,6 +123,8 @@ static void tig_art_gpu_cache_lru_push_back(TigArtGpuCacheEntry* entry)
 
 static void tig_art_gpu_cache_evict(TigArtGpuCacheEntry* entry)
 {
+    gpu_cache_memo_valid = false; // CE: the memo may hold this texture; drop it before free
+
     // Unlink from its hash bucket.
     uint32_t bucket = tig_art_gpu_cache_hash(entry->art_id) & TIG_ART_GPU_CACHE_BUCKET_MASK;
     TigArtGpuCacheEntry** slot = &tig_art_gpu_cache_buckets[bucket];
@@ -188,6 +220,11 @@ SDL_Texture* tig_art_gpu_cache_get(tig_art_id_t art_id)
         return NULL;
     }
 
+    if (gpu_cache_memo_enabled() && gpu_cache_memo_valid && gpu_cache_memo_art_id == art_id) {
+        tig_art_gpu_cache_hits++;
+        return gpu_cache_memo_tex;
+    }
+
     uint32_t bucket = tig_art_gpu_cache_hash(art_id) & TIG_ART_GPU_CACHE_BUCKET_MASK;
     TigArtGpuCacheEntry* entry;
 
@@ -197,6 +234,9 @@ SDL_Texture* tig_art_gpu_cache_get(tig_art_id_t art_id)
             tig_art_gpu_cache_lru_remove(entry);
             tig_art_gpu_cache_lru_push_back(entry);
             tig_art_gpu_cache_hits++;
+            gpu_cache_memo_art_id = art_id;
+            gpu_cache_memo_tex = entry->texture;
+            gpu_cache_memo_valid = true;
             return entry->texture;
         }
     }
@@ -241,6 +281,9 @@ SDL_Texture* tig_art_gpu_cache_get(tig_art_id_t art_id)
     tig_art_gpu_cache_entry_count++;
     tig_art_gpu_cache_total_bytes += entry_bytes;
 
+    gpu_cache_memo_art_id = art_id;
+    gpu_cache_memo_tex = tex;
+    gpu_cache_memo_valid = true;
     return tex;
 }
 
