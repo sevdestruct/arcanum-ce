@@ -589,6 +589,12 @@ bool gamelib_init(GameInitInfo* init_info)
 
     {
         int vsync_setting = settings_get_value(&settings, VSYNC_MODE_KEY);
+        // CE profiling: ARCANUM_VSYNC overrides the cfg vsync mode (0=off, 1=on,
+        // 2=adaptive) so we can A/B the modes without editing the cfg.
+        const char* vsync_env = getenv("ARCANUM_VSYNC");
+        if (vsync_env != NULL && vsync_env[0] != '\0') {
+            vsync_setting = atoi(vsync_env);
+        }
         int sdl_mode = vsync_setting == 2 ? SDL_RENDERER_VSYNC_ADAPTIVE
             : vsync_setting == 0 ? 0
             : 1;
@@ -1196,7 +1202,8 @@ static void gpu_test_channel_tick(void)
             // both at the same scroll position (kills the per-launch tile-count
             // confound). Affects the software-path CPU lighting blit.
             tig_video_simd_blit_set(ix);
-            tig_debug_printf("[gpu-cmd] simd %d\n", ix);
+            tig_art_terrain_simd_set(ix); // also toggle the terrain LERP NEON path
+            tig_debug_printf("[gpu-cmd] simd %d (video+terrain)\n", ix);
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).
@@ -2743,6 +2750,21 @@ bool gamelib_draw(void)
                                 (unsigned long long)fp.partial_samples);
                         }
                         tig_video_flip_perf_reset();
+                    }
+                    {
+                        // CE profiling: terrain(LERP-gradient) vs object(CONST) lit-pixel
+                        // split -- decides which scalar art.c loop the NEON port targets.
+                        extern uint64_t g_art_px_lerp, g_art_px_const, g_art_px_plain;
+                        uint64_t tot = g_art_px_lerp + g_art_px_const;
+                        if (tot > 0) {
+                            tig_debug_printf("[pixel-count] terrain-LERP=%.1fM (%.0f%%) object-CONST=%.1fM (%.0f%%) plain=%.1fM\n",
+                                (double)g_art_px_lerp / 1e6, 100.0 * (double)g_art_px_lerp / (double)tot,
+                                (double)g_art_px_const / 1e6, 100.0 * (double)g_art_px_const / (double)tot,
+                                (double)g_art_px_plain / 1e6);
+                        }
+                        g_art_px_lerp = 0;
+                        g_art_px_const = 0;
+                        g_art_px_plain = 0;
                     }
 
                     // CE (perf roadmap §1A): worst-frame trace -- the single frame this
