@@ -1275,6 +1275,16 @@ int tig_video_set_vsync_mode(int mode)
         mode == 0 ? "off" :
         mode == 1 ? "on" :
         mode == -1 ? "adaptive" : "custom");
+    {
+        // CE profiling: report the renderer driver + the ACTUAL negotiated vsync.
+        // SDL can silently map adaptive(-1) -> hard(1) on backends (e.g. macOS GL)
+        // that lack a late-swap equivalent; SDL_GetRenderVSync reveals the truth.
+        int actual_vsync = -999;
+        SDL_GetRenderVSync(tig_video_state.renderer, &actual_vsync);
+        const char* drv = SDL_GetRendererName(tig_video_state.renderer);
+        tig_debug_printf("[render-diag] driver=%s requested-vsync=%d actual-vsync=%d\n",
+            drv != NULL ? drv : "?", mode, actual_vsync);
+    }
     return TIG_OK;
 }
 
@@ -2407,14 +2417,25 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags)
 // CE: ARCANUM_OPT_SIMD_BLIT gate for the NEON per-pixel lighting blit fast
 // path (the COLOR_LERP branch below). Default on; set =0 to restore the scalar
 // tig_color_mul (64KB multiply-table) path for A/B comparison or as a fallback.
+static int video_simd_override = -1; // -1 = env; 0/1 = harness runtime override
 static bool video_simd_blit_enabled(void)
 {
     static int v = -1;
+    if (video_simd_override >= 0) {
+        return video_simd_override != 0;
+    }
     if (v < 0) {
         const char* e = getenv("ARCANUM_OPT_SIMD_BLIT");
         v = (e != NULL && e[0] == '0') ? 0 : 1;
     }
     return v;
+}
+
+// CE (harness): runtime SIMD/scalar toggle so one launch can A/B both at the same
+// scroll position, eliminating the per-launch tile-count confound. -1 = env.
+void tig_video_simd_blit_set(int on)
+{
+    video_simd_override = on;
 }
 
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info)
@@ -3616,7 +3637,14 @@ bool tig_video_window_create(TigInitInfo* init_info)
 
 // We're using streaming texture which is extremely slow in Metal.
 #if SDL_PLATFORM_MACOS
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl,metal");
+    // CE profiling: ARCANUM_RENDER_DRIVER overrides the driver so we can A/B GL vs
+    // Metal (e.g. =metal). The "streaming texture slow in Metal" rationale predates
+    // gpu-ui, which skips the framebuffer upload (software upload now measures ~0.5ms).
+    {
+        const char* drv_override = getenv("ARCANUM_RENDER_DRIVER");
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER,
+            (drv_override != NULL && drv_override[0] != '\0') ? drv_override : "opengl,metal");
+    }
 #elif SDL_PLATFORM_IOS
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2,metal");
 #endif

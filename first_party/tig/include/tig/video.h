@@ -376,6 +376,7 @@ int tig_video_buffer_fill(TigVideoBuffer* video_buffer, TigRect* rect, tig_color
 int tig_video_buffer_line(TigVideoBuffer* video_buffer, TigLine* line, TigRect* a3, tig_color_t color);
 int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
+void tig_video_simd_blit_set(int on); // CE (harness): runtime SIMD/scalar toggle for A/B
 
 // CE (feature/perf-gpu-accel Phase 2): GPU blit primitive.
 //

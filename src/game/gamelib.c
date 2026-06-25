@@ -21,6 +21,8 @@
 #include "ui/intgame.h"
 #include "ui/mainmenu_ui.h"
 #include "ui/wmap_ui.h"
+#include "ui/inven_ui.h"
+#include "ui/logbook_ui.h"
 #include "ui/sleep_ui.h"
 #include "ui/ui_anim.h"
 
@@ -1144,6 +1146,40 @@ static void gpu_test_channel_tick(void)
             // harness: open the travel/world map (to drive + measure the feather).
             wmap_ui_open();
             tig_debug_printf("[gpu-cmd] wmap open (created=%d)\n", wmap_ui_is_created());
+        } else if (strncmp(line, "invenclose", 10) == 0) {
+            if (inven_ui_is_created()) {
+                inven_ui_destroy();
+            }
+            tig_debug_printf("[gpu-cmd] inven close\n");
+        } else if (strncmp(line, "inven", 5) == 0) {
+            // harness: open the inventory window (exercises the UI render/composite).
+            int64_t pc = player_get_local_pc_obj();
+            if (pc != OBJ_HANDLE_NULL) {
+                inven_ui_open(pc, OBJ_HANDLE_NULL, INVEN_UI_MODE_INVENTORY);
+                tig_debug_printf("[gpu-cmd] inven open (created=%d)\n", inven_ui_is_created());
+            } else {
+                tig_debug_printf("[gpu-cmd] inven: no PC\n");
+            }
+        } else if (strncmp(line, "logbookclose", 12) == 0) {
+            logbook_ui_close();
+            tig_debug_printf("[gpu-cmd] logbook close\n");
+        } else if (strncmp(line, "logbook", 7) == 0) {
+            int64_t pc = player_get_local_pc_obj();
+            if (pc != OBJ_HANDLE_NULL) {
+                logbook_ui_open(pc);
+                tig_debug_printf("[gpu-cmd] logbook open\n");
+            } else {
+                tig_debug_printf("[gpu-cmd] logbook: no PC\n");
+            }
+        } else if (sscanf(line, "setmodule %255s", arg) == 1) {
+            // harness: force the active module, to test gamelib_load's save-driven
+            // module auto-switch (load a save from a DIFFERENT module after this).
+            if (gamelib_mod_load(arg)) {
+                gamelib_current_mode_name_set(arg);
+                tig_debug_printf("[gpu-cmd] setmodule %s (current=%s)\n", arg, gamelib_current_module_name_get());
+            } else {
+                tig_debug_printf("[gpu-cmd] setmodule %s FAILED\n", arg);
+            }
         } else if (sscanf(line, "setzoom %f", &fz) == 1) {
             // profiling: drive the zoom animation toward a target (1.0 = in, 0.5 = out).
             // Force availability so it engages regardless of freshly-loaded harness state
@@ -1155,6 +1191,12 @@ static void gpu_test_channel_tick(void)
             gamelib_invalidate_rect(NULL);
             tig_debug_printf("[gpu-cmd] setzoom %f (cur=%.3f avail=%d)\n",
                 (double)fz, (double)iso_zoom_current(), iso_zoom_is_available());
+        } else if (sscanf(line, "simd %d", &ix) == 1) {
+            // profiling: runtime SIMD/scalar lighting-blit toggle so ONE launch A/Bs
+            // both at the same scroll position (kills the per-launch tile-count
+            // confound). Affects the software-path CPU lighting blit.
+            tig_video_simd_blit_set(ix);
+            tig_debug_printf("[gpu-cmd] simd %d\n", ix);
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).
@@ -1165,6 +1207,9 @@ static void gpu_test_channel_tick(void)
             if (gamelib_zoom_perf_is_enabled()) {
                 gamelib_zoom_perf_warmed_up = true;
             }
+            // CE profiling: mirror the flip-perf split (SDL_UpdateTexture upload vs
+            // SDL_RenderPresent wait) so we can tell present-bound from render-bound.
+            tig_video_flip_perf_set_enabled(gamelib_zoom_perf_is_enabled());
             tig_debug_printf("[gpu-cmd] perf toggled\n");
         } else if (strncmp(line, "zoomlog", 7) == 0) {
             tig_debug_printf("[gpu-cmd] zoomlog cur=%.3f target=%.3f animating=%d avail=%d\n",
@@ -2683,6 +2728,22 @@ bool gamelib_draw(void)
                         stddev_frame_ms);
                     tig_debug_printf("%s", line);
                     gamelib_zoom_perf_log(line);
+                    {
+                        // CE profiling: present (vsync wait) vs update (texture upload)
+                        // split -- decides present-bound vs render-bound per path.
+                        TigVideoFlipPerf fp;
+                        tig_video_flip_perf_get(&fp);
+                        if (fp.samples > 0) {
+                            tig_debug_printf("[flip-perf] present avg %.2fms max %.2fms | upload avg %.2fms max %.2fms | %llu flips (%llu partial)\n",
+                                (double)fp.present_total_ns / (double)fp.samples / 1e6,
+                                (double)fp.present_max_ns / 1e6,
+                                (double)fp.update_total_ns / (double)fp.samples / 1e6,
+                                (double)fp.update_max_ns / 1e6,
+                                (unsigned long long)fp.samples,
+                                (unsigned long long)fp.partial_samples);
+                        }
+                        tig_video_flip_perf_reset();
+                    }
 
                     // CE (perf roadmap §1A): worst-frame trace -- the single frame this
                     // interval with the largest zoom-total, fully split. This is where the
@@ -3259,6 +3320,12 @@ bool gamelib_load(const char* name)
     unsigned int sentinel;
 
     tig_debug_printf("\ngamelib_load: Loading from File: %s.\n", name);
+
+    // CE: the active module is switched to the save's owning module by the caller
+    // (mainmenu sub_5432B0, directory-resolved) BEFORE we get here, so this loads
+    // against the correct mount. The harness loadsave path can force it first with
+    // the `setmodule` gpu-cmd. The earlier in-gamelib_load .gsi-stamp auto-switch was
+    // dropped on the rebase onto feature/ui-improvements -- its canonical home.
     tig_timer_now(&start_time);
 
     in_load = true;
