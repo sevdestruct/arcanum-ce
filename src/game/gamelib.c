@@ -601,6 +601,16 @@ bool gamelib_init(GameInitInfo* init_info)
         tig_video_set_vsync_mode(sdl_mode);
     }
 
+    // CE: idle present-skip (software path). On a static frame the framebuffer
+    // already matches the screen, so the flip's full upload + present is pure
+    // waste; skip it and sleep instead -> CPU/GPU/battery savings on menus /
+    // dialogs / inventory / idle. Default ON; `present skip=0` in arcanum.cfg
+    // opts out. Inert on the GPU-composite paths, and inert during active play
+    // (the scene animates). Validated visually (no stale/black frames). The
+    // `presentskip` gpucmd still overrides at runtime.
+    settings_register(&settings, "present skip", "1", NULL);
+    tig_video_present_skip_set(settings_get_value(&settings, "present skip") != 0 ? 1 : 0);
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 
