@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <SDL3/SDL.h>
 
 #include "tig/art_gpu_cache.h"
 
@@ -1905,6 +1906,325 @@ void tile_halfres_lerp_set(int on)
     halfres_lerp_override = on;
 }
 
+// CE (EXPERIMENTAL): gated 2-thread split of the sector-row loop.
+// ARCANUM_OPT_TILE_THREADS=1. Hazards handled: sector_lock's global in_sector_lock
+// guard + shared sector cache are serialized via g_tile_sector_mutex; the gap_scan
+// global-counter append is skipped while threaded (g_tile_threads_active); the
+// art-cache LRU touch (sub_51AA90) is left to race (benign lost-write with the warm
+// cache + resolve-once memo). sectors[] is per-call, so thread-local.
+static void tile_draw_rows(GameDrawInfo*, SectorRect*, int, int, const TigRect*, bool, tig_color_t, tig_color_t, bool);
+static bool tile_threads_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("ARCANUM_OPT_TILE_THREADS");
+        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+static SDL_Mutex* g_tile_sector_mutex = NULL;
+static volatile int g_tile_threads_active = 0;
+typedef struct {
+    GameDrawInfo* draw_info; SectorRect* v1; int row_start; int row_end;
+    const TigRect* dirty_union; bool dirty_union_set;
+    tig_color_t indoor_color; tig_color_t outdoor_color; bool halfres_lerp;
+} TileRowsArg;
+static int tile_rows_thread_fn(void* p)
+{
+    TileRowsArg* a = (TileRowsArg*)p;
+    tile_draw_rows(a->draw_info, a->v1, a->row_start, a->row_end, a->dirty_union,
+        a->dirty_union_set, a->indoor_color, a->outdoor_color, a->halfres_lerp);
+    return 0;
+}
+
+// CE (EXPERIMENTAL, gated): the body of tile_draw_iso's outer sector-row loop,
+// extracted verbatim into its own function so a row range [row_start, row_end)
+// can be drawn independently. Single-threaded this is byte-identical to the
+// original inline loop. When ARCANUM_OPT_TILE_THREADS=1 it is the per-thread
+// work unit (two threads split the rows). ALL formerly-per-iteration locals are
+// declared here so two invocations never share mutable scratch.
+//
+// HAZARD NOTE: this function calls sector_lock/sector_unlock, which are NOT
+// thread-safe (global `in_sector_lock` re-entry guard + shared cache mutation).
+// The threaded caller MUST pre-lock all sectors serially and not let two of
+// these run sector_lock concurrently. See tile_draw_iso's threaded path.
+static void tile_draw_rows(GameDrawInfo* draw_info,
+    SectorRect* v1,
+    int row_start,
+    int row_end,
+    const TigRect* dirty_union,
+    bool dirty_union_set,
+    tig_color_t indoor_color,
+    tig_color_t outdoor_color,
+    bool halfres_lerp)
+{
+    SectorRectRow* v3;
+    TigArtBlitInfo art_blit_info;
+    TigRect src_rect;
+    TigRect dst_rect;
+    TigRect tile_rect;
+    TigRect tile_subrect;
+    int v2;
+    int v4;
+    int indexes[SECTOR_RECT_DIM];
+    int widths[SECTOR_RECT_DIM];
+    bool sector_lock_results[SECTOR_RECT_DIM];
+    Sector* sectors[SECTOR_RECT_DIM];
+    int64_t loc_x;
+    int64_t loc_y;
+    TigRectListNode* rect_node;
+    int tile_type;
+    tig_color_t color;
+    tig_color_t v36[4];
+    tig_color_t v51[9];
+    int v10;
+    int v11;
+    int center_x;
+    int center_y;
+    int v15;
+    int v42;
+    bool blit_info_initialized;
+    int v38;
+
+    art_blit_info.flags = 0;
+    art_blit_info.src_rect = &src_rect;
+    art_blit_info.dst_rect = &dst_rect;
+
+    tile_rect.width = 78;
+    tile_rect.height = 40;
+
+    for (v2 = row_start; v2 < row_end; v2++) {
+        v3 = &(v1->rows[v2]);
+
+        for (v4 = 0; v4 < v3->num_cols; v4++) {
+            indexes[v4] = v3->tile_ids[v4];
+            widths[v4] = 64 - v3->num_hor_tiles[v4];
+            if (g_tile_threads_active) SDL_LockMutex(g_tile_sector_mutex);
+            sector_lock_results[v4] = sector_lock(v3->sector_ids[v4], &(sectors[v4]));
+            if (g_tile_threads_active) SDL_UnlockMutex(g_tile_sector_mutex);
+        }
+
+        location_xy(v3->origin_locs[0], &loc_x, &loc_y);
+
+        v10 = 0;
+        v11 = 0;
+
+        for (v38 = 0; v38 < v3->num_vert_tiles; v38++) {
+            center_x = (int)loc_x + v10;
+            center_y = (int)loc_y + v11;
+
+            for (v15 = 0; v15 < v3->num_cols; v15++) {
+                if (sector_lock_results[v15]) {
+                    for (v42 = 0; v42 < v3->num_hor_tiles[v15]; v42++) {
+                        if (halfres_lerp && (v38 & 1)) {
+                            indexes[v15]++;
+                            center_x -= 40;
+                            center_y += 20;
+                            continue;
+                        }
+                        blit_info_initialized = false;
+                        int tile_fade_center = 255;
+                        int tile_pre_sum = -1;
+                        bool tile_in_dirty = dirty_union_set
+                            && (center_x + 1) < dirty_union->x + dirty_union->width
+                            && (center_x + 1 + tile_rect.width) > dirty_union->x
+                            && center_y < dirty_union->y + dirty_union->height
+                            && (center_y + tile_rect.height) > dirty_union->y;
+                        if (tile_in_dirty && !roof_is_covered_xy(center_x + 40, center_y + 20, false)) {
+                            art_blit_info.art_id = sectors[v15]->tiles.art_ids[indexes[v15]];
+
+                            tile_type = tig_art_tile_id_type_get(art_blit_info.art_id);
+                            tile_rect.x = center_x + 1;
+                            tile_rect.y = center_y;
+
+                            rect_node = *draw_info->rects;
+                            while (rect_node != NULL) {
+                                if (tig_rect_intersection(&tile_rect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                                    src_rect.x = dst_rect.x - tile_rect.x;
+                                    src_rect.y = dst_rect.y - tile_rect.y;
+                                    src_rect.width = dst_rect.width;
+                                    src_rect.height = dst_rect.height;
+
+                                    if (!blit_info_initialized) {
+                                        blit_info_initialized = true;
+
+                                        art_blit_info.dst_video_buffer = dword_602DF0;
+                                        art_blit_info.field_14 = v36;
+
+                                        color = !tile_type ? indoor_color : outdoor_color;
+
+                                        if (sub_4DA360(center_x, center_y, color, v51)) {
+                                            art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_LERP;
+                                            if (!tile_hardware_accelerated) {
+                                                art_blit_info.flags |= TIG_ART_BLT_PALETTE_ORIGINAL;
+                                            }
+                                        } else if (v51[0] != color || tile_hardware_accelerated) {
+                                            art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_CONST;
+                                            art_blit_info.color = v51[0];
+                                            if (!tile_hardware_accelerated) {
+                                                art_blit_info.flags |= TIG_ART_BLT_PALETTE_ORIGINAL;
+                                            }
+                                        } else if (tile_gpu_active) {
+                                            art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_CONST | TIG_ART_BLT_PALETTE_ORIGINAL;
+                                            art_blit_info.color = v51[0];
+                                        } else {
+                                            art_blit_info.flags = 0;
+                                        }
+
+                                        if (tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
+                                            || tile_type == TIG_ART_TILE_TYPE_OUTDOOR) {
+                                            unsigned char ff[9];
+                                            tile_pre_sum = (int)tig_color_get_red(v51[4])
+                                                + (int)tig_color_get_green(v51[4])
+                                                + (int)tig_color_get_blue(v51[4]);
+                                            if (void_edge_fade_fade_factors(v3->sector_ids[v15], sectors[v15], indexes[v15], ff)) {
+                                                v51[0] = tig_color_mul(v51[0], tig_color_make(ff[0], ff[0], ff[0]));
+                                                v51[1] = tig_color_mul(v51[1], tig_color_make(ff[1], ff[1], ff[1]));
+                                                v51[2] = tig_color_mul(v51[2], tig_color_make(ff[2], ff[2], ff[2]));
+                                                v51[3] = tig_color_mul(v51[3], tig_color_make(ff[3], ff[3], ff[3]));
+                                                v51[4] = tig_color_mul(v51[4], tig_color_make(ff[4], ff[4], ff[4]));
+                                                v51[5] = tig_color_mul(v51[5], tig_color_make(ff[5], ff[5], ff[5]));
+                                                v51[6] = tig_color_mul(v51[6], tig_color_make(ff[6], ff[6], ff[6]));
+                                                v51[7] = tig_color_mul(v51[7], tig_color_make(ff[7], ff[7], ff[7]));
+                                                v51[8] = tig_color_mul(v51[8], tig_color_make(ff[8], ff[8], ff[8]));
+                                                art_blit_info.flags = TIG_ART_BLT_BLEND_COLOR_LERP;
+                                                if (!tile_hardware_accelerated) {
+                                                    art_blit_info.flags |= TIG_ART_BLT_PALETTE_ORIGINAL;
+                                                }
+                                                tile_fade_center = ff[4];
+                                            }
+                                        }
+                                    }
+
+                                    if ((art_blit_info.flags & TIG_ART_BLT_BLEND_COLOR_LERP) != 0) {
+                                        art_blit_info.field_18 = &tile_subrect;
+
+                                        tile_subrect.x = tile_rect.x;
+                                        tile_subrect.y = tile_rect.y;
+                                        tile_subrect.width = 39;
+                                        tile_subrect.height = 20;
+                                        if (tig_rect_intersection(&tile_subrect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                                            tile_subrect.x -= tile_rect.x;
+                                            tile_subrect.y -= tile_rect.y;
+
+                                            src_rect.x = dst_rect.x - tile_rect.x;
+                                            src_rect.y = dst_rect.y - tile_rect.y;
+                                            src_rect.width = dst_rect.width;
+                                            src_rect.height = dst_rect.height;
+
+                                            v36[0] = v51[0];
+                                            v36[1] = v51[1];
+                                            v36[2] = v51[4];
+                                            v36[3] = v51[3];
+
+                                            tile_blit_dispatch(&art_blit_info);
+                                        }
+
+                                        tile_subrect.x = tile_rect.x + 39;
+                                        tile_subrect.y = tile_rect.y;
+                                        if (tig_rect_intersection(&tile_subrect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                                            tile_subrect.x -= tile_rect.x;
+                                            tile_subrect.y -= tile_rect.y;
+
+                                            src_rect.x = dst_rect.x - tile_rect.x;
+                                            src_rect.y = dst_rect.y - tile_rect.y;
+                                            src_rect.width = dst_rect.width;
+                                            src_rect.height = dst_rect.height;
+
+                                            v36[0] = v51[1];
+                                            v36[1] = v51[2];
+                                            v36[2] = v51[5];
+                                            v36[3] = v51[4];
+
+                                            tile_blit_dispatch(&art_blit_info);
+                                        }
+
+                                        tile_subrect.x = tile_rect.x;
+                                        tile_subrect.y = tile_rect.y + 20;
+                                        if (tig_rect_intersection(&tile_subrect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                                            tile_subrect.x -= tile_rect.x;
+                                            tile_subrect.y -= tile_rect.y;
+
+                                            src_rect.x = dst_rect.x - tile_rect.x;
+                                            src_rect.y = dst_rect.y - tile_rect.y;
+                                            src_rect.width = dst_rect.width;
+                                            src_rect.height = dst_rect.height;
+
+                                            v36[0] = v51[3];
+                                            v36[1] = v51[4];
+                                            v36[2] = v51[7];
+                                            v36[3] = v51[6];
+
+                                            tile_blit_dispatch(&art_blit_info);
+                                        }
+
+                                        tile_subrect.x = tile_rect.x + 39;
+                                        tile_subrect.y = tile_rect.y + 20;
+                                        if (tig_rect_intersection(&tile_subrect, &(rect_node->rect), &dst_rect) == TIG_OK) {
+                                            tile_subrect.x -= tile_rect.x;
+                                            tile_subrect.y -= tile_rect.y;
+
+                                            src_rect.x = dst_rect.x - tile_rect.x;
+                                            src_rect.y = dst_rect.y - tile_rect.y;
+                                            src_rect.width = dst_rect.width;
+                                            src_rect.height = dst_rect.height;
+
+                                            v36[0] = v51[4];
+                                            v36[1] = v51[5];
+                                            v36[2] = v51[8];
+                                            v36[3] = v51[7];
+
+                                            tile_blit_dispatch(&art_blit_info);
+                                        }
+                                    } else {
+                                        tile_blit_dispatch(&art_blit_info);
+                                    }
+                                }
+                                rect_node = rect_node->next;
+                            }
+
+                            if (void_edge_fade_enabled()
+                                && blit_info_initialized
+                                && tile_pre_sum >= 300
+                                && tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
+                                && !void_edge_fade_dark_marked(v3->sector_ids[v15], indexes[v15])
+                                && gap_scan_count < (int)(sizeof(gap_scan_list) / sizeof(gap_scan_list[0]))
+                                && !g_tile_threads_active) {
+                                gap_scan_list[gap_scan_count].sec_id = v3->sector_ids[v15];
+                                gap_scan_list[gap_scan_count].index = indexes[v15];
+                                gap_scan_list[gap_scan_count].px = center_x + 40;
+                                gap_scan_list[gap_scan_count].py = center_y + 20;
+                                gap_scan_list[gap_scan_count].ff_center = tile_fade_center;
+                                gap_scan_count++;
+                            }
+                        }
+
+                        indexes[v15]++;
+                        center_x -= 40;
+                        center_y += 20;
+                    }
+
+                    indexes[v15] += widths[v15];
+                } else {
+                    center_x -= 40 * v3->num_hor_tiles[v15];
+                    center_y += 20 * v3->num_hor_tiles[v15];
+                }
+            }
+
+            v10 += 40;
+            v11 += 20;
+        }
+
+        for (v4 = 0; v4 < v3->num_cols; v4++) {
+            if (sector_lock_results[v4]) {
+                if (g_tile_threads_active) SDL_LockMutex(g_tile_sector_mutex);
+                sector_unlock(v3->sector_ids[v4]);
+                if (g_tile_threads_active) SDL_UnlockMutex(g_tile_sector_mutex);
+            }
+        }
+    }
+}
+
 void tile_draw_iso(GameDrawInfo* draw_info)
 {
     SectorRect* v1;
@@ -2003,13 +2323,38 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
     const bool halfres_lerp = halfres_lerp_enabled() && iso_zoom_is_animating();
 
-    for (v2 = 0; v2 < v1->num_rows; v2++) {
+    // CE (EXPERIMENTAL, gated): the outer sector-row loop body now lives in
+    // tile_draw_rows. Single-threaded this draws all rows exactly as the
+    // original inline loop did. The original loop below is preserved but
+    // bypassed (condition v2 < 0 never runs) to keep the byte-for-byte body
+    // available for diffing; the compiler drops it as dead code.
+    if (tile_threads_enabled() && v1->num_rows >= 2) {
+        if (g_tile_sector_mutex == NULL) g_tile_sector_mutex = SDL_CreateMutex();
+        int mid = v1->num_rows / 2;
+        TileRowsArg a0 = { draw_info, v1, 0, mid, &tile_draw_dirty_union,
+            tile_draw_dirty_union_set, indoor_color, outdoor_color, halfres_lerp };
+        TileRowsArg a1 = { draw_info, v1, mid, v1->num_rows, &tile_draw_dirty_union,
+            tile_draw_dirty_union_set, indoor_color, outdoor_color, halfres_lerp };
+        g_tile_threads_active = 1;
+        SDL_Thread* th = SDL_CreateThread(tile_rows_thread_fn, "tile_rows", &a0);
+        tile_rows_thread_fn(&a1); // run the second half on this thread
+        SDL_WaitThread(th, NULL);
+        g_tile_threads_active = 0;
+    } else {
+        tile_draw_rows(draw_info, v1, 0, v1->num_rows,
+            &tile_draw_dirty_union, tile_draw_dirty_union_set,
+            indoor_color, outdoor_color, halfres_lerp);
+    }
+
+    for (v2 = 0; v2 < 0; v2++) {
         v3 = &(v1->rows[v2]);
 
         for (v4 = 0; v4 < v3->num_cols; v4++) {
             indexes[v4] = v3->tile_ids[v4];
             widths[v4] = 64 - v3->num_hor_tiles[v4];
+            if (g_tile_threads_active) SDL_LockMutex(g_tile_sector_mutex);
             sector_lock_results[v4] = sector_lock(v3->sector_ids[v4], &(sectors[v4]));
+            if (g_tile_threads_active) SDL_UnlockMutex(g_tile_sector_mutex);
         }
 
         location_xy(v3->origin_locs[0], &loc_x, &loc_y);
@@ -2242,7 +2587,8 @@ void tile_draw_iso(GameDrawInfo* draw_info)
                                 && tile_pre_sum >= 300
                                 && tig_art_type(art_blit_info.art_id) != TIG_ART_TYPE_TILE
                                 && !void_edge_fade_dark_marked(v3->sector_ids[v15], indexes[v15])
-                                && gap_scan_count < (int)(sizeof(gap_scan_list) / sizeof(gap_scan_list[0]))) {
+                                && gap_scan_count < (int)(sizeof(gap_scan_list) / sizeof(gap_scan_list[0]))
+                                && !g_tile_threads_active) {
                                 gap_scan_list[gap_scan_count].sec_id = v3->sector_ids[v15];
                                 gap_scan_list[gap_scan_count].index = indexes[v15];
                                 gap_scan_list[gap_scan_count].px = center_x + 40;
@@ -2270,7 +2616,9 @@ void tile_draw_iso(GameDrawInfo* draw_info)
 
         for (v4 = 0; v4 < v3->num_cols; v4++) {
             if (sector_lock_results[v4]) {
+                if (g_tile_threads_active) SDL_LockMutex(g_tile_sector_mutex);
                 sector_unlock(v3->sector_ids[v4]);
+                if (g_tile_threads_active) SDL_UnlockMutex(g_tile_sector_mutex);
             }
         }
     }
