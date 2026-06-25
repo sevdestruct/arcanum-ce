@@ -2438,6 +2438,55 @@ bool gamelib_load(const char* name)
     unsigned int sentinel;
 
     tig_debug_printf("\ngamelib_load: Loading from File: %s.\n", name);
+
+    // CE: auto-switch the active module to the one this save belongs to. Saves
+    // record their module name (.gsi); loading a save made under a different
+    // module than the one currently mounted otherwise resolves wrong/missing
+    // content -- the "you have to set the module first" bug. gamelib_mod_load does
+    // the full unmount+mount switch (and sets up a fresh game on the module), so it
+    // runs HERE -- before the unarchive below -- and is followed by gamelib_reset to
+    // clear that fresh-game state so the save restore does not desync. The .gsi is
+    // named <slot><description>.gsi while `name` is just the slot, so glob for it.
+    {
+        GameSaveInfo sw_info;
+        TigFileList gsi_list;
+        char gsi_glob[TIG_MAX_PATH];
+        char gsi_base[TIG_MAX_PATH];
+        bool have_gsi = false;
+
+        snprintf(gsi_glob, sizeof(gsi_glob), "save\\%s*.gsi", name);
+        tig_file_list_create(&gsi_list, gsi_glob);
+        if (gsi_list.count > 0) {
+            const char* fn = gsi_list.entries[0].path;
+            const char* slash = strrchr(fn, '\\');
+            char* dot;
+            strncpy(gsi_base, slash != NULL ? slash + 1 : fn, sizeof(gsi_base) - 1);
+            gsi_base[sizeof(gsi_base) - 1] = '\0';
+            dot = strrchr(gsi_base, '.');
+            if (dot != NULL) {
+                *dot = '\0';
+            }
+            have_gsi = true;
+        }
+        tig_file_list_destroy(&gsi_list);
+
+        if (have_gsi && gamelib_saveinfo_load(gsi_base, &sw_info)) {
+            if (sw_info.module_name[0] != '\0'
+                && SDL_strcasecmp(sw_info.module_name, gamelib_current_module_name_get()) != 0) {
+                tig_debug_printf("gamelib_load: save module '%s' != current '%s' -- auto-switching module\n",
+                    sw_info.module_name, gamelib_current_module_name_get());
+                if (gamelib_mod_load(sw_info.module_name)) {
+                    gamelib_reset();
+                    gamelib_current_mode_name_set(sw_info.module_name);
+                } else {
+                    tig_debug_printf("gamelib_load: WARNING: module auto-switch to '%s' failed; loading with current module\n",
+                        sw_info.module_name);
+                }
+            }
+            gamelib_saveinfo_exit(&sw_info);
+        }
+    }
+
     tig_timer_now(&start_time);
 
     in_load = true;
@@ -2952,10 +3001,17 @@ bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info)
         if (tig_file_fread(&(save_info->version), sizeof(save_info->version), 1, stream) != 1) break;
 
         if (tig_file_fread(&size, sizeof(size), 1, stream) != 1) break;
+        // CE: the writer stores length + raw bytes with NO terminator; bound-check
+        // and NUL-terminate so callers don't read trailing garbage (e.g. module_name
+        // came back as "Arcanumv"). Also closes a pre-existing fread overflow.
+        if (size < 0 || size >= (int)sizeof(save_info->module_name)) break;
         if (tig_file_fread(save_info->module_name, size, 1, stream) != 1) break;
+        save_info->module_name[size] = '\0';
 
         if (tig_file_fread(&size, sizeof(size), 1, stream) != 1) break;
+        if (size < 0 || size >= (int)sizeof(save_info->pc_name)) break;
         if (tig_file_fread(save_info->pc_name, size, 1, stream) != 1) break;
+        save_info->pc_name[size] = '\0';
 
         if (tig_file_fread(&(save_info->map), sizeof(save_info->map), 1, stream) != 1) break;
         if (tig_file_fread(&(save_info->datetime), sizeof(save_info->datetime), 1, stream) != 1) break;
@@ -2965,7 +3021,9 @@ bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info)
         if (tig_file_fread(&(save_info->story_state), sizeof(save_info->story_state), 1, stream) != 1) break;
 
         if (tig_file_fread(&size, sizeof(size), 1, stream) != 1) break;
+        if (size < 0 || size >= (int)sizeof(save_info->description)) break;
         if (size != 0 && tig_file_fread(save_info->description, size, 1, stream) != 1) break;
+        save_info->description[size] = '\0';
 
         success = true;
     } while (0);
