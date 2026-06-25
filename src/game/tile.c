@@ -2340,7 +2340,13 @@ void tile_draw_iso(GameDrawInfo* draw_info)
     // original inline loop did. The original loop below is preserved but
     // bypassed (condition v2 < 0 never runs) to keep the byte-for-byte body
     // available for diffing; the compiler drops it as dead code.
-    if (tile_threads_enabled() && v1->num_rows >= 2) {
+    //
+    // SOFTWARE PATH ONLY (!tile_gpu_active): when the GPU world pass is open,
+    // tile_blit_dispatch routes each blit through tile_gpu_dispatch (shared GPU
+    // texture cache + deferred-blit queue + SDL render-command encoding -- all
+    // single-thread-only), so threading there would race the GPU. The GPU world
+    // pass is already ~<1ms, so it would gain nothing from this regardless.
+    if (tile_threads_enabled() && !tile_gpu_active && v1->num_rows >= 2) {
         if (g_tile_sector_mutex == NULL) g_tile_sector_mutex = SDL_CreateMutex();
         int mid = v1->num_rows / 2;
         TileRowsArg a0 = { draw_info, v1, 0, mid, &tile_draw_dirty_union,
