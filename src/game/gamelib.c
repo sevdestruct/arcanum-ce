@@ -611,6 +611,14 @@ bool gamelib_init(GameInitInfo* init_info)
     settings_register(&settings, "present skip", "1", NULL);
     tig_video_present_skip_set(settings_get_value(&settings, "present skip") != 0 ? 1 : 0);
 
+    // CE: 2-thread tile pass. Splits the iso sector-row loop across 2 threads on
+    // big (zoom-out / camera-move) full-redraws -- worst-frame render ~-42% there,
+    // neutral on light frames; byte-identical output. Hardened: thread-local art
+    // LRU + slow-path-only cache mutex. Default ON; `tile threads=0` opts out. The
+    // `tilethreads` gpucmd / ARCANUM_OPT_TILE_THREADS env still override at runtime.
+    settings_register(&settings, "tile threads", "1", NULL);
+    tile_threads_set(settings_get_value(&settings, "tile threads") != 0 ? 1 : 0);
+
     gamelib_mod_loaded = false;
     gamelib_load_data();
 
@@ -1230,6 +1238,10 @@ static void gpu_test_channel_tick(void)
             // profiling: runtime toggle for the half-res-during-lerp tile skip.
             tile_halfres_lerp_set(ix);
             tig_debug_printf("[gpu-cmd] halfreslerp %d\n", ix);
+        } else if (sscanf(line, "tilethreads %d", &ix) == 1) {
+            // profiling: runtime toggle for the 2-thread tile pass (same-launch A/B).
+            tile_threads_set(ix);
+            tig_debug_printf("[gpu-cmd] tilethreads %d\n", ix);
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).

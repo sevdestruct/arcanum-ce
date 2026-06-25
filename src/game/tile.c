@@ -1906,21 +1906,33 @@ void tile_halfres_lerp_set(int on)
     halfres_lerp_override = on;
 }
 
-// CE (EXPERIMENTAL): gated 2-thread split of the sector-row loop.
-// ARCANUM_OPT_TILE_THREADS=1. Hazards handled: sector_lock's global in_sector_lock
-// guard + shared sector cache are serialized via g_tile_sector_mutex; the gap_scan
-// global-counter append is skipped while threaded (g_tile_threads_active); the
-// art-cache LRU touch (sub_51AA90) is left to race (benign lost-write with the warm
-// cache + resolve-once memo). sectors[] is per-call, so thread-local.
+// CE: 2-thread split of the sector-row loop (default ON; cfg "tile threads",
+// gpucmd "tilethreads", env ARCANUM_OPT_TILE_THREADS). Splits big full-redraws
+// (zoom-out / camera-move) across 2 threads: worst-frame render ~-42% there,
+// neutral on light frames, byte-identical output. Hazards handled: sector_lock's
+// global in_sector_lock guard + shared sector cache serialized via g_tile_sector_mutex;
+// the gap_scan global-counter append skipped while threaded (g_tile_threads_active);
+// the shared art cache hardened in art.c (thread-local LRU dword_604714 + a
+// slow-path-only resolve mutex, armed via tig_art_resolve_lock_set around the
+// dispatch). sectors[] is per-call, so thread-local.
 static void tile_draw_rows(GameDrawInfo*, SectorRect*, int, int, const TigRect*, bool, tig_color_t, tig_color_t, bool);
+static int tile_threads_override = -1; // cfg "tile threads" / gpucmd "tilethreads"; -1 = unset
 static bool tile_threads_enabled(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    // Precedence: ARCANUM_OPT_TILE_THREADS env (explicit, for the A/B harness) >
+    // cfg/gpucmd override > default ON.
+    static int env = -2;
+    if (env == -2) {
         const char* e = getenv("ARCANUM_OPT_TILE_THREADS");
-        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+        env = (e != NULL) ? (e[0] == '1' ? 1 : 0) : -1;
     }
-    return cached != 0;
+    if (env >= 0) return env != 0;
+    if (tile_threads_override >= 0) return tile_threads_override != 0;
+    return true; // CE: default ON -- hardened (thread-local LRU + slow-path-only art mutex)
+}
+void tile_threads_set(int on)
+{
+    tile_threads_override = on;
 }
 static SDL_Mutex* g_tile_sector_mutex = NULL;
 static volatile int g_tile_threads_active = 0;
@@ -2336,9 +2348,11 @@ void tile_draw_iso(GameDrawInfo* draw_info)
         TileRowsArg a1 = { draw_info, v1, mid, v1->num_rows, &tile_draw_dirty_union,
             tile_draw_dirty_union_set, indoor_color, outdoor_color, halfres_lerp };
         g_tile_threads_active = 1;
+        tig_art_resolve_lock_set(1); // serialize the shared art-cache resolve across the 2 threads
         SDL_Thread* th = SDL_CreateThread(tile_rows_thread_fn, "tile_rows", &a0);
         tile_rows_thread_fn(&a1); // run the second half on this thread
         SDL_WaitThread(th, NULL);
+        tig_art_resolve_lock_set(0);
         g_tile_threads_active = 0;
     } else {
         tile_draw_rows(draw_info, v1, 0, v1->num_rows,

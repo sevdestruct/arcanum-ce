@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <SDL3/SDL.h>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -330,7 +331,15 @@ static float tig_art_cache_video_memory_fullness = 0.3f;
 static TigArtFilePathResolver tig_art_file_path_resolver;
 
 // 0x604714
-static int dword_604714;
+// CE: thread-local so the two tile-pass threads each keep their own last-resolved
+// cache index (the resolve-once + path memo fast paths). Transparent to the single-
+// threaded callers (the main thread keeps its own, identical to the old static).
+static _Thread_local int dword_604714;
+
+// CE: serialize art-cache resolve while the tile pass runs threaded (see
+// tig_art_resolve_lock_set below). Defined here so tig_art_blit can reference them.
+static SDL_Mutex* art_resolve_mutex = NULL;
+static volatile int art_resolve_threaded = 0;
 
 // 0x604718
 static bool tig_art_hardware_accelerated;
@@ -5674,6 +5683,20 @@ void tig_art_resolve_once_set(int on)
     art_resolve_once_override = on;
 }
 
+// CE: art-cache resolution lock, engaged ONLY while the tile pass runs threaded
+// (tile.c sets it around the 2-thread dispatch). sub_51AA90 mutates the shared
+// art cache (LRU dword_604714/.time, the fullness qsort, entry load) -- not
+// thread-safe -- so the resolve call in tig_art_blit is serialized while threaded.
+// The art_blit pixel fill AFTER resolution stays parallel, so this hardens the
+// race without giving up the threading win. Zero cost single-threaded (flag off).
+void tig_art_resolve_lock_set(int on)
+{
+    if (on && art_resolve_mutex == NULL) {
+        art_resolve_mutex = SDL_CreateMutex();
+    }
+    art_resolve_threaded = on;
+}
+
 // 0x51AA90
 int sub_51AA90(tig_art_id_t art_id)
 {
@@ -5698,6 +5721,13 @@ int sub_51AA90(tig_art_id_t art_id)
         return dword_604714;
     }
 
+    // CE: the slow path mutates the SHARED art cache (the fullness eviction qsort,
+    // the find/load, the LRU write). Serialize ONLY this while the tile pass runs
+    // threaded -- the fast hit paths above stay lock-free (thread-local dword_604714
+    // + a benign same-value .time write), which is where ~all warm-cache resolves
+    // land, so the threading win survives. Zero cost single-threaded (flag off).
+    if (art_resolve_threaded) SDL_LockMutex(art_resolve_mutex);
+
     // Called twice to check both system and video memory.
     tig_art_cache_check_fullness();
     tig_art_cache_check_fullness();
@@ -5708,6 +5738,7 @@ int sub_51AA90(tig_art_id_t art_id)
 
             if (!tig_art_cache_entry_load(art_id, "art\\badart.art", cache_entry_index)) {
                 tig_debug_printf("ART LOAD FAILURE!!! Trying to load badart.art\n");
+                if (art_resolve_threaded) SDL_UnlockMutex(art_resolve_mutex);
                 return -1;
             }
         }
@@ -5717,6 +5748,7 @@ int sub_51AA90(tig_art_id_t art_id)
     tig_art_cache_entries[cache_entry_index].art_id = art_id;
     dword_604714 = cache_entry_index;
 
+    if (art_resolve_threaded) SDL_UnlockMutex(art_resolve_mutex);
     return cache_entry_index;
 }
 
