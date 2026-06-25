@@ -378,6 +378,12 @@ int sub_520FB0(TigVideoBuffer* video_buffer, unsigned int flags);
 int tig_video_buffer_blit(TigVideoBufferBlitInfo* blit_info);
 void tig_video_simd_blit_set(int on); // CE (harness): runtime SIMD/scalar toggle for A/B
 
+// CE: idle present-skip -- skip the whole flip (full upload + present) on a
+// static frame, replacing the vsync wait with a short sleep. Off until validated;
+// env ARCANUM_OPT_PRESENT_SKIP=1 or tig_video_present_skip_set(1) enables it.
+void tig_video_present_skip_set(int on);     // runtime enable/disable (1/0)
+uint64_t tig_video_present_skip_get_count(void); // # frames skipped (diagnostics)
+
 // CE (feature/perf-gpu-accel Phase 2): GPU blit primitive.
 //
 // The source is a raw SDL_Texture (typically from the art GPU cache); the

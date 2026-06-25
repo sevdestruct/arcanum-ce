@@ -1297,8 +1297,65 @@ static uint64_t tig_video_flip_ticks_to_ns(uint64_t ticks)
 }
 
 // 0x51F8F0
+// CE: idle present-skip. On a static frame (the compositor set no present-dirty
+// hint, and no per-frame overlay is animating), the framebuffer texture already
+// matches the screen -- so the flip's full SDL_UpdateTexture + RenderClear +
+// RenderTexture + RenderPresent is pure waste. On the software path that's a
+// FULL-surface upload on every vsync (~MBs) for a screen that didn't change.
+// Skip the whole flip and replace the skipped vsync wait with a short sleep so
+// the main loop doesn't busy-spin. The skip is safe because the software surface
+// only changes where a window was dirty, which is exactly what sets the
+// present-dirty hint -- "no hint" therefore means "nothing changed". Software
+// path only for now; the GPU-present composite paths (gpu-ui / world-under) have
+// their own dirty model and are excluded. Off until validated; env
+// ARCANUM_OPT_PRESENT_SKIP=1 or the `presentskip` gpucmd enables it.
+#define TIG_VIDEO_IDLE_SLEEP_MS 8
+static int tig_video_present_skip_override = -1;
+static uint64_t tig_video_present_skip_count = 0;
+static bool tig_video_present_skip_active(void)
+{
+    static int cached = -1;
+    if (tig_video_present_skip_override >= 0) {
+        return tig_video_present_skip_override != 0;
+    }
+    if (cached < 0) {
+        const char* e = getenv("ARCANUM_OPT_PRESENT_SKIP");
+        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+void tig_video_present_skip_set(int on)
+{
+    tig_video_present_skip_override = on;
+}
+
+uint64_t tig_video_present_skip_get_count(void)
+{
+    return tig_video_present_skip_count;
+}
+
 int tig_video_flip(void)
 {
+    // CE: idle present-skip (software path) -- see the note above. Checked before
+    // the present-dirty hint is consumed below; on a skip we leave the hint as-is
+    // (already false on an idle frame) and the screen keeps showing the last
+    // presented frame, which is identical.
+    {
+        bool skip_gpu_ui = tig_video_gpu_ui_enabled && tig_video_ui_composite_func != NULL;
+        bool skip_gpu_world = tig_video_world_under_valid && tig_video_world_under_tex != NULL;
+        if (tig_video_present_skip_active()
+            && !tig_video_present_dirty_rect_valid
+            && !tig_fade_state.enabled
+            && !tig_video_show_fps
+            && !skip_gpu_ui
+            && !skip_gpu_world) {
+            tig_video_present_skip_count++;
+            SDL_Delay(TIG_VIDEO_IDLE_SLEEP_MS);
+            return TIG_OK;
+        }
+    }
+
     // Partial-upload fast path: only re-upload the rect the compositor
     // touched this present cycle. Falls back to full-surface upload when
     // no hint is set or the rect is bigger than ~3/4 of the surface

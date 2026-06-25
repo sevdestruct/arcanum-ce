@@ -1204,6 +1204,13 @@ static void gpu_test_channel_tick(void)
             tig_video_simd_blit_set(ix);
             tig_art_terrain_simd_set(ix); // also toggle the terrain LERP NEON path
             tig_debug_printf("[gpu-cmd] simd %d (video+terrain)\n", ix);
+        } else if (sscanf(line, "presentskip %d", &ix) == 1) {
+            // profiling: runtime toggle for the idle present-skip (software path).
+            // Reports the running skip count so a static screen can be verified to
+            // actually stop presenting (count climbs while idle, holds while active).
+            tig_video_present_skip_set(ix);
+            tig_debug_printf("[gpu-cmd] presentskip %d (idle skips so far: %llu)\n",
+                ix, (unsigned long long)tig_video_present_skip_get_count());
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).
