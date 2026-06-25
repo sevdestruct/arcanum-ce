@@ -1303,12 +1303,13 @@ static uint64_t tig_video_flip_ticks_to_ns(uint64_t ticks)
 // RenderTexture + RenderPresent is pure waste. On the software path that's a
 // FULL-surface upload on every vsync (~MBs) for a screen that didn't change.
 // Skip the whole flip and replace the skipped vsync wait with a short sleep so
-// the main loop doesn't busy-spin. The skip is safe because the software surface
-// only changes where a window was dirty, which is exactly what sets the
-// present-dirty hint -- "no hint" therefore means "nothing changed". Software
-// path only for now; the GPU-present composite paths (gpu-ui / world-under) have
-// their own dirty model and are excluded. Off until validated; env
-// ARCANUM_OPT_PRESENT_SKIP=1 or the `presentskip` gpucmd enables it.
+// the main loop doesn't busy-spin. The skip is safe because the surface (software)
+// or persistent GPU target only changes where a window was dirty, which is exactly
+// what sets the present-dirty hint -- "no hint" therefore means "nothing changed".
+// Works on BOTH the software and GPU-composite paths (the GPU world-under / gpu-ui
+// targets are persistent, so the last composite stays in the front buffer on a
+// skip). Default-on via the `present skip` cfg key; env ARCANUM_OPT_PRESENT_SKIP /
+// the `presentskip` gpucmd override at runtime.
 #define TIG_VIDEO_IDLE_SLEEP_MS 8
 static int tig_video_present_skip_override = -1;
 static uint64_t tig_video_present_skip_count = 0;
@@ -1337,19 +1338,20 @@ uint64_t tig_video_present_skip_get_count(void)
 
 int tig_video_flip(void)
 {
-    // CE: idle present-skip (software path) -- see the note above. Checked before
+    // CE: idle present-skip (BOTH software and GPU-composite paths). Checked before
     // the present-dirty hint is consumed below; on a skip we leave the hint as-is
     // (already false on an idle frame) and the screen keeps showing the last
-    // presented frame, which is identical.
+    // presented frame, which is identical. This is safe on every path because the
+    // GPU world-under / gpu-ui targets are PERSISTENT -- the last composite stays
+    // in the front buffer, and we only skip when nothing was invalidated (the iso
+    // window still sets the present-dirty hint when the GPU world scrolls/zooms/
+    // animates, so a changed GPU scene always presents). Verified: the skip count
+    // stays flat while the GPU world is active and only climbs when truly static.
     {
-        bool skip_gpu_ui = tig_video_gpu_ui_enabled && tig_video_ui_composite_func != NULL;
-        bool skip_gpu_world = tig_video_world_under_valid && tig_video_world_under_tex != NULL;
         if (tig_video_present_skip_active()
             && !tig_video_present_dirty_rect_valid
             && !tig_fade_state.enabled
-            && !tig_video_show_fps
-            && !skip_gpu_ui
-            && !skip_gpu_world) {
+            && !tig_video_show_fps) {
             tig_video_present_skip_count++;
             SDL_Delay(TIG_VIDEO_IDLE_SLEEP_MS);
             return TIG_OK;
