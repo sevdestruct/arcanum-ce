@@ -5647,11 +5647,46 @@ int art_blit(int cache_entry_index, TigArtBlitInfo* blit_info)
     return TIG_OK;
 }
 
+// CE (gated experiment): resolve-once. The existing memo below (dword_604714 path
+// strcmp) skips the cache lookup for a repeated art, but still rebuilds the path
+// string and strcmps it every call. On the LERP terrain path the SAME tile art_id
+// is resolved up to 4x in a row (the 4 bilinear quads), so that path build + strcmp
+// is pure repeat work. This stronger memo returns immediately when dword_604714
+// already holds this exact art_id -- skipping the path build + strcmp entirely.
+// Byte-identical (returns the same cache entry). ARCANUM_OPT_RESOLVE_ONCE=1.
+static int art_resolve_once_override = -1;
+static bool art_resolve_once_enabled(void)
+{
+    // Default ON: measured -22.8% on the zoom LERP render, byte-identical, both
+    // A/B orderings agree. ARCANUM_OPT_RESOLVE_ONCE=0 disables; the `resolveonce`
+    // gpucmd / override controls it at runtime.
+    static int cached = -1;
+    if (art_resolve_once_override >= 0) return art_resolve_once_override != 0;
+    if (cached < 0) {
+        const char* e = getenv("ARCANUM_OPT_RESOLVE_ONCE");
+        cached = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+void tig_art_resolve_once_set(int on)
+{
+    art_resolve_once_override = on;
+}
+
 // 0x51AA90
 int sub_51AA90(tig_art_id_t art_id)
 {
     char path[TIG_MAX_PATH];
     int cache_entry_index;
+
+    if (art_resolve_once_enabled()
+        && dword_604714 >= 0
+        && dword_604714 < tig_art_cache_entries_length
+        && tig_art_cache_entries[dword_604714].art_id == art_id) {
+        tig_art_cache_entries[dword_604714].time = tig_ping_timestamp;
+        return dword_604714;
+    }
 
     if (tig_art_build_path(art_id, path, sizeof(path)) != TIG_OK) {
         return -1;

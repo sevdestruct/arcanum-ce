@@ -1883,6 +1883,28 @@ void tile_gpu_test_capture(const char* abs_path)
 
 // NOTE: In the original code this function is a part of `tile_draw`, however
 // if `tile_draw_topdown` is definitely there, why `tile_draw_iso` should not?
+// CE (gated experiment): half-res-during-lerp. While the zoom is actively
+// animating, skip the blit of every other vertical tile row -- the prior frame's
+// pixels stay in the persistent world buffer and the bilinear downscale blurs over
+// the gaps. Halves the per-tile fill work during the lerp; blurrier mid-zoom, crisp
+// when settled. ARCANUM_OPT_HALFRES_LERP=1.
+static int halfres_lerp_override = -1;
+static bool halfres_lerp_enabled(void)
+{
+    static int cached = -1;
+    if (halfres_lerp_override >= 0) return halfres_lerp_override != 0;
+    if (cached < 0) {
+        const char* e = getenv("ARCANUM_OPT_HALFRES_LERP");
+        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+void tile_halfres_lerp_set(int on)
+{
+    halfres_lerp_override = on;
+}
+
 void tile_draw_iso(GameDrawInfo* draw_info)
 {
     SectorRect* v1;
@@ -1979,6 +2001,8 @@ void tile_draw_iso(GameDrawInfo* draw_info)
         }
     }
 
+    const bool halfres_lerp = halfres_lerp_enabled() && iso_zoom_is_animating();
+
     for (v2 = 0; v2 < v1->num_rows; v2++) {
         v3 = &(v1->rows[v2]);
 
@@ -2000,6 +2024,16 @@ void tile_draw_iso(GameDrawInfo* draw_info)
             for (v15 = 0; v15 < v3->num_cols; v15++) {
                 if (sector_lock_results[v15]) {
                     for (v42 = 0; v42 < v3->num_hor_tiles[v15]; v42++) {
+                        // CE half-res-during-lerp: on odd vertical rows while zooming,
+                        // skip the blit work but still advance the tile index + iso
+                        // step so the grid stays aligned (the prior pixels remain for
+                        // the downscale to blur).
+                        if (halfres_lerp && (v38 & 1)) {
+                            indexes[v15]++;
+                            center_x -= 40;
+                            center_y += 20;
+                            continue;
+                        }
                         blit_info_initialized = false;
                         int tile_fade_center = 255;
                         int tile_pre_sum = -1;

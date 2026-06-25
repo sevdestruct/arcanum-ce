@@ -7,6 +7,7 @@
 
 bool tile_init(GameInitInfo* init_info);
 void tile_exit(void);
+void tile_halfres_lerp_set(int on); // CE (harness): runtime half-res-during-lerp A/B toggle
 void tile_resize(GameResizeInfo* resize_info);
 void tile_update_view(ViewOptions* view_options);
 void tile_toggle_visibility(void);

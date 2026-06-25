@@ -1221,6 +1221,15 @@ static void gpu_test_channel_tick(void)
             tig_video_present_skip_set(ix);
             tig_debug_printf("[gpu-cmd] presentskip %d (idle skips so far: %llu)\n",
                 ix, (unsigned long long)tig_video_present_skip_get_count());
+        } else if (sscanf(line, "resolveonce %d", &ix) == 1) {
+            // profiling: runtime toggle for the resolve-once art-cache memo so ONE
+            // launch A/Bs both at the same scroll position (ambient-load robust).
+            tig_art_resolve_once_set(ix);
+            tig_debug_printf("[gpu-cmd] resolveonce %d\n", ix);
+        } else if (sscanf(line, "halfreslerp %d", &ix) == 1) {
+            // profiling: runtime toggle for the half-res-during-lerp tile skip.
+            tile_halfres_lerp_set(ix);
+            tig_debug_printf("[gpu-cmd] halfreslerp %d\n", ix);
         } else if (strncmp(line, "perf", 4) == 0) {
             // profiling: toggle the F9 zoom-perf log (per-pass total + max, dumped
             // periodically to the debug log).

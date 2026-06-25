@@ -421,6 +421,7 @@ void tig_art_ping(void);
 int tig_art_misc_id_create(unsigned int num, unsigned int palette, tig_art_id_t* art_id);
 void tig_art_flush(void);
 void tig_art_terrain_simd_set(int on); // CE (harness): runtime terrain LERP NEON toggle
+void tig_art_resolve_once_set(int on); // CE (harness): runtime resolve-once A/B toggle
 int tig_art_exists(tig_art_id_t art_id);
 int tig_art_touch(tig_art_id_t art_id);
 void sub_5022B0(TigArtBlitPaletteAdjustCallback callback);
