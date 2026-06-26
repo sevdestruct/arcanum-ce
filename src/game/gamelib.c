@@ -617,7 +617,10 @@ bool gamelib_init(GameInitInfo* init_info)
     // neutral on light frames; byte-identical output. Hardened: thread-local art
     // LRU + slow-path-only cache mutex. Default ON; `tile threads=0` opts out. The
     // `tilethreads` gpucmd / ARCANUM_OPT_TILE_THREADS env still override at runtime.
-    settings_register(&settings, "tile threads", "1", NULL);
+    // CE: DEFAULT OFF -- the 2-thread tile pass crashes on a cold art cache (first
+    // draw after a save-load); see tile_threads_enabled(). Gated on only for warm-
+    // cache experiments via `tile threads=1` / gpucmd / env.
+    settings_register(&settings, "tile threads", "0", NULL);
     tile_threads_set(settings_get_value(&settings, "tile threads") != 0 ? 1 : 0);
 
     gamelib_mod_loaded = false;

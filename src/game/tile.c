@@ -1906,7 +1906,8 @@ void tile_halfres_lerp_set(int on)
     halfres_lerp_override = on;
 }
 
-// CE: 2-thread split of the sector-row loop (default ON; cfg "tile threads",
+// CE: 2-thread split of the sector-row loop (default OFF -- cold-cache crash, see
+// tile_threads_enabled; gated ON only for warm-cache experiments via cfg "tile threads",
 // gpucmd "tilethreads", env ARCANUM_OPT_TILE_THREADS). Splits big full-redraws
 // (zoom-out / camera-move) across 2 threads: worst-frame render ~-42% there,
 // neutral on light frames, byte-identical output. Hazards handled: sector_lock's
@@ -1928,7 +1929,15 @@ static bool tile_threads_enabled(void)
     }
     if (env >= 0) return env != 0;
     if (tile_threads_override >= 0) return tile_threads_override != 0;
-    return true; // CE: default ON -- hardened (thread-local LRU + slow-path-only art mutex)
+    // CE: default OFF. The 2-thread split CRASHES on a cold art cache (first draw
+    // after a save-load): the lock-free fast-path resolve read races a concurrent
+    // slow-path entry load and art_blit derefs a torn pixel pointer -> SIGSEGV.
+    // The thread-local-LRU + slow-path-mutex hardening only made the WARM-cache case
+    // safe (verified byte-identical there); cold-cache draws run the slow path for
+    // ~every tile, so the race is near-certain, not "near-zero". Safe default-on would
+    // need a pre-warm pass (resolve all visible art single-threaded, then split only
+    // the blit) -- deferred. Gated ON only for warm-cache experiments.
+    return false;
 }
 void tile_threads_set(int on)
 {
