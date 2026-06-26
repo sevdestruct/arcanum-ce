@@ -68,6 +68,7 @@ void mainmenu_ui_exit(void);
 void mainmenu_ui_start(MainMenuType type);
 void mainmenu_ui_start_at_window(MainMenuWindowType window_type);
 void sub_5412D0(void);
+void mainmenu_ui_harness_newgame(int pregen_idx); // CE harness: start new game w/ premade char
 bool mainmenu_ui_handle(void);
 bool mainmenu_ui_is_active(void);
 

@@ -20,6 +20,7 @@
 #include "ui/fate_ui.h"
 #include "ui/follower_ui.h"
 #include "ui/intgame.h"
+#include "ui/dialog_ui.h"
 #include "ui/mainmenu_ui.h"
 #include "ui/wmap_ui.h"
 #include "ui/inven_ui.h"
@@ -1123,6 +1124,21 @@ static void gpu_test_channel_tick(void)
                 // harness is actually watchable.
                 sub_5412D0();
                 tig_debug_printf("[gpu-cmd] dismissed mainmenu -> in-game\n");
+            }
+        } else if (strncmp(line, "newgame", 7) == 0) {
+            // CE harness: start a new game with a premade character -- a save-format-
+            // independent real-level workload for cross-branch benchmarking. Optional
+            // index picks the premade (default 1 = Merwin). Lands in the start map.
+            ix = 1;
+            sscanf(line, "newgame %d", &ix);
+            tig_debug_printf("[gpu-cmd] newgame pregen=%d\n", ix);
+            mainmenu_ui_harness_newgame(ix);
+        } else if (strncmp(line, "dlgclose", 8) == 0) {
+            // CE harness: dismiss the intro dialogue (base Arcanum opens in one) so the
+            // workout can scroll/walk/zoom freely.
+            if (dialog_ui_is_local_pc_in_dialog()) {
+                dialog_ui_end_dialog(player_get_local_pc_obj(), 0);
+                tig_debug_printf("[gpu-cmd] dlgclose: dismissed dialog\n");
             }
         } else if (sscanf(line, "setpath %255s", arg) == 1) {
             settings_set_str_value(&settings, RENDER_PATH_KEY, arg);

@@ -5325,6 +5325,21 @@ bool mainmenu_ui_pregen_char_execute(int btn)
     return true;
 }
 
+// CE harness (newgame): start a new game with a premade character, exactly as the
+// menu's "New Game -> pregen -> Accept" path does (pregen_char_create sets up the
+// pregen state + window; pregen_char_execute creates the PC, sets pregen flags,
+// auto-equips, and calls sub_5412D0 to fade into the start map). No interactive
+// character creation, so a benchmark can land in a real start map on ANY module or
+// branch -- save-format independent. pregen_idx 1 = Merwin (first premade); clamped.
+void mainmenu_ui_harness_newgame(int pregen_idx)
+{
+    mainmenu_ui_pregen_char_create();
+    if (pregen_idx >= 1 && pregen_idx < mainmenu_ui_pregen_char_cnt) {
+        mainmenu_ui_pregen_char_idx = pregen_idx;
+    }
+    mainmenu_ui_pregen_char_execute(0);
+}
+
 // 0x545C50
 void mainmenu_ui_charedit_create(void)
 {
