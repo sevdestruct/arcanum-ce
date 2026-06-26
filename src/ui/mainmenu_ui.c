@@ -88,14 +88,16 @@ static void mainmenu_ui_load_game_mouse_up(int a1, int a2);
 static void sub_542560(void);
 static void mainmenu_ui_load_game_refresh(TigRect* rect);
 static void sub_542D00(char* str, TigRect* rect, tig_font_handle_t font);
+static void mainmenu_ui_draw_list_name(const char* name, TigRect* rect, tig_font_handle_t font);
 static void sub_542DF0(char* str, TigRect* rect, tig_font_handle_t font);
 static void sub_542EA0(char* str, TigRect* rect, tig_font_handle_t font);
 static void mmUITextWriteCenteredToArray(char* str, TigRect* rects, int cnt, tig_font_handle_t font);
 static char* sub_543040(int index);
+static const char* mainmenu_ui_row_module_tag(int index);
 static void sub_543060(void);
 static void sub_5430D0(void);
 static bool mainmenu_ui_load_game_handle_delete(void);
-static bool sub_5432B0(const char* name);
+static bool sub_5432B0(const char* name, const char* module_hint);
 static void mainmenu_ui_save_game_create(void);
 static void mainmenu_ui_save_game_destroy(void);
 static bool mainmenu_ui_save_game_execute(int btn);
@@ -103,7 +105,7 @@ static bool mainmenu_ui_save_game_button_pressed(tig_button_handle_t button_hand
 static bool mainmenu_ui_save_game_button_released(tig_button_handle_t button_handle);
 static void mainmenu_ui_save_game_mouse_up(int x, int y);
 static void mainmenu_ui_save_game_refresh(TigRect* rect);
-static void sub_544100(const char* str, TigRect* rect, tig_font_handle_t font);
+static void sub_544100(const char* str, TigRect* rect, tig_font_handle_t font, bool left_align);
 static void sub_544210(void);
 static void sub_544250(void);
 static void sub_544290(void);
@@ -170,6 +172,8 @@ static void sub_548FF0(int a1);
 static void sub_549450(void);
 static void mainmenu_ui_textedit_on_enter(TextEdit* textedit);
 static void mainmenu_ui_textedit_on_change(TextEdit* textedit);
+static void mainmenu_ui_textedit_on_arrow_up(TextEdit* textedit);
+static void mainmenu_ui_textedit_on_arrow_down(TextEdit* textedit);
 static void mainmenu_ui_feedback(int num);
 static void mainmenu_fonts_init(void);
 static void mainmenu_fonts_exit(void);
@@ -529,6 +533,8 @@ static TextEdit mainmenu_ui_textedit = {
     mainmenu_ui_textedit_on_enter,
     mainmenu_ui_textedit_on_change,
     NULL,
+    mainmenu_ui_textedit_on_arrow_up,
+    mainmenu_ui_textedit_on_arrow_down,
 };
 
 // 0x5C4030
@@ -802,7 +808,10 @@ static MainMenuWindowInfo mainmenu_ui_load_game_window_info = {
     },
     mainmenu_ui_load_game_refresh,
     mainmenu_ui_load_game_execute,
-    { 42, 120, 145, 213 },
+    // CE: widen the list text area from 145 to 168 to use the dead margin between the
+    // names and the scrollbar (at x=213) -- lets save names show a few more characters
+    // and pushes the dim [Module] tag toward the right edge instead of mid-panel.
+    { 42, 120, 160, 213 },
     mainmenu_ui_load_game_mouse_up,
     { 0 },
     NULL,
@@ -900,7 +909,9 @@ static MainMenuWindowInfo mainmenu_ui_save_game_window_info = {
     },
     mainmenu_ui_save_game_refresh,
     mainmenu_ui_save_game_execute,
-    { 42, 120, 145, 213 },
+    // CE: widen the list text area (see the Load window) to use the margin up to the
+    // scrollbar, for longer save names + a right-aligned [Module] tag.
+    { 42, 120, 160, 213 },
     mainmenu_ui_save_game_mouse_up,
     { 0 },
     NULL,
@@ -1406,6 +1417,11 @@ static tig_font_handle_t dword_64C228[2][3];
 // 0x64C240
 static tig_font_handle_t dword_64C240;
 
+// CE: dim (grey) list font for the "[Module]" tag drawn on Load-menu rows, so the
+// tag reads as secondary annotation (like dialogue emotes) rather than competing
+// with the save description. Created in mainmenu_ui_init, destroyed in exit.
+static tig_font_handle_t mainmenu_ui_dim_font;
+
 // 0x64C244
 static MainMenuType mainmenu_ui_type;
 
@@ -1459,6 +1475,13 @@ int64_t* dword_64C41C;
 
 // 0x64C420
 int dword_64C420;
+
+// CE: one-shot guard. An up/down arrow that exits the Save-name input is handled on
+// key PRESS (text-edit), but its key RELEASE then falls through to the list's own
+// up/down nav (the input is no longer focused) and moves the selection a SECOND time
+// -- "leapfrogging" the intended row. Set when the input exits via an arrow; the next
+// up/down release in the Save window is swallowed instead of navigating.
+static bool mainmenu_ui_arrow_exit_pending;
 
 // 0x64C424
 static bool mainmenu_ui_auto_equip_items_on_start;
@@ -1591,6 +1614,13 @@ bool mainmenu_ui_init(GameInitInfo* init_info)
     font_desc.color = tig_color_make(255, 210, 0);
     tig_font_create(&font_desc, &dword_64C240);
 
+    // CE: dim grey font for the Load-menu "[Module]" tag.
+    font_desc.flags = 0;
+    tig_art_interface_id_create(dword_5C4030[0], 0, 0, 0, &(font_desc.art_id));
+    font_desc.str = NULL;
+    font_desc.color = tig_color_make(140, 140, 140);
+    tig_font_create(&font_desc, &mainmenu_ui_dim_font);
+
     mes_file_entry.num = 500;
     mes_get_msg(mainmenu_ui_mainmenu_mes_file, &mes_file_entry);
     strncpy(mainmenu_ui_textedit_buffer, mes_file_entry.str, 23);
@@ -1633,6 +1663,7 @@ void mainmenu_ui_exit(void)
     }
 
     tig_font_destroy(dword_64C240);
+    tig_font_destroy(mainmenu_ui_dim_font);
     mes_unload(mainmenu_ui_rules_mainmenu_mes_file);
     mes_unload(mainmenu_ui_mainmenu_mes_file);
 
@@ -2041,6 +2072,19 @@ bool mainmenu_ui_handle(void)
                 if (!msg.data.keyboard.pressed
                     && msg.data.keyboard.scancode == SDL_SCANCODE_ESCAPE
                     && mainmenu_ui_window_type != MM_WINDOW_MAINMENU) {
+                    // CE: if a name is being typed (new save / new character), ESC
+                    // cancels the INPUT first -- unfocus back to the prompt and keep
+                    // the window open -- instead of closing the whole window out from
+                    // under the user. A second ESC then closes as usual.
+                    if (textedit_ui_is_focused()) {
+                        textedit_ui_unfocus(&mainmenu_ui_textedit);
+                        dword_64C428 = false;
+                        mainmenu_ui_textedit_buffer[0] = '\0';
+                        if (main_menu_window_info[mainmenu_ui_window_type]->refresh_func != NULL) {
+                            main_menu_window_info[mainmenu_ui_window_type]->refresh_func(NULL);
+                        }
+                        break;
+                    }
                     // If the menu stack has a parent (e.g. user opened
                     // Options from the pause menu, or Save/Load from the
                     // pause menu), pop back to the parent like the original
@@ -2619,7 +2663,11 @@ void mainmenu_ui_load_game_create(void)
     if (dword_64C37C) {
         gamelib_savelist_create_module(dword_64C37C, &mainmenu_ui_gsl);
     } else {
-        gamelib_savelist_create(&mainmenu_ui_gsl);
+        // CE: aggregate saves across data\Save AND every module's own save folder,
+        // each tagged with its owning module, so the Load menu shows all saves at
+        // once and can auto-switch to the right module on load (no manual "set the
+        // module first"). See gamelib_savelist_create_all.
+        gamelib_savelist_create_all(&mainmenu_ui_gsl);
     }
 
     gamelib_savelist_sort(&mainmenu_ui_gsl, GAME_SAVE_LIST_ORDER_DATE, false);
@@ -2709,6 +2757,12 @@ void mainmenu_ui_load_game_create(void)
         dword_64C450 = true;
     }
 
+    // CE: opt the Load window into translucent-black so its near-black areas reveal
+    // what's behind it -- the live game world when opened over gameplay, the menu
+    // backdrop on the title screen (window-context underlay pick). Honors the
+    // "translucent black ui" cfg; a no-op when off or when there's no underlay.
+    intgame_apply_translucent_black_window(mainmenu_ui_window_handle, true);
+
     scrollbar_ui_control_redraw(stru_64C220);
     tig_window_display();
 }
@@ -2728,6 +2782,10 @@ void sub_542200(void)
 // 0x542230
 void mainmenu_ui_load_game_destroy(void)
 {
+    // CE: clear the translucent-black tint so it doesn't bleed onto the next screen
+    // that reuses this shared mainmenu window.
+    intgame_apply_translucent_black_window(mainmenu_ui_window_handle, false);
+
     scrollbar_ui_control_destroy(stru_64C220);
 
     if (mainmenu_ui_gsi_loaded) {
@@ -2792,7 +2850,13 @@ bool mainmenu_ui_load_game_execute(int btn)
     strncpy(name, mainmenu_ui_gsl.names[index], 8);
     name[8] = '\0';
 
-    return sub_5432B0(name);
+    // CE: pass the selected entry's OWNING MODULE (resolved by directory when the
+    // list was built) as the authoritative hint. The 8-char slot alone is ambiguous
+    // -- the same slot (e.g. "Slot0000") can exist under multiple modules -- so
+    // re-deriving the module from the slot could switch to the wrong one. The list
+    // entry already knows which module this row represents.
+    return sub_5432B0(name,
+        mainmenu_ui_gsl.entry_modules != NULL ? mainmenu_ui_gsl.entry_modules[index] : NULL);
 }
 
 // 0x542420
@@ -2912,7 +2976,7 @@ void sub_542560(void)
         mainmenu_ui_gsi_loaded = false;
 
         if (window->selected_index > -1
-            && gamelib_saveinfo_load(mainmenu_ui_gsl.names[window->selected_index], &mainmenu_ui_gsi)) {
+            && gamelib_saveinfo_load_located(mainmenu_ui_gsl.names[window->selected_index], &mainmenu_ui_gsi)) {
             mainmenu_ui_gsi_loaded = true;
         }
     }
@@ -3004,6 +3068,9 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
             dst_rect.height = 20;
 
             for (index = window->top_index; index < window->cnt; index++) {
+                const char* row_tag;
+                TigRect text_rect;
+
                 if (dst_rect.y >= max_y) {
                     break;
                 }
@@ -3011,8 +3078,37 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
                 font = window->selected_index == index ? dword_64C240 : dword_64C210[0];
                 tig_font_push(font);
                 name = sub_543040(index);
+                text_rect = dst_rect;
+
+                // CE: draw the "[Module]" tag dim and right-aligned, reserving its
+                // width so the description truncates before it -- the module name
+                // stays fully visible instead of being clipped at the row edge.
+                row_tag = mainmenu_ui_row_module_tag(index);
+                if (row_tag != NULL) {
+                    TigFont tag_desc;
+                    TigRect tag_rect;
+
+                    tag_desc.width = 0;
+                    tag_desc.height = 0;
+                    tag_desc.str = (char*)row_tag;
+                    tag_desc.flags = 0;
+                    tig_font_push(mainmenu_ui_dim_font);
+                    tig_font_measure(&tag_desc);
+
+                    tag_rect = dst_rect;
+                    tag_rect.x = dst_rect.x + dst_rect.width - tag_desc.width;
+                    tag_rect.width = tag_desc.width;
+                    sub_5418A0((char*)row_tag, &tag_rect, mainmenu_ui_dim_font, 0);
+                    tig_font_pop();
+
+                    text_rect.width -= tag_desc.width + 8;
+                    if (text_rect.width < 0) {
+                        text_rect.width = 0;
+                    }
+                }
+
                 if (*name != '\0') {
-                    sub_542D00(name, &dst_rect, font);
+                    mainmenu_ui_draw_list_name(name, &text_rect, font);
                 }
                 dst_rect.y += 20;
                 tig_font_pop();
@@ -3025,10 +3121,21 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
             && stru_5C46C0.y < rect->y + rect->height
             && rect->x < stru_5C46C0.x + stru_5C46C0.width
             && rect->y < stru_5C46C0.y + stru_5C46C0.height)) {
+        // CE: ALWAYS clear the detail content box when this panel is (re)drawn, before
+        // we even know whether the selected save's info loads. Gating the clear on
+        // gsi_loaded left the PREVIOUS save's longer text on screen whenever the newly-
+        // selected save's info failed to read -- the "names collapsed onto wrong longer
+        // names" bug. 281,55,468,300 is the content area inside the ornate frame; the
+        // thumbnail blit below mutates stru_5C46C0 to the image size so we can't reuse it.
+        {
+            TigRect detail_clear = { 281, 55, 468, 300 };
+            tig_window_fill(mainmenu_ui_window_handle, &detail_clear, tig_color_make(0, 0, 0));
+        }
+
         if (window->selected_index > -1) {
             if (!mainmenu_ui_gsi_loaded
                 && mainmenu_ui_gsl.count > 0
-                && gamelib_saveinfo_load(mainmenu_ui_gsl.names[window->selected_index], &mainmenu_ui_gsi)) {
+                && gamelib_saveinfo_load_located(mainmenu_ui_gsl.names[window->selected_index], &mainmenu_ui_gsi)) {
                 mainmenu_ui_gsi_loaded = true;
             }
 
@@ -3075,10 +3182,24 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
 
                         sub_542DF0(mainmenu_ui_gsi.description, &stru_5C4730, font);
 
-                        if (map_by_type(MAP_TYPE_START_MAP) == mainmenu_ui_gsi.map) {
-                            area = area_get_nearest_area_in_range(mainmenu_ui_gsi.pc_location, true);
-                        } else if (!map_get_area(mainmenu_ui_gsi.map, &area)) {
-                            area = 0;
+                        // CE: the area NAME (map/area tables) and the quest/story text
+                        // (script_story_state_info) are resolved from the CURRENTLY
+                        // mounted module's data. For a save that belongs to a DIFFERENT
+                        // module than the one mounted, those lookups return the wrong
+                        // module's entries (e.g. a Vormantown save showed Arcanum's
+                        // "Shrouded Hills" + a bogus quest). We can't load the other
+                        // module's tables just to preview, so show "Unknown location."
+                        // and no story for cross-module saves rather than wrong info.
+                        bool same_module = mainmenu_ui_gsi.module_name[0] == '\0'
+                            || SDL_strcasecmp(mainmenu_ui_gsi.module_name, gamelib_loaded_module_name_get()) == 0;
+
+                        area = 0;
+                        if (same_module) {
+                            if (map_by_type(MAP_TYPE_START_MAP) == mainmenu_ui_gsi.map) {
+                                area = area_get_nearest_area_in_range(mainmenu_ui_gsi.pc_location, true);
+                            } else if (!map_get_area(mainmenu_ui_gsi.map, &area)) {
+                                area = 0;
+                            }
                         }
 
                         if (area > 0) {
@@ -3097,7 +3218,9 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
                         datetime_format_time(&(mainmenu_ui_gsi.datetime), str, sizeof(str));
                         sub_542EA0(str, &stru_5C4700, font);
 
-                        story_state_desc = script_story_state_info(mainmenu_ui_gsi.story_state);
+                        story_state_desc = same_module
+                            ? script_story_state_info(mainmenu_ui_gsi.story_state)
+                            : NULL;
                         if (story_state_desc != NULL && *story_state_desc != '\0') {
                             mmUITextWriteCenteredToArray(story_state_desc, stru_5C4740, 4, font);
                         }
@@ -3146,6 +3269,43 @@ void mainmenu_ui_load_game_refresh(TigRect* rect)
     }
 
     mmUIWinRefreshScrollBar();
+}
+
+// CE: draw a save list name left-aligned, truncated with a trailing "..." when it
+// doesn't fit rect->width. sub_542D00 also truncates but draws its ellipsis at the
+// wrong x (rect.x + ellipsis_width instead of after the text), so the dots overlap
+// the start and effectively vanish -- hence list names looked hard-cut with no
+// ellipsis. This builds "<prefix>..." that fits, then draws it normally.
+static void mainmenu_ui_draw_list_name(const char* name, TigRect* rect, tig_font_handle_t font)
+{
+    char buf[COMPAT_MAX_FNAME + 4];
+    TigFont fd;
+    size_t len;
+
+    fd.width = 0;
+    fd.height = 0;
+    fd.str = (char*)name;
+    fd.flags = 0;
+    tig_font_measure(&fd);
+    if (fd.width <= rect->width) {
+        sub_5418A0((char*)name, rect, font, 0);
+        return;
+    }
+
+    len = strlen(name);
+    for (;;) {
+        snprintf(buf, sizeof(buf), "%.*s...", (int)len, name);
+        fd.width = 0;
+        fd.height = 0;
+        fd.str = buf;
+        fd.flags = 0;
+        tig_font_measure(&fd);
+        if (fd.width <= rect->width || len == 0) {
+            break;
+        }
+        len--;
+    }
+    sub_5418A0(buf, rect, font, 0);
 }
 
 // 0x542D00
@@ -3223,58 +3383,162 @@ void sub_542EA0(char* str, TigRect* rect, tig_font_handle_t font)
     sub_5418A0(str, &text_rect, font, 0);
 }
 
+// CE: number of lines a greedy word-wrap at max line width W uses (a word wider
+// than W still takes its own line). word_w[] = per-word pixel widths.
+static int mainmenu_ui_wrap_line_count(const int* word_w, int nwords, int space_w, int W)
+{
+    int lines = 1;
+    int cur = 0;
+    int i;
+
+    for (i = 0; i < nwords; i++) {
+        if (cur != 0 && cur + space_w + word_w[i] > W) {
+            lines++;
+            cur = word_w[i];
+        } else {
+            cur += (cur == 0 ? 0 : space_w) + word_w[i];
+        }
+    }
+    return lines;
+}
+
 // 0x542F50
+// CE: BALANCED centered word-wrap into an array of cnt line rects. The original did a
+// greedy wrap (fill each line to the max), which leaves a stubby last line -- e.g.
+// "...you are currently attempting to" / "find its owner." Instead: find how many
+// lines a full-width greedy wrap needs (clamped to cnt), then binary-search the
+// SMALLEST max-line-width that still fits in that many lines, and wrap at that width.
+// Minimizing the longest line makes the lines come out roughly even.
 void mmUITextWriteCenteredToArray(char* str, TigRect* rects, int cnt, tig_font_handle_t font)
 {
-    TigFont font_desc;
-    TigRect text_rect;
-    char* curr = str;
-    char* space = NULL;
-    char* pch;
+    char buf[1024];
+    char* words[128];
+    int word_w[128];
+    char line[1024];
+    TigFont fd;
+    TigRect tr;
+    int nwords = 0;
+    int space_w;
+    int full_w;
+    int target_w;
+    int lines_needed;
+    int i;
+    int line_idx;
+    int cur;
+    char* p;
 
-    // NOTE: Original code is slightly different but does the same thing.
-    while (*curr != '\0' && cnt > 0) {
-        font_desc.width = 0;
-        font_desc.height = 0;
-        font_desc.flags = 0;
-        font_desc.str = curr;
-        tig_font_measure(&font_desc);
+    if (str == NULL || *str == '\0' || cnt <= 0) {
+        return;
+    }
 
-        text_rect = *rects;
-        if (font_desc.width < text_rect.width) {
-            text_rect.x += (text_rect.width - font_desc.width) / 2;
-            text_rect.width = font_desc.width;
-            sub_5418A0(curr, &text_rect, font, 0);
-            rects++;
-            cnt--;
+    full_w = rects[0].width;
 
-            if (space == NULL) {
-                break;
+    // Tokenize (on a copy; spaces become NUL).
+    snprintf(buf, sizeof(buf), "%s", str);
+    p = buf;
+    while (*p != '\0' && nwords < 128) {
+        while (*p == ' ') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        words[nwords++] = p;
+        while (*p != '\0' && *p != ' ') {
+            p++;
+        }
+        if (*p != '\0') {
+            *p = '\0';
+            p++;
+        }
+    }
+    if (nwords == 0) {
+        return;
+    }
+
+    for (i = 0; i < nwords; i++) {
+        fd.width = 0;
+        fd.height = 0;
+        fd.flags = 0;
+        fd.str = words[i];
+        tig_font_measure(&fd);
+        word_w[i] = fd.width;
+    }
+    fd.width = 0;
+    fd.height = 0;
+    fd.flags = 0;
+    fd.str = " ";
+    tig_font_measure(&fd);
+    space_w = fd.width;
+
+    lines_needed = mainmenu_ui_wrap_line_count(word_w, nwords, space_w, full_w);
+    if (lines_needed > cnt) {
+        lines_needed = cnt;
+    }
+
+    target_w = full_w;
+    if (lines_needed > 1) {
+        int lo = 0;
+        int hi = full_w;
+        for (i = 0; i < nwords; i++) {
+            if (word_w[i] > lo) {
+                lo = word_w[i]; // can't wrap narrower than the widest single word
             }
-
-            curr = space + 1;
-
-            *space = ' ';
-            space = NULL;
-        } else {
-            pch = strrchr(str, ' ');
-            if (pch == NULL) {
-                tig_debug_printf("MainMenuUI: mmUITextWriteCenteredToArray: ERROR: Coudn't fit entire to string to print: '%s'!\n", str);
-                break;
+        }
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (mainmenu_ui_wrap_line_count(word_w, nwords, space_w, mid) <= lines_needed) {
+                target_w = mid;
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
             }
-
-            if (space != NULL) {
-                *space = ' ';
-            }
-
-            space = pch;
-            *space = '\0';
         }
     }
 
-    if (space != NULL) {
-        *space = ' ';
-        space = NULL;
+    // Greedy-wrap at target_w; draw each line centered in its rect.
+    line[0] = '\0';
+    cur = 0;
+    line_idx = 0;
+    for (i = 0; i < nwords && line_idx < cnt; i++) {
+        if (cur != 0 && cur + space_w + word_w[i] > target_w) {
+            fd.width = 0;
+            fd.height = 0;
+            fd.flags = 0;
+            fd.str = line;
+            tig_font_measure(&fd);
+            tr = rects[line_idx];
+            if (fd.width < tr.width) {
+                tr.x += (tr.width - fd.width) / 2;
+                tr.width = fd.width;
+            }
+            sub_5418A0(line, &tr, font, 0);
+            line_idx++;
+            line[0] = '\0';
+            cur = 0;
+            if (line_idx >= cnt) {
+                break;
+            }
+        }
+        if (cur != 0) {
+            strcat(line, " ");
+            cur += space_w;
+        }
+        strcat(line, words[i]);
+        cur += word_w[i];
+    }
+    if (line[0] != '\0' && line_idx < cnt) {
+        fd.width = 0;
+        fd.height = 0;
+        fd.flags = 0;
+        fd.str = line;
+        tig_font_measure(&fd);
+        tr = rects[line_idx];
+        if (fd.width < tr.width) {
+            tr.x += (tr.width - fd.width) / 2;
+            tr.width = fd.width;
+        }
+        sub_5418A0(line, &tr, font, 0);
     }
 }
 
@@ -3286,6 +3550,25 @@ char* sub_543040(int index)
     } else {
         return "";
     }
+}
+
+// CE: the owning-module tag string ("[Module]") for a Load-menu row, or NULL if the
+// list isn't module-tagged (the Save menu's plain list). Drawn separately, dim and
+// right-aligned, by the Load refresh -- not folded into sub_543040 -- so the module
+// name never gets clipped by description truncation.
+static const char* mainmenu_ui_row_module_tag(int index)
+{
+    static char buf[64];
+
+    if ((mainmenu_ui_window_type != MM_WINDOW_LOAD_GAME
+            && mainmenu_ui_window_type != MM_WINDOW_SAVE_GAME)
+        || mainmenu_ui_gsl.entry_modules == NULL
+        || mainmenu_ui_gsl.entry_modules[index] == NULL) {
+        return NULL;
+    }
+
+    snprintf(buf, sizeof(buf), "[%s]", mainmenu_ui_gsl.entry_modules[index]);
+    return buf;
 }
 
 // 0x543060
@@ -3348,12 +3631,16 @@ bool mainmenu_ui_load_game_handle_delete(void)
         mainmenu_ui_gsi_loaded = false;
     }
 
+    // CE: rebuild the SAME aggregated, module-tagged list the Load menu uses (was
+    // gamelib_savelist_create, which dropped cross-module entries and the [Module]
+    // labels after a delete). Take the count from the rebuilt list rather than a
+    // blind cnt-- (cross-module deletes may remove an entry not in the old count).
     gamelib_savelist_destroy(&mainmenu_ui_gsl);
-    gamelib_savelist_create(&mainmenu_ui_gsl);
+    gamelib_savelist_create_all(&mainmenu_ui_gsl);
 
     gamelib_savelist_sort(&mainmenu_ui_gsl, GAME_SAVE_LIST_ORDER_DATE, false);
     window->selected_index = -1;
-    window->cnt--;
+    window->cnt = mainmenu_ui_gsl.count;
     window->refresh_func(NULL);
 
     return true;
@@ -3371,7 +3658,7 @@ bool sub_543220(void)
     }
 
     path = gamelib_last_save_name();
-    if (path[0] == '\0' || !gamelib_saveinfo_load(path, &mainmenu_ui_gsi)) {
+    if (path[0] == '\0' || !gamelib_saveinfo_load_located(path, &mainmenu_ui_gsi)) {
         return false;
     }
     mainmenu_ui_gsi_loaded = true;
@@ -3379,7 +3666,7 @@ bool sub_543220(void)
     strncpy(name, path, 8);
     name[8] = '\0';
 
-    rc = sub_5432B0(name);
+    rc = sub_5432B0(name, NULL);
     if (mainmenu_ui_gsi_loaded) {
         gamelib_saveinfo_exit(&mainmenu_ui_gsi);
         mainmenu_ui_gsi_loaded = false;
@@ -3389,19 +3676,65 @@ bool sub_543220(void)
 }
 
 // 0x5432B0
-bool sub_5432B0(const char* name)
+bool sub_5432B0(const char* name, const char* module_hint)
 {
     MesFileEntry mes_file_entry;
     UiMessage ui_message;
+    char save_module[TIG_MAX_PATH];
+    GameSaveInfo save_info;
+    bool save_info_ok;
 
     sub_542200();
 
-    if (mainmenu_ui_gsi.version == 25) {
+    // CE: auto-switch to the module this save belongs to BEFORE anything reads the
+    // save, so the player no longer has to set the module manually first. This MUST
+    // happen before reading the saveinfo and before gamelib_load: a cross-module
+    // save's .gsi/.tfaf only resolve once its module is mounted, so doing the version
+    // check first (under the wrong module) wrongly reported "corrupt". Mirrors the
+    // options-screen switch (gamelib_mod_load + gameuilib_mod_load).
+    //
+    // module_hint is the authoritative owning module from the Load list entry (which
+    // resolved it by directory). Prefer it: the 8-char slot alone is ambiguous when
+    // the same slot exists under multiple modules. Fall back to a directory search by
+    // slot only when no hint is given (e.g. the "continue last save" path).
+    save_module[0] = '\0';
+    if (module_hint != NULL && module_hint[0] != '\0') {
+        snprintf(save_module, sizeof(save_module), "%s", module_hint);
+    } else if (!gamelib_find_save_module(name, save_module, sizeof(save_module))) {
+        save_module[0] = '\0';
+    }
+
+    if (save_module[0] != '\0'
+        && SDL_strcasecmp(save_module, gamelib_loaded_module_name_get()) != 0) {
+        // Bracket the switch: gamelib_mod_load runs gameinit_reset, whose throwaway
+        // fresh-game (start map + PC) would otherwise flush start-map mobiles into
+        // Save\Current and leak into the loaded save. The save's own load restores the
+        // real map/PC. gamelib_load (below) doesn't run gameinit, so the bracket can
+        // close right after the switch.
+        gamelib_loading_active_set(true);
+        if (gamelib_mod_load(save_module)) {
+            gameuilib_mod_load();
+        } else {
+            tig_debug_printf("mainmenu_ui: WARNING: auto-switch to module '%s' failed; loading with current module\n",
+                save_module);
+        }
+        gamelib_loading_active_set(false);
+    }
+
+    // Read the saveinfo now that the save's module is mounted (recovering the full
+    // <slot><description> base name from the slot). Self-contained -- do not rely on
+    // the caller's mainmenu_ui_gsi, which may have been read under a different module.
+    save_info_ok = gamelib_saveinfo_load_by_slot(name, &save_info);
+
+    if (save_info_ok && save_info.version == 25) {
         mainmenu_ui_reset();
         sub_40DAB0();
 
         if (gamelib_load(name)) {
-            gamelib_current_mode_name_set(mainmenu_ui_gsi.module_name);
+            // Prefer the directory-derived module (authoritative) over the .gsi stamp
+            // for the active module name, so a later save re-stamps it correctly.
+            gamelib_current_mode_name_set(save_module[0] != '\0' ? save_module : save_info.module_name);
+            gamelib_saveinfo_exit(&save_info);
 
             mes_file_entry.num = 5000; // "Game Loaded Successfully."
             mes_get_msg(mainmenu_ui_mainmenu_mes_file, &mes_file_entry);
@@ -3417,6 +3750,10 @@ bool sub_5432B0(const char* name)
         }
 
         mainmenu_ui_reset();
+    }
+
+    if (save_info_ok) {
+        gamelib_saveinfo_exit(&save_info);
     }
 
     mes_file_entry.num = 5001; // "Save Game Corrupt!  Load Failed!"
@@ -3441,6 +3778,10 @@ void mainmenu_ui_save_game_create(void)
 
     sub_542200();
     gamelib_savelist_create(&mainmenu_ui_gsl);
+    // CE: tag each row with its owning module so the Save menu shows the same dim
+    // "[Module]" labels as the Load menu. The list stays current-context (saving
+    // writes to the current module), only the labels are added.
+    gamelib_savelist_tag_modules(&mainmenu_ui_gsl);
     gamelib_savelist_sort(&mainmenu_ui_gsl, GAME_SAVE_LIST_ORDER_DATE, false);
     mainmenu_ui_textedit_buffer[0] = '\0';
     window->cnt = mainmenu_ui_gsl.count + 1;
@@ -3500,6 +3841,10 @@ void mainmenu_ui_save_game_create(void)
     }
 
     intgame_pc_lens_do(PC_LENS_MODE_PASSTHROUGH, &pc_lens);
+
+    // CE: same translucent-black opt-in as the Load window (see there).
+    intgame_apply_translucent_black_window(mainmenu_ui_window_handle, true);
+
     scrollbar_ui_control_redraw(stru_64C220);
 
     tig_window_display();
@@ -3508,6 +3853,10 @@ void mainmenu_ui_save_game_create(void)
 // 0x543580
 void mainmenu_ui_save_game_destroy(void)
 {
+    // CE: clear the translucent-black tint so it doesn't bleed onto the next screen
+    // that reuses this shared mainmenu window.
+    intgame_apply_translucent_black_window(mainmenu_ui_window_handle, false);
+
     scrollbar_ui_control_destroy(stru_64C220);
 
     if (mainmenu_ui_gsi_loaded) {
@@ -3779,12 +4128,16 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
             tig_font_push(font);
 
             char* name;
+            const char* row_tag = NULL;
+            TigRect text_rect = dst_rect;
             if (idx > 0) {
                 name = sub_543040(idx - 1);
+                // Existing-save rows get the same dim "[Module]" tag as the Load menu.
+                row_tag = mainmenu_ui_row_module_tag(idx - 1);
             } else if (idx == 0) {
                 if (textedit_ui_is_focused()) {
                     name = NULL;
-                    sub_544100(mainmenu_ui_textedit_buffer, &dst_rect, font);
+                    sub_544100(mainmenu_ui_textedit_buffer, &dst_rect, font, true);
                 } else {
                     mes_file_entry.num = 5055;
                     mes_get_msg(mainmenu_ui_mainmenu_mes_file, &mes_file_entry);
@@ -3792,8 +4145,31 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
                 }
             }
 
+            if (row_tag != NULL) {
+                TigFont tag_desc;
+                TigRect tag_rect;
+
+                tag_desc.width = 0;
+                tag_desc.height = 0;
+                tag_desc.str = (char*)row_tag;
+                tag_desc.flags = 0;
+                tig_font_push(mainmenu_ui_dim_font);
+                tig_font_measure(&tag_desc);
+
+                tag_rect = dst_rect;
+                tag_rect.x = dst_rect.x + dst_rect.width - tag_desc.width;
+                tag_rect.width = tag_desc.width;
+                sub_5418A0((char*)row_tag, &tag_rect, mainmenu_ui_dim_font, 0);
+                tig_font_pop();
+
+                text_rect.width -= tag_desc.width + 8;
+                if (text_rect.width < 0) {
+                    text_rect.width = 0;
+                }
+            }
+
             if (name != NULL && *name != '\0') {
-                sub_542D00(name, &dst_rect, font);
+                mainmenu_ui_draw_list_name(name, &text_rect, font);
             }
 
             dst_rect.y += 20;
@@ -3806,10 +4182,18 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
             && stru_5C46C0.y < rect->y + rect->height
             && rect->x < stru_5C46C0.x + stru_5C46C0.width
             && rect->y < stru_5C46C0.y + stru_5C46C0.height)) {
+        // CE: ALWAYS clear the detail content box when redrawn (see the Load refresh):
+        // gating it on gsi_loaded left stale text from the previous save when the newly
+        // selected one's info failed to read.
+        {
+            TigRect detail_clear = { 281, 55, 468, 300 };
+            tig_window_fill(mainmenu_ui_window_handle, &detail_clear, tig_color_make(0, 0, 0));
+        }
+
         if (window->selected_index > 0) {
             if (!mainmenu_ui_gsi_loaded
                 && mainmenu_ui_gsl.count > 0
-                && gamelib_saveinfo_load(mainmenu_ui_gsl.names[window->selected_index - 1], &mainmenu_ui_gsi)) {
+                && gamelib_saveinfo_load_located(mainmenu_ui_gsl.names[window->selected_index - 1], &mainmenu_ui_gsi)) {
                 mainmenu_ui_gsi_loaded = true;
             }
 
@@ -3926,7 +4310,7 @@ void mainmenu_ui_save_game_refresh(TigRect* rect)
 }
 
 // 0x544100
-void sub_544100(const char* str, TigRect* rect, tig_font_handle_t font)
+void sub_544100(const char* str, TigRect* rect, tig_font_handle_t font, bool left_align)
 {
     char mutable_str[200];
     TigFont font_desc;
@@ -3944,7 +4328,15 @@ void sub_544100(const char* str, TigRect* rect, tig_font_handle_t font)
 
     text_rect = *rect;
 
-    if (font_desc.width < rect->width) {
+    // CE: the Save-name input is left-aligned so the I-beam starts where the "New"
+    // prompt was (left edge), instead of jumping to the row center the moment you
+    // focus it. The new-CHARACTER name field stays centered (left_align == false).
+    if (left_align) {
+        if (font_desc.width < rect->width) {
+            text_rect.width = font_desc.width;
+        }
+        sub_5418A0(mutable_str, &text_rect, font, 0);
+    } else if (font_desc.width < rect->width) {
         text_rect.x += (rect->width - font_desc.width) / 2;
         text_rect.width = font_desc.width;
         sub_5418A0(mutable_str, &text_rect, font, 0);
@@ -4028,7 +4420,7 @@ void sub_544290(void)
 
     mainmenu_ui_gsi_loaded = false;
     if (window->selected_index > 0) {
-        if (gamelib_saveinfo_load(mainmenu_ui_gsl.names[window->selected_index - 1], &mainmenu_ui_gsi)) {
+        if (gamelib_saveinfo_load_located(mainmenu_ui_gsl.names[window->selected_index - 1], &mainmenu_ui_gsi)) {
             mainmenu_ui_gsi_loaded = true;
         }
     } else {
@@ -4062,11 +4454,15 @@ bool mainmenu_ui_save_game_handle_delete(void)
         mainmenu_ui_gsi_loaded = false;
     }
 
+    // CE: rebuild current-context + re-tag with modules (was create with no tags ->
+    // labels vanished after a delete). The Save list has a leading new-save slot, so
+    // the window count is the list count + 1.
     gamelib_savelist_destroy(&mainmenu_ui_gsl);
     gamelib_savelist_create(&mainmenu_ui_gsl);
+    gamelib_savelist_tag_modules(&mainmenu_ui_gsl);
     gamelib_savelist_sort(&mainmenu_ui_gsl, GAME_SAVE_LIST_ORDER_DATE, false);
     window->selected_index = -1;
-    window->cnt--;
+    window->cnt = mainmenu_ui_gsl.count + 1;
     window->refresh_func(NULL);
 
     return true;
@@ -4091,7 +4487,7 @@ void mainmenu_ui_last_save_create(void)
             mainmenu_ui_gsi_loaded = false;
         }
 
-        if (gamelib_saveinfo_load(path, &mainmenu_ui_gsi)) {
+        if (gamelib_saveinfo_load_located(path, &mainmenu_ui_gsi)) {
             mainmenu_ui_gsi_loaded = true;
             mainmenu_ui_active = true;
 
@@ -4141,7 +4537,7 @@ void mainmenu_ui_last_save_create(void)
             tig_window_display();
             strncpy(name, path, 8);
             name[8] = '\0';
-            sub_5432B0(name);
+            sub_5432B0(name, NULL);
 
             if (mainmenu_ui_gsi_loaded) {
                 gamelib_saveinfo_exit(&mainmenu_ui_gsi);
@@ -4279,7 +4675,7 @@ void mainmenu_ui_new_char_refresh(TigRect* rect)
         mes_get_msg(mainmenu_ui_mainmenu_mes_file, &mes_file_entry);
 
         if (textedit_ui_is_focused()) {
-            sub_544100(str, &mainmenu_ui_shared_char_name_rect, dword_64C218[1]);
+            sub_544100(str, &mainmenu_ui_shared_char_name_rect, dword_64C218[1], false);
         } else {
             sub_542DF0(str, &mainmenu_ui_shared_char_name_rect, dword_64C218[1]);
         }
@@ -7503,9 +7899,19 @@ bool mainmenu_ui_message_filter(TigMessage* msg)
                     }
                     return true;
                 case SDL_SCANCODE_UP:
+                    // CE: swallow the release from an arrow that just exited the name
+                    // input (already landed on the right row -- don't move again).
+                    if (mainmenu_ui_arrow_exit_pending) {
+                        mainmenu_ui_arrow_exit_pending = false;
+                        return true;
+                    }
                     sub_544210();
                     return true;
                 case SDL_SCANCODE_DOWN:
+                    if (mainmenu_ui_arrow_exit_pending) {
+                        mainmenu_ui_arrow_exit_pending = false;
+                        return true;
+                    }
                     sub_544250();
                     return true;
                 case SDL_SCANCODE_BACKSPACE:
@@ -8034,6 +8440,61 @@ void mainmenu_ui_textedit_on_change(TextEdit* textedit)
     if (mainmenu_ui_window_type == MM_WINDOW_SAVE_GAME) {
         scrollbar_ui_control_redraw(stru_64C220);
     }
+}
+
+// CE: leave the new-save name input and move list selection. Shared exit step for the
+// up/down arrow-at-boundary handlers below. `new_selected` is the row to highlight
+// after exiting (clamped by the caller), or -1 to leave nothing selected.
+static void mainmenu_ui_textedit_exit_to_row(int new_selected)
+{
+    MainMenuWindowInfo* window = main_menu_window_info[mainmenu_ui_window_type];
+
+    textedit_ui_unfocus(&mainmenu_ui_textedit);
+    dword_64C428 = false;
+    mainmenu_ui_textedit_buffer[0] = '\0';
+
+    // Swallow the matching key release so the list nav doesn't move the selection
+    // again (the exit happened on press; the release would otherwise leapfrog a row).
+    mainmenu_ui_arrow_exit_pending = true;
+
+    // Reset the cached saveinfo so the refresh reloads it for the new selection.
+    if (mainmenu_ui_gsi_loaded) {
+        gamelib_saveinfo_exit(&mainmenu_ui_gsi);
+        mainmenu_ui_gsi_loaded = false;
+    }
+
+    window->selected_index = new_selected;
+    window->refresh_func(NULL);
+    scrollbar_ui_control_redraw(stru_64C220);
+}
+
+// CE: DOWN from the Save-name input -> exit the input and select the first existing
+// save (row 0 is the "New" input row). No-op outside the Save window.
+void mainmenu_ui_textedit_on_arrow_down(TextEdit* textedit)
+{
+    MainMenuWindowInfo* window;
+
+    (void)textedit;
+    if (mainmenu_ui_window_type != MM_WINDOW_SAVE_GAME) {
+        return;
+    }
+    window = main_menu_window_info[mainmenu_ui_window_type];
+    // cnt = saves + 1 (row 0 = New). Land on the first save if any, else stay put.
+    mainmenu_ui_textedit_exit_to_row(window->cnt > 1 ? 1 : window->selected_index);
+}
+
+// CE: UP from a BLANK Save-name input -> exit and wrap to the bottom save. (Non-blank
+// up just moves the cursor to the line start, handled in textedit_ui_process_message.)
+void mainmenu_ui_textedit_on_arrow_up(TextEdit* textedit)
+{
+    MainMenuWindowInfo* window;
+
+    (void)textedit;
+    if (mainmenu_ui_window_type != MM_WINDOW_SAVE_GAME) {
+        return;
+    }
+    window = main_menu_window_info[mainmenu_ui_window_type];
+    mainmenu_ui_textedit_exit_to_row(window->cnt > 1 ? window->cnt - 1 : window->selected_index);
 }
 
 // 0x549580

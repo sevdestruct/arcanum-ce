@@ -11328,6 +11328,81 @@ void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool ena
         p.underlay, p.threshold, p.r, p.g, p.b);
 }
 
+// CE: underlay pick for a full OVERLAY WINDOW (Save/Load), as opposed to the
+// modal/HUD-bar tint above. The difference: this picks whatever is VISUALLY BEHIND
+// the window so its near-black areas reveal it correctly wherever it's opened --
+//   - over the live game world (Cmd+S/L, or via the in-game menu) -> the iso world;
+//   - on the title / main menu -> the menu backdrop;
+//   - pre-game with neither -> no tint.
+// The shared picker deliberately returns "no underlay" whenever the mainmenu is
+// active (to stop MODALS punching through to the game world), but opening Save/Load
+// makes the mainmenu active -- so a window opened over gameplay would never reveal
+// the world. Here the iso world wins whenever it exists and the title backdrop isn't
+// the thing on screen, which is exactly the "show the right thing for where it's
+// called" behavior.
+static IntgameTintParams intgame_translucent_black_pick_window(void)
+{
+    IntgameTintParams params = {
+        .underlay = TIG_WINDOW_HANDLE_INVALID,
+        .threshold = 8,
+        .r = 0, .g = 0, .b = 0,
+    };
+
+    bool backdrop_exiting = mainmenu_ui_backdrop_is_exiting();
+    tig_window_handle_t backdrop = mainmenu_ui_get_backdrop_handle();
+
+    // Title / main menu: the custom backdrop is what's on screen behind the window.
+    if (!backdrop_exiting
+        && backdrop != TIG_WINDOW_HANDLE_INVALID
+        && mainmenu_ui_has_custom_backdrop_art()) {
+        params.underlay = backdrop;
+        params.r = 204; // ~80% darken
+        params.g = 204;
+        params.b = 204;
+        return params;
+    }
+
+    // Over a live game: reveal the iso world (the modal/HUD picker would suppress this
+    // because the mainmenu is "active" while Save/Load is up).
+    if (!backdrop_exiting && intgame_iso_interface_is_created()) {
+        params.underlay = intgame_iso_window;
+        params.r = 128; // ~50% darken, matching gameplay panels
+        params.g = 128;
+        params.b = 128;
+        return params;
+    }
+
+    return params; // no sensible underlay
+}
+
+// CE: opt a full overlay window (Save/Load) into translucent-black, using the
+// window-context underlay pick above so it reveals the world when over gameplay and
+// the backdrop on the menu. Same cfg gate and disable semantics as the modal version.
+void intgame_apply_translucent_black_window(tig_window_handle_t window_handle, bool enable)
+{
+    if (window_handle == TIG_WINDOW_HANDLE_INVALID) {
+        return;
+    }
+    if (!enable) {
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    if (!settings_get_value(&settings, TRANSLUCENT_BLACK_UI_KEY)) {
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    IntgameTintParams p = intgame_translucent_black_pick_window();
+    if (p.underlay == TIG_WINDOW_HANDLE_INVALID) {
+        tig_window_tint_enable(window_handle, false,
+            TIG_WINDOW_HANDLE_INVALID, 0, 0, 0, 0);
+        return;
+    }
+    tig_window_tint_enable(window_handle, true,
+        p.underlay, p.threshold, p.r, p.g, p.b);
+}
+
 // CE: world-knockout key colour — pure magenta. A window opted into
 // knockout shows the raw iso world wherever its pixels are this colour, so
 // custom-shaped panels can punch clean holes to the world. Magenta is

@@ -154,8 +154,17 @@ bool textedit_ui_process_message(TigMessage* msg)
                 textedit_ui_pos = 0;
                 break;
             case SDLK_UP:
-                // Move cursor one "page" left.
-                if (textedit_ui_pos - 40 >= 0) {
+                // CE: with an on_arrow_up handler (Save-name input), up moves the
+                // cursor to the line start; when the field is empty it instead fires
+                // the handler so the host can exit + move its list selection. Without a
+                // handler, vanilla "page left".
+                if (textedit_ui_current_textedit->on_arrow_up != NULL) {
+                    if (textedit_ui_len == 0) {
+                        textedit_ui_current_textedit->on_arrow_up(textedit_ui_current_textedit);
+                        return true;
+                    }
+                    textedit_ui_pos = 0;
+                } else if (textedit_ui_pos - 40 >= 0) {
                     textedit_ui_pos -= 40;
                 }
                 break;
@@ -172,8 +181,17 @@ bool textedit_ui_process_message(TigMessage* msg)
                 }
                 break;
             case SDLK_DOWN:
-                // Move cursor one "page" right.
-                if (textedit_ui_pos + 40 < textedit_ui_len) {
+                // CE: with an on_arrow_down handler (Save-name input), down moves the
+                // cursor to the line end; once it's already there (or the field is
+                // empty) it fires the handler so the host can exit + move its list
+                // selection down. Without a handler, vanilla "page right".
+                if (textedit_ui_current_textedit->on_arrow_down != NULL) {
+                    if (textedit_ui_len == 0 || textedit_ui_pos == textedit_ui_len) {
+                        textedit_ui_current_textedit->on_arrow_down(textedit_ui_current_textedit);
+                        return true;
+                    }
+                    textedit_ui_pos = textedit_ui_len;
+                } else if (textedit_ui_pos + 40 < textedit_ui_len) {
                     textedit_ui_pos += 40;
                 }
                 break;

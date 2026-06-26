@@ -337,6 +337,11 @@ int intgame_hud_bottom_slide_offset_get(void);
 // given window. Gated by the TranslucentBlackUI cfg flag — when off
 // (or enable=false), this clears any prior alpha state on the window.
 void intgame_apply_translucent_black(tig_window_handle_t window_handle, bool enable);
+// CE: translucent-black for a full overlay WINDOW (Save/Load). Unlike the modal
+// version, it reveals the live game world when the window is opened over gameplay
+// (Cmd+S/L or via the in-game menu) and the menu backdrop on the title screen --
+// "show what's behind the window wherever it's called."
+void intgame_apply_translucent_black_window(tig_window_handle_t window_handle, bool enable);
 // CE: opt a window into the world-knockout composite — pixels painted the
 // world-knockout key colour (intgame_world_knockout_key()) show the raw
 // iso world, for custom window shapes / cut-outs. Disabled with enable=
