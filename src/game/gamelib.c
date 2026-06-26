@@ -3637,6 +3637,32 @@ bool gamelib_render_lens_view(TigVideoBuffer* target_vb, int64_t center_obj, int
     return ok;
 }
 
+// CE: pixel delta (in iso-screen space) that would bring an object's SPRITE CENTRE --
+// not its tile/feet -- to the centre of the iso view. Same sprite-rect basis (0x7) as
+// gamelib_render_lens_view, so a PC-lens overlay recenter frames the sprite middle
+// regardless of race/height instead of the feet/base. Returns false (no delta written)
+// when the sprite rect is unavailable (invisible / off-map), so the caller can fall
+// back to plain tile centring. The delta is suitable for camera_tween_by().
+bool gamelib_sprite_center_screen_delta(int64_t obj, int64_t* dx, int64_t* dy)
+{
+    TigRect sprite_rect;
+
+    if (obj == OBJ_HANDLE_NULL || dx == NULL || dy == NULL) {
+        return false;
+    }
+
+    object_get_rect(obj, 0x7, &sprite_rect);
+    if (sprite_rect.width <= 0 || sprite_rect.height <= 0) {
+        return false;
+    }
+
+    *dx = (int64_t)(sprite_rect.x + sprite_rect.width / 2)
+        - (int64_t)(gamelib_iso_content_rect.x + gamelib_iso_content_rect.width / 2);
+    *dy = (int64_t)(sprite_rect.y + sprite_rect.height / 2)
+        - (int64_t)(gamelib_iso_content_rect.y + gamelib_iso_content_rect.height / 2);
+    return true;
+}
+
 // 0x404740
 void gamelib_draw_editor(GameDrawInfo* draw_info)
 {

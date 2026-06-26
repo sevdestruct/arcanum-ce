@@ -5465,13 +5465,29 @@ void sub_551A10(int64_t obj)
     int64_t x;
     int64_t y;
 
-    if (obj != OBJ_HANDLE_NULL) {
-        location = obj_field_int64_get(obj, OBJ_F_LOCATION);
-        location_calc_dist_from_screen_center(location, &x, &y);
+    if (obj == OBJ_HANDLE_NULL) {
+        return;
+    }
+
+    // CE: when an overlay with a PC lens opens, frame the PC's SPRITE CENTRE (height-
+    // independent) rather than its tile/feet, and GLIDE there instead of snapping --
+    // smoother when the overlay pops up mid-move. Safe only when the lens renders its
+    // own PC-centred view (pc lens follows player): then the main camera needn't be
+    // centred by lens-redraw time. With the cheap "sample the live view" lens path the
+    // camera must be centred immediately, so fall through to the original tile snap.
+    if (gamelib_pc_lens_follows_player()
+        && gamelib_sprite_center_screen_delta(obj, &x, &y)) {
         if (x != 0 || y != 0) {
-            location_origin_set(location);
-            iso_redraw();
+            camera_tween_by(x, y, 0); // 0 = camera_tween's default smooth glide
         }
+        return;
+    }
+
+    location = obj_field_int64_get(obj, OBJ_F_LOCATION);
+    location_calc_dist_from_screen_center(location, &x, &y);
+    if (x != 0 || y != 0) {
+        location_origin_set(location);
+        iso_redraw();
     }
 }
 
