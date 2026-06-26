@@ -1084,6 +1084,31 @@ static void gpu_test_channel_tick(void)
         int ix, iy;
         float fz;
         if (sscanf(line, "loadsave %255s", arg) == 1) {
+            // CE harness: auto-switch to the save's owning module before loading,
+            // mirroring the Load menu (mainmenu_ui sub_5432B0). gamelib_load no longer
+            // self-switches, so a cross-module `loadsave` would otherwise resolve
+            // against the wrong mount. Resolve the module by directory
+            // (modules\<M>\save -> M, else the default module), and if it differs from
+            // what's mounted, do the gated mod_load + gameui mod_load pair. This drops
+            // the need to hand-prepend a `setmodule` for cross-module test saves.
+            char save_module[TIG_MAX_PATH];
+            save_module[0] = '\0';
+            if (gamelib_find_save_module(arg, save_module, sizeof(save_module))
+                && save_module[0] != '\0'
+                && SDL_strcasecmp(save_module, gamelib_loaded_module_name_get()) != 0) {
+                tig_debug_printf("[gpu-cmd] loadsave: switching module %s -> %s\n",
+                    gamelib_loaded_module_name_get(), save_module);
+                // Bracket with loading_active so gamelib_mod_load's gameinit_reset skips
+                // its throwaway fresh-game setup (else it leaks start-map mobiles into
+                // the loaded save). The save's own load restores the real map/PC.
+                gamelib_loading_active_set(true);
+                if (gamelib_mod_load(save_module)) {
+                    ui_gameuilib_mod_load();
+                } else {
+                    tig_debug_printf("[gpu-cmd] loadsave: module switch to '%s' FAILED\n", save_module);
+                }
+                gamelib_loading_active_set(false);
+            }
             tig_debug_printf("[gpu-cmd] loadsave %s\n", arg);
             if (!gamelib_load(arg)) {
                 tig_debug_printf("[gpu-cmd] loadsave FAILED\n");
