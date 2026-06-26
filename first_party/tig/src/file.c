@@ -307,7 +307,7 @@ bool tig_file_unarchive_native(const char* src, const char* dst)
     SDL_snprintf(path1, sizeof(path1), "%s.tfaf", src);
     data_stream = tig_file_fopen_native(path1, "rb");
     if (data_stream == NULL) {
-        // FIXME: Leaks `stream1`.
+        tig_file_fclose(index_stream);
         return false;
     }
 
@@ -416,8 +416,14 @@ bool copy_file_stream_size(TigFile* dst_stream, TigFile* src_stream, size_t size
 {
     unsigned char buffer[COPY_BUFFER_SIZE];
 
+    // CE: copying zero bytes is a no-op SUCCESS -- the destination file has already
+    // been created (caller opened it "wb"). Returning false here aborted unarchive on
+    // the first empty file in a save (e.g. an empty maps\<map>\mobile.des, common for
+    // maps with no mobile changes -- notably Vormantown's Multiplayer-Map), so any
+    // such save failed to load. The archive WRITER emits these 0-byte entries
+    // (copy_file_stream handles empty fine), so the reader must accept them too.
     if (size == 0) {
-        return false;
+        return true;
     }
 
     while (size > COPY_BUFFER_SIZE) {
