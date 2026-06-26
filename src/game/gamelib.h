@@ -159,6 +159,11 @@ typedef struct GameSaveList {
     char* module;
     unsigned int count;
     char** names;
+    // CE: per-entry owning module, parallel to names[] (NULL when not tracked,
+    // e.g. the plain create()/create_module() lists). Populated by
+    // gamelib_savelist_create_all so the Load menu can show a [module] tag and
+    // auto-switch to the right module on load. Freed by gamelib_savelist_destroy.
+    char** entry_modules;
 } GameSaveList;
 
 typedef enum GameSaveListOrder {
@@ -229,10 +234,18 @@ bool gamelib_draw(void);
 // the head isn't clipped. Must be called outside the main draw. Returns
 // false (no render) outside a normal iso game session.
 bool gamelib_render_lens_view(TigVideoBuffer* target_vb, int64_t center_obj, int width, int height);
+// CE: pixel delta to bring an object's SPRITE CENTRE (not its tile/feet) to the iso
+// view centre, for camera_tween_by(). Returns false if the sprite rect is unavailable.
+// Lets the PC-lens overlay recenter frame the sprite middle, height-independent.
+bool gamelib_sprite_center_screen_delta(int64_t obj, int64_t* dx, int64_t* dy);
 void gamelib_renderlock_acquire(void);
 void gamelib_renderlock_release(void);
 void gamelib_clear_screen(void);
 const char* gamelib_current_module_name_get(void);
+// CE: the module whose data is actually MOUNTED right now (set by gamelib_mod_load),
+// as opposed to gamelib_current_module_name_get() which gamelib_reset clobbers to
+// "Arcanum". Use this to decide whether a load needs to switch modules.
+const char* gamelib_loaded_module_name_get(void);
 void gamelib_current_mode_name_set(const char* name);
 bool gamelib_save(const char* name, const char* description);
 bool gamelib_load(const char* name);
@@ -240,16 +253,41 @@ bool gamelib_delete(const char* name);
 const char* gamelib_last_save_name(void);
 bool gamelib_in_save(void);
 bool gamelib_in_load(void);
+// CE: bracket a load (incl. the module switch it performs first) so gameinit_reset
+// skips its throwaway fresh-game setup, which otherwise leaks start-map mobile
+// state into the loaded save. See gamelib_loading_active in gamelib.c.
+void gamelib_loading_active_set(bool active);
+bool gamelib_loading_active_get(void);
 void gamelib_set_extra_save_func(GameExtraSaveFunc func);
 void gamelib_set_extra_load_func(GameExtraLoadFunc func);
 void gamelib_savelist_create(GameSaveList* save_list);
 void gamelib_savelist_create_module(const char* module, GameSaveList* save_list);
+// CE: aggregate saves across data\Save (legacy/default location) AND every
+// modules\<M>\save folder into one list, tagging each entry with its owning
+// module (data\ -> default module; modules\<M>\ -> M, directory-authoritative).
+void gamelib_savelist_create_all(GameSaveList* save_list);
+// CE: tag an existing list's entries with their owning module (for the Save menu,
+// which keeps its current-context list but wants the same [module] labels as Load).
+void gamelib_savelist_tag_modules(GameSaveList* save_list);
+// CE: resolve which module a save belongs to by WHERE it lives on disk: a save
+// under modules\<M>\save is module M (authoritative); otherwise it is the default
+// module (data\Save). Returns false if no such save exists. out_module must hold
+// at least TIG_MAX_PATH. This is the directory-based module detection used to
+// auto-switch on load, independent of the (possibly wrong) .gsi module stamp.
+bool gamelib_find_save_module(const char* name, char* out_module, size_t out_size);
+// CE: load saveinfo from just the 8-char slot (globs <slot>*.gsi to recover the
+// full <slot><description> base name). The save's module must be mounted first.
+bool gamelib_saveinfo_load_by_slot(const char* slot, GameSaveInfo* save_info);
 void gamelib_savelist_destroy(GameSaveList* save_list);
 void gamelib_savelist_sort(GameSaveList* save_list, GameSaveListOrder order, bool a3);
 bool gamelib_saveinfo_init(const char* name, const char* description, GameSaveInfo* save_info);
 void gamelib_saveinfo_exit(GameSaveInfo* save_info);
 bool gamelib_saveinfo_save(GameSaveInfo* save_info);
 bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info);
+// CE: like gamelib_saveinfo_load but locates the save's directory first (any module
+// folder, else data\Save), so a cross-module save previews correctly regardless of
+// which module is currently mounted.
+bool gamelib_saveinfo_load_located(const char* name, GameSaveInfo* save_info);
 void gamelib_thumbnail_size_set(int width, int height);
 int gamelib_game_difficulty_get(void);
 void gamelib_redraw(void);

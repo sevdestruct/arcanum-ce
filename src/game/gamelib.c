@@ -131,6 +131,9 @@ typedef struct GameLibModule {
 typedef struct GameSaveEntry {
     time_t modify_time;
     char* path;
+    // CE: owning module for this entry, carried through the sort so it stays
+    // aligned with the name when entries are reordered (NULL when untracked).
+    char* module;
 } GameSaveEntry;
 
 static int game_save_entry_compare_by_date(const void* va, const void* vb);
@@ -313,6 +316,15 @@ static bool in_save;
 
 // 0x5D10E4
 static bool in_load;
+
+// CE: set by the load UI around a load-driven module switch. While true,
+// gameinit_reset skips its fresh-game setup (opening the module start map +
+// player_create). That fresh game is immediately discarded by the load anyway, and
+// -- critically -- the start map it opens gets flushed to Save\Current on the next
+// map_close, leaving stale start-map mobile state that merges into the loaded save
+// (a leftover NPC "from another save"). Distinct from in_load, which gamelib_load
+// only sets AFTER the switch has already happened.
+static bool gamelib_loading_active;
 
 // 0x5D10E8
 static bool in_reset;
@@ -2275,6 +2287,14 @@ const char* gamelib_current_module_name_get(void)
     return gamelib_current_module_name;
 }
 
+// CE: the module whose data is actually mounted (set by gamelib_mod_load @1143).
+// Unlike gamelib_current_module_name, gamelib_reset never clobbers this, so it is
+// the reliable answer to "what module is loaded right now".
+const char* gamelib_loaded_module_name_get(void)
+{
+    return byte_5D0EA4;
+}
+
 // 0x402FF0
 void gamelib_current_mode_name_set(const char* name)
 {
@@ -2438,55 +2458,6 @@ bool gamelib_load(const char* name)
     unsigned int sentinel;
 
     tig_debug_printf("\ngamelib_load: Loading from File: %s.\n", name);
-
-    // CE: auto-switch the active module to the one this save belongs to. Saves
-    // record their module name (.gsi); loading a save made under a different
-    // module than the one currently mounted otherwise resolves wrong/missing
-    // content -- the "you have to set the module first" bug. gamelib_mod_load does
-    // the full unmount+mount switch (and sets up a fresh game on the module), so it
-    // runs HERE -- before the unarchive below -- and is followed by gamelib_reset to
-    // clear that fresh-game state so the save restore does not desync. The .gsi is
-    // named <slot><description>.gsi while `name` is just the slot, so glob for it.
-    {
-        GameSaveInfo sw_info;
-        TigFileList gsi_list;
-        char gsi_glob[TIG_MAX_PATH];
-        char gsi_base[TIG_MAX_PATH];
-        bool have_gsi = false;
-
-        snprintf(gsi_glob, sizeof(gsi_glob), "save\\%s*.gsi", name);
-        tig_file_list_create(&gsi_list, gsi_glob);
-        if (gsi_list.count > 0) {
-            const char* fn = gsi_list.entries[0].path;
-            const char* slash = strrchr(fn, '\\');
-            char* dot;
-            strncpy(gsi_base, slash != NULL ? slash + 1 : fn, sizeof(gsi_base) - 1);
-            gsi_base[sizeof(gsi_base) - 1] = '\0';
-            dot = strrchr(gsi_base, '.');
-            if (dot != NULL) {
-                *dot = '\0';
-            }
-            have_gsi = true;
-        }
-        tig_file_list_destroy(&gsi_list);
-
-        if (have_gsi && gamelib_saveinfo_load(gsi_base, &sw_info)) {
-            if (sw_info.module_name[0] != '\0'
-                && SDL_strcasecmp(sw_info.module_name, gamelib_current_module_name_get()) != 0) {
-                tig_debug_printf("gamelib_load: save module '%s' != current '%s' -- auto-switching module\n",
-                    sw_info.module_name, gamelib_current_module_name_get());
-                if (gamelib_mod_load(sw_info.module_name)) {
-                    gamelib_reset();
-                    gamelib_current_mode_name_set(sw_info.module_name);
-                } else {
-                    tig_debug_printf("gamelib_load: WARNING: module auto-switch to '%s' failed; loading with current module\n",
-                        sw_info.module_name);
-                }
-            }
-            gamelib_saveinfo_exit(&sw_info);
-        }
-    }
-
     tig_timer_now(&start_time);
 
     in_load = true;
@@ -2606,25 +2577,66 @@ bool gamelib_load(const char* name)
 }
 
 // 0x403790
+// CE: rewritten to be directory-authoritative and cross-module aware.
+// The old version assumed `name` was the 8-char slot and that "save\" resolved to
+// the right place -- both false now: a save's .gsi is "<slot><description>.gsi"
+// while its archive parts are slot-named, and a save may live under any module's
+// own save folder (writable per-module model), not the currently-mounted one. The
+// old code therefore left the .gsi behind (dead entry lingered in the list) and
+// couldn't touch cross-module saves at all. Now: find the directory that physically
+// holds this slot's .gsi (any module folder, else data\Save), and remove EVERY
+// "<slot>*" file there (.gsi/.bmp/.tfaf/.tfai). The autosave is no longer special-
+// cased -- it deletes like any other (it simply regenerates on the next autosave).
 bool gamelib_delete(const char* name)
 {
+    GameModuleList module_list;
+    TigFileList file_list;
+    unsigned int index;
+    char slot[16];
+    char dir[TIG_MAX_PATH];
+    char glob[TIG_MAX_PATH];
     char path[TIG_MAX_PATH];
+    bool found = false;
 
-    if (SDL_strcasecmp(name, "SlotAutoAuto-Save") == 0) {
-        return false;
+    strncpy(slot, name, 8);
+    slot[8] = '\0';
+
+    // Locate the directory holding this save: a module's own save folder (where its
+    // directory-resolved module lives), else the legacy/default data\Save.
+    gamelib_modlist_create(&module_list, 0);
+    for (index = 0; index < module_list.count && !found; index++) {
+        snprintf(glob, sizeof(glob), ".\\Modules\\%s\\save\\%s*.gsi", module_list.paths[index], slot);
+        tig_file_list_create(&file_list, glob);
+        if (file_list.count > 0) {
+            snprintf(dir, sizeof(dir), ".\\Modules\\%s\\save", module_list.paths[index]);
+            found = true;
+        }
+        tig_file_list_destroy(&file_list);
+    }
+    gamelib_modlist_destroy(&module_list);
+
+    if (!found) {
+        snprintf(glob, sizeof(glob), ".\\data\\Save\\%s*.gsi", slot);
+        tig_file_list_create(&file_list, glob);
+        if (file_list.count > 0) {
+            snprintf(dir, sizeof(dir), ".\\data\\Save");
+            found = true;
+        }
+        tig_file_list_destroy(&file_list);
     }
 
-    snprintf(path, sizeof(path), "save\\%s.gsi", name);
-    tig_file_remove(path);
+    if (!found) {
+        // Last resort: the repo-resolved current save dir.
+        snprintf(dir, sizeof(dir), "save");
+    }
 
-    snprintf(&(path[13]), sizeof(path) - 13, ".bmp");
-    tig_file_remove(path);
-
-    snprintf(&(path[13]), sizeof(path) - 13, ".tfaf");
-    tig_file_remove(path);
-
-    snprintf(&(path[13]), sizeof(path) - 13, ".tfai");
-    tig_file_remove(path);
+    snprintf(glob, sizeof(glob), "%s\\%s*.*", dir, slot);
+    tig_file_list_create(&file_list, glob);
+    for (index = 0; index < file_list.count; index++) {
+        compat_join_path(path, sizeof(path), dir, file_list.entries[index].path);
+        tig_file_remove(path);
+    }
+    tig_file_list_destroy(&file_list);
 
     return true;
 }
@@ -2664,6 +2676,19 @@ bool gamelib_in_load(void)
     return in_load;
 }
 
+// CE: see gamelib_loading_active. The load UI brackets a load (including the module
+// switch it does first) with these so gameinit_reset can skip the throwaway fresh
+// game that would otherwise leak start-map state into the save being loaded.
+void gamelib_loading_active_set(bool active)
+{
+    gamelib_loading_active = active;
+}
+
+bool gamelib_loading_active_get(void)
+{
+    return gamelib_loading_active;
+}
+
 // 0x4038E0
 void gamelib_set_extra_save_func(GameExtraSaveFunc func)
 {
@@ -2687,6 +2712,7 @@ void gamelib_savelist_create(GameSaveList* save_list)
     save_list->count = 0;
     save_list->names = NULL;
     save_list->module = NULL;
+    save_list->entry_modules = NULL;
 
     tig_file_list_create(&file_list, "save\\slot*.*");
 
@@ -2713,6 +2739,7 @@ void gamelib_savelist_create_module(const char* module, GameSaveList* save_list)
     save_list->count = 0;
     save_list->names = NULL;
     save_list->module = STRDUP(module);
+    save_list->entry_modules = NULL;
 
     snprintf(path, sizeof(path), ".\\Modules\\%s\\save\\slot*.*", module);
     tig_file_list_create(&file_list, path);
@@ -2728,6 +2755,182 @@ void gamelib_savelist_create_module(const char* module, GameSaveList* save_list)
     tig_file_list_destroy(&file_list);
 }
 
+// CE: aggregate every save the player could load -- the legacy/default location
+// (data\Save, resolved through the repo stack as "save\") plus each installed
+// module's own modules\<M>\save folder -- into one list, with per-entry owning
+// module. data\ saves are tagged with the default module; module-folder saves are
+// tagged with that folder's module (directory-authoritative, ignoring the possibly
+// wrong .gsi stamp). Lets the Load menu show all saves at once and auto-switch to
+// the right module on load. Backward compatible: pre-existing data\Save saves and
+// per-module saves both appear.
+static void gamelib_savelist_append_scan(GameSaveList* save_list, const char* glob, const char* owning_module)
+{
+    TigFileList file_list;
+    unsigned int index;
+    char fname[COMPAT_MAX_FNAME];
+    char ext[COMPAT_MAX_EXT];
+
+    tig_file_list_create(&file_list, glob);
+
+    for (index = 0; index < file_list.count; index++) {
+        compat_splitpath(file_list.entries[index].path, NULL, NULL, fname, ext);
+        if (SDL_strcasecmp(ext, ".gsi") == 0) {
+            save_list->names = (char**)REALLOC(save_list->names, sizeof(*save_list->names) * (save_list->count + 1));
+            save_list->entry_modules = (char**)REALLOC(save_list->entry_modules, sizeof(*save_list->entry_modules) * (save_list->count + 1));
+            save_list->names[save_list->count] = STRDUP(fname);
+            save_list->entry_modules[save_list->count] = owning_module != NULL ? STRDUP(owning_module) : NULL;
+            save_list->count++;
+        }
+    }
+
+    tig_file_list_destroy(&file_list);
+}
+
+void gamelib_savelist_create_all(GameSaveList* save_list)
+{
+    GameModuleList module_list;
+    unsigned int index;
+    char glob[TIG_MAX_PATH];
+    const char* default_module = gamelib_default_module_name_get();
+
+    save_list->count = 0;
+    save_list->names = NULL;
+    save_list->module = NULL;
+    save_list->entry_modules = NULL;
+
+    // Legacy / default save location: data\Save. Scanned by explicit path (NOT the
+    // repo-resolved "save\", which would also pull in whatever module is mounted
+    // right now and mis-tag those saves as the default module). Tag with the default
+    // module so loading switches there if needed.
+    gamelib_savelist_append_scan(save_list, ".\\data\\Save\\slot*.*", default_module);
+
+    // Each installed module's own per-module save folder (the writable-mount /
+    // upstream model -- where new saves land). The default module is included too:
+    // its loose-dir saves live in modules\<default>\save, distinct from the legacy
+    // data\Save scanned above. Directory is authoritative for the tag.
+    gamelib_modlist_create(&module_list, 0);
+    for (index = 0; index < module_list.count; index++) {
+        snprintf(glob, sizeof(glob), ".\\Modules\\%s\\save\\slot*.*", module_list.paths[index]);
+        gamelib_savelist_append_scan(save_list, glob, module_list.paths[index]);
+    }
+    gamelib_modlist_destroy(&module_list);
+}
+
+// CE: which module does save <name> belong to? Directory-authoritative: if it
+// lives under modules\<M>\save it is module M; otherwise it is the default module
+// (data\Save). Independent of the .gsi module stamp (which can be wrong).
+//
+// `name` is the 8-char slot (e.g. "Slot0020") -- what callers pass to gamelib_load.
+// The .gsi on disk is named <slot><description> ("Slot0020Vtown.gsi"), so we GLOB
+// "<slot>*.gsi" rather than testing "<slot>.gsi" (which never matches a save that
+// has a description -- the bug that made auto-switch silently never fire).
+bool gamelib_find_save_module(const char* name, char* out_module, size_t out_size)
+{
+    GameModuleList module_list;
+    TigFileList file_list;
+    unsigned int index;
+    char glob[TIG_MAX_PATH];
+    bool found = false;
+
+    gamelib_modlist_create(&module_list, 0);
+    for (index = 0; index < module_list.count && !found; index++) {
+        snprintf(glob, sizeof(glob), ".\\Modules\\%s\\save\\%s*.gsi", module_list.paths[index], name);
+        tig_file_list_create(&file_list, glob);
+        if (file_list.count > 0) {
+            snprintf(out_module, out_size, "%s", module_list.paths[index]);
+            found = true;
+        }
+        tig_file_list_destroy(&file_list);
+    }
+    gamelib_modlist_destroy(&module_list);
+
+    if (found) {
+        return true;
+    }
+
+    // Not in any module folder -- the legacy/default location (data\Save),
+    // reachable through the repo stack as "save\<slot>*.gsi".
+    snprintf(glob, sizeof(glob), "save\\%s*.gsi", name);
+    tig_file_list_create(&file_list, glob);
+    found = file_list.count > 0;
+    tig_file_list_destroy(&file_list);
+    if (found) {
+        snprintf(out_module, out_size, "%s", gamelib_default_module_name_get());
+        return true;
+    }
+
+    return false;
+}
+
+// CE: load a save's GameSaveInfo given only its 8-char SLOT (what the load flow
+// has), recovering the full <slot><description> base name the .gsi is stored under.
+// The save's module must already be mounted so "save\" resolves to its folder.
+bool gamelib_saveinfo_load_by_slot(const char* slot, GameSaveInfo* save_info)
+{
+    TigFileList file_list;
+    unsigned int index;
+    char glob[TIG_MAX_PATH];
+    char base[TIG_MAX_PATH];
+    char fname[COMPAT_MAX_FNAME];
+    char ext[COMPAT_MAX_EXT];
+    bool have_base = false;
+
+    snprintf(glob, sizeof(glob), "save\\%s*.gsi", slot);
+    tig_file_list_create(&file_list, glob);
+    for (index = 0; index < file_list.count; index++) {
+        compat_splitpath(file_list.entries[index].path, NULL, NULL, fname, ext);
+        if (SDL_strcasecmp(ext, ".gsi") == 0) {
+            snprintf(base, sizeof(base), "%s", fname);
+            have_base = true;
+            break;
+        }
+    }
+    tig_file_list_destroy(&file_list);
+
+    if (!have_base) {
+        return false;
+    }
+
+    return gamelib_saveinfo_load(base, save_info);
+}
+
+// CE: fill entry_modules for an already-built list (e.g. the plain create() list the
+// Save menu uses) by resolving each save's owning module from disk. Lets the Save
+// menu show the same "[Module]" tags as the Load menu without changing which saves
+// it lists or where a save is written. Allocates entry_modules if absent; the array
+// and its strings are freed by gamelib_savelist_destroy.
+void gamelib_savelist_tag_modules(GameSaveList* save_list)
+{
+    unsigned int index;
+    char slot[16];
+    char module[TIG_MAX_PATH];
+
+    if (save_list->count == 0) {
+        return;
+    }
+
+    if (save_list->entry_modules == NULL) {
+        save_list->entry_modules = (char**)MALLOC(sizeof(*save_list->entry_modules) * save_list->count);
+        for (index = 0; index < save_list->count; index++) {
+            save_list->entry_modules[index] = NULL;
+        }
+    }
+
+    for (index = 0; index < save_list->count; index++) {
+        strncpy(slot, save_list->names[index], 8);
+        slot[8] = '\0';
+
+        if (save_list->entry_modules[index] != NULL) {
+            FREE(save_list->entry_modules[index]);
+            save_list->entry_modules[index] = NULL;
+        }
+
+        if (gamelib_find_save_module(slot, module, sizeof(module))) {
+            save_list->entry_modules[index] = STRDUP(module);
+        }
+    }
+}
+
 // 0x403BB0
 void gamelib_savelist_destroy(GameSaveList* save_list)
 {
@@ -2735,14 +2938,22 @@ void gamelib_savelist_destroy(GameSaveList* save_list)
 
     for (index = 0; index < save_list->count; index++) {
         FREE(save_list->names[index]);
+        if (save_list->entry_modules != NULL && save_list->entry_modules[index] != NULL) {
+            FREE(save_list->entry_modules[index]);
+        }
     }
 
     if (save_list->names != NULL) {
         FREE(save_list->names);
     }
 
+    if (save_list->entry_modules != NULL) {
+        FREE(save_list->entry_modules);
+    }
+
     save_list->count = 0;
     save_list->names = NULL;
+    save_list->entry_modules = NULL;
 
     if (save_list->module != NULL) {
         FREE(save_list->module);
@@ -2764,19 +2975,37 @@ void gamelib_savelist_sort(GameSaveList* save_list, GameSaveListOrder order, boo
     entries = (GameSaveEntry*)MALLOC(sizeof(*entries) * save_list->count);
 
     for (index = 0; index < save_list->count; index++) {
+        // CE: per-entry owning module (aggregated lists) takes precedence over the
+        // whole-list module (create_module); NULL falls back to the repo-resolved
+        // "save\" location. Try the module folder first, then "save\" -- this finds
+        // both module-folder saves and data\Save saves (default-module-tagged
+        // entries whose module folder has no such file fall through to "save\").
+        const char* entry_module;
+        bool resolved = false;
+
         entries[index].path = save_list->names[index];
-        if (save_list->module != NULL) {
+        entries[index].module = (save_list->entry_modules != NULL)
+            ? save_list->entry_modules[index]
+            : NULL;
+
+        entry_module = entries[index].module != NULL ? entries[index].module : save_list->module;
+
+        if (entry_module != NULL) {
             snprintf(path, sizeof(path),
                 ".\\Modules\\%s\\save\\%s.gsi",
-                save_list->module,
+                entry_module,
                 save_list->names[index]);
-        } else {
+            resolved = tig_file_exists(path, &file_info);
+        }
+
+        if (!resolved) {
             snprintf(path, sizeof(path),
                 "save\\%s.gsi",
                 save_list->names[index]);
+            resolved = tig_file_exists(path, &file_info);
         }
 
-        if (!tig_file_exists(path, &file_info)) {
+        if (!resolved) {
             tig_debug_printf("GameLib: : ERROR: Couldn't find file!\n");
             // FIX: Memory leak.
             FREE(entries);
@@ -2797,6 +3026,9 @@ void gamelib_savelist_sort(GameSaveList* save_list, GameSaveListOrder order, boo
 
     for (index = 0; index < save_list->count; index++) {
         save_list->names[index] = entries[index].path;
+        if (save_list->entry_modules != NULL) {
+            save_list->entry_modules[index] = entries[index].module;
+        }
     }
 
     FREE(entries);
@@ -2976,34 +3208,45 @@ bool gamelib_saveinfo_save(GameSaveInfo* save_info)
 }
 
 // 0x404270
-bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info)
+// CE: core saveinfo reader, parameterized by the save DIRECTORY prefix so a save can
+// be previewed from a module folder that isn't the currently-mounted one. save_dir
+// is "save" (repo-resolved current context) or an explicit ".\Modules\<M>\save" /
+// ".\data\Save". The .gsi is "<name>.gsi" (name = full <slot><description>); the
+// thumbnail is "<slot>.bmp" (slot = first 8 chars).
+static bool gamelib_saveinfo_load_from(const char* save_dir, const char* name, GameSaveInfo* save_info)
 {
     TigFile* stream;
     int size;
     bool success = false;
+    char gsi_path[TIG_MAX_PATH];
+    char bmp_path[TIG_MAX_PATH];
+    char slot[16];
 
-    snprintf(byte_5D0A50, sizeof(byte_5D0A50), "save\\%s.gsi", name);
+    snprintf(gsi_path, sizeof(gsi_path), "%s\\%s.gsi", save_dir, name);
 
-    stream = tig_file_fopen(byte_5D0A50, "rb");
+    stream = tig_file_fopen(gsi_path, "rb");
     if (stream == NULL) {
         return false;
     }
 
     save_info->thumbnail_video_buffer = NULL;
 
-    strcpy(byte_5D0A50, "save\\");
-    strncpy(&(byte_5D0A50[5]), name, 8);
-    strcpy(&(byte_5D0A50[13]), ".bmp");
+    strncpy(slot, name, 8);
+    slot[8] = '\0';
+    snprintf(bmp_path, sizeof(bmp_path), "%s\\%s.bmp", save_dir, slot);
 
     do {
-        if (tig_video_buffer_load_from_bmp(byte_5D0A50, &save_info->thumbnail_video_buffer, 0x1) != TIG_OK) break;
+        if (tig_video_buffer_load_from_bmp(bmp_path, &save_info->thumbnail_video_buffer, 0x1) != TIG_OK) break;
 
         if (tig_file_fread(&(save_info->version), sizeof(save_info->version), 1, stream) != 1) break;
 
+        // CE: the .gsi stores each string as length + raw bytes with NO terminator.
+        // GameSaveInfo (mainmenu_ui_gsi) is reused across selections, so without
+        // NUL-terminating, a shorter string leaves the PREVIOUS (longer) one's tail in
+        // the buffer -- e.g. selecting "Bridge" after "...Glitch...Nighttime" showed
+        // "Bridgeave-Glitchhttime". Bound-check + terminate each (also closes a
+        // pre-existing fread buffer overflow). [Was the 48d361f6 fix, reverted; redone.]
         if (tig_file_fread(&size, sizeof(size), 1, stream) != 1) break;
-        // CE: the writer stores length + raw bytes with NO terminator; bound-check
-        // and NUL-terminate so callers don't read trailing garbage (e.g. module_name
-        // came back as "Arcanumv"). Also closes a pre-existing fread overflow.
         if (size < 0 || size >= (int)sizeof(save_info->module_name)) break;
         if (tig_file_fread(save_info->module_name, size, 1, stream) != 1) break;
         save_info->module_name[size] = '\0';
@@ -3031,6 +3274,59 @@ bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info)
     tig_file_fclose(stream);
 
     return success;
+}
+
+bool gamelib_saveinfo_load(const char* name, GameSaveInfo* save_info)
+{
+    return gamelib_saveinfo_load_from("save", name, save_info);
+}
+
+// CE: load saveinfo for a save that may belong to a module that ISN'T currently
+// mounted, by first locating the directory that physically holds it (any module's
+// save folder, else data\Save), then reading from there. The Load/Save menus use
+// this so the detail panel (thumbnail, PC name, map, level...) is correct regardless
+// of which module is mounted -- previously the repo-resolved "save\" read showed a
+// same-slot save from the current module, or stale/empty info.
+bool gamelib_saveinfo_load_located(const char* name, GameSaveInfo* save_info)
+{
+    GameModuleList module_list;
+    TigFileList file_list;
+    unsigned int index;
+    char slot[16];
+    char dir[TIG_MAX_PATH];
+    char glob[TIG_MAX_PATH];
+    bool found = false;
+
+    strncpy(slot, name, 8);
+    slot[8] = '\0';
+
+    gamelib_modlist_create(&module_list, 0);
+    for (index = 0; index < module_list.count && !found; index++) {
+        snprintf(glob, sizeof(glob), ".\\Modules\\%s\\save\\%s*.gsi", module_list.paths[index], slot);
+        tig_file_list_create(&file_list, glob);
+        if (file_list.count > 0) {
+            snprintf(dir, sizeof(dir), ".\\Modules\\%s\\save", module_list.paths[index]);
+            found = true;
+        }
+        tig_file_list_destroy(&file_list);
+    }
+    gamelib_modlist_destroy(&module_list);
+
+    if (!found) {
+        snprintf(glob, sizeof(glob), ".\\data\\Save\\%s*.gsi", slot);
+        tig_file_list_create(&file_list, glob);
+        if (file_list.count > 0) {
+            snprintf(dir, sizeof(dir), ".\\data\\Save");
+            found = true;
+        }
+        tig_file_list_destroy(&file_list);
+    }
+
+    if (!found) {
+        snprintf(dir, sizeof(dir), "save");
+    }
+
+    return gamelib_saveinfo_load_from(dir, name, save_info);
 }
 
 // 0x4044A0
@@ -3705,16 +4001,16 @@ bool gamelib_load_module_data(const char* module_name)
     path1[end] = '\0';
 
     if (tig_file_is_directory(path1)) {
-        // CE: in the game, the module's loose dir is read-only CONTENT —
-        // runtime writes (Save\Current, TIGCache\) must fall through to
-        // data\ instead of polluting the module dir (and being mistaken
-        // for stale state on the next module load). The EDITOR authors
-        // module content here, so it stays writable there.
-        if (gamelib_init_info.editor) {
-            tig_file_repository_add(path1);
-        } else {
-            tig_file_repository_add_readonly(path1);
-        }
+        // CE: mount the module loose dir WRITABLE, matching upstream/alexbatalov.
+        // An earlier CE branch (ce21ac34) mounted it read-only in the game to keep
+        // runtime writes (Save\Current, TIGCache\) out of the module dir. That broke
+        // save/load: upstream keeps each module's Save\Current INSIDE its own dir
+        // (per-module, self-isolating), so the roundtrip works; the read-only mount
+        // forced every module to share one data\Save\Current, and imperfect clearing
+        // left cross-module stale state -> loads fell back to the empty ShopMap. The
+        // genuine custom-UI override dirs (custom\default, custom\modules\<name>) stay
+        // read-only via gamelib_mount_custom_overrides; only the module dir reverts.
+        tig_file_repository_add(path1);
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }
@@ -3724,10 +4020,8 @@ bool gamelib_load_module_data(const char* module_name)
             if (gamelib_mod_dat_path[0] == '\0') {
                 tig_file_copy_directory(path1, "Module template");
             }
-            tig_file_repository_add(path1);
-        } else {
-            tig_file_repository_add_readonly(path1);
         }
+        tig_file_repository_add(path1);
         strcpy(gamelib_mod_dir_path, path1);
         return true;
     }

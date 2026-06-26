@@ -1,5 +1,6 @@
 #include "game/gameinit.h"
 
+#include "game/gamelib.h"
 #include "game/map.h"
 #include "game/mes.h"
 #include "game/player.h"
@@ -61,7 +62,14 @@ void gameinit_reset(void)
 {
     int map;
 
-    if (!gameinit_editor) {
+    // CE: skip the fresh-game setup when this runs as part of LOADING a save (the UI
+    // brackets the load + its module switch with gamelib_loading_active). Opening the
+    // start map + creating a default PC here is throwaway during a load -- the save
+    // restore replaces it -- and worse, the opened start map gets flushed to
+    // Save\Current on the next map_close, leaving stale start-map mobiles that merge
+    // into the loaded save (a phantom NPC "from another save"). The save's own load
+    // funcs open the correct map and restore the PC.
+    if (!gameinit_editor && !gamelib_loading_active_get()) {
         map = map_by_type(MAP_TYPE_SHOPPING_MAP);
         if (map == 0) {
             map = map_by_type(MAP_TYPE_START_MAP);
