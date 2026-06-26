@@ -1140,6 +1140,55 @@ static void gpu_test_channel_tick(void)
                 dialog_ui_end_dialog(player_get_local_pc_obj(), 0);
                 tig_debug_printf("[gpu-cmd] dlgclose: dismissed dialog\n");
             }
+        } else if (strncmp(line, "gotomap ", 8) == 0) {
+            // CE harness: teleport the PC to a named map's starting location, e.g.
+            // `gotomap Shrouded Hills` -- a HEAVY town scene for benchmarking, reached
+            // after `newgame` so it's save-format independent and works on every branch
+            // (teleport_do is core engine). map_list_info_find resolves the name to a
+            // 0-based index; the map id is index+1.
+            {
+                const char* mapname = line + 8;
+                int gmidx = map_list_info_find(mapname);
+                if (gmidx >= 0) {
+                    int gmap = gmidx + 1;
+                    int64_t gx = 0, gy = 0;
+                    if (map_get_starting_location(gmap, &gx, &gy)) {
+                        TeleportData td;
+                        memset(&td, 0, sizeof(td));
+                        td.flags = TELEPORT_FADE_IN;
+                        td.obj = player_get_local_pc_obj();
+                        td.loc = LOCATION_MAKE(gx, gy);
+                        td.map = gmap;
+                        teleport_do(&td);
+                        tig_debug_printf("[gpu-cmd] gotomap '%s' -> map %d @ (%lld,%lld)\n",
+                            mapname, gmap, (long long)gx, (long long)gy);
+                    } else {
+                        tig_debug_printf("[gpu-cmd] gotomap '%s': no start loc\n", mapname);
+                    }
+                } else {
+                    tig_debug_printf("[gpu-cmd] gotomap '%s': not found\n", mapname);
+                }
+            }
+        } else if (strncmp(line, "wherepc", 7) == 0) {
+            // CE harness: report the PC's current map + tile coords (to capture a
+            // heavy scene's location from a save, then teleport there after newgame).
+            int64_t ploc = obj_field_int64_get(player_get_local_pc_obj(), OBJ_F_LOCATION);
+            tig_debug_printf("[gpu-cmd] wherepc: map=%d loc=(%lld,%lld)\n",
+                map_current_map(), (long long)LOCATION_GET_X(ploc), (long long)LOCATION_GET_Y(ploc));
+        } else if (strncmp(line, "tele ", 5) == 0) {
+            // CE harness: teleport the PC to map + tile coords, e.g. the Shrouded Hills
+            // town center on the overworld -- a heavy object-dense scene, save-independent.
+            int tmap; long long tx = 0, ty = 0;
+            if (sscanf(line, "tele %d %lld %lld", &tmap, &tx, &ty) == 3) {
+                TeleportData td;
+                memset(&td, 0, sizeof(td));
+                td.flags = TELEPORT_FADE_IN;
+                td.obj = player_get_local_pc_obj();
+                td.loc = LOCATION_MAKE((int64_t)tx, (int64_t)ty);
+                td.map = tmap;
+                teleport_do(&td);
+                tig_debug_printf("[gpu-cmd] tele map %d @ (%lld,%lld)\n", tmap, tx, ty);
+            }
         } else if (sscanf(line, "setpath %255s", arg) == 1) {
             settings_set_str_value(&settings, RENDER_PATH_KEY, arg);
             // CE harness: a runtime render-path switch must recompute cached
