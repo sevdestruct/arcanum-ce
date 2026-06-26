@@ -1125,6 +1125,15 @@ static void gpu_test_channel_tick(void)
                 sub_5412D0();
                 tig_debug_printf("[gpu-cmd] dismissed mainmenu -> in-game\n");
             }
+        } else if (strncmp(line, "newgameat ", 10) == 0) {
+            // CE harness: new game spawning the premade PC at map+(x,y) -- a heavy town
+            // scene -- via the synchronous menu->game transition (channel-safe on every
+            // branch, unlike an in-game tele). Checked before "newgame" (prefix match).
+            int ngmap; long long ngx = 0, ngy = 0;
+            if (sscanf(line, "newgameat %d %lld %lld", &ngmap, &ngx, &ngy) == 3) {
+                tig_debug_printf("[gpu-cmd] newgameat map %d @ (%lld,%lld)\n", ngmap, ngx, ngy);
+                mainmenu_ui_harness_newgame_at(1, ngmap, (int64_t)ngx, (int64_t)ngy);
+            }
         } else if (strncmp(line, "newgame", 7) == 0) {
             // CE harness: start a new game with a premade character -- a save-format-
             // independent real-level workload for cross-branch benchmarking. Optional

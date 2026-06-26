@@ -69,6 +69,7 @@ void mainmenu_ui_start(MainMenuType type);
 void mainmenu_ui_start_at_window(MainMenuWindowType window_type);
 void sub_5412D0(void);
 void mainmenu_ui_harness_newgame(int pregen_idx); // CE harness: start new game w/ premade char
+void mainmenu_ui_harness_newgame_at(int pregen_idx, int map, int64_t x, int64_t y); // CE harness: + spawn at map/loc
 bool mainmenu_ui_handle(void);
 bool mainmenu_ui_is_active(void);
 

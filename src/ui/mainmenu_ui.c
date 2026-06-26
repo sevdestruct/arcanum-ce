@@ -1881,6 +1881,12 @@ static void mainmenu_ui_pump_until_close_settled(int timeout_ms)
     }
 }
 
+// CE harness: new-game spawn override (set by mainmenu_ui_harness_newgame_at). When
+// g_harness_ng_map > 0, sub_5412E0 spawns the PC there instead of the module start map.
+static int g_harness_ng_map = 0;
+static int64_t g_harness_ng_x = 0;
+static int64_t g_harness_ng_y = 0;
+
 // 0x5412E0
 void sub_5412E0(bool a1)
 {
@@ -1938,6 +1944,16 @@ void sub_5412E0(bool a1)
                 if (!map_get_starting_location(map, &x, &y)) {
                     tig_debug_printf("MMUI: ERROR: Teleport/World Loc Failure!\n");
                     exit(EXIT_FAILURE);
+                }
+
+                // CE harness: redirect the new-game spawn to a specified map+loc (e.g.
+                // the Shrouded Hills town) so a benchmark lands in a HEAVY scene via this
+                // synchronous, loop-pumping menu->game transition -- which the command
+                // channel survives (an in-game teleport does not, on the older branches).
+                if (g_harness_ng_map > 0) {
+                    map = g_harness_ng_map;
+                    x = g_harness_ng_x;
+                    y = g_harness_ng_y;
                 }
 
                 fade_data.flags = 0;
@@ -5333,11 +5349,28 @@ bool mainmenu_ui_pregen_char_execute(int btn)
 // branch -- save-format independent. pregen_idx 1 = Merwin (first premade); clamped.
 void mainmenu_ui_harness_newgame(int pregen_idx)
 {
+    g_harness_ng_map = 0; // spawn at the module's default start map
     mainmenu_ui_pregen_char_create();
     if (pregen_idx >= 1 && pregen_idx < mainmenu_ui_pregen_char_cnt) {
         mainmenu_ui_pregen_char_idx = pregen_idx;
     }
     mainmenu_ui_pregen_char_execute(0);
+}
+
+// CE harness: like mainmenu_ui_harness_newgame but spawns the PC at map+(x,y) -- e.g.
+// a heavy town -- via the synchronous menu->game transition (channel-safe on all
+// branches, unlike an in-game teleport). map<=0 falls back to the default start map.
+void mainmenu_ui_harness_newgame_at(int pregen_idx, int map, int64_t x, int64_t y)
+{
+    g_harness_ng_map = map;
+    g_harness_ng_x = x;
+    g_harness_ng_y = y;
+    mainmenu_ui_pregen_char_create();
+    if (pregen_idx >= 1 && pregen_idx < mainmenu_ui_pregen_char_cnt) {
+        mainmenu_ui_pregen_char_idx = pregen_idx;
+    }
+    mainmenu_ui_pregen_char_execute(0);
+    g_harness_ng_map = 0; // reset so a later default newgame isn't affected
 }
 
 // 0x545C50
