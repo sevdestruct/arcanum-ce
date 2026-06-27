@@ -581,6 +581,19 @@ bool gamelib_init(GameInitInfo* init_info)
     // tile_init based on the same setting.
     settings_register(&settings, RENDER_PATH_KEY, TILE_RENDER_PATH_SOFTWARE, NULL);
 
+#if defined(ARCANUM_HARNESS)
+    // Headless harness runs on SDL's software renderer (no GPU); force the software
+    // tile path so tile_init (below) doesn't spin up a GPU art cache that can't work
+    // there, regardless of what arcanum.cfg's "render path" says. Set before tile_init.
+    {
+        const char* hl = getenv("ARCANUM_HEADLESS");
+        if (hl != NULL && hl[0] != '\0') {
+            settings_set_str_value(&settings, RENDER_PATH_KEY, TILE_RENDER_PATH_SOFTWARE);
+            tig_debug_printf("[harness] headless: forcing software render path\n");
+        }
+    }
+#endif
+
     settings_register(&settings, VSYNC_MODE_KEY, "2", NULL);
 
     // CE: surface the highres "aspect snap" toggle (default on) as a real
@@ -1213,6 +1226,11 @@ static void gpu_test_channel_tick(void)
                     tig_debug_printf("[gpu-cmd] gotomap '%s': not found\n", mapname);
                 }
             }
+        } else if (strncmp(line, "maplist", 7) == 0) {
+            // CE harness: dump the loaded map list (id, name, start coords) so a
+            // scenario author can find ids/names for tele/gotomap. id = index+1.
+            map_list_info_dump();
+            tig_debug_printf("[gpu-cmd] maplist dumped\n");
         } else if (strncmp(line, "wherepc", 7) == 0) {
             // CE harness: report the PC's current map + tile coords (to capture a
             // heavy scene's location from a save, then teleport there after newgame).

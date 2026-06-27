@@ -82,6 +82,8 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `gotomap <name>` — teleport to a named map's start location (`map_list_info_find`); also
   settles before continuing.
 - `wherepc` — log the PC's current map + tile coords (read a scene's coords from a save).
+- `maplist` — dump all loaded maps (`id`, name, start coords) to the debug log; the `id` is
+  what `tele`/`gotomap` use. Decodes the obfuscated map dir names to readable names.
 - `scrollto <x> <y>` / `scrollby <dx> <dy>` — absolute / relative camera move.
 - `walkby <dx> <dy>` — walk the PC dx,dy tiles (camera follows).
 - `setzoom <f>` — drive the iso zoom toward f (1.0 in, 0.5 out).
@@ -133,6 +135,11 @@ ARCANUM_GPU_CMD=/path/to/script.txt \
   "…/arcanum-ce" -window -ApplePersistenceIgnoreState YES   # avoid the window-restore hang
 ```
 
+- **Headless:** pass `-headless` (or `tools/arbiter.sh <scenario> --headless`) to run on SDL's
+  dummy video driver + software renderer — no window, GL context, or vsync. Needs no display
+  and no `caffeinate` (there is no GL swap to wedge), so it is the CI mode. It forces the
+  software render path (`ARCANUM_HEADLESS`/`ARCANUM_RENDER_DRIVER=software`), so GPU-path
+  scenarios must run windowed. Captures render at the dummy driver's default size.
 - End a run with the `quit` command — it exits cleanly (see Command reference), so the
   `SIGKILL` workaround below is only needed when a run is aborted mid-script.
 - After a `SIGKILL`, macOS window-state restoration hangs the *next* launch
@@ -212,12 +219,15 @@ Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.
 4. **Scenarios as first-class. — DONE.** Versioned `tools/scenarios/*.txt` (`town-stress`,
    `zoom-sweep`) run via `tools/arbiter.sh <name>`, which propagates the scenario's exit code.
    See [Scenarios & tooling](#scenarios--tooling).
-5. **Introspection + capture-diff. — DONE (capture side).** `tools/gpu_test/diff_bmp.py` is
-   now tolerance-capable (`--tolerance-delta`/`--tolerance-px`, default 0 = strict) and
-   `spikecap <ms> [max]` does auto-capture-on-spike. `wherepc` already exists; a permanent
-   `maplist` is still open.
-6. **Headless software-only mode** for CI perf gates (no window/vsync, run + dump) — the
-   biggest force-multiplier, gated on a GL-context-free software render path. **Next.**
+5. **Introspection + capture-diff. — DONE.** `tools/gpu_test/diff_bmp.py` is tolerance-capable
+   (`--tolerance-delta`/`--tolerance-px`, default 0 = strict); `spikecap <ms> [max]` does
+   auto-capture-on-spike; `wherepc` and `maplist` (dumps id/name/start for all 81 maps,
+   decoding the obfuscated dir names) cover introspection.
+6. **Headless software-only mode. — DONE.** `-headless` runs on SDL's dummy video driver +
+   software renderer (no window / GL context / vsync), forcing the software render path. Needs
+   no display and no `caffeinate`. `tools/arbiter.sh <scenario> --headless` is the CI form;
+   verified `town-stress --headless` runs the full scenario and passes its gate with no
+   display. See [Launch recipe](#launch-recipe-macos).
 
 ### Phase 2 — finish the extraction
 Move the command channel and the new-game override fully into `harness.c` by first exposing

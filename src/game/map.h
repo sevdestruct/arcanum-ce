@@ -44,6 +44,7 @@ void map_enable_gender_check(void);
 void map_gender_check(void);
 bool map_list_info_load(void);
 int map_list_info_find(const char* name);
+void map_list_info_dump(void);
 bool map_list_info_set(int index, const char* name, int64_t x, int64_t y, bool is_start_map, int worldmap, int area);
 bool map_list_info_add(const char* name, int64_t x, int64_t y, bool is_start_map);
 bool map_list_info_add_internal(const char* name, int64_t x, int64_t y, bool is_start_map);

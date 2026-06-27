@@ -2089,6 +2089,20 @@ int map_list_info_find(const char* name)
     return -1;
 }
 
+// CE harness: dump the loaded map list (index, map id, name, start coords) to the
+// debug log -- so a scenario author can discover map ids/names for tele/gotomap
+// without reading a save. The map id passed to `tele`/`teleport_do` is index+1.
+void map_list_info_dump(void)
+{
+    tig_debug_printf("[maplist] %d maps (id = index+1):\n", map_list_info_count);
+    for (int index = 0; index < map_list_info_count; index++) {
+        tig_debug_printf("[maplist]   id %d  '%s'  start (%lld,%lld)\n",
+            index + 1, map_list_info[index].name,
+            (long long)map_list_info[index].x,
+            (long long)map_list_info[index].y);
+    }
+}
+
 // 0x412830
 bool map_list_info_set(int index, const char* name, int64_t x, int64_t y, bool is_start_map, int worldmap, int area)
 {

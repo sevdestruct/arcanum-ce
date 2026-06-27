@@ -120,6 +120,23 @@ int main(int argc, char** argv)
         }
     }
 
+#if defined(ARCANUM_HARNESS)
+    // CE harness: headless mode -- run on SDL's dummy video driver + software
+    // renderer, with no real window / GL context / vsync. Lets a scenario run in
+    // CI with no display (and with no GL swap to wedge on display sleep, so no
+    // caffeinate is needed). The SDL video-driver hint must be set before the
+    // SDL_InitSubSystem(VIDEO) below. ARCANUM_HEADLESS is read by gamelib_init to
+    // force the software tile path; ARCANUM_RENDER_DRIVER is honored by
+    // tig_video_init's render-driver hint (else it would force opengl/metal).
+    bool headless = strstr(lpCmdLine, "-headless") != NULL;
+    if (headless) {
+        setenv("ARCANUM_HEADLESS", "1", 1);
+        setenv("ARCANUM_RENDER_DRIVER", "software", 1);
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+        tig_debug_printf("[harness] headless: SDL dummy video + software renderer\n");
+    }
+#endif
+
     highres_config_load();
     highres_config = highres_config_get();
 
@@ -152,6 +169,11 @@ int main(int argc, char** argv)
 #if SDL_PLATFORM_MACOS
     if (highres_config->aspect_snap && highres_config->ignore_notch) {
         should_snap_aspect = true;
+    }
+#endif
+#if defined(ARCANUM_HARNESS)
+    if (headless) {
+        should_snap_aspect = false; // no display to snap the aspect against
     }
 #endif
     if (should_snap_aspect) {

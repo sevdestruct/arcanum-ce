@@ -8,8 +8,13 @@
 # docs/arbiter-harness.md for the command reference.
 #
 # Usage:
-#   tools/arbiter.sh <scenario> [--app "<app name or path>"]
+#   tools/arbiter.sh <scenario> [--app "<app name or path>"] [--headless]
 #   tools/arbiter.sh --list
+#
+# --headless runs on SDL's dummy video driver + software renderer (no window / GL
+# context / vsync), so it works with no display and needs no caffeinate -- the
+# intended CI mode. (Forces the software render path; GPU-path scenarios should
+# run windowed.)
 #
 # Env overrides:
 #   APP   path to the variant .app (or a bare app name under ~/Applications/Arcanum)
@@ -34,9 +39,11 @@ fi
 
 SCENARIO="$1"; shift
 APP="${APP:-Arcanum Community Edition (Harness Settle)}"
+HEADLESS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app) APP="$2"; shift 2 ;;
+    --headless) HEADLESS=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -61,8 +68,9 @@ if [[ ! -x "$BIN" ]]; then
   exit 2
 fi
 
-# Display sleep wedges the GL vsync swap; keep it awake for the run.
-if ! pgrep -f "caffeinate -dis" >/dev/null 2>&1; then
+# Display sleep wedges the GL vsync swap; keep it awake for windowed runs.
+# Headless uses the dummy driver (no swap), so no caffeinate is needed.
+if [[ "$HEADLESS" -eq 0 ]] && ! pgrep -f "caffeinate -dis" >/dev/null 2>&1; then
   caffeinate -dis &
   CAFFEINATE_PID=$!
 fi
@@ -74,12 +82,16 @@ rm -f "$DEBUG_LOG"
 
 echo "==> scenario: $SCENARIO  ($SCEN_FILE)"
 echo "==> app:      $APP_PATH"
+[[ "$HEADLESS" -eq 1 ]] && echo "==> mode:     headless (dummy video + software renderer)"
+
+HL_ARG=()
+[[ "$HEADLESS" -eq 1 ]] && HL_ARG=(-headless)
 
 # Run foreground from the data root so the binary finds ./data, ./modules. The
 # scenario ends in `quit`, which exits cleanly (harness pre-confirms the modal),
 # so we get the real exit code -- including assert-render-under's exit(1).
 ( cd "$ARC_DIR" && ARCANUM_GPU_CMD="$SCEN_FILE" \
-    "$BIN" -window -ApplePersistenceIgnoreState YES >/tmp/arcanum-arbiter.out 2>&1 )
+    "$BIN" -window "${HL_ARG[@]}" -ApplePersistenceIgnoreState YES >/tmp/arcanum-arbiter.out 2>&1 )
 RC=$?
 
 echo "==> scenario exit: $RC"
