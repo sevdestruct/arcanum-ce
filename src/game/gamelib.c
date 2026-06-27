@@ -1420,6 +1420,17 @@ static void gpu_test_channel_tick(void)
             // frame instead of wall-clock, so a seeded run is reproducible. 0 = off.
             harness_set_fixed_dt(ix);
             tig_debug_printf("[gpu-cmd] fixeddt %d\n", ix);
+        } else if (strncmp(line, "spikecap ", 9) == 0) {
+            // diagnosis: arm auto-capture-on-spike -- dump the iso buffer to
+            // /tmp/arcanum-spike-<n>.bmp whenever a frame's render time reaches
+            // <ms>, up to <max> (default 8) captures. `spikecap 0` disables.
+            float sms = 0.0f;
+            int smax = 8;
+            if (sscanf(line, "spikecap %f %d", &sms, &smax) >= 1) {
+                if (smax <= 0) smax = 8;
+                harness_set_spike_capture((double)sms, smax);
+                tig_debug_printf("[gpu-cmd] spikecap %.2fms max %d\n", (double)sms, smax);
+            }
         } else if (strncmp(line, "bench-ab ", 9) == 0) {
             // CI A/B: measure mean render (full-redraw) time with a perf toggle OFF
             // vs ON, in the SAME launch at the current scene. Interleaved over a few

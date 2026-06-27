@@ -4,12 +4,21 @@ GPU vs software render diff for arcanum-ce.
 
 Usage:
     diff_bmp.py <reference.bmp> <candidate.bmp> [--out-dir DIR]
+                [--tolerance-delta D] [--tolerance-px N]
 
 Reads both BMPs, reports per-pixel difference stats, and writes a heatmap
 PNG (`diff_heatmap.png`) and an "obvious bug regions" PNG (`diff_regions.png`)
-to OUT_DIR (default /tmp). Exit code 0 if frames are pixel-identical, 1 if
-any difference (always print stats; the bug-region image is only written
-when meaningful differences exist).
+to OUT_DIR (default /tmp). Exit code 0 if within tolerance, 1 if not
+(always print stats; the bug-region image is only written when meaningful
+differences exist).
+
+Tolerance (for capture-diff regression gating -- see docs/arbiter-harness.md
+"Determinism": seeded harness captures are only ~99.95% byte-reproducible, so
+exact-match is too strict; gate above the ambient-animation noise floor):
+  --tolerance-delta D  a pixel counts as "differing" only if its max channel
+                       delta exceeds D (default 0 = any difference counts).
+  --tolerance-px N     PASS if at most N pixels differ (default 0 = identical).
+Both default to 0, preserving the original strict pixel-identical behavior.
 
 Stats reported:
   - total pixels
@@ -35,11 +44,19 @@ except ImportError as e:
 def parse_args():
     args = sys.argv[1:]
     out_dir = "/tmp"
+    tol_delta = 0
+    tol_px = 0
     paths = []
     i = 0
     while i < len(args):
         if args[i] == "--out-dir":
             out_dir = args[i + 1]
+            i += 2
+        elif args[i] == "--tolerance-delta":
+            tol_delta = int(args[i + 1])
+            i += 2
+        elif args[i] == "--tolerance-px":
+            tol_px = int(args[i + 1])
             i += 2
         else:
             paths.append(args[i])
@@ -47,7 +64,7 @@ def parse_args():
     if len(paths) != 2:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    return Path(paths[0]), Path(paths[1]), Path(out_dir)
+    return Path(paths[0]), Path(paths[1]), Path(out_dir), tol_delta, tol_px
 
 
 def find_largest_region(mask, min_area=64):
@@ -78,7 +95,7 @@ def find_largest_region(mask, min_area=64):
 
 
 def main():
-    ref_path, cand_path, out_dir = parse_args()
+    ref_path, cand_path, out_dir, tol_delta, tol_px = parse_args()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not ref_path.exists():
@@ -98,7 +115,7 @@ def main():
     c = np.asarray(cand, dtype=np.int16)
     delta = np.abs(r - c)            # H x W x 3
     per_pixel = delta.max(axis=2)    # max channel delta per pixel
-    differ = per_pixel > 0
+    differ = per_pixel > tol_delta   # pixels exceeding the per-channel tolerance
     n_diff = int(differ.sum())
     n_total = int(per_pixel.size)
     pct = 100.0 * n_diff / n_total
@@ -106,9 +123,15 @@ def main():
     print(f"reference : {ref_path}")
     print(f"candidate : {cand_path}")
     print(f"size      : {ref.size[0]} x {ref.size[1]} = {n_total} px")
+    if tol_delta or tol_px:
+        print(f"tolerance : delta>{tol_delta} per channel, allow <= {tol_px} px")
     print(f"differing : {n_diff} px ({pct:.2f}%)")
     if n_diff == 0:
-        print("PASS: pixel-identical")
+        print("PASS: pixel-identical" if not tol_delta
+              else f"PASS: no pixel exceeds delta {tol_delta}")
+        return 0
+    if n_diff <= tol_px:
+        print(f"PASS: within tolerance ({n_diff} <= {tol_px} px)")
         return 0
 
     print(f"max delta : {int(per_pixel.max())}")

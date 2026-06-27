@@ -1,0 +1,31 @@
+# town-stress -- heavy town scene (Shrouded Hills), deterministic, exercising the
+# object-dense render path under movement, camera scroll, and a zoom sweep, then
+# gating render time. Run with: tools/arbiter.sh town-stress
+#
+# seed + fixeddt first so the spawn and the per-frame time advance are reproducible
+# (see docs/arbiter-harness.md "Determinism" -- captures are ~99.95% repro, use a
+# tolerance for capture-diff).
+seed 1
+fixeddt 16
+# newgameat <map> <x> <y>: synchronous menu->game transition into the town center.
+newgameat 1 90234 84162
+wait 200
+dlgclose
+wait 30
+# Move the PC around (camera follows) and scroll, to drive object + tile churn.
+walkby 4 4
+wait 60
+walkby -4 -4
+wait 60
+scrollby 240 0
+wait 30
+scrollby -240 0
+wait 30
+# Zoom sweep (the heaviest full-redraw path).
+setzoom 0.5
+wait 90
+setzoom 1.0
+wait 90
+# Perf gate: fail (exit 1) if mean full-redraw render time hits 16ms (60fps budget).
+assert-render-under 16.0 120
+quit

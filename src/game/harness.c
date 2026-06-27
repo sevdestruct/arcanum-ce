@@ -15,7 +15,20 @@
 
 #include "game/gamelib.h"  // gamelib_zoom_perf_is_enabled() — emitter dedupe; gamelib_ping()
 #include "game/teleport.h" // teleport_is_pending / teleport_is_teleporting
+#include "game/tile.h"     // tile_gpu_test_capture() — spike capture
 #include "ui/iso.h"        // iso_redraw()
+
+// Auto-capture-on-spike state (see harness_set_spike_capture).
+static double harness_spike_ms = 0.0;
+static int harness_spike_max = 0;
+static int harness_spike_count = 0;
+
+void harness_set_spike_capture(double ms, int max)
+{
+    harness_spike_ms = ms;
+    harness_spike_max = max;
+    harness_spike_count = 0;
+}
 
 // Frame-timer accumulators (moved verbatim from main.c). bench_on latches once from
 // ARCANUM_GPU_CMD so the timer is inert outside a harness run.
@@ -72,6 +85,20 @@ void harness_frame_present_end(void)
     bench_r2 = harness_now_ns();
     unsigned long long rdr = bench_r1 - bench_r0;
     unsigned long long win = bench_r2 - bench_r1;
+
+    // Auto-capture-on-spike: dump the just-rendered iso buffer when this frame's
+    // render time crosses the armed threshold (capped at harness_spike_max).
+    if (harness_spike_ms > 0.0
+        && harness_spike_count < harness_spike_max
+        && (double)rdr / 1e6 >= harness_spike_ms) {
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/arcanum-spike-%d.bmp", harness_spike_count);
+        tile_gpu_test_capture(path);
+        fprintf(stderr, "[harness] spike capture %s: render %.2fms >= %.2fms\n",
+            path, (double)rdr / 1e6, harness_spike_ms);
+        harness_spike_count++;
+    }
+
     bench_rsum += rdr;
     if (rdr > bench_rmax) {
         bench_rmax = rdr;

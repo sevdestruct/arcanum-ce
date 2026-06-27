@@ -117,6 +117,10 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `perf` — toggle the rich zoom-perf log (render/blit/OTHER/frame avg-max-stddev).
 - `zoomlog`, `trace` — zoom + GPU-dispatch tracing.
 - `capture <abs_path>` — dump the iso world buffer to a BMP (for pixel diffs).
+- `spikecap <ms> [max]` — auto-capture-on-spike: dump the iso buffer to
+  `/tmp/arcanum-spike-<n>.bmp` whenever a frame's render time reaches `ms`, up to `max`
+  (default 8) captures, then stop. `spikecap 0` disables. Catches the offending frame in a
+  long run without a human watching.
 - `wait <N>`, `quit` — clean exit. `quit` pre-confirms the "Are you sure you want to quit?"
   modal (via `harness_request_quit()`), so the process exits on its own instead of hanging on
   a prompt the channel can't drive. No `SIGKILL` needed to end a scripted run.
@@ -136,6 +140,37 @@ ARCANUM_GPU_CMD=/path/to/script.txt \
   (and `defaults write <bundle-id> ApplePersistenceIgnoreState -bool YES`) avoids it.
 - Run perf measurements serially with no other load; the universal frame-timer dumps the
   `[zoom-perf]` format to `/tmp/arcanum-zoom-perf.log` (parser in the scratchpad / `tools/`).
+
+## Scenarios & tooling
+
+Named, versioned scenarios live as command scripts under `tools/scenarios/*.txt` and run
+through `tools/arbiter.sh`:
+
+```sh
+tools/arbiter.sh --list                 # list scenarios
+tools/arbiter.sh town-stress            # run one; exit code is the scenario's
+tools/arbiter.sh zoom-sweep --app "Arcanum Community Edition (Perf GPU Accel)"
+```
+
+`arbiter.sh` handles `caffeinate`, kills a stale instance, runs the build foreground from the
+data root, and **propagates the scenario's exit code** — so an `assert-render-under` failure
+(or a crash) fails the script, making it a drop-in headless CI gate. Needs a
+`-DARCANUM_HARNESS=ON` build deployed (override the app with `--app`/`APP`).
+
+- `town-stress` — heavy Shrouded Hills town: move + scroll + zoom-sweep, then
+  `assert-render-under 16.0` as the gate. (Verified PASS at ~2.9 ms avg.)
+- `zoom-sweep` — `bench-ab resolveonce` at z=1.0 and z=0.5 (the z=0.5 full-redraw path is
+  ~3× heavier: ~10 ms vs ~3 ms). It A/Bs `resolveonce`, **not** `tilethreads` — the 2-thread
+  tile pass ships default-OFF because it SIGSEGVs on a cold art cache
+  (`tile_rows_thread_fn → art_blit`), which a heavy town + forced full redraws reliably trips.
+
+Capture-diff is `tools/gpu_test/diff_bmp.py` (now tolerance-capable):
+```sh
+python3 tools/gpu_test/diff_bmp.py a.bmp b.bmp --tolerance-delta 16 --tolerance-px 2000
+```
+Defaults (0/0) keep the original strict pixel-identical check; the tolerance flags gate above
+the determinism noise floor (the measured floor is a single 64×32 animated sprite,
+max channel delta ≈13 — `--tolerance-delta 16` clears it to 0 differing px).
 
 ## Roadmap
 
@@ -174,12 +209,15 @@ Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.
    `harness_measure_render_ms(frames)` pump (forces a full redraw per frame for a stable,
    representative number). Verified: assert PASS→exit 0, FAIL→exit 1 (before `quit`); bench-ab
    reports per-toggle deltas.
-4. **Scenarios as first-class.** Promote the ad-hoc workout `.txt` files to named, versioned
-   `scenario <name>` scripts under `tools/` (`town-stress`, `zoom-sweep`).
-5. **Introspection + capture-diff.** Make `maplist`/`wherepc` permanent; add `capture-diff
-   <a> <b>` (**tolerance-based** pixel delta — see #2) and auto-capture-on-spike.
+4. **Scenarios as first-class. — DONE.** Versioned `tools/scenarios/*.txt` (`town-stress`,
+   `zoom-sweep`) run via `tools/arbiter.sh <name>`, which propagates the scenario's exit code.
+   See [Scenarios & tooling](#scenarios--tooling).
+5. **Introspection + capture-diff. — DONE (capture side).** `tools/gpu_test/diff_bmp.py` is
+   now tolerance-capable (`--tolerance-delta`/`--tolerance-px`, default 0 = strict) and
+   `spikecap <ms> [max]` does auto-capture-on-spike. `wherepc` already exists; a permanent
+   `maplist` is still open.
 6. **Headless software-only mode** for CI perf gates (no window/vsync, run + dump) — the
-   biggest force-multiplier, gated on a GL-context-free software render path.
+   biggest force-multiplier, gated on a GL-context-free software render path. **Next.**
 
 ### Phase 2 — finish the extraction
 Move the command channel and the new-game override fully into `harness.c` by first exposing

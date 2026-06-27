@@ -56,6 +56,12 @@ double harness_measure_render_ms(int frames);
 void harness_set_fixed_dt(int ms);
 int harness_fixed_dt_ms(void);
 
+// Auto-capture-on-spike: when ms > 0, the per-frame timer dumps an iso capture to
+// /tmp/arcanum-spike-<n>.bmp whenever a frame's render time reaches `ms`, up to
+// `max` captures (then it stops to avoid spamming). 0 disables. Lets a scenario
+// self-capture the offending frame for diagnosis without a human watching.
+void harness_set_spike_capture(double ms, int max);
+
 // The `quit` channel command enqueues TIG_MESSAGE_QUIT and calls this. The main
 // loop's quit handler would otherwise open the blocking "Are you sure?" confirm
 // modal -- which runs its own pump (no gamelib_ping), so the channel can't drive

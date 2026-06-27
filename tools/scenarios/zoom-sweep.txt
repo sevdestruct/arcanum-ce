@@ -1,0 +1,24 @@
+# zoom-sweep -- measure render cost across the zoom range at a heavy town scene,
+# A/B-ing the resolve-once art-cache memo at each zoom level. Run with:
+#   tools/arbiter.sh zoom-sweep
+# (bench-ab is informational; this scenario reports deltas, it does not gate.)
+#
+# NB: we A/B `resolveonce`, NOT `tilethreads` -- the 2-thread tile pass ships
+# default-OFF because it races on a cold art cache (tile_rows_thread_fn ->
+# art_blit SIGSEGV), which a heavy town + forced full redraws reliably trips.
+# See the tile_threading memory / docs/arbiter-harness.md.
+seed 1
+fixeddt 16
+newgameat 1 90234 84162
+wait 200
+dlgclose
+wait 30
+# Zoomed-in (z=1.0).
+bench-ab resolveonce 120
+# Zoomed-out (z=0.5): the full-redraw-heavy path.
+setzoom 0.5
+wait 90
+bench-ab resolveonce 120
+setzoom 1.0
+wait 60
+quit
