@@ -24,6 +24,13 @@ void harness_frame_render_begin(void); // before iso_redraw()
 void harness_frame_render_end(void);   // after iso_redraw()
 void harness_frame_present_end(void);  // after tig_window_display()
 
+// The autonomous arbiter test command channel. Pumped every frame from
+// gamelib_ping (menu AND in-game); reads ARCANUM_GPU_CMD (a command file) and
+// dispatches the commands documented in docs/arbiter-harness.md. No-op unless
+// ARCANUM_GPU_CMD names a readable file. Lives here so all harness logic is in
+// one place; the only gamelib hook is the one-line call in gamelib_ping.
+void harness_channel_tick(void);
+
 // Pump real game frames until the in-flight PC teleport / map transition has been
 // carried out (teleport_is_pending() clears), or timeout_ms elapses. The command
 // channel reads its commands at the top of gamelib_ping, BEFORE the per-module

@@ -36,15 +36,18 @@ testing too — just flip the flag.
 
 | Piece | File | Gated how |
 | --- | --- | --- |
-| Frame-timer (universal per-frame perf dump) | `src/game/harness.c` / `harness.h` | whole file body `#if ARCANUM_HARNESS`; main loop calls 3 hooks, also gated |
-| Command channel (`gpu_test_channel_tick` + all commands) | `src/game/gamelib.c` | function + its `gamelib_ping` call gated in place |
-| New-game spawn override (`mainmenu_ui_harness_newgame[_at]`, `g_harness_ng_*`, the `sub_5412E0` redirect) | `src/ui/mainmenu_ui.c` / `mainmenu_ui.h` | functions, globals, and the override block gated in place |
+| Frame-timer + command channel + settle/measure/headless/spike state (`harness_channel_tick` + all commands, `harness_settle`, `harness_measure_render_ms`, `harness_set_fixed_dt`, `harness_request_quit`, `harness_set_spike_capture`) | `src/game/harness.c` / `harness.h` | whole file body `#if ARCANUM_HARNESS`; the only hooks elsewhere are the one-line gated calls listed below |
+| Hooks into core files | `gamelib.c` (1-line `harness_channel_tick()` in `gamelib_ping` + 2 accessors `gamelib_render_path_set`/`gamelib_zoom_perf_set_warmed_up`), `main.c` (3 frame-timer calls + `-headless`), `timeevent.c` (fixed-dt), `teleport.c` (`teleport_is_pending`), `map.c` (`map_list_info_dump`) | each gated in place |
+| New-game spawn override (`mainmenu_ui_harness_newgame[_at]`, `g_harness_ng_*`, the `sub_5412E0` redirect) | `src/ui/mainmenu_ui.c` / `mainmenu_ui.h` | functions, globals, and the override block gated in place; the public `mainmenu_ui_harness_newgame_at` entry is the accessor the channel calls |
 | Rich zoom-perf instrument (`gamelib_zoom_perf_*`; F9 key + `perf` cmd toggle it) | `src/game/gamelib.c`, `src/main.c` | `gamelib_zoom_perf_toggle()` body + the F9 case gated; accumulators stay compiled but **inert** (the flag never goes true, so every `is_enabled()` consumer short-circuits) |
 
-The frame-timer is extracted to `harness.c` (it is self-contained). The channel and the
-new-game override are **gated in place** because they touch file-private statics (`settings`,
-the mainmenu pregen state). Fully moving them to `harness.c` is a clean follow-up — it just
-needs a handful of accessor functions exposed first (see [Roadmap](#roadmap), phase 2).
+**Phase 2 DONE:** the command channel now lives entirely in `harness.c` as
+`harness_channel_tick()` — `gamelib.c` keeps only the one-line gated call in `gamelib_ping`
+plus two tiny accessors (`gamelib_render_path_set` for `setpath`, `gamelib_zoom_perf_set_warmed_up`
+for `perf`). The new-game spawn override stays in `mainmenu_ui.c` because it is inseparable
+from the mainmenu pregen-spawn statics it drives, and its public entry
+`mainmenu_ui_harness_newgame_at` already *is* the accessor the channel uses — moving the 3-int
+`g_harness_ng_*` state out would split it from its only consumer (`sub_5412E0`) for no gain.
 
 The **rich zoom-perf instrument** (`gamelib_zoom_perf_*` — the detailed render/blit/OTHER/
 frame-stats dump, toggled by **F9** in-game and by the `perf` gpu-cmd) is gated at its
@@ -229,12 +232,14 @@ Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.
    verified `town-stress --headless` runs the full scenario and passes its gate with no
    display. See [Launch recipe](#launch-recipe-macos).
 
-### Phase 2 — finish the extraction
-Move the command channel and the new-game override fully into `harness.c` by first exposing
-small accessors for the statics they touch: a render-path setter (wraps the `settings`
-static for `setpath`), and the pregen-spawn entry (already public via
-`mainmenu_ui_harness_newgame_at`). Then `gamelib.c`/`mainmenu_ui.c` keep only the gated
-one-line hooks, and all harness logic lives in one file — easier to expand and to diff.
+### Phase 2 — DONE
+The command channel was moved fully into `harness.c` as `harness_channel_tick()`. The two
+file-private statics it touched are now behind gated accessors — `gamelib_render_path_set`
+(wraps `settings` for `setpath`) and `gamelib_zoom_perf_set_warmed_up` (for `perf`). `gamelib.c`
+keeps only the one-line `harness_channel_tick()` call in `gamelib_ping`. The new-game spawn
+override stays in `mainmenu_ui.c` (inseparable from the mainmenu pregen statics; its public
+`mainmenu_ui_harness_newgame_at` is already the accessor the channel calls). Verified
+behavior-identical (`town-stress --headless` unchanged; both build variants compile).
 
 ## Merging with the multiplayer arbiter
 

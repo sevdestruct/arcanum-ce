@@ -373,6 +373,16 @@ bool gamelib_void_edge_fade(void);
 void gamelib_zoom_perf_toggle(void);
 bool gamelib_zoom_perf_is_enabled(void);
 
+#if defined(ARCANUM_HARNESS)
+// Harness accessors: expose the file-private statics the arbiter channel (now in
+// harness.c) needs, so all harness logic lives in one file. Compiled out of ship.
+//  - set_warmed_up: skip the warmup gate so the rich instrument samples immediately
+//    (the harness loop doesn't drive the record_tig_ping warmup count).
+//  - render_path_set: set the tile render path ("software"/"hardware").
+void gamelib_zoom_perf_set_warmed_up(bool warmed_up);
+void gamelib_render_path_set(const char* mode);
+#endif
+
 // Monotonic ns clock for caller-side timing. Cheap (clock_gettime).
 // Pair with gamelib_perf_record_* helpers to attribute time to a bucket.
 uint64_t gamelib_perf_now_ns(void);
