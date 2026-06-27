@@ -158,4 +158,16 @@ void harness_settle(int timeout_ms)
     harness_settling = false;
 }
 
+static bool harness_quit_requested = false;
+
+void harness_request_quit(void)
+{
+    harness_quit_requested = true;
+}
+
+bool harness_wants_quit(void)
+{
+    return harness_quit_requested;
+}
+
 #endif // ARCANUM_HARNESS

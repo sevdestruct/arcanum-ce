@@ -627,10 +627,24 @@ void main_loop(void)
             bool saved_pressed = (message.type == TIG_MESSAGE_KEYBOARD)
                 ? message.data.keyboard.pressed : false;
 
-            if (message.type == TIG_MESSAGE_QUIT
-                && mainmenu_ui_confirm_quit() == TIG_WINDOW_MODAL_DIALOG_CHOICE_OK) {
-                mainmenu_ui_reset();
-                return;
+            if (message.type == TIG_MESSAGE_QUIT) {
+                bool quit_confirmed;
+#if defined(ARCANUM_HARNESS)
+                // A `quit` from the test channel pre-chooses OK -- the confirm
+                // modal runs its own pump the channel can't drive, so opening it
+                // would hang a scripted run. Exit straight away.
+                if (harness_wants_quit()) {
+                    quit_confirmed = true;
+                } else
+#endif
+                {
+                    quit_confirmed = mainmenu_ui_confirm_quit()
+                        == TIG_WINDOW_MODAL_DIALOG_CHOICE_OK;
+                }
+                if (quit_confirmed) {
+                    mainmenu_ui_reset();
+                    return;
+                }
             }
 
             if (message.type == TIG_MESSAGE_REDRAW) {

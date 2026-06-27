@@ -97,7 +97,9 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `perf` — toggle the rich zoom-perf log (render/blit/OTHER/frame avg-max-stddev).
 - `zoomlog`, `trace` — zoom + GPU-dispatch tracing.
 - `capture <abs_path>` — dump the iso world buffer to a BMP (for pixel diffs).
-- `wait <N>`, `quit` (clean exit).
+- `wait <N>`, `quit` — clean exit. `quit` pre-confirms the "Are you sure you want to quit?"
+  modal (via `harness_request_quit()`), so the process exits on its own instead of hanging on
+  a prompt the channel can't drive. No `SIGKILL` needed to end a scripted run.
 
 ## Launch recipe (macOS)
 
@@ -107,6 +109,8 @@ ARCANUM_GPU_CMD=/path/to/script.txt \
   "…/arcanum-ce" -window -ApplePersistenceIgnoreState YES   # avoid the window-restore hang
 ```
 
+- End a run with the `quit` command — it exits cleanly (see Command reference), so the
+  `SIGKILL` workaround below is only needed when a run is aborted mid-script.
 - After a `SIGKILL`, macOS window-state restoration hangs the *next* launch
   (`_reopenWindowsAsNecessaryIncludingRestorableState`). `-ApplePersistenceIgnoreState YES`
   (and `defaults write <bundle-id> ApplePersistenceIgnoreState -bool YES`) avoids it.

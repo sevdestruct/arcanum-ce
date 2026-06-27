@@ -1385,6 +1385,9 @@ static void gpu_test_channel_tick(void)
             tig_debug_printf("[gpu-cmd] trace armed\n");
         } else if (strncmp(line, "quit", 4) == 0) {
             tig_debug_printf("[gpu-cmd] quit\n");
+            // Pre-choose OK so the main loop's quit handler skips the blocking
+            // "Are you sure?" confirm modal (which the channel can't drive).
+            harness_request_quit();
             TigMessage msg;
             memset(&msg, 0, sizeof(msg));
             msg.type = TIG_MESSAGE_QUIT;

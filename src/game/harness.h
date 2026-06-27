@@ -39,6 +39,15 @@ void harness_settle(int timeout_ms);
 // re-entrantly consume further commands.
 bool harness_is_settling(void);
 
+// The `quit` channel command enqueues TIG_MESSAGE_QUIT and calls this. The main
+// loop's quit handler would otherwise open the blocking "Are you sure?" confirm
+// modal -- which runs its own pump (no gamelib_ping), so the channel can't drive
+// its OK and the run hangs. harness_request_quit() records that the OK outcome is
+// pre-chosen; harness_wants_quit() lets the main loop skip the modal and exit. A
+// scripted run has no progress to protect, so the confirm is pure friction here.
+void harness_request_quit(void);
+bool harness_wants_quit(void);
+
 #endif // ARCANUM_HARNESS
 
 #endif /* ARCANUM_GAME_HARNESS_H_ */
