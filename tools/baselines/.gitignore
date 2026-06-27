@@ -1,0 +1,6 @@
+# Capture baselines are environment-specific: harness captures are only ~99.95%
+# reproducible (ambient-animation floor) and the software renderer's output can
+# vary by machine / SDL version, so a committed baseline would false-fail
+# elsewhere. Generate locally with: tools/arbiter.sh <scenario> --update-baselines
+*
+!.gitignore

@@ -204,6 +204,23 @@ Defaults (0/0) keep the original strict pixel-identical check; the tolerance fla
 the determinism noise floor (the measured floor is a single 64×32 animated sprite,
 max channel delta ≈13 — `--tolerance-delta 16` clears it to 0 differing px).
 
+`arbiter.sh` integrates the visual gate + a machine-readable report:
+```sh
+tools/arbiter.sh smoke --headless --update-baselines        # adopt this run's captures
+tools/arbiter.sh smoke --headless --check-captures \         # gate vs baselines + emit JSON
+  --report /tmp/report.json
+```
+- A scenario opts into the visual gate by writing captures to `/tmp/arbiter-captures/` (e.g.
+  `capturescreen /tmp/arbiter-captures/town.bmp`). `--check-captures` tolerance-diffs each
+  against `tools/baselines/<scenario>/` (defaults: `--tolerance-px 700 --tolerance-delta 16`,
+  above the ~550 px floor); a missing baseline or over-tolerance diff fails the run.
+- Baselines are **git-ignored** (env-specific: ~99.95% reproducible + software-renderer output
+  varies by machine/SDL version) — create them per environment with `--update-baselines`.
+- `--report FILE` writes a JSON summary (exit code, assert pass/fail counts, `bench-ab`
+  results, capture-diff results) for CI dashboards.
+- `smoke` is a self-test scenario exercising input injection, `get`/`assert`, `capturescreen`,
+  and the perf gates under `strict 1` — run it in CI to catch harness rot.
+
 ## Roadmap
 
 Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.

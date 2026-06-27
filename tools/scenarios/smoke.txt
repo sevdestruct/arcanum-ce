@@ -1,0 +1,28 @@
+# smoke -- a self-test that exercises the core harness commands (and a visual
+# baseline) so CI catches harness rot. Run:
+#   tools/arbiter.sh smoke --headless --check-captures
+# First time (to create the baseline): add --update-baselines.
+strict 1
+seed 1
+fixeddt 16
+newgameat 1 90234 84162
+wait 200
+dlgclose
+wait 30
+# introspection + state gates
+get pc.map
+get pc.hp
+get pc.gold
+assert pc.map == 1
+assert pc.hp > 0
+assert pc.gold >= 0
+# input injection (no crash; drives the real pipeline)
+mousemove 512 384
+click 512 384
+wait 30
+# visual baseline (full frame incl HUD) -> gated by --check-captures
+capturescreen /tmp/arbiter-captures/town.bmp
+# perf gates
+assert-render-under 60 60
+assert-render-max 300 60
+quit
