@@ -48,6 +48,7 @@
 #include "game/gfade.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
+#include "game/harness.h"
 #include "game/highres_config.h"
 #include "game/hrp.h"
 #include "game/invensource.h"
@@ -1064,6 +1065,11 @@ static void gpu_test_channel_tick(void)
     if (cmd_path == NULL || cmd_path[0] == '\0') {
         return;
     }
+    // Re-entrancy guard: harness_settle() pumps gamelib_ping (which calls us) to
+    // finish an in-flight teleport. Do not consume more commands while it does.
+    if (harness_is_settling()) {
+        return;
+    }
     if (wait_frames > 0) {
         wait_frames--;
         return;
@@ -1170,6 +1176,9 @@ static void gpu_test_channel_tick(void)
                         td.loc = LOCATION_MAKE(gx, gy);
                         td.map = gmap;
                         teleport_do(&td);
+                        // Let the transition complete before the next command runs
+                        // (teleport_ping carries it out AFTER this channel tick).
+                        harness_settle(8000);
                         tig_debug_printf("[gpu-cmd] gotomap '%s' -> map %d @ (%lld,%lld)\n",
                             mapname, gmap, (long long)gx, (long long)gy);
                     } else {
@@ -1197,6 +1206,9 @@ static void gpu_test_channel_tick(void)
                 td.loc = LOCATION_MAKE((int64_t)tx, (int64_t)ty);
                 td.map = tmap;
                 teleport_do(&td);
+                // Let the transition complete before the next command runs
+                // (teleport_ping carries it out AFTER this channel tick).
+                harness_settle(8000);
                 tig_debug_printf("[gpu-cmd] tele map %d @ (%lld,%lld)\n", tmap, tx, ty);
             }
         } else if (sscanf(line, "setpath %255s", arg) == 1) {

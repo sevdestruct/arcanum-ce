@@ -144,6 +144,11 @@ bool teleport_is_teleporting(void)
     return teleport_processing;
 }
 
+bool teleport_is_pending(void)
+{
+    return teleport_pending;
+}
+
 // 0x4D3420
 bool teleport_is_teleporting_obj(int64_t obj)
 {

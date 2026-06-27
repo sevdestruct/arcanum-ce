@@ -4,11 +4,18 @@
 // unit, so the file can stay in the always-compiled source list with zero ship cost.
 #if defined(ARCANUM_HARNESS)
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
-#include "game/gamelib.h" // gamelib_zoom_perf_is_enabled() — emitter dedupe
+#include <tig/core.h>     // tig_ping()
+#include <tig/timer.h>    // tig_timer_now / tig_timer_elapsed
+#include <tig/window.h>   // tig_window_display()
+
+#include "game/gamelib.h"  // gamelib_zoom_perf_is_enabled() — emitter dedupe; gamelib_ping()
+#include "game/teleport.h" // teleport_is_pending / teleport_is_teleporting
+#include "ui/iso.h"        // iso_redraw()
 
 // Frame-timer accumulators (moved verbatim from main.c). bench_on latches once from
 // ARCANUM_GPU_CMD so the timer is inert outside a harness run.
@@ -109,6 +116,46 @@ void harness_frame_present_end(void)
         bench_fmax = 0;
         bench_fsq = 0.0;
     }
+}
+
+static bool harness_settling = false;
+
+bool harness_is_settling(void)
+{
+    return harness_settling;
+}
+
+void harness_settle(int timeout_ms)
+{
+    if (harness_settling) {
+        return; // defensive: never nest a settle pump
+    }
+    if (!teleport_is_pending() && !teleport_is_teleporting()) {
+        return; // nothing in flight
+    }
+
+    // Pump the same core steps the main loop runs each frame, so the pending
+    // teleport advances to completion exactly as it would in normal play. The
+    // teleport itself (map swap + the synchronous fade in tig_video_fade) is
+    // carried out inside gamelib_ping's per-module teleport_ping. harness_settling
+    // keeps the nested gamelib_ping's channel tick from consuming more commands.
+    harness_settling = true;
+
+    tig_timestamp_t start;
+    tig_timer_now(&start);
+    while (teleport_is_pending() || teleport_is_teleporting()) {
+        tig_ping();
+        gamelib_ping();
+        iso_redraw();
+        tig_window_display();
+        if (timeout_ms > 0 && tig_timer_elapsed(start) >= timeout_ms) {
+            fprintf(stderr, "[harness] settle: timed out after %dms with a "
+                            "teleport still in flight\n", timeout_ms);
+            break;
+        }
+    }
+
+    harness_settling = false;
 }
 
 #endif // ARCANUM_HARNESS

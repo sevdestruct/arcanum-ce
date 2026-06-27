@@ -75,9 +75,12 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `dlgclose` — dismiss the intro dialogue (base Arcanum opens in one).
 
 **Navigation / camera**
-- `tele <map> <x> <y>` — teleport the PC in-game (async; the channel does NOT survive this on
-  pre-rework branches — prefer `newgameat`).
-- `gotomap <name>` — teleport to a named map's start location (`map_list_info_find`).
+- `tele <map> <x> <y>` — teleport the PC in-game. Calls `harness_settle()` after `teleport_do`,
+  so the transition (incl. a map change) completes before the next command runs — the channel
+  now survives an in-game teleport (see Roadmap #1). `newgameat` is still the way to reach a
+  heavy scene with no prior in-game state.
+- `gotomap <name>` — teleport to a named map's start location (`map_list_info_find`); also
+  settles before continuing.
 - `wherepc` — log the PC's current map + tile coords (read a scene's coords from a save).
 - `scrollto <x> <y>` / `scrollby <dx> <dy>` — absolute / relative camera move.
 - `walkby <dx> <dy>` — walk the PC dx,dy tiles (camera follows).
@@ -114,11 +117,23 @@ ARCANUM_GPU_CMD=/path/to/script.txt \
 
 Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.
 
-1. **Generalize the channel-survives-transition fix.** `newgameat` works by letting
-   `sub_5412E0` pump the game loop until the spawn teleport completes. Promote that to a
-   `harness_settle()` primitive (pump `teleport_ping`/load until `!teleport_is_teleporting()`)
-   so in-game `tele`, map changes, and any mid-game transition keep the channel alive — this
-   is what blocked the clean cross-branch *town* workout on the old engines.
+1. **Generalize the channel-survives-transition fix. — DONE.** `harness_settle(int
+   timeout_ms)` (`harness.c`) now pumps real game frames (`tig_ping` / `gamelib_ping` /
+   `iso_redraw` / `tig_window_display`) until the in-flight PC teleport is carried out, then
+   returns. The `tele` and `gotomap` channel commands call it right after `teleport_do`, so
+   an in-game teleport — *including a map change* (`map_open_in_game`) — completes before the
+   channel reads the next command. Two implementation notes on the original sketch:
+   - The poll signal is **`teleport_is_pending()`** (a new accessor), NOT
+     `teleport_is_teleporting()`. The latter only reflects the momentary `teleport_processing`
+     flag (true *during* `teleport_process`, which runs inside `teleport_ping`), so an
+     out-of-loop poller never observes it true. `teleport_pending` is the real "requested but
+     not yet carried out" gate.
+   - The bug it fixes is intra-frame **ordering**: the channel reads all its commands at the
+     top of `gamelib_ping`, *before* the per-module `teleport_ping` that performs a requested
+     teleport. Without settling, a `wherepc`/`capture` right after `tele` ran against the
+     pre-teleport map. A `harness_is_settling()` guard makes the nested `gamelib_ping` inside
+     the pump skip the channel so it can't re-consume commands. Verified: post-`tele`
+     `wherepc` reports the destination; `gotomap ShopMap` lands the channel on map 14.
 2. **Determinism.** A `seed <N>` command (fix the RNG) + premade char + fixed workout =
    byte-reproducible runs = real regression detection via `capture` diffs.
 3. **Bake in A/B + a perf gate.** A `bench-ab <toggle>` command that runs the same workout

@@ -36,6 +36,12 @@ void teleport_exit(void);
 void teleport_ping(tig_timestamp_t timestamp);
 bool teleport_do(TeleportData* teleport_data);
 bool teleport_is_teleporting(void);
+// True between teleport_do() and the teleport_ping() that processes it -- i.e. a
+// PC teleport/map transition is requested but not yet carried out. Unlike
+// teleport_is_teleporting() (which is only true momentarily, while
+// teleport_process runs inside teleport_ping), this stays true across the
+// pending window, so an out-of-loop caller can poll it to settle a transition.
+bool teleport_is_pending(void);
 bool teleport_is_teleporting_obj(int64_t obj);
 
 #endif /* ARCANUM_GAME_TELEPORT_H_ */

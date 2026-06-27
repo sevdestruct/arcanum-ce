@@ -14,6 +14,8 @@
 
 #if defined(ARCANUM_HARNESS)
 
+#include <stdbool.h>
+
 // Universal frame-timer. The main loop calls these around the per-frame draw so every
 // branch is measured with one instrument (dumps the shared [zoom-perf] format to
 // /tmp/arcanum-zoom-perf.log every 60 frames). Self-gating no-op unless ARCANUM_GPU_CMD
@@ -21,6 +23,21 @@
 void harness_frame_render_begin(void); // before iso_redraw()
 void harness_frame_render_end(void);   // after iso_redraw()
 void harness_frame_present_end(void);  // after tig_window_display()
+
+// Pump real game frames until the in-flight PC teleport / map transition has been
+// carried out (teleport_is_pending() clears), or timeout_ms elapses. The command
+// channel reads its commands at the top of gamelib_ping, BEFORE the per-module
+// teleport_ping that actually performs a requested teleport -- so without settling,
+// commands issued right after an in-game `tele`/`gotomap` run against the
+// pre-teleport map. Calling this after teleport_do() lets the transition complete
+// first, so the channel survives mid-game transitions (not just the menu->game one,
+// which the synchronous mainmenu pump already covered). No-op if nothing is pending.
+void harness_settle(int timeout_ms);
+
+// True while harness_settle() is pumping frames. gpu_test_channel_tick checks this
+// and returns early so the nested gamelib_ping inside the settle pump does not
+// re-entrantly consume further commands.
+bool harness_is_settling(void);
 
 #endif // ARCANUM_HARNESS
 
