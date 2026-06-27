@@ -34,10 +34,27 @@ void harness_frame_present_end(void);  // after tig_window_display()
 // which the synchronous mainmenu pump already covered). No-op if nothing is pending.
 void harness_settle(int timeout_ms);
 
-// True while harness_settle() is pumping frames. gpu_test_channel_tick checks this
-// and returns early so the nested gamelib_ping inside the settle pump does not
-// re-entrantly consume further commands.
-bool harness_is_settling(void);
+// True while the harness is pumping its own frame loop (harness_settle or
+// harness_measure_render_ms). gpu_test_channel_tick checks this and returns early so
+// the nested gamelib_ping inside the pump does not re-entrantly consume further
+// commands.
+bool harness_is_pumping(void);
+
+// Pump `frames` real frames, forcing a full redraw each frame, and return the mean
+// iso_redraw (render) time in milliseconds. The full-redraw force makes the number
+// stable and representative (the worst-case render cost) regardless of the scene's
+// dirty state, so it is a meaningful basis for bench-ab / assert-render-under.
+double harness_measure_render_ms(int frames);
+
+// Determinism: when > 0, timeevent_ping advances game/animation time by this fixed
+// per-ping delta (ms) instead of wall-clock, removing the dominant source of
+// capture nondeterminism (time-of-day lighting + animation-phase drift between
+// runs). 0 = off (normal wall-clock time). Pair with `seed` (issued before the
+// scene is built) for the most reproducible runs. NOTE: scene-entry transitions
+// still pump a wall-clock-bounded number of frames, so this reduces -- but does
+// not by itself guarantee -- byte-identical captures; see docs/arbiter-harness.md.
+void harness_set_fixed_dt(int ms);
+int harness_fixed_dt_ms(void);
 
 // The `quit` channel command enqueues TIG_MESSAGE_QUIT and calls this. The main
 // loop's quit handler would otherwise open the blocking "Are you sure?" confirm

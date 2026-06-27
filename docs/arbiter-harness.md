@@ -93,6 +93,26 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `setpath <software|gpu>`, `resolveonce 0|1`, `halfreslerp 0|1`, `tilethreads 0|1`,
   `gpucachememo 0|1`, `presentskip 0|1`, `simd 0|1`.
 
+**Determinism**
+- `seed <N>` — fix the engine RNG (`random_seed`, the only RNG source). Issue it *before*
+  `newgame` so the scene spawn's RNG draws are fixed too.
+- `fixeddt <ms>` — advance game/animation time by a fixed `ms` per frame instead of
+  wall-clock (0 = off). Removes time-of-day lighting + animation drift between runs.
+- Together these make a captured scene ~99.95% byte-reproducible. They do *not* yield a
+  byte-identical capture: scene-entry transitions pump a wall-clock-bounded number of
+  frames, so one in-place ambient animation's phase still drifts (measured floor ≈ 1.6 KB /
+  ~550 px of a 1280×804 frame). Treat `capture` regression checks as **tolerance-based**,
+  not exact-match — a real rendering regression dwarfs that floor.
+
+**CI gate**
+- `bench-ab <toggle> [frames]` — same-launch A/B of a perf toggle (`simd`, `presentskip`,
+  `resolveonce`, `halfreslerp`, `tilethreads`, `gpucachememo`): measures mean full-redraw
+  render time with the option OFF vs ON, interleaved over 3 rounds of `frames` (default 120)
+  so thermal/ordering drift hits both arms equally, and logs the delta + %.
+- `assert-render-under <ms> [frames]` — measure mean full-redraw render time over `frames`
+  (default 120); if it is ≥ `ms`, log FAIL to stderr and `exit(1)`. Turns a workout into a
+  headless perf gate (non-zero exit on regression).
+
 **Instrumentation / control**
 - `perf` — toggle the rich zoom-perf log (render/blit/OTHER/frame avg-max-stddev).
 - `zoomlog`, `trace` — zoom + GPU-dispatch tracing.
@@ -135,18 +155,29 @@ Prioritized; #1 is the highest-leverage capability, #3 turns it into a CI tool.
    - The bug it fixes is intra-frame **ordering**: the channel reads all its commands at the
      top of `gamelib_ping`, *before* the per-module `teleport_ping` that performs a requested
      teleport. Without settling, a `wherepc`/`capture` right after `tele` ran against the
-     pre-teleport map. A `harness_is_settling()` guard makes the nested `gamelib_ping` inside
+     pre-teleport map. A `harness_is_pumping()` guard makes the nested `gamelib_ping` inside
      the pump skip the channel so it can't re-consume commands. Verified: post-`tele`
      `wherepc` reports the destination; `gotomap ShopMap` lands the channel on map 14.
-2. **Determinism.** A `seed <N>` command (fix the RNG) + premade char + fixed workout =
-   byte-reproducible runs = real regression detection via `capture` diffs.
-3. **Bake in A/B + a perf gate.** A `bench-ab <toggle>` command that runs the same workout
-   with an option off then on (same-launch, ambient-robust) and reports the delta; an
-   `assert-render-under <ms>` that exit-codes non-zero on regression — now it is CI-able.
+2. **Determinism. — DONE (near-deterministic).** `seed <N>` fixes the engine LCG;
+   `fixeddt <ms>` advances game/animation time by a fixed per-frame delta instead of
+   wall-clock (hooked in `timeevent_ping`). Together they make a captured scene ~99.95%
+   byte-reproducible. They do NOT give byte-identical captures: scene-entry transitions pump
+   a wall-clock-bounded number of frames, so one in-place ambient animation's phase still
+   drifts (measured floor ≈ 1.6 KB / ~550 px; `seed`+`fixeddt` cut the diff from 1908→1647
+   bytes vs `seed` alone). The remaining gap would need frame-deterministic scene entry —
+   not worth it. **Consequence for #5: `capture-diff` must be tolerance-based, not
+   exact-match** — a real regression dwarfs the animation floor.
+3. **Bake in A/B + a perf gate. — DONE.** `bench-ab <toggle> [frames]` measures mean
+   full-redraw render time OFF vs ON, interleaved over 3 rounds so thermal/ordering drift
+   hits both arms (a single off→on lies on sub-10% deltas — see `software_render_findings`).
+   `assert-render-under <ms> [frames]` `exit(1)`s on regression. Both reuse a new
+   `harness_measure_render_ms(frames)` pump (forces a full redraw per frame for a stable,
+   representative number). Verified: assert PASS→exit 0, FAIL→exit 1 (before `quit`); bench-ab
+   reports per-toggle deltas.
 4. **Scenarios as first-class.** Promote the ad-hoc workout `.txt` files to named, versioned
    `scenario <name>` scripts under `tools/` (`town-stress`, `zoom-sweep`).
 5. **Introspection + capture-diff.** Make `maplist`/`wherepc` permanent; add `capture-diff
-   <a> <b>` (pixel delta) and auto-capture-on-spike.
+   <a> <b>` (**tolerance-based** pixel delta — see #2) and auto-capture-on-spike.
 6. **Headless software-only mode** for CI perf gates (no window/vsync, run + dump) — the
    biggest force-multiplier, gated on a GL-context-free software render path.
 

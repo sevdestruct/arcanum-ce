@@ -1052,6 +1052,30 @@ void gamelib_exit(void)
 //   quit                      tig_message_post(TIG_MESSAGE_QUIT) -> clean exit
 //   # comment                 ignored
 #if defined(ARCANUM_HARNESS)
+// Map a perf-toggle name (the same names as the standalone gpu-cmd toggles) to its
+// setter, for bench-ab. Returns false for an unknown name. Keep in sync with the
+// individual toggle commands below.
+static bool harness_apply_toggle(const char* name, int on)
+{
+    if (strcmp(name, "simd") == 0) {
+        tig_video_simd_blit_set(on);
+        tig_art_terrain_simd_set(on);
+    } else if (strcmp(name, "presentskip") == 0) {
+        tig_video_present_skip_set(on);
+    } else if (strcmp(name, "resolveonce") == 0) {
+        tig_art_resolve_once_set(on);
+    } else if (strcmp(name, "halfreslerp") == 0) {
+        tile_halfres_lerp_set(on);
+    } else if (strcmp(name, "tilethreads") == 0) {
+        tile_threads_set(on);
+    } else if (strcmp(name, "gpucachememo") == 0) {
+        tig_art_gpu_cache_memo_set(on);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void gpu_test_channel_tick(void)
 {
     static const char* cmd_path = NULL;
@@ -1065,9 +1089,9 @@ static void gpu_test_channel_tick(void)
     if (cmd_path == NULL || cmd_path[0] == '\0') {
         return;
     }
-    // Re-entrancy guard: harness_settle() pumps gamelib_ping (which calls us) to
-    // finish an in-flight teleport. Do not consume more commands while it does.
-    if (harness_is_settling()) {
+    // Re-entrancy guard: harness_settle()/harness_measure_render_ms() pump
+    // gamelib_ping (which calls us). Do not consume more commands while they do.
+    if (harness_is_pumping()) {
         return;
     }
     if (wait_frames > 0) {
@@ -1093,6 +1117,7 @@ static void gpu_test_channel_tick(void)
 
         char arg[256];
         int ix, iy;
+        unsigned int uix;
         float fz;
         if (sscanf(line, "loadsave %255s", arg) == 1) {
             // CE harness: auto-switch to the save's owning module before loading,
@@ -1383,6 +1408,68 @@ static void gpu_test_channel_tick(void)
         } else if (strncmp(line, "trace", 5) == 0) {
             tile_gpu_trace_arm();
             tig_debug_printf("[gpu-cmd] trace armed\n");
+        } else if (sscanf(line, "seed %u", &uix) == 1) {
+            // determinism: fix the engine LCG (random_prev_value) so the same
+            // seed + a fixed workout is byte-reproducible -- enables capture-diff
+            // regression detection. Issue it right before the segment to make
+            // deterministic; random_rand() is the engine's only RNG source.
+            random_seed(uix);
+            tig_debug_printf("[gpu-cmd] seed %u\n", uix);
+        } else if (sscanf(line, "fixeddt %d", &ix) == 1) {
+            // determinism: advance game/animation time by a fixed delta (ms) per
+            // frame instead of wall-clock, so a seeded run is reproducible. 0 = off.
+            harness_set_fixed_dt(ix);
+            tig_debug_printf("[gpu-cmd] fixeddt %d\n", ix);
+        } else if (strncmp(line, "bench-ab ", 9) == 0) {
+            // CI A/B: measure mean render (full-redraw) time with a perf toggle OFF
+            // vs ON, in the SAME launch at the current scene. Interleaved over a few
+            // rounds (off,on,off,on,...) so thermal drift / first-pass ordering hits
+            // both arms equally -- a single off-then-on lies on sub-10% deltas.
+            char tname[64];
+            int frames = 120;
+            if (sscanf(line, "bench-ab %63s %d", tname, &frames) >= 1) {
+                if (frames <= 0) frames = 120;
+                if (!harness_apply_toggle(tname, 0)) {
+                    tig_debug_printf("[gpu-cmd] bench-ab: unknown toggle '%s'\n", tname);
+                } else {
+                    const int rounds = 3;
+                    double off_sum = 0.0, on_sum = 0.0;
+                    harness_measure_render_ms(20); // warmup, discard
+                    int r;
+                    for (r = 0; r < rounds; r++) {
+                        harness_apply_toggle(tname, 0);
+                        off_sum += harness_measure_render_ms(frames);
+                        harness_apply_toggle(tname, 1);
+                        on_sum += harness_measure_render_ms(frames);
+                    }
+                    double off = off_sum / rounds;
+                    double on = on_sum / rounds;
+                    double delta = on - off;
+                    double pct = off > 0.0 ? delta / off * 100.0 : 0.0;
+                    tig_debug_printf("[gpu-cmd] bench-ab %s: off %.3fms, on %.3fms, "
+                        "delta %+.3fms (%+.1f%%) over %dx%d frames\n",
+                        tname, off, on, delta, pct, rounds, frames);
+                }
+            }
+        } else if (strncmp(line, "assert-render-under ", 20) == 0) {
+            // CI gate: measure mean render (full-redraw) time over N frames at the
+            // current scene; exit non-zero if it is at/above the threshold so a perf
+            // regression fails a headless run. Default 120 frames.
+            float thresh = 0.0f;
+            int frames = 120;
+            int n = sscanf(line, "assert-render-under %f %d", &thresh, &frames);
+            if (n >= 1) {
+                if (frames <= 0) frames = 120;
+                double avg = harness_measure_render_ms(frames);
+                bool pass = avg < thresh;
+                tig_debug_printf("[gpu-cmd] assert-render-under %.2fms over %d frames: "
+                    "avg %.3fms -> %s\n", (double)thresh, frames, avg, pass ? "PASS" : "FAIL");
+                if (!pass) {
+                    fprintf(stderr, "[harness] assert-render-under FAILED: "
+                        "avg %.3fms >= threshold %.2fms\n", avg, (double)thresh);
+                    exit(1);
+                }
+            }
         } else if (strncmp(line, "quit", 4) == 0) {
             tig_debug_printf("[gpu-cmd] quit\n");
             // Pre-choose OK so the main loop's quit handler skips the blocking

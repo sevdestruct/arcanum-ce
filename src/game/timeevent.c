@@ -7,6 +7,7 @@
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/gfade.h"
+#include "game/harness.h"
 #include "game/item.h"
 #include "game/light.h"
 #include "game/magictech.h"
@@ -808,12 +809,23 @@ void timeevent_ping(tig_timestamp_t timestamp)
     int iter = 0;
     TimeEventNode offending_node_candidate;
 
-    delta = tig_timer_between(dword_5E8610, timestamp);
-    if (delta < 5) {
-        return;
-    }
+#if defined(ARCANUM_HARNESS)
+    // Determinism: drive time by a fixed per-ping delta instead of wall-clock so a
+    // seeded run advances game/animation time identically every run.
+    int harness_dt = harness_fixed_dt_ms();
+    if (harness_dt > 0) {
+        delta = harness_dt;
+        dword_5E8610 = timestamp;
+    } else
+#endif
+    {
+        delta = tig_timer_between(dword_5E8610, timestamp);
+        if (delta < 5) {
+            return;
+        }
 
-    dword_5E8610 = timestamp;
+        dword_5E8610 = timestamp;
+    }
 
     if (delta > 250) {
         delta = 250;

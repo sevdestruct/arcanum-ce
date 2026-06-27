@@ -118,36 +118,51 @@ void harness_frame_present_end(void)
     }
 }
 
-static bool harness_settling = false;
+static bool harness_pumping = false;
 
-bool harness_is_settling(void)
+bool harness_is_pumping(void)
 {
-    return harness_settling;
+    return harness_pumping;
+}
+
+// Pump one real frame -- the same core steps the main loop runs -- and return the
+// iso_redraw (render) duration in ns. When force_full is set, the whole iso surface
+// is invalidated first so the frame does a full redraw (representative worst-case
+// render cost) rather than a cheap partial/dirty-gated one.
+static unsigned long long harness_pump_one_frame(bool force_full)
+{
+    tig_ping();
+    gamelib_ping();
+    if (force_full) {
+        gamelib_invalidate_rect(NULL);
+    }
+    unsigned long long t0 = harness_now_ns();
+    iso_redraw();
+    unsigned long long t1 = harness_now_ns();
+    tig_window_display();
+    return t1 - t0;
 }
 
 void harness_settle(int timeout_ms)
 {
-    if (harness_settling) {
-        return; // defensive: never nest a settle pump
+    if (harness_pumping) {
+        return; // defensive: never nest a pump
     }
     if (!teleport_is_pending() && !teleport_is_teleporting()) {
         return; // nothing in flight
     }
 
-    // Pump the same core steps the main loop runs each frame, so the pending
-    // teleport advances to completion exactly as it would in normal play. The
-    // teleport itself (map swap + the synchronous fade in tig_video_fade) is
-    // carried out inside gamelib_ping's per-module teleport_ping. harness_settling
-    // keeps the nested gamelib_ping's channel tick from consuming more commands.
-    harness_settling = true;
+    // Pump real frames so the pending teleport advances to completion exactly as it
+    // would in normal play. The teleport itself (map swap + the synchronous fade in
+    // tig_video_fade) is carried out inside gamelib_ping's per-module teleport_ping.
+    // harness_pumping keeps the nested gamelib_ping's channel tick from consuming
+    // more commands.
+    harness_pumping = true;
 
     tig_timestamp_t start;
     tig_timer_now(&start);
     while (teleport_is_pending() || teleport_is_teleporting()) {
-        tig_ping();
-        gamelib_ping();
-        iso_redraw();
-        tig_window_display();
+        harness_pump_one_frame(false);
         if (timeout_ms > 0 && tig_timer_elapsed(start) >= timeout_ms) {
             fprintf(stderr, "[harness] settle: timed out after %dms with a "
                             "teleport still in flight\n", timeout_ms);
@@ -155,7 +170,39 @@ void harness_settle(int timeout_ms)
         }
     }
 
-    harness_settling = false;
+    harness_pumping = false;
+}
+
+double harness_measure_render_ms(int frames)
+{
+    if (frames <= 0) {
+        return 0.0;
+    }
+    bool nested = harness_pumping;
+    harness_pumping = true;
+
+    unsigned long long sum = 0;
+    int i;
+    for (i = 0; i < frames; i++) {
+        sum += harness_pump_one_frame(true);
+    }
+
+    if (!nested) {
+        harness_pumping = false;
+    }
+    return (double)sum / (double)frames / 1e6;
+}
+
+static int harness_fixed_dt = 0;
+
+void harness_set_fixed_dt(int ms)
+{
+    harness_fixed_dt = ms;
+}
+
+int harness_fixed_dt_ms(void)
+{
+    return harness_fixed_dt;
 }
 
 static bool harness_quit_requested = false;
