@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "game/gamelib.h" // gamelib_zoom_perf_is_enabled() — emitter dedupe
+
 // Frame-timer accumulators (moved verbatim from main.c). bench_on latches once from
 // ARCANUM_GPU_CMD so the timer is inert outside a harness run.
 static int bench_init = 0, bench_on = 0, bench_n = 0;
@@ -50,6 +52,14 @@ void harness_frame_render_end(void)
 void harness_frame_present_end(void)
 {
     if (!bench_on) {
+        return;
+    }
+    // CE: the rich gamelib zoom-perf instrument writes the same [zoom-perf]
+    // log. When it is toggled on (F9 / `perf` gpu-cmd) it is authoritative —
+    // stand this universal timer down so the two never double-write the log.
+    // Clear prev so the resumed frame-delta is clean, not a gap-sized spike.
+    if (gamelib_zoom_perf_is_enabled()) {
+        bench_prev = 0;
         return;
     }
     bench_r2 = harness_now_ns();

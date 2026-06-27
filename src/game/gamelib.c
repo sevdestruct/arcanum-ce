@@ -1996,6 +1996,12 @@ static void gamelib_zoom_perf_log(const char* line)
 
 void gamelib_zoom_perf_toggle(void)
 {
+    // CE: the rich zoom-perf instrument is harness-only. With ARCANUM_HARNESS
+    // off this toggle is a no-op, so gamelib_zoom_perf_enabled stays false and
+    // every is_enabled()-gated accumulator across the engine (main loop, map,
+    // wmap fade) stays inert in ship builds. F9 and the `perf` gpu-cmd — its
+    // only two callers — are gated too, so nothing can flip it on in a release.
+#if defined(ARCANUM_HARNESS)
     gamelib_zoom_perf_enabled = !gamelib_zoom_perf_enabled;
     tig_video_flip_perf_set_enabled(gamelib_zoom_perf_enabled);
     // CE: ride the same toggle to enable per-call timing of the
@@ -2058,6 +2064,7 @@ void gamelib_zoom_perf_toggle(void)
         gamelib_zoom_perf_enabled ? "ON" : "OFF");
     tig_debug_printf("%s", line);
     gamelib_zoom_perf_log(line);
+#endif // ARCANUM_HARNESS
 }
 
 bool gamelib_zoom_perf_is_enabled(void)

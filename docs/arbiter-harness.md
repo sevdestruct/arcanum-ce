@@ -39,11 +39,24 @@ testing too — just flip the flag.
 | Frame-timer (universal per-frame perf dump) | `src/game/harness.c` / `harness.h` | whole file body `#if ARCANUM_HARNESS`; main loop calls 3 hooks, also gated |
 | Command channel (`gpu_test_channel_tick` + all commands) | `src/game/gamelib.c` | function + its `gamelib_ping` call gated in place |
 | New-game spawn override (`mainmenu_ui_harness_newgame[_at]`, `g_harness_ng_*`, the `sub_5412E0` redirect) | `src/ui/mainmenu_ui.c` / `mainmenu_ui.h` | functions, globals, and the override block gated in place |
+| Rich zoom-perf instrument (`gamelib_zoom_perf_*`; F9 key + `perf` cmd toggle it) | `src/game/gamelib.c`, `src/main.c` | `gamelib_zoom_perf_toggle()` body + the F9 case gated; accumulators stay compiled but **inert** (the flag never goes true, so every `is_enabled()` consumer short-circuits) |
 
 The frame-timer is extracted to `harness.c` (it is self-contained). The channel and the
 new-game override are **gated in place** because they touch file-private statics (`settings`,
 the mainmenu pregen state). Fully moving them to `harness.c` is a clean follow-up — it just
 needs a handful of accessor functions exposed first (see [Roadmap](#roadmap), phase 2).
+
+The **rich zoom-perf instrument** (`gamelib_zoom_perf_*` — the detailed render/blit/OTHER/
+frame-stats dump, toggled by **F9** in-game and by the `perf` gpu-cmd) is gated at its
+*activation*: with `ARCANUM_HARNESS` off, `gamelib_zoom_perf_toggle()` is a no-op and the F9
+case is empty, so the flag never goes true and every `is_enabled()`-gated accumulator (the
+draw path, the main loop, `map.c`, `wmap_ui.c`) stays dormant. The accumulator code itself
+stays compiled — it is interleaved with the hot render path, so leaving it inert is cheaper
+and safer than threading `#if`s through every loop; a full compile-out is a phase-2 item.
+Because the rich instrument and the universal frame-timer both emit the same `[zoom-perf]`
+log, the frame-timer **stands itself down whenever the rich instrument is active**, so the
+two never double-write (this also fixes the mixed-emitter ambiguity in the cross-branch
+sweeps, where current-branch runs had both live).
 
 ## Command reference
 
