@@ -1881,11 +1881,13 @@ static void mainmenu_ui_pump_until_close_settled(int timeout_ms)
     }
 }
 
+#if defined(ARCANUM_HARNESS)
 // CE harness: new-game spawn override (set by mainmenu_ui_harness_newgame_at). When
 // g_harness_ng_map > 0, sub_5412E0 spawns the PC there instead of the module start map.
 static int g_harness_ng_map = 0;
 static int64_t g_harness_ng_x = 0;
 static int64_t g_harness_ng_y = 0;
+#endif
 
 // 0x5412E0
 void sub_5412E0(bool a1)
@@ -1946,6 +1948,7 @@ void sub_5412E0(bool a1)
                     exit(EXIT_FAILURE);
                 }
 
+#if defined(ARCANUM_HARNESS)
                 // CE harness: redirect the new-game spawn to a specified map+loc (e.g.
                 // the Shrouded Hills town) so a benchmark lands in a HEAVY scene via this
                 // synchronous, loop-pumping menu->game transition -- which the command
@@ -1955,6 +1958,7 @@ void sub_5412E0(bool a1)
                     x = g_harness_ng_x;
                     y = g_harness_ng_y;
                 }
+#endif
 
                 fade_data.flags = 0;
                 fade_data.color = 0;
@@ -5347,6 +5351,7 @@ bool mainmenu_ui_pregen_char_execute(int btn)
 // auto-equips, and calls sub_5412D0 to fade into the start map). No interactive
 // character creation, so a benchmark can land in a real start map on ANY module or
 // branch -- save-format independent. pregen_idx 1 = Merwin (first premade); clamped.
+#if defined(ARCANUM_HARNESS)
 void mainmenu_ui_harness_newgame(int pregen_idx)
 {
     g_harness_ng_map = 0; // spawn at the module's default start map
@@ -5372,6 +5377,7 @@ void mainmenu_ui_harness_newgame_at(int pregen_idx, int map, int64_t x, int64_t 
     mainmenu_ui_pregen_char_execute(0);
     g_harness_ng_map = 0; // reset so a later default newgame isn't affected
 }
+#endif // ARCANUM_HARNESS
 
 // 0x545C50
 void mainmenu_ui_charedit_create(void)

@@ -14,6 +14,7 @@
 #include "game/ai.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/harness.h"
 #include "game/critter.h"
 #include "game/descriptions.h"
 #include "game/dialog.h"
@@ -579,20 +580,14 @@ void main_loop(void)
         // delta, dump every 60 frames to /tmp/arcanum-zoom-perf.log. Gated on
         // ARCANUM_GPU_CMD so it only runs under the harness. Makes cross-branch perf
         // apples-to-apples (same metric on every branch, old or new).
-        static int bench_init = 0, bench_on = 0, bench_n = 0;
-        static unsigned long long bench_rsum = 0, bench_rmax = 0, bench_wsum = 0,
-            bench_fsum = 0, bench_fmax = 0, bench_prev = 0;
-        static double bench_fsq = 0.0;
-        if (!bench_init) {
-            bench_init = 1;
-            const char* be = getenv("ARCANUM_GPU_CMD");
-            bench_on = (be != NULL && be[0] != '\0') ? 1 : 0;
-        }
-        struct timespec _bts;
-        unsigned long long _r0 = 0, _r1 = 0, _r2 = 0;
-        if (bench_on) { clock_gettime(CLOCK_MONOTONIC, &_bts); _r0 = (unsigned long long)_bts.tv_sec * 1000000000ULL + _bts.tv_nsec; }
+        // CE: the universal frame-timer now lives in harness.c (gated on ARCANUM_HARNESS).
+#if defined(ARCANUM_HARNESS)
+        harness_frame_render_begin();
+#endif
         iso_redraw();
-        if (bench_on) { clock_gettime(CLOCK_MONOTONIC, &_bts); _r1 = (unsigned long long)_bts.tv_sec * 1000000000ULL + _bts.tv_nsec; }
+#if defined(ARCANUM_HARNESS)
+        harness_frame_render_end();
+#endif
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
             bucket_iso_redraw_ns = now - perf_t0;
@@ -606,32 +601,9 @@ void main_loop(void)
         // color-key holes.
         intgame_hud_tick_apply_tint();
         tig_window_display();
-        if (bench_on) {
-            clock_gettime(CLOCK_MONOTONIC, &_bts);
-            _r2 = (unsigned long long)_bts.tv_sec * 1000000000ULL + _bts.tv_nsec;
-            unsigned long long rdr = _r1 - _r0, win = _r2 - _r1;
-            bench_rsum += rdr; if (rdr > bench_rmax) bench_rmax = rdr;
-            bench_wsum += win;
-            if (bench_prev != 0) {
-                unsigned long long fd = _r2 - bench_prev;
-                bench_fsum += fd; if (fd > bench_fmax) bench_fmax = fd;
-                double fm = (double)fd / 1e6; bench_fsq += fm * fm;
-            }
-            bench_prev = _r2;
-            if (++bench_n >= 60) {
-                double favg = (double)bench_fsum / 60.0 / 1e6;
-                double var = bench_fsq / 60.0 - favg * favg; if (var < 0) var = 0;
-                double sd = var; if (sd > 0) { double g = sd; int _i; for (_i = 0; _i < 24; _i++) g = 0.5 * (g + sd / g); sd = g; }
-                FILE* bf = fopen("/tmp/arcanum-zoom-perf.log", "a");
-                if (bf != NULL) {
-                    fprintf(bf, "[zoom-perf] z=1.00 over 60 frames: render %.2fms, blit 0.00ms, OTHER 0.00ms (max 0.00ms), zoom-total 0.00ms (max 0.00ms), dirty 100%%, full-redraws 100%% | frame avg %.2fms max %.2fms stddev %.2fms\n",
-                        (double)bench_rsum / 60.0 / 1e6, favg, (double)bench_fmax / 1e6, sd);
-                    fclose(bf);
-                }
-                bench_n = 0; bench_rsum = 0; bench_rmax = 0; bench_wsum = 0;
-                bench_fsum = 0; bench_fmax = 0; bench_fsq = 0.0;
-            }
-        }
+#if defined(ARCANUM_HARNESS)
+        harness_frame_present_end();
+#endif
         if (perf_on) {
             uint64_t now = gamelib_perf_now_ns();
             bucket_win_display_ns = now - perf_t0;

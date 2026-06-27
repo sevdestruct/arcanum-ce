@@ -5,6 +5,12 @@ project(arcanum LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED YES)
 
+# CE arbiter harness -- the test/benchmark command channel + frame-timer. OFF by
+# default so ship/release builds omit it entirely (zero footprint, no test channel in
+# a public binary). Dev/CI builds: configure with -DARCANUM_HARNESS=ON. See
+# docs/arbiter-harness.md.
+option(ARCANUM_HARNESS "Build the test/benchmark arbiter harness (dev only)" OFF)
+
 # ------------------------------------------------------------------------------
 # DEPENDENCIES
 # ------------------------------------------------------------------------------
@@ -80,6 +86,8 @@ set(SRCS
     "src/game/gameinit.h"
     "src/game/gamelib.c"
     "src/game/gamelib.h"
+    "src/game/harness.c"
+    "src/game/harness.h"
     "src/game/gfade.c"
     "src/game/gfade.h"
     "src/game/gmovie.c"
@@ -335,6 +343,11 @@ if(ANDROID)
     add_library(arcanum-ce SHARED)
 else()
     add_executable(arcanum-ce WIN32 MACOSX_BUNDLE)
+endif()
+
+if(ARCANUM_HARNESS)
+    target_compile_definitions(arcanum-ce PRIVATE ARCANUM_HARNESS=1)
+    message(STATUS "arbiter harness: ENABLED (dev build)")
 endif()
 
 target_sources(arcanum-ce PUBLIC

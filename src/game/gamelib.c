@@ -1050,6 +1050,7 @@ void gamelib_exit(void)
 //   scrollto <x> <y>          center camera on tile (x,y)
 //   quit                      tig_message_post(TIG_MESSAGE_QUIT) -> clean exit
 //   # comment                 ignored
+#if defined(ARCANUM_HARNESS)
 static void gpu_test_channel_tick(void)
 {
     static const char* cmd_path = NULL;
@@ -1383,6 +1384,7 @@ static void gpu_test_channel_tick(void)
     }
     fclose(fp);
 }
+#endif // ARCANUM_HARNESS
 
 void gamelib_ping(void)
 {
@@ -1392,7 +1394,9 @@ void gamelib_ping(void)
 
     // CE: pump the autonomous test channel before module pings so a loadsave
     // command takes effect this same frame.
+#if defined(ARCANUM_HARNESS)
     gpu_test_channel_tick();
+#endif
 
     bool perf_on = gamelib_zoom_perf_enabled;
     uint64_t ping_start_ns = perf_on ? gamelib_zoom_perf_now_ns() : 0;
