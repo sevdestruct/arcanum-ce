@@ -10,10 +10,15 @@
 #include <string.h>
 #include <time.h>
 
+#include <SDL3/SDL_render.h>  // SDL_RenderReadPixels (full-frame capture)
+#include <SDL3/SDL_surface.h> // SDL_SaveBMP / SDL_DestroySurface
+
 #include <tig/art.h>      // tig_art_{terrain_simd,resolve_once,gpu_cache_memo}_set
 #include <tig/core.h>     // tig_ping()
 #include <tig/debug.h>    // tig_debug_printf()
-#include <tig/message.h>  // tig_message_enqueue, TIG_MESSAGE_QUIT
+#include <tig/kb.h>       // tig_kb_set_key (keyboard injection)
+#include <tig/message.h>  // tig_message_enqueue, TIG_MESSAGE_{QUIT,MOUSE}
+#include <tig/mouse.h>    // tig_mouse_set_position (mouse injection)
 #include <tig/timer.h>    // tig_timer_now / tig_timer_elapsed
 #include <tig/video.h>    // tig_video_{simd_blit,present_skip,flip_perf}_*
 #include <tig/window.h>   // tig_window_display()
@@ -21,14 +26,18 @@
 #include "game/anim.h"     // anim_goal_run_to_tile
 #include "game/gamelib.h"  // channel deps: gamelib_load/mod_load/render_path_set/zoom_perf/...
 #include "game/iso_zoom.h" // iso_zoom_set_target / current / available
+#include "game/item.h"     // item_gold_get (state queries)
 #include "game/light.h"    // light_invalidate_rect (setpath)
 #include "game/location.h" // LOCATION_MAKE / location_origin_set
 #include "game/map.h"      // map_list_info_find / map_get_starting_location / map_current_map / dump
 #include "game/obj.h"      // obj_field_int64_get, OBJ_F_LOCATION, OBJ_HANDLE_NULL
-#include "game/object.h"   // object_invalidate_rect (setpath)
+#include "game/object.h"   // object_invalidate_rect (setpath); object_hp_current/max (queries)
 #include "game/player.h"   // player_get_local_pc_obj
+#include "game/quest.h"    // quest_state_get / quest_global_state_get (queries)
 #include "game/random.h"   // random_seed (seed)
 #include "game/scroll.h"   // scroll_by
+#include "game/script.h"   // script_global_var_get / script_global_flag_get (queries)
+#include "game/stat.h"     // stat_level_get, STAT_LEVEL (queries)
 #include "game/teleport.h" // teleport_do / teleport_is_pending / teleport_is_teleporting
 #include "game/tile.h"     // tile_{halfres_lerp,threads}_set, tile_gpu_test_capture, tile_gpu_trace_arm
 #include "game/ui.h"       // ui_gameuilib_mod_load (loadsave module switch)
@@ -221,24 +230,37 @@ void harness_settle(int timeout_ms)
     harness_pumping = false;
 }
 
-double harness_measure_render_ms(int frames)
+// Pump `frames` full-redraw frames; report mean and/or max render time (ms).
+static void harness_measure_render_stats(int frames, double* mean_ms, double* max_ms)
 {
-    if (frames <= 0) {
-        return 0.0;
-    }
     bool nested = harness_pumping;
     harness_pumping = true;
 
-    unsigned long long sum = 0;
+    unsigned long long sum = 0, mx = 0;
     int i;
     for (i = 0; i < frames; i++) {
-        sum += harness_pump_one_frame(true);
+        unsigned long long r = harness_pump_one_frame(true);
+        sum += r;
+        if (r > mx) {
+            mx = r;
+        }
     }
 
     if (!nested) {
         harness_pumping = false;
     }
-    return (double)sum / (double)frames / 1e6;
+    if (mean_ms != NULL) *mean_ms = (double)sum / (double)frames / 1e6;
+    if (max_ms != NULL) *max_ms = (double)mx / 1e6;
+}
+
+double harness_measure_render_ms(int frames)
+{
+    if (frames <= 0) {
+        return 0.0;
+    }
+    double mean = 0.0;
+    harness_measure_render_stats(frames, &mean, NULL);
+    return mean;
 }
 
 static int harness_fixed_dt = 0;
@@ -289,6 +311,100 @@ static bool harness_apply_toggle(const char* name, int on)
     return true;
 }
 
+// Strict mode (set by the `strict` command): an unrecognized command aborts the
+// run with a non-zero exit, so a typo in a CI scenario fails loudly instead of
+// silently no-opping. Off by default to keep ad-hoc/interactive runs forgiving.
+static bool harness_strict = false;
+
+// Enqueue a synthetic mouse event at (x,y). tig_message_dequeue runs every mouse
+// message through tig_button_process_mouse_msg + tig_window_filter_message, so an
+// injected event drives the real button/window pipeline exactly like hardware input.
+static void harness_mouse_event(int x, int y, TigMessageMouseEvent ev)
+{
+    TigMessage m;
+    memset(&m, 0, sizeof(m));
+    tig_timer_now(&m.timestamp);
+    m.type = TIG_MESSAGE_MOUSE;
+    m.data.mouse.x = x;
+    m.data.mouse.y = y;
+    m.data.mouse.event = ev;
+    tig_message_enqueue(&m);
+}
+
+// Inject a full click (move -> button down -> button up) at (x,y). The move first
+// sets hover state so the button registers MOUSE_INSIDE before the press, matching
+// the real input sequence. left=true -> left button, else right.
+static void harness_click(int x, int y, bool left)
+{
+    tig_mouse_set_position(x, y);
+    harness_mouse_event(x, y, TIG_MESSAGE_MOUSE_MOVE);
+    harness_mouse_event(x, y, left ? TIG_MESSAGE_MOUSE_LEFT_BUTTON_DOWN
+                                   : TIG_MESSAGE_MOUSE_RIGHT_BUTTON_DOWN);
+    harness_mouse_event(x, y, left ? TIG_MESSAGE_MOUSE_LEFT_BUTTON_UP
+                                   : TIG_MESSAGE_MOUSE_RIGHT_BUTTON_UP);
+}
+
+// Resolve a named state query to an int64 value; false for an unknown query (or a
+// pc.* query before a PC exists). Lets `get`/`assert` inspect game state so the
+// harness can catch logic regressions, not just visual/perf ones. Supported:
+//   pc.map pc.x pc.y pc.hp pc.hpmax pc.gold pc.level   (PC scalars)
+//   pc.stat.<id>   (any STAT_* by numeric id)
+//   gvar.<i> gflag.<i>   (script_global_var/flag)
+//   quest.<n>   (per-PC quest state)   gquest.<n>   (global quest state)
+static bool harness_query(const char* q, int64_t* out)
+{
+    int idx;
+    int64_t pc = player_get_local_pc_obj();
+    if (strcmp(q, "pc.map") == 0) { *out = map_current_map(); return true; }
+    if (strncmp(q, "pc.", 3) == 0 && pc == OBJ_HANDLE_NULL) {
+        return false; // no PC yet -> query unavailable
+    }
+    if (strcmp(q, "pc.x") == 0) { *out = LOCATION_GET_X(obj_field_int64_get(pc, OBJ_F_LOCATION)); return true; }
+    if (strcmp(q, "pc.y") == 0) { *out = LOCATION_GET_Y(obj_field_int64_get(pc, OBJ_F_LOCATION)); return true; }
+    if (strcmp(q, "pc.hp") == 0) { *out = object_hp_current(pc); return true; }
+    if (strcmp(q, "pc.hpmax") == 0) { *out = object_hp_max(pc); return true; }
+    if (strcmp(q, "pc.gold") == 0) { *out = item_gold_get(pc); return true; }
+    if (strcmp(q, "pc.level") == 0) { *out = stat_level_get(pc, STAT_LEVEL); return true; }
+    if (sscanf(q, "pc.stat.%d", &idx) == 1) { *out = stat_level_get(pc, idx); return true; }
+    if (sscanf(q, "gvar.%d", &idx) == 1) { *out = script_global_var_get(idx); return true; }
+    if (sscanf(q, "gflag.%d", &idx) == 1) { *out = script_global_flag_get(idx); return true; }
+    if (sscanf(q, "quest.%d", &idx) == 1) { *out = quest_state_get(pc, idx); return true; }
+    if (sscanf(q, "gquest.%d", &idx) == 1) { *out = quest_global_state_get(idx); return true; }
+    return false;
+}
+
+// Integer comparison by operator string (==, !=, <, <=, >, >=).
+static bool harness_cmp(int64_t a, const char* op, int64_t b)
+{
+    if (strcmp(op, "==") == 0) return a == b;
+    if (strcmp(op, "!=") == 0) return a != b;
+    if (strcmp(op, "<") == 0)  return a < b;
+    if (strcmp(op, "<=") == 0) return a <= b;
+    if (strcmp(op, ">") == 0)  return a > b;
+    if (strcmp(op, ">=") == 0) return a >= b;
+    return false;
+}
+
+// Capture the full composited frame (incl HUD/UI) to a BMP via the main renderer.
+// Best in headless (software renderer); in windowed GPU mode the post-present
+// backbuffer readback may be unreliable. Unlike `capture` (iso world buffer only),
+// this sees the whole screen so UI/HUD regressions are catchable.
+static bool harness_capture_screen(const char* abs_path)
+{
+    SDL_Renderer* renderer = NULL;
+    if (tig_video_renderer_get(&renderer) != TIG_OK || renderer == NULL) {
+        return false;
+    }
+    SDL_Surface* surf = SDL_RenderReadPixels(renderer, NULL);
+    if (surf == NULL) {
+        tig_debug_printf("[gpu-cmd] capturescreen: RenderReadPixels failed: %s\n", SDL_GetError());
+        return false;
+    }
+    bool ok = SDL_SaveBMP(surf, abs_path);
+    SDL_DestroySurface(surf);
+    return ok;
+}
+
 // The autonomous arbiter test command channel. Pumped from gamelib_ping every
 // frame (menu AND in-game). Reads ARCANUM_GPU_CMD line by line; no-op unless that
 // env names a readable file. Command reference: docs/arbiter-harness.md.
@@ -332,8 +448,10 @@ void harness_channel_tick(void)
         if (n == 0 || line[0] == '#') continue;
 
         char arg[256];
+        char op[8];
         int ix, iy;
         unsigned int uix;
+        long long llv;
         float fz;
         if (sscanf(line, "loadsave %255s", arg) == 1) {
             // CE harness: auto-switch to the save's owning module before loading,
@@ -476,6 +594,13 @@ void harness_channel_tick(void)
             wait_frames = ix;
             tig_debug_printf("[gpu-cmd] wait %d\n", ix);
             break; // honour wait immediately
+        } else if (sscanf(line, "capturescreen %255s", arg) == 1) {
+            // full-frame capture incl HUD/UI (vs `capture` = iso world buffer only).
+            if (harness_capture_screen(arg)) {
+                tig_debug_printf("[gpu-cmd] capturescreen %s\n", arg);
+            } else {
+                tig_debug_printf("[gpu-cmd] capturescreen %s FAILED\n", arg);
+            }
         } else if (sscanf(line, "capture %255s", arg) == 1) {
             tile_gpu_test_capture(arg);
             tig_debug_printf("[gpu-cmd] capture %s\n", arg);
@@ -507,6 +632,35 @@ void harness_channel_tick(void)
                     (long long)LOCATION_GET_X(tgt), (long long)LOCATION_GET_Y(tgt));
             } else {
                 tig_debug_printf("[gpu-cmd] walkby: no PC\n");
+            }
+        } else if (sscanf(line, "click %d %d", &ix, &iy) == 2) {
+            // input injection: a real left click at screen (x,y) -- drives the
+            // actual button/window/iso-picker pipeline (not a high-level call), so
+            // UI buttons, hotspots, and world clicks can be tested headlessly.
+            harness_click(ix, iy, true);
+            tig_debug_printf("[gpu-cmd] click %d %d\n", ix, iy);
+        } else if (sscanf(line, "rclick %d %d", &ix, &iy) == 2) {
+            harness_click(ix, iy, false);
+            tig_debug_printf("[gpu-cmd] rclick %d %d\n", ix, iy);
+        } else if (sscanf(line, "mousemove %d %d", &ix, &iy) == 2) {
+            tig_mouse_set_position(ix, iy);
+            harness_mouse_event(ix, iy, TIG_MESSAGE_MOUSE_MOVE);
+            tig_debug_printf("[gpu-cmd] mousemove %d %d\n", ix, iy);
+        } else if (sscanf(line, "key %63s", arg) == 1) {
+            // input injection: press+release a key by SDL name ("Return", "Escape",
+            // "F1", "A", "Space", "Up", ...). Drives the real keyboard path.
+            SDL_Scancode sc = SDL_GetScancodeFromName(arg);
+            if (sc == SDL_SCANCODE_UNKNOWN) {
+                tig_debug_printf("[gpu-cmd] key: unknown key name '%s'\n", arg);
+                if (harness_strict) {
+                    fprintf(stderr, "[harness] strict: unknown key name '%s'\n", arg);
+                    exit(1);
+                }
+            } else {
+                SDL_Keycode kc = SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, false);
+                tig_kb_set_key(kc, sc, true);
+                tig_kb_set_key(kc, sc, false);
+                tig_debug_printf("[gpu-cmd] key %s (scancode %d)\n", arg, (int)sc);
             }
         } else if (sscanf(line, "wmapscroll %d %d", &ix, &iy) == 2) {
             // harness: scroll the OPEN travel map by dx,dy (drives wmap_void_feather
@@ -702,6 +856,65 @@ void harness_channel_tick(void)
                     exit(1);
                 }
             }
+        } else if (strncmp(line, "assert-render-max ", 18) == 0) {
+            // CI gate on the WORST frame (not the mean) -- catches hitching/spikes
+            // that a mean hides. exit(1) if max full-redraw render time >= threshold.
+            // Checked before the generic `assert` so it isn't shadowed by it.
+            float thresh = 0.0f;
+            int frames = 120;
+            if (sscanf(line, "assert-render-max %f %d", &thresh, &frames) >= 1) {
+                if (frames <= 0) frames = 120;
+                double mean = 0.0, mx = 0.0;
+                harness_measure_render_stats(frames, &mean, &mx);
+                bool pass = mx < thresh;
+                tig_debug_printf("[gpu-cmd] assert-render-max %.2fms over %d frames: "
+                    "max %.3fms (mean %.3f) -> %s\n", (double)thresh, frames, mx, mean,
+                    pass ? "PASS" : "FAIL");
+                if (!pass) {
+                    fprintf(stderr, "[harness] assert-render-max FAILED: "
+                        "max %.3fms >= threshold %.2fms\n", mx, (double)thresh);
+                    exit(1);
+                }
+            }
+        } else if (sscanf(line, "get %255s", arg) == 1) {
+            // introspection: log a state query's value (see harness_query). Does
+            // not gate -- use `assert` for that.
+            int64_t v = 0;
+            if (harness_query(arg, &v)) {
+                tig_debug_printf("[gpu-cmd] get %s = %lld\n", arg, (long long)v);
+            } else {
+                tig_debug_printf("[gpu-cmd] get %s: unknown/unavailable query\n", arg);
+                if (harness_strict) {
+                    fprintf(stderr, "[harness] strict: unknown query '%s'\n", arg);
+                    exit(1);
+                }
+            }
+        } else if (strncmp(line, "assert-", 7) != 0
+            && sscanf(line, "assert %255s %7s %lld", arg, op, &llv) == 3) {
+            // (the `assert-` guard keeps assert-render-under/-max from being eaten here)
+            // CI gate: compare a state query against a value; exit(1) on mismatch so
+            // a logic regression fails a headless run. e.g. `assert pc.map == 1`,
+            // `assert pc.gold >= 100`, `assert quest.5 != 0`.
+            int64_t v = 0;
+            if (!harness_query(arg, &v)) {
+                fprintf(stderr, "[harness] assert: unknown/unavailable query '%s'\n", arg);
+                exit(1);
+            }
+            bool pass = harness_cmp(v, op, (int64_t)llv);
+            tig_debug_printf("[gpu-cmd] assert %s %s %lld: actual %lld -> %s\n",
+                arg, op, llv, (long long)v, pass ? "PASS" : "FAIL");
+            if (!pass) {
+                fprintf(stderr, "[harness] assert FAILED: %s (%lld) %s %lld\n",
+                    arg, (long long)v, op, llv);
+                exit(1);
+            }
+        } else if (strncmp(line, "strict", 6) == 0) {
+            // CI hygiene: when on, an unrecognized command aborts (exit 1) instead
+            // of silently no-opping, so a typo fails the run loudly. `strict 0` off.
+            int on = 1;
+            sscanf(line, "strict %d", &on);
+            harness_strict = (on != 0);
+            tig_debug_printf("[gpu-cmd] strict %d\n", harness_strict ? 1 : 0);
         } else if (strncmp(line, "quit", 4) == 0) {
             tig_debug_printf("[gpu-cmd] quit\n");
             // Pre-choose OK so the main loop's quit handler skips the blocking
@@ -714,6 +927,10 @@ void harness_channel_tick(void)
             break;
         } else {
             tig_debug_printf("[gpu-cmd] unknown: %s\n", line);
+            if (harness_strict) {
+                fprintf(stderr, "[harness] strict: unknown command '%s'\n", line);
+                exit(1);
+            }
         }
     }
     fclose(fp);

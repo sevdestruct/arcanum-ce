@@ -94,6 +94,21 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 **UI**
 - `inven`/`invenclose`, `logbook`/`logbookclose`, `wmap`/`wmapclose`/`wmapcap`/`wmaphalf`/`wmapscroll`.
 
+**Input injection** (drives the *real* input path — `tig_message_dequeue` runs every injected
+mouse message through `tig_button_process_mouse_msg` + `tig_window_filter_message`, so buttons,
+hotspots, and the iso world-picker all fire exactly as with hardware input)
+- `click <x> <y>` / `rclick <x> <y>` — left/right click at screen pixel (move→down→up).
+- `mousemove <x> <y>` — move the cursor (sets hover state).
+- `key <name>` — press+release a key by SDL name: `Return`, `Escape`, `Space`, `F1`, `A`,
+  `Up`, … (`SDL_GetScancodeFromName`).
+
+**State introspection / assertions** (catch *logic* regressions, not just visual/perf)
+- `get <query>` — log a state value. Queries: `pc.map` `pc.x` `pc.y` `pc.hp` `pc.hpmax`
+  `pc.gold` `pc.level`; `pc.stat.<id>` (any `STAT_*`); `gvar.<i>` `gflag.<i>`
+  (`script_global_var/flag`); `quest.<n>` (per-PC) / `gquest.<n>` (global quest state).
+- `assert <query> <op> <value>` — compare a query (`==` `!=` `<` `<=` `>` `>=`); `exit(1)` on
+  mismatch. e.g. `assert pc.map == 1`, `assert pc.gold >= 100`, `assert quest.5 != 0`.
+
 **Render path + perf toggles** (same setters the cfg keys use — for same-launch A/B)
 - `setpath <software|gpu>`, `resolveonce 0|1`, `halfreslerp 0|1`, `tilethreads 0|1`,
   `gpucachememo 0|1`, `presentskip 0|1`, `simd 0|1`.
@@ -117,11 +132,18 @@ from `gamelib_ping` (menu AND in-game). `wait N` pauses N frames; `# …` is a c
 - `assert-render-under <ms> [frames]` — measure mean full-redraw render time over `frames`
   (default 120); if it is ≥ `ms`, log FAIL to stderr and `exit(1)`. Turns a workout into a
   headless perf gate (non-zero exit on regression).
+- `assert-render-max <ms> [frames]` — same, but gates the **worst** frame, not the mean —
+  catches hitching/spikes a mean would hide.
 
 **Instrumentation / control**
 - `perf` — toggle the rich zoom-perf log (render/blit/OTHER/frame avg-max-stddev).
 - `zoomlog`, `trace` — zoom + GPU-dispatch tracing.
 - `capture <abs_path>` — dump the iso world buffer to a BMP (for pixel diffs).
+- `capturescreen <abs_path>` — dump the **full composited frame incl HUD/UI** (via
+  `SDL_RenderReadPixels`) — so UI/HUD regressions are catchable, not just the world. Best in
+  headless (software renderer); the post-present readback is unreliable in windowed GPU mode.
+- `strict [0|1]` — when on (default when bare), an unrecognized command `exit(1)`s instead of
+  silently no-opping, so a typo fails a CI run loudly.
 - `spikecap <ms> [max]` — auto-capture-on-spike: dump the iso buffer to
   `/tmp/arcanum-spike-<n>.bmp` whenever a frame's render time reaches `ms`, up to `max`
   (default 8) captures, then stop. `spikecap 0` disables. Catches the offending frame in a
